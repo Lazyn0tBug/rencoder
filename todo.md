@@ -205,6 +205,31 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
   - `target_path_helper_returns_inner_path`: Target::File/Dir unwrap to inner PathBuf
 - **Verify**: 4 new main.rs tests pass; workspace tests still 176/176.
 
+## U11. Integration tests + documentation — DONE
+
+- [x] `encode_cmd` fully wired (Config::load → init_encoder_cache → signal::install_handler → collect_files → transcode_batch → summary)
+- [x] `From<FormatArg> for VideoFormat` impl in main.rs
+- [x] `print_encode_summary` prints Total/Success/Reduced/Skipped/Failed counts
+- [x] `smart_encode_lib/tests/integration.rs` — 6 E2E tests:
+  - probe_real_video_returns_codec_and_fps
+  - analyze_fps_groups_mixed_fixtures (24/30/60 fps fixtures)
+  - analyze_fps_handles_probe_failure_for_missing_file
+  - transcode_batch_end_to_end_produces_output_files (AV1)
+  - transcode_batch_skips_when_output_exists
+  - init_encoder_cache_works_without_nvidia_smi
+- [x] `smart_encode_cli/tests/cli.rs` — 9 subprocess tests:
+  - version_prints_and_exits_zero
+  - top_level_help_prints_subcommands
+  - encode_help_prints_options
+  - analyze_help_prints_options
+  - unknown_subcommand_exits_nonzero
+  - analyze_subcommand_produces_stats_for_real_videos
+  - analyze_subcommand_writes_verbose_file
+  - encode_subcommand_produces_output_file
+  - encode_rejects_missing_target
+- [x] `README.md` — install, quickstart, CLI reference (encode + analyze), config schema, logging, development
+- **Verify**: `cargo test --workspace` 200/200 pass (was 185; +6 lib integration + +9 CLI integration).
+
 ## U12. Parallel analyze (optional)
 
 - [ ] `analyze_fps_parallel` in `analyzer/fps_stats.rs` behind `#[cfg(feature = "parallel-analyze")]`
