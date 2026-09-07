@@ -62,7 +62,10 @@ Rencoder 是一个智能视频转码与分析工具，支持：
 | 命令行解析 | `clap`（derive） | 仅 CLI 前端 |
 | 交互模式 | `dialoguer` | 仅 CLI 前端 |
 | 错误处理 | `anyhow`（CLI）+ `thiserror`（核心库） | 分层清晰 |
-| 日志 | `env_logger` + `log` | 核心库用 `log` 宏 |
+| 日志（核心库） | `log` | 核心库用 `log` 宏，保持库 API 稳定 |
+| 日志（CLI 前端） | `tracing` + `tracing-subscriber` + `tracing-log` | CLI 用结构化 tracing；`tracing-log` 桥接库内 `log` 事件 |
+| 日志（文件 sink） | `./log/rencoder.YYYY-MM-DD.NN.log` | 日滚 + 10MB 大小滚（NN 自增），7 天保留（`max_age_days=0` 不限）；自定义 `MakeWriter` 实现 |
+| 日志（span） | `#[instrument]` + `FmtSpan::CLOSE` | 关键函数（`encode_cmd` / `analyze_cmd`）记录 span 上下文，便于排障 |
 | 配置 | `serde_json` | 替代 `jq` |
 | Rust 版本 | 2021 Edition | 稳定 |
 | 目标平台 | Linux / macOS（Windows 后续） | 跨平台 |
@@ -98,6 +101,30 @@ Rencoder 是一个智能视频转码与分析工具，支持：
                 ├─ 否 → 软件编码
                 └─ 是 → nvenc ✓
 ```
+
+### 2.3 关于日志栈的决策
+
+**核心库仍用 `log`**：
+
+- 库对外暴露的是稳定的 `Result<_, EncodeError>` API；把 `tracing` 写进 API 表面会强制所有调用方依赖 `tracing`。
+- 库的日志语义是“底层发声”，固定为 `log` 即可，没必要结构化。
+
+**CLI 用 `tracing`**：
+
+- `tracing` 提供结构化字段和 span 上下文（`#[instrument]` 自动给每个事件挂上函数名 + 字段），排障时比纯文本日志更清晰。
+- `tracing-subscriber` 的 `Registry` + 多 `Layer` 模式天然支持双 sink（stdout + 文件）。
+- `tracing-log::LogTracer::init()` 把库内 `log` 事件桥接到 `tracing` 的 subscriber，调用方无需关心两边日志格式差异，`RUST_LOG` 一套规则同时控制两层。
+
+**文件 sink 用自写 `MakeWriter` 而非 `tracing_appender`**：
+
+- `tracing_appender::rolling` 只支持按 `Rotation`（DAILY / HOURLY / NEVER）滚动，**不支持大小阈值**。我们需要“日滚 + 10 MB 大小滚”，必须自己实现 `MakeWriter`。
+- 文件名 `rencoder.YYYY-MM-DD.NN.log`：日期每天更换，NN 在当天文件超过 `max_size` 时自增。
+- 启动时根据 `max_age_days` 清理过期文件（`0` 表示不清理）。
+- `FileSinkHandle` 仅持有 `&Mutex<Inner>`，利用 `Mutex` 的内部可变性避开 `MakeWriter` 给的 `&'a self` 限制。
+
+**为什么不用 `colored` crate**：
+
+- 颜色化是终端能力，`tracing-subscriber` 的 `fmt` 层默认不染色，且 ANSI 颜色在重定向到文件时会变成噪音；如需彩色输出，让终端通过 `RUST_LOG_STYLE=always` 等环境变量启用，避免库内硬编码。
 
 > 注：`nvidia-smi` 的 `io::Error`（找不到可执行文件）和"执行成功但无 GPU"都归为同一降级路径，`init_encoder_cache` 不应因此返回 `EncodeError`。
 
@@ -148,7 +175,8 @@ smart_encode_cli/
 ├── args.rs               # clap 参数（含 --nv）
 ├── interact.rs           # dialoguer 交互
 ├── signal.rs             # ctrlc + parking_lot::Mutex
-└── log.rs
+├── tracing_init.rs       # tracing-subscriber 初始化 + 双 sink
+└── file_sink.rs          # 自定义 MakeWriter：日/大小双轴滚动
 ```
 
 ---
@@ -617,8 +645,10 @@ clap = { version = "4", features = ["derive"] }
 dialoguer = "0.11"
 ctrlc = "3"
 parking_lot = "0.12"
-env_logger = "0.10"
-colored = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-log = "0.2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 anyhow = "1"
 ```
 
