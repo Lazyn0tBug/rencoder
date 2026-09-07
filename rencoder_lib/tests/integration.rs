@@ -227,3 +227,56 @@ fn init_encoder_cache_works_without_nvidia_smi() {
         || !cache.encoders_output.is_empty(),
         "encoders output should be populated (or empty if ffmpeg missing)");
 }
+
+
+// ---- c-probe FFI bridge (only with the feature) ----
+
+#[cfg(feature = "c-probe")]
+#[test]
+fn c_probe_matches_cli_probe_for_real_video() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+    let dir = fixture_dir("cprobe");
+    let video = make_video(&dir, "test.mp4", 30, 1);
+
+    let cli = probe_video_metadata(&video).expect("cli probe");
+    let ffi = rencoder_lib::ffi::probe_video_metadata_fast(&video)
+        .expect("ffi probe should succeed (libavformat compiled)");
+
+    assert_eq!(cli.codec, ffi.codec, "codec should match");
+    // fps values can differ slightly in formatting (e.g. "30/1" vs
+    // "29.97"); compare the parsed numeric value.
+    let cli_fps = cli.best_fps().expect("cli fps");
+    let ffi_fps = ffi.best_fps().expect("ffi fps");
+    assert!(
+        (cli_fps - ffi_fps).abs() < 0.5,
+        "fps should be close: cli={cli_fps} ffi={ffi_fps}"
+    );
+    // Duration: both should be ~1 second.
+    assert!(cli.duration_secs.is_some());
+    assert!(ffi.duration_secs.is_some());
+    let cli_d = cli.duration_secs.unwrap();
+    let ffi_d = ffi.duration_secs.unwrap();
+    assert!(
+        (cli_d - ffi_d).abs() < 0.5,
+        "duration should be close: cli={cli_d} ffi={ffi_d}"
+    );
+}
+
+#[cfg(feature = "c-probe")]
+#[test]
+fn c_probe_handles_missing_file_gracefully() {
+    let missing = std::env::temp_dir().join("rencoder_does_not_exist_xyz.mp4");
+    let _ = std::fs::remove_file(&missing);
+    // FFI returns a Result -- the C side reports an "open failed" via
+    // a zeroed result struct (all fields NULL); the Rust side returns
+    // Ok(VideoMetadata::default()) -- the analyzer treats this as a
+    // failed probe (no codec / fps).
+    let result = rencoder_lib::ffi::probe_video_metadata_fast(&missing)
+        .expect("ffi should not panic on missing file");
+    assert!(result.codec.is_none());
+    assert!(result.best_fps().is_none());
+}
+

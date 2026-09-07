@@ -22,6 +22,7 @@ pub fn probe_video_metadata(input: &Path) -> Result<VideoMetadata, EncodeError> 
             "-v", "error",
             "-select_streams", "v:0",
             "-show_entries", "stream=codec_name,avg_frame_rate,r_frame_rate",
+            "-show_entries", "format=duration",
             "-of", "json",
         ])
         .arg(input)
@@ -91,7 +92,15 @@ fn parse_probe_output(json: &str) -> Result<VideoMetadata, EncodeError> {
     let duration_secs = stream
         .get("duration")
         .and_then(Value::as_str)
-        .and_then(|s| s.parse::<f64>().ok());
+        .and_then(|s| s.parse::<f64>().ok())
+        // Some fixtures (e.g. lavfi-generated) report duration at the
+        // format level rather than per-stream. Fall back to format.duration.
+        .or_else(|| {
+            v.get("format")
+                .and_then(|f| f.get("duration"))
+                .and_then(Value::as_str)
+                .and_then(|s| s.parse::<f64>().ok())
+        });
 
     Ok(VideoMetadata {
         codec,

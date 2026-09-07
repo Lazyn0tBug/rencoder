@@ -17,8 +17,11 @@ polars = { version = "0.53", default-features = false, features = ["csv", "lazy"
 [features]
 default = []
 parallel-analyze = ["dep:rayon"]
-# c-probe: declared now to silence cfg warnings; deps + ffi module land in Phase 13.
-c-probe = []
+c-probe = ["dep:cc", "dep:pkg-config"]
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+pkg-config = { version = "0.3", optional = true }
 
 [dev-dependencies]
 pretty_assertions = "1"

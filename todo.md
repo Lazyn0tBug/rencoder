@@ -259,7 +259,19 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
 - **Verify**: `cargo test --workspace` 207/207; with `--features parallel-analyze` 157/157. `cargo clippy --workspace --all-targets` clean.
 - **Note**: c-probe interaction test (R17) deferred to U13 when the FFI bridge lands; the parallel path will pick it up automatically via `probe_video_metadata_auto`'s feature-gated dispatch.
 
-## U13. C FFI probe (optional)
+## U13. C FFI probe — DONE
+
+- [x] `Cargo.toml`: c-probe feature now depends on `dep:cc` and `dep:pkg-config` (optional build deps); dev-deps unchanged
+- [x] `build.rs`: when c-probe enabled, invokes `pkg-config --cflags --libs libavformat` directly, parses `-I` (passed to cc) and `-l`/`-L` (emitted as cargo link directives). Sidesteps the `pkg-config` crate's `.includes()` integration with `cc-rs` which didn't reliably propagate include paths here.
+- [x] `src/ffi/video_probe.c`: stateless libavformat bridge. Allocates a fresh `AVFormatContext` per call (rayon-safe per R17); returns malloc'd CStrings for codec + avg_frame_rate + r_frame_rate; failure (open failed / no streams) returns a zeroed struct so the Rust side sees None fields.
+- [x] `src/ffi/mod.rs`: `#[repr(C)]` ProbeResult mirroring the C side; reads each field, parses fps strings via the existing `parse_fps_value`, frees the C result via `rencoder_free`. Returns `Err(Probe(...))` only on NUL-in-path or calloc failure.
+- [x] `lib.rs`: `pub mod ffi;` gated on `c-probe`.
+- [x] CLI probe invocation: added `-show_entries format=duration` so `format.duration` is requested alongside the per-stream fields; `parse_probe_output` falls back to `format.duration` when `streams[0].duration` is missing (lavfi-generated fixtures put it there).
+- [x] Integration tests (gated on c-probe feature, run with `--features c-probe`):
+  - `c_probe_matches_cli_probe_for_real_video`: codec matches exactly, fps within 0.5, duration within 0.5s.
+  - `c_probe_handles_missing_file_gracefully`: nonexistent path returns `Ok(VideoMetadata::default())` (all None fields), no panic.
+- **Verify**: `cargo test --workspace` 207/207; with `--features c-probe` 155/155. `cargo clippy --workspace --all-targets --features c-probe` clean.
+
 
 - [ ] Uncomment `pub mod ffi;` in `lib.rs` with `#[cfg(feature = "c-probe")]`
 - [ ] `rencoder_lib/ffi/video_probe.c` — thin shim around `avformat_open_input` + `avformat_find_stream_info`

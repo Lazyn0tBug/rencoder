@@ -2513,8 +2513,10 @@ dependencies = [
 name = "rencoder_lib"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "log",
  "num_cpus",
+ "pkg-config",
  "polars",
  "pretty_assertions",
  "rayon",

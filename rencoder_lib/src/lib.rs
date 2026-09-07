@@ -15,5 +15,7 @@ pub mod path_util;
 pub mod processor;
 pub mod types;
 
-// Phase 16: optional C FFI bridge for high-performance probing.
-// pub mod ffi;  // gated on `c-probe` feature
+/// Optional C FFI bridge to libavformat for high-performance probing.
+/// Compiled only when the `c-probe` feature is enabled.
+#[cfg(feature = "c-probe")]
+pub mod ffi;
