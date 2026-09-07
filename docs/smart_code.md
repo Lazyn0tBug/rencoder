@@ -67,6 +67,8 @@ Rencoder 是一个智能视频转码与分析工具，支持：
 | 日志（文件 sink） | `./log/rencoder.YYYY-MM-DD.NN.log` | 日滚 + 10MB 大小滚（NN 自增），7 天保留（`max_age_days=0` 不限）；自定义 `MakeWriter` 实现 |
 | 日志（span） | `#[instrument]` + `FmtSpan::CLOSE` | 关键函数（`encode_cmd` / `analyze_cmd`）记录 span 上下文，便于排障 |
 | 配置 | `serde_json` | 替代 `jq` |
+| 分析聚合 | `polars`（DataFrame `group_by` + `agg`） | 复用 Polars 生态；不再手写 BTreeMap 遍历 |
+| 分析输出（默认） | per-file CSV 到 stdout + 一行 summary 到 stderr | 原始数据可管道到 DuckDB/Polars 二次分析；摘要与数据流分离 |
 | Rust 版本 | 2021 Edition | 稳定 |
 | 目标平台 | Linux / macOS（Windows 后续） | 跨平台 |
 
@@ -158,7 +160,7 @@ smart_encode_lib/
 │   └── limit.rs          # MaxFpsConfig
 ├── analyzer/
 │   ├── mod.rs
-│   └── fps_stats.rs      # 帧率统计
+│   └── fps_stats.rs      # 分析器：probe → AnalysisRecord → Polars 聚合 → FpsStats / CSV
 ├── processor/
 │   ├── mod.rs
 │   └── batch.rs          # 批量处理（失败不中断）
@@ -464,11 +466,38 @@ pub fn transcode_batch(
 #### 视频分析
 
 ```rust
+/// Raw per-file records. The CLI emits these as CSV; downstream tools
+/// (DuckDB / Polars) consume the CSV for arbitrary analysis.
+pub struct AnalysisRecord {
+    pub path: PathBuf,
+    pub fps: Option<u32>,
+    pub codec: Option<String>,
+    pub duration_secs: Option<f64>,
+    pub file_bytes: u64,
+}
+
+/// Build per-file records by probing each input. Failed probes still
+/// produce a row (with `fps`/`codec`/`duration_secs` = None).
+pub fn analyze_records(files: &[PathBuf]) -> Result<Vec<AnalysisRecord>, EncodeError>;
+
+/// Aggregate records into `FpsStats`. Internally backed by a Polars
+/// DataFrame; the public `FpsStats` is the rendered view.
 pub fn analyze_fps(files: &[PathBuf]) -> Result<FpsStats, EncodeError>;
 
+/// Render records as CSV (header + rows, with proper quoting).
+pub fn records_to_csv(records: &[AnalysisRecord]) -> String;
+
 #[cfg(feature = "parallel-analyze")]
-pub fn analyze_fps_parallel(files: &[PathBuf]) -> Result<FpsStats, EncodeError>;
+pub fn analyze_records_parallel(files: &[PathBuf]) -> Result<Vec<AnalysisRecord>, EncodeError>;
 ```
+
+CLI 输出双轨：
+- **CSV to stdout**（默认）：每行一个文件，列 `path, fps, codec, duration_secs, file_bytes`。
+- **Summary to stderr**：单行汇总（`Analyzed X files (Y parsed, Z failed)`）。
+- `--format text`：人类可读的汇总（旧 `FpsStats::summary()` 行为）。
+- `-o FILE`：CSV 写到文件而不是 stdout。
+
+聚合在 Polars 中完成：`group_by(fps).agg([count, sum(duration_secs)])`。失败探测的行有空 `fps`/`codec`/`duration_secs`，保留 `path`/`file_bytes` 便于下游 `WHERE fps IS NULL` 筛选。
 
 #### C FFI 桥接层（可选特性 `c-probe`）
 
@@ -625,6 +654,7 @@ log = "0.4"
 thiserror = "1"
 num_cpus = "1"
 rayon = { version = "1", optional = true }
+polars = { version = "0.46", features = ["lazy", "csv"] }
 
 [build-dependencies]
 cc = { version = "1", optional = true }
@@ -691,10 +721,10 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 
 | 类型 | 覆盖范围 |
 |---|---|
-| 单元测试 | `parse_fps_value`、`MaxFpsConfig::need_reduce`、`probe_video_metadata`、`FpsStats`、`collect_files`、`should_skip_encoding` 决策表 |
-| 集成测试 | CLI 黑盒，对比 `encode.zsh` / `video_fps_stats.zsh` 输出 |
+| 单元测试 | `parse_fps_value`、`MaxFpsConfig::need_reduce`、`probe_video_metadata`、`FpsStats`、`AnalysisRecord` / Polars 聚合、`collect_files`、`should_skip_encoding` 决策表 |
+| 集成测试 | CLI 黑盒：encode 端到端产出 `.mkv`；analyze 默认输出 CSV 到 stdout（一行一文件，列 `path, fps, codec, duration_secs, file_bytes`）；`--format text` 旧汇总；`-o FILE` 写文件 |
 | 最大帧率测试 | 25fps 不降帧、30fps 不降帧、29.97fps 不降帧、60fps 降帧 |
-| 视频分析测试 | 对比 `video_fps_stats.zsh` 统计结果 |
+| 视频分析测试 | `analyze_records` 产出 per-file records；Polars `group_by(fps).agg(count, sum(duration_secs))` 与手写 `FpsStats::summary` 数值一致；`records_to_csv` 输出可被标准 CSV 解析 |
 | 编码器缓存测试 | 验证只执行一次 `ffmpeg -encoders` |
 | NVIDIA 测试 | `--nv` + `nvidia-smi` 双重条件验证 |
 | 并发安全测试 | `c-probe` + `parallel-analyze` 同时启用，100+ 文件并行探测 |
