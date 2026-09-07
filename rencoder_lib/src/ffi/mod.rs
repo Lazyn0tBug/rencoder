@@ -26,6 +26,20 @@ extern "C" {
     fn rencoder_free(result: *mut ProbeResult);
 }
 
+/// RAII guard that calls `rencoder_free` on drop. Ensures the C-side
+/// malloc'd struct is released even if the read block panics.
+struct ProbeGuard(*mut ProbeResult);
+
+impl Drop for ProbeGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: `rencoder_free` accepts the null pointer as a no-op
+            // and otherwise frees the malloc'd struct + its strings.
+            unsafe { rencoder_free(self.0) };
+        }
+    }
+}
+
 /// Probe a video file via libavformat. Returns None fields on probe
 /// failure (matching the CLI probe's behavior).
 pub fn probe_video_metadata_fast(input: &Path) -> Result<VideoMetadata, EncodeError> {
@@ -35,10 +49,12 @@ pub fn probe_video_metadata_fast(input: &Path) -> Result<VideoMetadata, EncodeEr
     if raw.is_null() {
         return Err(EncodeError::Probe("c-probe: calloc failed".into()));
     }
+    let _guard = ProbeGuard(raw); // rencoder_free runs on scope exit (incl. panic).
+
     // SAFETY: `raw` is a non-null pointer to a ProbeResult that the C
     // bridge allocated via calloc. Fields are either malloc'd CStrings or
-    // a double (or NULL for missing data). We read each field, copy the
-    // data, then call rencoder_free.
+    // a double (or NULL for missing data). We read each field into owned
+    // Rust data before the guard frees the C memory.
     let result = unsafe { &*raw };
 
     let codec = read_cstr(result.codec_name);
@@ -51,8 +67,6 @@ pub fn probe_video_metadata_fast(input: &Path) -> Result<VideoMetadata, EncodeEr
     } else {
         Some(result.duration)
     };
-
-    unsafe { rencoder_free(raw) };
 
     Ok(VideoMetadata {
         codec,
@@ -69,9 +83,8 @@ fn read_cstr(ptr: *mut c_char) -> Option<String> {
         return None;
     }
     // SAFETY: caller guarantees the pointer is a malloc'd C string with
-    // a nul terminator, and we own the memory until rencoder_free is
-    // called. The pointer remains valid until we call rencoder_free, which
-    // happens after we return from this function.
+    // a nul terminator, and the C memory remains valid until the
+    // surrounding `ProbeGuard` drops at end of scope.
     let cstr = unsafe { CStr::from_ptr(ptr) };
     cstr.to_str().ok().map(|s| s.to_owned())
 }
