@@ -33,15 +33,18 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
 - [ ] `MaxFpsConfig::default().enabled()` returns `false` test
 - **Verify**: `cargo test -p smart_encode_lib --lib types` passes all `need_reduce` cases
 
-## U3. Probing
+## U3. Probing — DONE
 
-- [ ] `parse_fps_value` in `fps/parse.rs` — accepts `"30000/1001"`, `"25"`, `"29.97"`; rejects `0`, negatives, NaN, infinity
-- [ ] `parse_fps_value` unit tests (5 cases)
-- [ ] `probe_video_metadata` in `ffmpeg/probe.rs` — single `ffprobe` call returning codec + avg_fps + nominal_fps
-- [ ] `probe_video_metadata_auto` — dispatch to CLI probe (default) or C FFI (when `c-probe` feature enabled, in U13)
-- [ ] Integration test against a small fixture video (commit a tiny `.mp4` under `tests/fixtures/`)
-- [ ] `VideoMetadata::best_fps` and `is_valid` tests (already in types.rs; verify they pass)
-- **Verify**: `cargo test -p smart_encode_lib --lib probe parse` passes; integration test produces expected metadata
+- [x] `parse_fps_value` skeleton in `fps/parse.rs` — trim, dispatch to fraction/integer, validate
+- [x] `validate_fps` helper — rejects non-finite and <= 0
+- [x] `parse_fraction` — f64 parse both sides, explicit `d == 0.0` check, distinct errors
+- [x] `probe_video_metadata` in `ffmpeg/probe.rs` — single `ffprobe` call
+- [x] `parse_probe_output` (pure JSON mapping, split from subprocess)
+- [x] `probe_video_metadata_auto` feature-gated dispatch
+- [x] Unit tests: 13 parse cases (parses_fraction, parses_integer, parses_decimal, parses_decimal_with_trailing_zero, trims_whitespace, rejects_empty, rejects_zero_fraction_numerator, rejects_zero_denominator, rejects_negative_integer, rejects_negative_decimal, rejects_garbage, rejects_nan, rejects_infinity)
+- [x] Unit tests: 6 probe cases (parses_full_output, parses_minimal_output, rejects_empty_streams, rejects_no_streams_key, rejects_invalid_json, parses_nominal_when_avg_missing)
+- [x] Integration test: `real_ffprobe_against_fixture` (generates 1s 30fps H.264, probes, asserts h264 + ~30fps)
+- **Verify**: `cargo test -p smart_encode_lib --lib` 25/25 pass
 
 ## U4. Encoder cache + selection
 
