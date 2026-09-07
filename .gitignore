@@ -3,5 +3,5 @@
 *.swp
 *~
 /log/
-/smart_encode_cli/log/
+/rencoder_cli/log/
 .claude/settings.local.json

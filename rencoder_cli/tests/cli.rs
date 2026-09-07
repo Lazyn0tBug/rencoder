@@ -1,4 +1,4 @@
-//! CLI smoke + end-to-end tests. Spawns the `smart-encode` binary as a
+//! CLI smoke + end-to-end tests. Spawns the `rencoder` binary as a
 //! subprocess and verifies exit codes, stdout/stderr shape, and file
 //! outputs. Tests skip (with a logged warning) when `ffmpeg` is not
 //! available so the suite stays CI-friendly.
@@ -6,9 +6,9 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// Path to the compiled `smart-encode` binary, supplied by Cargo.
+/// Path to the compiled `rencoder` binary, supplied by Cargo.
 fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_smart-encode")
+    env!("CARGO_BIN_EXE_rencoder")
 }
 
 fn ffmpeg_available() -> bool {
@@ -73,7 +73,7 @@ fn version_prints_and_exits_zero() {
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("smart-encode"),
+        stdout.contains("rencoder"),
         "expected version string, got: {stdout}"
     );
 }

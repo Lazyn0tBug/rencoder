@@ -8,7 +8,7 @@ mod tracing_init;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use smart_encode_lib::{
+use rencoder_lib::{
     collect::collect_files,
     config::Config,
     ffmpeg::encoder_cache::init_encoder_cache,
@@ -41,7 +41,7 @@ fn main() -> Result<()> {
     }
 }
 
-/// `smart-encode encode ...` -- full pipeline: load config, init encoder
+/// `rencoder encode ...` -- full pipeline: load config, init encoder
 /// cache, install SIGINT handler, collect files, run the batch, print
 /// per-file + summary lines.
 #[instrument(skip_all, fields(format = ?_args.format, files = tracing::field::Empty))]
@@ -104,7 +104,7 @@ fn encode_cmd(_args: args::EncodeArgs) -> Result<()> {
     Ok(())
 }
 
-/// `smart-encode analyze ...` -- probes each file, groups by rounded fps,
+/// `rencoder analyze ...` -- probes each file, groups by rounded fps,
 /// prints summary, optionally writes a detailed file.
 #[instrument(skip_all, fields(dir = ?args.dir, file = ?args.file, parallel = args.parallel))]
 fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
@@ -122,9 +122,9 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
         warn!("--parallel not yet implemented; running serially");
     }
 
-    let records = smart_encode_lib::analyzer::fps_stats::analyze_records(&files)
+    let records = rencoder_lib::analyzer::fps_stats::analyze_records(&files)
         .with_context(|| "fps analysis failed")?;
-    let stats = smart_encode_lib::analyzer::fps_stats::aggregate_records(&records);
+    let stats = rencoder_lib::analyzer::fps_stats::aggregate_records(&records);
 
     // One-line summary to stderr regardless of output format.
     eprintln!(
@@ -141,7 +141,7 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
 
     match args.format {
         AnalyzeFormatArg::Csv => {
-            let body = smart_encode_lib::analyzer::fps_stats::records_to_csv(&records);
+            let body = rencoder_lib::analyzer::fps_stats::records_to_csv(&records);
             if args.output == Path::new("-") {
                 to_stdout(&body);
             } else {
@@ -170,7 +170,7 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
 }
 
 /// Render records as JSON Lines: one `AnalysisRecord` per line.
-fn records_to_jsonl(records: &[smart_encode_lib::analyzer::fps_stats::AnalysisRecord]) -> String {
+fn records_to_jsonl(records: &[rencoder_lib::analyzer::fps_stats::AnalysisRecord]) -> String {
     let mut out = String::new();
     for r in records {
         let fps = r

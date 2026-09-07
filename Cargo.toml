@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
-    "smart_encode_lib",
-    "smart_encode_cli",
+    "rencoder_lib",
+    "rencoder_cli",
 ]
 
 [workspace.package]

@@ -24,8 +24,8 @@ Rencoder 是一个智能视频转码与分析工具，支持：
 
 本项目采用 **CLI + Lib 双层架构**：
 
-- **核心库（`smart_encode_lib`）**：包含所有业务逻辑，不依赖任何前端交互。
-- **CLI 前端（`smart_encode_cli`）**：基于核心库构建，提供命令行接口。
+- **核心库（`rencoder_lib`）**：包含所有业务逻辑，不依赖任何前端交互。
+- **CLI 前端（`rencoder_cli`）**：基于核心库构建，提供命令行接口。
 
 ### 1.1 外部工具约束
 
@@ -138,10 +138,10 @@ Rencoder 是一个智能视频转码与分析工具，支持：
 
 ### 3.1 模块划分
 
-#### 核心库（`smart_encode_lib`）
+#### 核心库（`rencoder_lib`）
 
 ```
-smart_encode_lib/
+rencoder_lib/
 ├── lib.rs                # 库入口
 ├── error.rs              # EncodeError（#[non_exhaustive]）
 ├── config.rs             # 配置结构
@@ -169,10 +169,10 @@ smart_encode_lib/
     └── video_probe.c
 ```
 
-#### CLI 前端（`smart_encode_cli`）
+#### CLI 前端（`rencoder_cli`）
 
 ```
-smart_encode_cli/
+rencoder_cli/
 ├── main.rs
 ├── args.rs               # clap 参数（含 --nv）
 ├── interact.rs           # dialoguer 交互
@@ -527,7 +527,7 @@ pub fn probe_video_metadata_auto(input: &Path) -> Result<VideoMetadata, EncodeEr
 #### 转码模式参数
 
 ```
-smart-encode encode [选项] [--] [额外FFmpeg参数]
+rencoder encode [选项] [--] [额外FFmpeg参数]
 
 选项：
   -c, --format FORMAT     目标格式: x264|hevc|vp9|av1 (默认: av1)
@@ -543,7 +543,7 @@ smart-encode encode [选项] [--] [额外FFmpeg参数]
 #### 分析模式参数
 
 ```
-smart-encode analyze [选项]
+rencoder analyze [选项]
 
 选项：
   -d, --dir DIR           指定目录（递归），默认当前目录
@@ -670,7 +670,7 @@ c-probe = ["cc", "pkg-config"]
 
 ```toml
 [dependencies]
-smart_encode_lib = { path = "../smart_encode_lib", features = ["parallel-analyze"] }
+rencoder_lib = { path = "../rencoder_lib", features = ["parallel-analyze"] }
 clap = { version = "4", features = ["derive"] }
 dialoguer = "0.11"
 ctrlc = "3"

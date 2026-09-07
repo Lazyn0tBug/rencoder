@@ -4,8 +4,8 @@ Rust rewrite of `encode.zsh` and `video_fps_stats.zsh`: smart video transcoding 
 
 ## Workspace
 
-- `smart_encode_lib` -- core library (`thiserror`, `walkdir`, `rayon`)
-- `smart_encode_cli` -- CLI frontend (`clap`, `dialoguer`, `ctrlc`, `parking_lot`)
+- `rencoder_lib` -- core library (`thiserror`, `walkdir`, `rayon`)
+- `rencoder_cli` -- CLI frontend (`clap`, `dialoguer`, `ctrlc`, `parking_lot`)
 
 Design source of truth: `docs/smart_code.md`. Update the doc first when behavior changes.
 
@@ -14,7 +14,7 @@ Design source of truth: `docs/smart_code.md`. Update the doc first when behavior
 ```bash
 cargo build
 cargo build --release
-cargo build -p smart_encode_lib --features parallel-analyze
+cargo build -p rencoder_lib --features parallel-analyze
 ```
 
 ## Test
@@ -42,4 +42,4 @@ cargo fmt --check
 
 ## TODO
 
-- `MaxFpsConfig::need_reduce` in `smart_encode_lib/src/types.rs` -- the source-fps > cap predicate. Awaiting design input on epsilon tolerance semantics (strict vs. non-strict, which side of the comparison the eps lives on).
+- `MaxFpsConfig::need_reduce` in `rencoder_lib/src/types.rs` -- the source-fps > cap predicate. Awaiting design input on epsilon tolerance semantics (strict vs. non-strict, which side of the comparison the eps lives on).

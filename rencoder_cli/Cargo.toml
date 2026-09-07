@@ -1,16 +1,16 @@
 [package]
-name = "smart_encode_cli"
+name = "rencoder_cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "CLI frontend for Rencoder."
 
 [[bin]]
-name = "smart-encode"
+name = "rencoder"
 path = "src/main.rs"
 
 [dependencies]
-smart_encode_lib = { path = "../smart_encode_lib", features = ["parallel-analyze"] }
+rencoder_lib = { path = "../rencoder_lib", features = ["parallel-analyze"] }
 clap = { version = "4", features = ["derive"] }
 dialoguer = "0.11"
 ctrlc = "3"

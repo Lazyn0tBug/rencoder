@@ -6,10 +6,10 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
-/// Top-level CLI: `smart-encode <subcommand> ...`
+/// Top-level CLI: `rencoder <subcommand> ...`
 #[derive(Parser, Debug)]
 #[command(
-    name = "smart-encode",
+    name = "rencoder",
     version,
     about = "Smart video transcoder and analyzer"
 )]
@@ -140,7 +140,7 @@ mod tests {
 
     #[test]
     fn encode_defaults_to_av1() {
-        let cli = parse_ok(&["smart-encode", "encode", "-f", "in.mp4"]);
+        let cli = parse_ok(&["rencoder", "encode", "-f", "in.mp4"]);
         match cli.command {
             Command::Encode(args) => {
                 assert_eq!(args.format, FormatArg::Av1);
@@ -169,7 +169,7 @@ mod tests {
             ("vp9", FormatArg::Vp9),
             ("av1", FormatArg::Av1),
         ] {
-            let cli = parse_ok(&["smart-encode", "encode", "-f", "in.mp4", "-c", s]);
+            let cli = parse_ok(&["rencoder", "encode", "-f", "in.mp4", "-c", s]);
             match cli.command {
                 Command::Encode(args) => assert_eq!(args.format, expected, "for {s}"),
                 _ => panic!("expected Encode for {s}"),
@@ -179,14 +179,14 @@ mod tests {
 
     #[test]
     fn encode_invalid_format_rejected() {
-        parse_err(&["smart-encode", "encode", "-f", "in.mp4", "-c", "divx"]);
+        parse_err(&["rencoder", "encode", "-f", "in.mp4", "-c", "divx"]);
     }
 
     // ---- encode: bitrate / crf ----
 
     #[test]
     fn encode_bitrate_flag_parses_u32() {
-        let cli = parse_ok(&["smart-encode", "encode", "-f", "in.mp4", "-b", "5000"]);
+        let cli = parse_ok(&["rencoder", "encode", "-f", "in.mp4", "-b", "5000"]);
         match cli.command {
             Command::Encode(args) => assert_eq!(args.bitrate, Some(5000)),
             _ => panic!("expected Encode"),
@@ -196,12 +196,12 @@ mod tests {
     #[test]
     fn encode_bitrate_negative_rejected() {
         // u32 parser rejects negative.
-        parse_err(&["smart-encode", "encode", "-f", "in.mp4", "-b", "-5"]);
+        parse_err(&["rencoder", "encode", "-f", "in.mp4", "-b", "-5"]);
     }
 
     #[test]
     fn encode_crf_flag_sets_bool() {
-        let cli = parse_ok(&["smart-encode", "encode", "-f", "in.mp4", "--crf"]);
+        let cli = parse_ok(&["rencoder", "encode", "-f", "in.mp4", "--crf"]);
         match cli.command {
             Command::Encode(args) => {
                 assert!(args.crf);
@@ -217,7 +217,7 @@ mod tests {
     fn encode_max_fps_canonical_values() {
         for fps in ["24", "25", "30", "60"] {
             let cli = parse_ok(&[
-                "smart-encode", "encode", "-f", "in.mp4", "--max-fps", fps,
+                "rencoder", "encode", "-f", "in.mp4", "--max-fps", fps,
             ]);
             match cli.command {
                 Command::Encode(args) => {
@@ -230,7 +230,7 @@ mod tests {
 
     #[test]
     fn encode_max_fps_zero_means_disabled() {
-        let cli = parse_ok(&["smart-encode", "encode", "-f", "in.mp4", "--max-fps", "0"]);
+        let cli = parse_ok(&["rencoder", "encode", "-f", "in.mp4", "--max-fps", "0"]);
         match cli.command {
             Command::Encode(args) => assert_eq!(args.max_fps, 0.0),
             _ => panic!(),
@@ -242,7 +242,7 @@ mod tests {
     #[test]
     fn encode_extra_args_after_double_dash() {
         let cli = parse_ok(&[
-            "smart-encode", "encode", "-f", "in.mp4",
+            "rencoder", "encode", "-f", "in.mp4",
             "--", "-ss", "10", "-metadata", "title=foo",
         ]);
         match cli.command {
@@ -255,7 +255,7 @@ mod tests {
 
     #[test]
     fn encode_extra_args_empty_when_no_double_dash() {
-        let cli = parse_ok(&["smart-encode", "encode", "-f", "in.mp4"]);
+        let cli = parse_ok(&["rencoder", "encode", "-f", "in.mp4"]);
         match cli.command {
             Command::Encode(args) => assert!(args.extra_args.is_empty()),
             _ => panic!(),
@@ -267,7 +267,7 @@ mod tests {
     #[test]
     fn encode_extensions_repeatable() {
         let cli = parse_ok(&[
-            "smart-encode", "encode", "-d", "/d",
+            "rencoder", "encode", "-d", "/d",
             "-e", "mp4", "-e", "mkv", "-e", "avi",
         ]);
         match cli.command {
@@ -281,7 +281,7 @@ mod tests {
 
     #[test]
     fn encode_nv_flag_sets_bool() {
-        let cli = parse_ok(&["smart-encode", "encode", "-f", "in.mp4", "--nv"]);
+        let cli = parse_ok(&["rencoder", "encode", "-f", "in.mp4", "--nv"]);
         match cli.command {
             Command::Encode(args) => assert!(args.enable_nv),
             _ => panic!(),
@@ -290,7 +290,7 @@ mod tests {
 
     #[test]
     fn encode_interactive_flag() {
-        let cli = parse_ok(&["smart-encode", "encode", "-f", "in.mp4", "-i"]);
+        let cli = parse_ok(&["rencoder", "encode", "-f", "in.mp4", "-i"]);
         match cli.command {
             Command::Encode(args) => assert!(args.interactive),
             _ => panic!(),
@@ -300,7 +300,7 @@ mod tests {
     #[test]
     fn encode_config_path() {
         let cli = parse_ok(&[
-            "smart-encode", "encode", "-f", "in.mp4", "--config", "/etc/rencoder.json",
+            "rencoder", "encode", "-f", "in.mp4", "--config", "/etc/rencoder.json",
         ]);
         match cli.command {
             Command::Encode(args) => assert_eq!(args.config, Some(PathBuf::from("/etc/rencoder.json"))),
@@ -312,7 +312,7 @@ mod tests {
 
     #[test]
     fn analyze_defaults() {
-        let cli = parse_ok(&["smart-encode", "analyze"]);
+        let cli = parse_ok(&["rencoder", "analyze"]);
         match cli.command {
             Command::Analyze(args) => {
                 assert_eq!(args.dir, None);
@@ -329,7 +329,7 @@ mod tests {
     #[test]
     fn analyze_with_all_flags() {
         let cli = parse_ok(&[
-            "smart-encode", "analyze",
+            "rencoder", "analyze",
             "-d", "/d", "-e", "mp4", "-p", "--format", "text", "-o", "stats.txt",
         ]);
         match cli.command {
@@ -347,7 +347,7 @@ mod tests {
     #[test]
     fn analyze_extensions_repeatable() {
         let cli = parse_ok(&[
-            "smart-encode", "analyze", "-d", "/d", "-e", "mp4", "-e", "mkv",
+            "rencoder", "analyze", "-d", "/d", "-e", "mp4", "-e", "mkv",
         ]);
         match cli.command {
             Command::Analyze(args) => assert_eq!(args.ext, vec!["mp4", "mkv"]),
@@ -357,7 +357,7 @@ mod tests {
 
     #[test]
     fn analyze_single_file() {
-        let cli = parse_ok(&["smart-encode", "analyze", "-f", "/single.mp4"]);
+        let cli = parse_ok(&["rencoder", "analyze", "-f", "/single.mp4"]);
         match cli.command {
             Command::Analyze(args) => assert_eq!(args.file, Some(PathBuf::from("/single.mp4"))),
             _ => panic!(),
@@ -368,12 +368,12 @@ mod tests {
 
     #[test]
     fn no_subcommand_errors() {
-        parse_err(&["smart-encode"]);
+        parse_err(&["rencoder"]);
     }
 
     #[test]
     fn unknown_subcommand_errors() {
-        parse_err(&["smart-encode", "frobnicate"]);
+        parse_err(&["rencoder", "frobnicate"]);
     }
 
     #[test]
@@ -382,7 +382,7 @@ mod tests {
         // clap level (interact mode can populate later), but clap doesn't
         // complain either -- the validation lives in main.rs (Phase 11).
         // This test just verifies clap parses the bare command.
-        let cli = parse_ok(&["smart-encode", "encode"]);
+        let cli = parse_ok(&["rencoder", "encode"]);
         assert!(matches!(cli.command, Command::Encode(_)));
     }
 }

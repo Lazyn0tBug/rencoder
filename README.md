@@ -34,7 +34,7 @@ sudo apt-get install ffmpeg
 
 ```sh
 cargo build --release
-# Binary: target/release/smart-encode
+# Binary: target/release/rencoder
 ```
 
 ## Quickstart
@@ -42,7 +42,7 @@ cargo build --release
 ### Analyze a directory of videos
 
 ```sh
-smart-encode analyze -d ./my_videos/
+rencoder analyze -d ./my_videos/
 ```
 
 Sample output:
@@ -57,40 +57,40 @@ Total: 8 files (8 parsed, 0 failed)
 Add `-v` to write per-file details to `fps_stats.txt`:
 
 ```sh
-smart-encode analyze -d ./my_videos/ -v
+rencoder analyze -d ./my_videos/ -v
 ```
 
 ### Transcode a single file
 
 ```sh
-smart-encode encode -f movie.mp4 -c av1
+rencoder encode -f movie.mp4 -c av1
 # Output: movie.av1.mkv
 ```
 
 CRF mode for AV1 (quality-based):
 
 ```sh
-smart-encode encode -f movie.mp4 -c av1 --crf -b 45
+rencoder encode -f movie.mp4 -c av1 --crf -b 45
 ```
 
 Cap frame rate to 30 fps (60 fps source gets downsampled):
 
 ```sh
-smart-encode encode -d ./highfps/ -c av1 --max-fps 30
+rencoder encode -d ./highfps/ -c av1 --max-fps 30
 ```
 
 ### Transcode a directory recursively
 
 ```sh
-smart-encode encode -d ./input/ -c x264 -b 5000 -e mp4 -e mov
+rencoder encode -d ./input/ -c x264 -b 5000 -e mp4 -e mov
 ```
 
 ## CLI reference
 
-### `smart-encode encode`
+### `rencoder encode`
 
 ```
-smart-encode encode [OPTIONS] [--] [EXTRA_FFMPEG_ARGS]
+rencoder encode [OPTIONS] [--] [EXTRA_FFMPEG_ARGS]
 
 Options:
   -c, --format FORMAT         Target format: x264|hevc|vp9|av1 (default: av1)
@@ -107,10 +107,10 @@ Options:
   -h, --help                  Print help
 ```
 
-### `smart-encode analyze`
+### `rencoder analyze`
 
 ```
-smart-encode analyze [OPTIONS]
+rencoder analyze [OPTIONS]
 
 Options:
   -d, --dir DIR               Input directory (recursive, default: cwd)
@@ -174,10 +174,10 @@ Examples:
 
 ```sh
 # Verbose analyze
-RUST_LOG=debug smart-encode analyze -d ./my_videos/
+RUST_LOG=debug rencoder analyze -d ./my_videos/
 
 # Encode with spans visible
-smart-encode encode -d ./input/ -c av1 --max-fps 30
+rencoder encode -d ./input/ -c av1 --max-fps 30
 ```
 
 ## Development
@@ -192,8 +192,8 @@ cargo fmt --check             # formatting
 Run a single crate's tests:
 
 ```sh
-cargo test -p smart_encode_lib           # core
-cargo test -p smart_encode_cli --bin smart-encode  # CLI unit tests
+cargo test -p rencoder_lib           # core
+cargo test -p rencoder_cli --bin rencoder  # CLI unit tests
 cargo test --workspace                   # everything
 ```
 
@@ -202,8 +202,8 @@ cargo test --workspace                   # everything
 See `docs/smart_code.md` for the full design (architecture, KTDs, R-IDs,
 test matrix).
 
-- `smart_encode_lib/` — core library. All business logic.
-- `smart_encode_cli/` — CLI binary (clap + tracing + signal handling).
+- `rencoder_lib/` — core library. All business logic.
+- `rencoder_cli/` — CLI binary (clap + tracing + signal handling).
 - The library uses `log`; the CLI uses `tracing` with a `tracing-log`
   bridge so both feed the same subscriber.
 

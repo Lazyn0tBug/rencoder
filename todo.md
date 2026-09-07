@@ -8,9 +8,9 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
 
 ## U1. Foundation (workspace, types, errors, config) — DONE
 
-- [x] Workspace `Cargo.toml` with `smart_encode_lib` + `smart_encode_cli`
-- [x] `smart_encode_lib/Cargo.toml` with deps (walkdir, serde_json, log, thiserror, num_cpus, rayon opt)
-- [x] `smart_encode_cli/Cargo.toml` with deps (clap, dialoguer, ctrlc, parking_lot, env_logger, anyhow)
+- [x] Workspace `Cargo.toml` with `rencoder_lib` + `rencoder_cli`
+- [x] `rencoder_lib/Cargo.toml` with deps (walkdir, serde_json, log, thiserror, num_cpus, rayon opt)
+- [x] `rencoder_cli/Cargo.toml` with deps (clap, dialoguer, ctrlc, parking_lot, env_logger, anyhow)
 - [x] `EncodeError` with `#[non_exhaustive]` (7 variants per origin §5)
 - [x] All public types in `types.rs` (`VideoFormat`, `VideoMetadata`, `MaxFpsConfig`, `ProcessOutput`, `EncoderCache`, `EncodeParams`, `Target`, `TranscodeTask`, `TranscodeResult`, `FpsStats`, `AnalyzeParams`)
 - [x] `Config` struct + `Config::load` + `Config::max_fps_config()` (5 unit tests passing)
@@ -19,7 +19,7 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
 - [x] Project CLAUDE.md (build/test, external tools, conventions, TODO)
 - [x] `.gitignore` (target, .DS_Store, *.swp, *~, .claude/settings.local.json)
 - [x] Initial commit (`8a35100`)
-- **Verify**: `cargo check --workspace` clean, `cargo test -p smart_encode_lib --lib config` 5/5 pass
+- **Verify**: `cargo check --workspace` clean, `cargo test -p rencoder_lib --lib config` 5/5 pass
 
 ## U2. Max FPS predicate
 
@@ -31,7 +31,7 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
   - [ ] `29.97` @ cap=30, eps=0.05 → `false`
   - [ ] `25.0` @ cap=30 → `false`
 - [ ] `MaxFpsConfig::default().enabled()` returns `false` test
-- **Verify**: `cargo test -p smart_encode_lib --lib types` passes all `need_reduce` cases
+- **Verify**: `cargo test -p rencoder_lib --lib types` passes all `need_reduce` cases
 
 ## U3. Probing — DONE
 
@@ -44,7 +44,7 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
 - [x] Unit tests: 13 parse cases (parses_fraction, parses_integer, parses_decimal, parses_decimal_with_trailing_zero, trims_whitespace, rejects_empty, rejects_zero_fraction_numerator, rejects_zero_denominator, rejects_negative_integer, rejects_negative_decimal, rejects_garbage, rejects_nan, rejects_infinity)
 - [x] Unit tests: 6 probe cases (parses_full_output, parses_minimal_output, rejects_empty_streams, rejects_no_streams_key, rejects_invalid_json, parses_nominal_when_avg_missing)
 - [x] Integration test: `real_ffprobe_against_fixture` (generates 1s 30fps H.264, probes, asserts h264 + ~30fps)
-- **Verify**: `cargo test -p smart_encode_lib --lib` 25/25 pass
+- **Verify**: `cargo test -p rencoder_lib --lib` 25/25 pass
 
 ## U4. Encoder cache + selection — DONE (post-review fixes applied)
 
@@ -64,7 +64,7 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
   - Removed dead `EncodeParams.enable_nv` field; `cache.has_nvidia` is the source of truth
   - `probe_video_metadata_auto` falls back from c-probe FFI to CLI on failure (defensive, c-probe lands in Phase 13)
 - [x] Tests: 9 encoder_cache + 7 select_encoder + 8 config + 6 probe = 30 U4-related tests
-- **Verify**: `cargo test -p smart_encode_lib --lib` 45/45 pass; workspace clean
+- **Verify**: `cargo test -p rencoder_lib --lib` 45/45 pass; workspace clean
 
 ## U5. Command builder + single-file transcode — DONE
 
@@ -88,7 +88,7 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
   - Step 1: 7 need_reduce tests + 1 default test in `types.rs` (23 types tests total)
   - Step 2+3: 19 tests in `command.rs` (7 skip-table + 12 argv-layout)
   - Step 4: 7 tests in `batch.rs` (skip/reduce/no-r/fail/missing-encoder/exists)
-- **Verify**: `cargo test -p smart_encode_lib --lib` 108/108 pass (was 75; +33 from U5)
+- **Verify**: `cargo test -p rencoder_lib --lib` 108/108 pass (was 75; +33 from U5)
 
 ## U6. File collection + batch transcode — DONE
 
@@ -105,7 +105,7 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
 - [x] Tests added per step:
   - collect: 12 tests (file-target 5 cases, dir-target 7 cases including symlink file + loop guards)
   - batch: 7 tests (order preserved, failure-doesn't-abort, callback in order, no-callback path, empty list, output-path derivation, public-API sanity)
-- **Verify**: `cargo test -p smart_encode_lib --lib` 127/127 pass (was 108; +19 from U6)
+- **Verify**: `cargo test -p rencoder_lib --lib` 127/127 pass (was 108; +19 from U6)
 
 ## U7. FPS analyzer — DONE (initial; refactored under U7.5)
 
@@ -118,11 +118,11 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
 - [x] Tests added per step:
   - Step 1: 5 FpsStats::summary/detailed tests in `types.rs` (group counts, totals, empty, failures, path grouping)
   - Step 2: 7 analyze_fps tests in `analyzer/fps_stats.rs` (empty input, group-by-fps, integer fps, probe failure, missing fps, mixed success+failure, boundary rounding)
-- **Verify**: `cargo test -p smart_encode_lib --lib` 139/139 pass (was 127; +12 from U7)
+- **Verify**: `cargo test -p rencoder_lib --lib` 139/139 pass (was 127; +12 from U7)
 
 ## U7.5. Polars-based analyzer refactor — DONE
 
-- [x] Add `polars = { version = "0.46", features = ["lazy", "csv"] }` to `smart_encode_lib/Cargo.toml`
+- [x] Add `polars = { version = "0.46", features = ["lazy", "csv"] }` to `rencoder_lib/Cargo.toml`
 - [x] `AnalysisRecord` struct: `path`, `fps: Option<u32>`, `codec: Option<String>`, `duration_secs: Option<f64>`, `file_bytes: u64`
 - [x] `analyze_records(files) -> Result<Vec<AnalysisRecord>, EncodeError>` — per-file probe + record (failed probes still emit a row with None metric fields)
 - [x] `analyze_fps` refactored to call `analyze_records` then aggregate via Polars `group_by + agg` (count, sum duration_secs); FpsStats is the rendered output
@@ -142,10 +142,10 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
 - [ ] `log::init()` in `log.rs` — `env_logger::Builder::from_env(Env::default().default_filter_or("info"))`
 - [ ] `main.rs` dispatches on subcommand; encodes → build params → init cache → install signal → batch
 - [ ] Tests:
-  - [ ] `Args::try_parse_from(["smart-encode", "encode", "-f", "in.mp4"])` → `Ok(Encode(...))`
+  - [ ] `Args::try_parse_from(["rencoder", "encode", "-f", "in.mp4"])` → `Ok(Encode(...))`
   - [ ] Extra args after `--` end up in `extra_args`
   - [ ] Manual SIGINT during encode deletes partial file
-- **Verify**: `cargo build -p smart_encode_cli` succeeds; manual SIGINT test passes
+- **Verify**: `cargo build -p rencoder_cli` succeeds; manual SIGINT test passes
 
 ## U9. Interactive mode
 
@@ -166,13 +166,13 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
 - [ ] `AnalyzeArgs` in `args.rs`: `-d/--dir`, `-f/--file`, `-e/--ext`, `-p/--parallel`, `-v/--verbose`, `-o/--output`
 - [ ] `main.rs` dispatches: builds `AnalyzeParams`, runs `analyze_fps` (or `analyze_fps_parallel` when `parallel`), prints summary, writes detailed file when `-v`
 - [ ] Tests:
-  - [ ] `Args::try_parse_from(["smart-encode", "analyze", "-d", ".", "-p", "-v"])` → `parallel=true, verbose=true`
+  - [ ] `Args::try_parse_from(["rencoder", "analyze", "-d", ".", "-p", "-v"])` → `parallel=true, verbose=true`
   - [ ] End-to-end on fixture directory produces stats summary
-- **Verify**: `cargo run -p smart_encode_cli -- analyze -d tests/fixtures -v` succeeds
+- **Verify**: `cargo run -p rencoder_cli -- analyze -d tests/fixtures -v` succeeds
 
 ## U11. Integration tests + documentation
 
-- [ ] `smart_encode_lib/tests/` integration test files
+- [ ] `rencoder_lib/tests/` integration test files
 - [ ] `tests/fixtures/` with small sample videos (a few KB each: low-fps, high-fps, already-target-codec)
 - [ ] Origin §6 test matrix:
   - [ ] 25 fps → no reduce
@@ -223,14 +223,14 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
 - [x] `encode_cmd` fully wired (Config::load → init_encoder_cache → signal::install_handler → collect_files → transcode_batch → summary)
 - [x] `From<FormatArg> for VideoFormat` impl in main.rs
 - [x] `print_encode_summary` prints Total/Success/Reduced/Skipped/Failed counts
-- [x] `smart_encode_lib/tests/integration.rs` — 6 E2E tests:
+- [x] `rencoder_lib/tests/integration.rs` — 6 E2E tests:
   - probe_real_video_returns_codec_and_fps
   - analyze_fps_groups_mixed_fixtures (24/30/60 fps fixtures)
   - analyze_fps_handles_probe_failure_for_missing_file
   - transcode_batch_end_to_end_produces_output_files (AV1)
   - transcode_batch_skips_when_output_exists
   - init_encoder_cache_works_without_nvidia_smi
-- [x] `smart_encode_cli/tests/cli.rs` — 9 subprocess tests:
+- [x] `rencoder_cli/tests/cli.rs` — 9 subprocess tests:
   - version_prints_and_exits_zero
   - top_level_help_prints_subcommands
   - encode_help_prints_options
@@ -249,12 +249,12 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
 - [ ] `rayon::prelude::*`; merge results via `Mutex<FpsStats>` (parking_lot) or per-thread reduce
 - [ ] `c-probe` interaction test: 100 concurrent probes complete without UB
 - [ ] Tests: parallel output identical to serial
-- **Verify**: `cargo test -p smart_encode_lib --features parallel-analyze` passes
+- **Verify**: `cargo test -p rencoder_lib --features parallel-analyze` passes
 
 ## U13. C FFI probe (optional)
 
 - [ ] Uncomment `pub mod ffi;` in `lib.rs` with `#[cfg(feature = "c-probe")]`
-- [ ] `smart_encode_lib/ffi/video_probe.c` — thin shim around `avformat_open_input` + `avformat_find_stream_info`
+- [ ] `rencoder_lib/ffi/video_probe.c` — thin shim around `avformat_open_input` + `avformat_find_stream_info`
 - [ ] Returns codec name + `avg_frame_rate` + `r_frame_rate` via a malloc'd C struct
 - [ ] `build.rs` gated on `c-probe`; uses `cc` to compile + `pkg-config` for libavformat
 - [ ] Rust wrapper in `ffi/mod.rs`: `Box`-wraps the C struct, frees with `libc::free`
@@ -267,7 +267,7 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
 ## U14. GUI prototype (DEFERRED)
 
 - [ ] Framework decision (Tauri / egui / Slint) — separate decision, separate crate
-- [ ] New crate `smart_encode_gui` consuming `smart_encode_lib`
+- [ ] New crate `rencoder_gui` consuming `rencoder_lib`
 - [ ] Use `ProcessOutput::Piped` for live progress UI
 - **Verify**: out of scope for this plan
 

@@ -57,7 +57,7 @@ KTDs traceable to `docs/smart_code.md` §2.
 
 | ID  | Decision | Why |
 |-----|----------|-----|
-| K1  | Library/CLI split (`smart_encode_lib` + `smart_encode_cli`). | Lets a future GUI/TUI/web frontend reuse the library without dragging in clap/dialoguer. |
+| K1  | Library/CLI split (`rencoder_lib` + `rencoder_cli`). | Lets a future GUI/TUI/web frontend reuse the library without dragging in clap/dialoguer. |
 | K2  | `thiserror` in the library, `anyhow` in the CLI. | Library returns structured, exhaustively-matchable errors; CLI prints-and-exits. Mixing layers would leak UI concerns into the library. |
 | K3  | `#[non_exhaustive]` on `EncodeError`. | Forward-compat: Phase 8's `TranscodeResult::Failed(EncodeError)` consumers stay compilable when new variants are added in Phase 16/17. |
 | K4  | `walkdir` (no `fd`), `serde_json` (no `jq`), `rayon` (no `xargs`). | Pure-Rust toolchain; no external process spawns for orchestration. |
@@ -71,7 +71,7 @@ KTDs traceable to `docs/smart_code.md` §2.
 ## High-Level Technical Design
 
 ```
-                            smart_encode_cli (Phase 8-13)
+                            rencoder_cli (Phase 8-13)
                             ----------------------------
         clap args  --->  dialoguer (interactive)
                 \          |
@@ -79,7 +79,7 @@ KTDs traceable to `docs/smart_code.md` §2.
                   +-> signal.rs (ctrlc + parking_lot::Mutex)
                               |
                               v
-                    smart_encode_lib  (Phase 1-7)
+                    rencoder_lib  (Phase 1-7)
                     --------------------------------
    +-----------+-----------+------------+---------------+-----------+
    |           |           |            |               |           |
@@ -132,28 +132,28 @@ The `-r` block is the single most error-prone position; the unit test in U5 must
   - `Cargo.toml`
   - `CLAUDE.md`
   - `.gitignore`
-  - `smart_encode_lib/Cargo.toml`
-  - `smart_encode_lib/src/lib.rs`
-  - `smart_encode_lib/src/error.rs`
-  - `smart_encode_lib/src/types.rs`
-  - `smart_encode_lib/src/path_util.rs`
-  - `smart_encode_lib/src/config.rs`
-  - `smart_encode_lib/src/collect.rs`
-  - `smart_encode_lib/src/ffmpeg/{mod,probe,encoder,encoder_cache,command}.rs`
-  - `smart_encode_lib/src/fps/{mod,parse,limit}.rs`
-  - `smart_encode_lib/src/analyzer/{mod,fps_stats}.rs`
-  - `smart_encode_lib/src/processor/{mod,batch}.rs`
-  - `smart_encode_cli/Cargo.toml`
-  - `smart_encode_cli/src/{main,args,interact,log,signal}.rs`
-- **Status**: complete in initial commit (commit `8a35100`). Tests in `smart_encode_lib/src/config.rs` cover missing-file, missing-keys, unknown-keys, and round-trip cases (5 passing).
-- **Test scenarios**: `cargo check --workspace` is clean; `cargo test -p smart_encode_lib --lib config` passes 5/5.
+  - `rencoder_lib/Cargo.toml`
+  - `rencoder_lib/src/lib.rs`
+  - `rencoder_lib/src/error.rs`
+  - `rencoder_lib/src/types.rs`
+  - `rencoder_lib/src/path_util.rs`
+  - `rencoder_lib/src/config.rs`
+  - `rencoder_lib/src/collect.rs`
+  - `rencoder_lib/src/ffmpeg/{mod,probe,encoder,encoder_cache,command}.rs`
+  - `rencoder_lib/src/fps/{mod,parse,limit}.rs`
+  - `rencoder_lib/src/analyzer/{mod,fps_stats}.rs`
+  - `rencoder_lib/src/processor/{mod,batch}.rs`
+  - `rencoder_cli/Cargo.toml`
+  - `rencoder_cli/src/{main,args,interact,log,signal}.rs`
+- **Status**: complete in initial commit (commit `8a35100`). Tests in `rencoder_lib/src/config.rs` cover missing-file, missing-keys, unknown-keys, and round-trip cases (5 passing).
+- **Test scenarios**: `cargo check --workspace` is clean; `cargo test -p rencoder_lib --lib config` passes 5/5.
 
 ### U2. Max FPS predicate
 
 - **Goal**: Implement `MaxFpsConfig::need_reduce` to encode the encode.zsh semantics.
 - **Requirements**: R3, R6, R21.
 - **Dependencies**: U1.
-- **Files**: `smart_encode_lib/src/types.rs`.
+- **Files**: `rencoder_lib/src/types.rs`.
 - **Approach**: Strict `>` with epsilon on the right side (`src_fps > max_fps + eps`). At the boundary `src_fps == max_fps`, the file is NOT reduced (preserves quality on already-at-cap content). The 29.97-vs-30 case falls into the band `[max_fps, max_fps + eps]` and stays untouched.
 - **Test scenarios** (must match origin §6):
   - `need_reduce(60.0)` with `max_fps=30, eps=0.05` → `true`
@@ -162,7 +162,7 @@ The `-r` block is the single most error-prone position; the unit test in U5 must
   - `need_reduce(25.0)` → `false` (below cap)
   - `need_reduce(NaN)` → `false` (defensive; caller preconditions say it won't happen)
   - `MaxFpsConfig::default().enabled()` → `false`
-- **Verification**: `cargo test -p smart_encode_lib --lib types` passes; manual sanity check at REPL.
+- **Verification**: `cargo test -p rencoder_lib --lib types` passes; manual sanity check at REPL.
 
 ### U3. Probing: `probe_video_metadata` + `parse_fps_value`
 
@@ -170,8 +170,8 @@ The `-r` block is the single most error-prone position; the unit test in U5 must
 - **Requirements**: R9, R10 (uses walkdir later but not here).
 - **Dependencies**: U1.
 - **Files**:
-  - `smart_encode_lib/src/ffmpeg/probe.rs`
-  - `smart_encode_lib/src/fps/parse.rs`
+  - `rencoder_lib/src/ffmpeg/probe.rs`
+  - `rencoder_lib/src/fps/parse.rs`
 - **Approach**: `Command::new("ffprobe").args(["-v","error","-select_streams","v:0","-show_entries","stream=codec_name,avg_frame_rate,r_frame_rate","-of","json", input])` then `serde_json::from_str`. Map the JSON to `VideoMetadata`. For `parse_fps_value`, split on `/` first; if both sides parse as integers, divide; otherwise try `f64::from_str`. Reject negative, zero, NaN, infinity.
 - **Test scenarios**:
   - `parse_fps_value("30000/1001")` → `29.97002997002997` within `1e-6`
@@ -188,8 +188,8 @@ The `-r` block is the single most error-prone position; the unit test in U5 must
 - **Requirements**: R1, R7, R12, R20.
 - **Dependencies**: U1.
 - **Files**:
-  - `smart_encode_lib/src/ffmpeg/encoder_cache.rs`
-  - `smart_encode_lib/src/ffmpeg/encoder.rs`
+  - `rencoder_lib/src/ffmpeg/encoder_cache.rs`
+  - `rencoder_lib/src/ffmpeg/encoder.rs`
 - **Approach**: `init_encoder_cache(enable_nv)` runs `ffmpeg -encoders` once, stores output. When `enable_nv`, runs `nvidia-smi -L`; `io::Error` (missing binary) or empty stdout is treated as "no GPU" and logged at `info!`, not as `EncodeError`. `select_encoder` consults the cache via `has_encoder(name)`; the format-to-encoder mapping is hardcoded (libsvtav1 for AV1, libx264 for H.264, libx265 for HEVC, libvpx-vp9 for VP9) with config-file overrides for power users.
 - **Test scenarios**:
   - `EncoderCache::has_encoder("libsvtav1")` against mocked `encoders_output` containing the string → `true`
@@ -206,8 +206,8 @@ The `-r` block is the single most error-prone position; the unit test in U5 must
 - **Requirements**: R3, R4, R5, R13, R21.
 - **Dependencies**: U2, U3, U4.
 - **Files**:
-  - `smart_encode_lib/src/ffmpeg/command.rs`
-  - `smart_encode_lib/src/processor/batch.rs`
+  - `rencoder_lib/src/ffmpeg/command.rs`
+  - `rencoder_lib/src/processor/batch.rs`
 - **Approach**: `build_ffmpeg_command(task, params, encoder, src_fps)` returns `Vec<String>`. The `-r` block is inserted only when `params.max_fps.enabled()` AND `src_fps.is_some()` AND `params.max_fps.need_reduce(src_fps.unwrap())` — note the R21 carve-out for `src_fps = None`. Audio codec selection mirrors the script (`-c:a copy` if compatible, else `libopus`/`aac`). `transcode_single` is the orchestrator: existence check → probe → predicate → skip-table → encoder selection → command build → `Command::status()`.
 - **Test scenarios**:
   - `build_ffmpeg_command` with `max_fps=30, src_fps=Some(60.0)` produces argv with `-r 30` placed AFTER `-i` and BEFORE the output path. Assert position by index, not just presence.
@@ -226,8 +226,8 @@ The `-r` block is the single most error-prone position; the unit test in U5 must
 - **Requirements**: R10.
 - **Dependencies**: U5.
 - **Files**:
-  - `smart_encode_lib/src/collect.rs`
-  - `smart_encode_lib/src/processor/batch.rs`
+  - `rencoder_lib/src/collect.rs`
+  - `rencoder_lib/src/processor/batch.rs`
 - **Approach**: `walkdir::WalkDir::new(root).follow_links(false).into_iter().filter_map(...)` filters by extension (case-insensitive). `transcode_batch` calls `transcode_single` per file, accumulates `Vec<(PathBuf, TranscodeResult)>`, and never short-circuits on `Failed(_)`. The optional `result_callback` is fired after each file for live UI updates.
 - **Test scenarios**:
   - `collect_files` on a directory with `mp4` + `txt` + subdirectory containing `mkv` returns 2 paths.
@@ -243,7 +243,7 @@ The `-r` block is the single most error-prone position; the unit test in U5 must
 - **Requirements**: R16, R18.
 - **Dependencies**: U3, U6.
 - **Files**:
-  - `smart_encode_lib/src/analyzer/fps_stats.rs`
+  - `rencoder_lib/src/analyzer/fps_stats.rs`
 - **Approach**: For each file, `probe_video_metadata_auto` → `best_fps()` → `round` to `u32` → `FpsStats::add(fps, path)`. Failures increment `failed_files` and log at `warn!`. `FpsStats::summary` prints group counts; `FpsStats::detailed` lists files per group.
 - **Test scenarios**:
   - Empty input list → `FpsStats { total_files: 0, parsed_files: 0, ... }`.
@@ -258,14 +258,14 @@ The `-r` block is the single most error-prone position; the unit test in U5 must
 - **Requirements**: R13, R14, R19.
 - **Dependencies**: U1.
 - **Files**:
-  - `smart_encode_cli/src/args.rs`
-  - `smart_encode_cli/src/signal.rs`
-  - `smart_encode_cli/src/log.rs`
-  - `smart_encode_cli/src/main.rs`
+  - `rencoder_cli/src/args.rs`
+  - `rencoder_cli/src/signal.rs`
+  - `rencoder_cli/src/log.rs`
+  - `rencoder_cli/src/main.rs`
 - **Approach**: `Args` enum with `Encode(EncodeArgs)` and `Analyze(AnalyzeArgs)` subcommands (clap derive). `EncodeArgs` mirrors origin §3.4. `signal::install_handler` takes `Arc<Mutex<Option<PathBuf>>>` (parking_lot, no poisoning); the per-file `transcode_single` clones the Arc, sets the current output before invoking ffmpeg, and clears it after.
 - **Test scenarios**:
-  - `Args::try_parse_from(["smart-encode", "encode", "-f", "in.mp4"])` parses without error.
-  - `Args::try_parse_from(["smart-encode", "encode", "--"])` followed by arbitrary extra args preserves them in `extra_args`.
+  - `Args::try_parse_from(["rencoder", "encode", "-f", "in.mp4"])` parses without error.
+  - `Args::try_parse_from(["rencoder", "encode", "--"])` followed by arbitrary extra args preserves them in `extra_args`.
   - `signal::install_handler` registers without panicking; manual SIGINT during a run deletes the partial file.
 - **Verification**: `clap` unit tests pass; manual SIGINT test on a long-running encode.
 
@@ -275,20 +275,20 @@ The `-r` block is the single most error-prone position; the unit test in U5 must
 - **Requirements**: R19.
 - **Dependencies**: U8.
 - **Files**:
-  - `smart_encode_cli/src/interact.rs`
+  - `rencoder_cli/src/interact.rs`
 - **Approach**: Sequential `dialoguer::Select` + `Input` + `Confirm` prompts. The summary block at the end renders with `colored` so users can verify before commit.
 - **Test scenarios**: Hard to unit-test `dialoguer` directly; verify the assembled `EncodeParams` matches the user's inputs via a thin wrapper that bypasses the terminal.
 - **Verification**: Manual walk-through; assert the printed summary matches each input.
 
 ### U10. Analyze subcommand
 
-- **Goal**: `smart-encode analyze` runs the analyzer with the right CLI surface (`-d`, `-f`, `-e`, `-p`, `-v`, `-o` per origin §3.4).
+- **Goal**: `rencoder analyze` runs the analyzer with the right CLI surface (`-d`, `-f`, `-e`, `-p`, `-v`, `-o` per origin §3.4).
 - **Requirements**: R18, R19.
 - **Dependencies**: U7, U8.
-- **Files**: `smart_encode_cli/src/args.rs` (extend), `smart_encode_cli/src/main.rs` (dispatch).
+- **Files**: `rencoder_cli/src/args.rs` (extend), `rencoder_cli/src/main.rs` (dispatch).
 - **Approach**: `AnalyzeArgs` mirrors origin §3.4; main dispatches based on the subcommand. `-p` flips `AnalyzeParams.parallel`.
 - **Test scenarios**:
-  - `Args::try_parse_from(["smart-encode", "analyze", "-d", ".", "-p", "-v"])` parses with `parallel=true, verbose=true`.
+  - `Args::try_parse_from(["rencoder", "analyze", "-d", ".", "-p", "-v"])` parses with `parallel=true, verbose=true`.
   - End-to-end against a small fixture directory produces a stats summary.
 - **Verification**: CLI integration tests; smoke test.
 
@@ -298,9 +298,9 @@ The `-r` block is the single most error-prone position; the unit test in U5 must
 - **Requirements**: all (verification only).
 - **Dependencies**: U1 through U10.
 - **Files**:
-  - `smart_encode_lib/tests/integration.rs` (or per-feature integration test files)
+  - `rencoder_lib/tests/integration.rs` (or per-feature integration test files)
   - `README.md`
-- **Approach**: Spawn `smart_encode_cli` as a subprocess against fixture videos; compare exit codes, output file presence, and (for the analyzer) summary text against `video_fps_stats.zsh` reference output. README sections: install (Homebrew/apt for ffmpeg + cargo build), quickstart, CLI reference, config schema.
+- **Approach**: Spawn `rencoder_cli` as a subprocess against fixture videos; compare exit codes, output file presence, and (for the analyzer) summary text against `video_fps_stats.zsh` reference output. README sections: install (Homebrew/apt for ffmpeg + cargo build), quickstart, CLI reference, config schema.
 - **Test scenarios** (origin §6):
   - Max-FPS matrix: 25/30/29.97 → no reduce; 60 → reduce.
   - Encoder-cache: `ffmpeg -encoders` runs exactly once across 100 files.
@@ -313,12 +313,12 @@ The `-r` block is the single most error-prone position; the unit test in U5 must
 - **Goal**: `analyze_fps_parallel` using `rayon::par_iter` over the file list, behind the `parallel-analyze` feature.
 - **Requirements**: R11, R17, R18.
 - **Dependencies**: U7.
-- **Files**: `smart_encode_lib/src/analyzer/fps_stats.rs` (extend), `smart_encode_lib/Cargo.toml` (already declares `rayon` as optional).
+- **Files**: `rencoder_lib/src/analyzer/fps_stats.rs` (extend), `rencoder_lib/Cargo.toml` (already declares `rayon` as optional).
 - **Approach**: `rayon::prelude::*`; results merge into the single `FpsStats` via `Mutex<FpsStats>` (parking_lot) or per-thread accumulation + reduce. The `c-probe` path must be thread-safe per R17.
 - **Test scenarios**:
   - 100-file parallel run produces identical `FpsStats.groups` to serial.
   - Mixed-success run: failures do not deadlock the parallel iterator.
-- **Verification**: `cargo test -p smart_encode_lib --features parallel-analyze` passes.
+- **Verification**: `cargo test -p rencoder_lib --features parallel-analyze` passes.
 
 ### U13. C FFI probe (optional)
 
@@ -326,22 +326,22 @@ The `-r` block is the single most error-prone position; the unit test in U5 must
 - **Requirements**: R2, R17.
 - **Dependencies**: U3.
 - **Files**:
-  - `smart_encode_lib/src/ffi/mod.rs`
-  - `smart_encode_lib/src/ffi/video_probe.c`
-  - `smart_encode_lib/build.rs` (conditional on `c-probe`)
-  - `smart_encode_lib/Cargo.toml` (add `cc`, `pkg-config` build deps)
+  - `rencoder_lib/src/ffi/mod.rs`
+  - `rencoder_lib/src/ffi/video_probe.c`
+  - `rencoder_lib/build.rs` (conditional on `c-probe`)
+  - `rencoder_lib/Cargo.toml` (add `cc`, `pkg-config` build deps)
 - **Approach**: A thin C shim around `avformat_open_input` + `avformat_find_stream_info` reads codec name, `avg_frame_rate`, `r_frame_rate` and returns a malloc'd C struct; the Rust side wraps it in `Box` and frees via `libc::free`. The bridge is stateless (R17): each call creates its own `AVFormatContext`. `pkg-config` resolves the libavformat link flags.
 - **Test scenarios**:
   - `probe_video_metadata_fast(path)` returns the same `VideoMetadata` as `probe_video_metadata(path)` for each fixture.
   - 100 concurrent calls from `rayon` complete without UB (run under Miri or thread sanitizer if available).
-- **Verification**: `cargo test -p smart_encode_lib --features c-probe` passes; `cargo build --features c-probe --release` succeeds on Linux and macOS.
+- **Verification**: `cargo test -p rencoder_lib --features c-probe` passes; `cargo build --features c-probe --release` succeeds on Linux and macOS.
 
 ### U14. GUI prototype (optional, deferred)
 
 - **Goal**: A standalone GUI process that uses `ProcessOutput::Piped` (R13) to drive a live progress UI.
 - **Requirements**: R13.
 - **Dependencies**: U8 (uses the same library surface).
-- **Files**: outside this workspace for now; a separate `smart_encode_gui` crate.
+- **Files**: outside this workspace for now; a separate `rencoder_gui` crate.
 - **Approach**: Pick the GUI framework later (Tauri vs egui vs Slint); the only library contract is that `ProcessOutput::Piped` returns stdout/stderr streams that the GUI can attach to.
 - **Status**: deferred — origin marks Phase 17 as "optional". This plan leaves the library surface ready but does not scaffold the GUI.
 
@@ -383,13 +383,13 @@ End-to-end checks (CI + manual):
 1. `cargo build --workspace` is clean.
 2. `cargo build --release` is clean.
 3. `cargo test --workspace` passes (unit + integration).
-4. `cargo test -p smart_encode_lib --features parallel-analyze` passes.
-5. `cargo test -p smart_encode_lib --features c-probe` passes.
+4. `cargo test -p rencoder_lib --features parallel-analyze` passes.
+5. `cargo test -p rencoder_lib --features c-probe` passes.
 6. `cargo clippy --all-targets --all-features -- -D warnings` is clean.
 7. `cargo fmt --check` is clean.
-8. `smart-encode encode -f sample.mp4 -c av1 -b 45` produces a valid `sample.av1.mkv`.
-9. `smart-encode encode -f highfps.mp4 -c av1 --max-fps 30` produces output with fps <= 30.
-10. `smart-encode analyze -d ./fixtures -p -v -o stats.txt` produces a non-empty stats file.
+8. `rencoder encode -f sample.mp4 -c av1 -b 45` produces a valid `sample.av1.mkv`.
+9. `rencoder encode -f highfps.mp4 -c av1 --max-fps 30` produces output with fps <= 30.
+10. `rencoder analyze -d ./fixtures -p -v -o stats.txt` produces a non-empty stats file.
 
 ## Sources & Research
 

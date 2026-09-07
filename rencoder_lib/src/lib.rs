@@ -1,6 +1,6 @@
-//! smart_encode_lib -- core library for Rencoder.
+//! rencoder_lib -- core library for Rencoder.
 //!
-//! All business logic lives here. The CLI frontend in `smart_encode_cli`
+//! All business logic lives here. The CLI frontend in `rencoder_cli`
 //! consumes this crate and adds clap/dialoguer/signal-handling on top.
 //!
 //! See `docs/smart_code.md` for the full design.
