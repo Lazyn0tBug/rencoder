@@ -182,14 +182,28 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
   - `ctrlc::set_handler` removes the registered partial file and exits 1
   - `Arc<Mutex<Option<PathBuf>>>` (parking_lot, no poisoning — per R14)
   - Module-level `#[allow(dead_code)]`; U11 wires main.rs into the per-batch loop
-- [x] `log::init()` + `log::builder()` (seam for testing)
-  - RUST_LOG env, default filter `info`, no timestamp prefix
+- [x] `tracing_init::init()` (CLI uses `tracing` not `log`)
+  - `tracing-log` bridge captures the library's `log` events into tracing
+  - `RUST_LOG` env filter, default `info`, no target/time prefix
 - [x] `main.rs`: parses args, dispatches on subcommand, both `encode_cmd` / `analyze_cmd` are stubs returning Ok — Phase 11 fills in the pipeline
 - [x] Tests (28 new in this CLI crate, all passing):
   - args: 21 tests covering every flag, format variants, `--` passthrough, subcommand errors
   - signal: 5 tests for register/clear/replace/remove helpers + install_handler smoke
-  - log: 2 tests for builder construction + init smoke
-- **Verify**: `cargo test --workspace` 173/173 pass (was 145 lib; +28 CLI). `cargo build --workspace --all-targets` clean.
+  - tracing_init: 1 test for idempotent init
+- **Verify**: `cargo test --workspace` 176/176 pass. `cargo build --workspace --all-targets` clean.
+
+## U10. Analyze subcommand — DONE
+
+- [x] `analyze_cmd(args)` in `main.rs`: Target resolution -> collect_files -> analyze_fps -> print summary
+- [x] `target_from_analyze_args(args)` helper: --file > --dir > current_dir (testable)
+- [x] Verbose mode writes `stats.detailed()` to `args.output` (default `fps_stats.txt`)
+- [x] `--parallel` warns (U12 not implemented yet) and falls back to serial
+- [x] Tests:
+  - `target_from_file_flag_wins`: --file beats --dir
+  - `target_from_dir_flag`: --dir alone gives Target::Dir
+  - `target_defaults_to_current_dir`: no flag -> cwd
+  - `target_path_helper_returns_inner_path`: Target::File/Dir unwrap to inner PathBuf
+- **Verify**: 4 new main.rs tests pass; workspace tests still 176/176.
 
 ## U12. Parallel analyze (optional)
 
