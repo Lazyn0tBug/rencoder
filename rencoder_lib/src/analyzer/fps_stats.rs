@@ -271,6 +271,7 @@ pub fn aggregate_records(records: &[AnalysisRecord]) -> FpsStats {
 mod tests {
     use super::*;
     use crate::types::VideoMetadata;
+    use pretty_assertions::assert_eq;
 
     fn h264(fps: f64) -> AnalysisRecord {
         AnalysisRecord {
@@ -484,7 +485,9 @@ mod tests {
         let mut parallel = analyze_records_with_probe_parallel(&files, probe);
 
         // par_iter() preserves order, but compare sorted to make the
-        // assertion robust against future rayon changes.
+        // assertion robust against future rayon changes. pretty_assertions
+        // gives a field-by-field diff when this fails -- useful since
+        // AnalysisRecord has 5 fields.
         serial.sort_by_key(|r| r.path.clone());
         parallel.sort_by_key(|r| r.path.clone());
         assert_eq!(serial, parallel);

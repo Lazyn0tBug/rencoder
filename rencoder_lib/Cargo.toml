@@ -19,3 +19,6 @@ default = []
 parallel-analyze = ["dep:rayon"]
 # c-probe: declared now to silence cfg warnings; deps + ffi module land in Phase 13.
 c-probe = []
+
+[dev-dependencies]
+pretty_assertions = "1"
