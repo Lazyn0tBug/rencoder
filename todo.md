@@ -173,6 +173,24 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
 - [ ] CI workflow file (`.github/workflows/ci.yml`) — build, test, clippy, fmt
 - **Verify**: `cargo test --workspace` all pass; `cargo clippy --all-targets --all-features -- -D warnings` clean; `cargo fmt --check` clean
 
+## U8. CLI core — DONE (stubs only)
+
+- [x] `Cli` struct + `Command` enum (Encode/Analyze) in `args.rs`
+- [x] `EncodeArgs`: `-c/--format` (ValueEnum: x264/hevc/vp9/av1, default av1), `-b/--bitrate`, `-f/--file`, `-d/--dir`, `-e/--ext`, `-i/--interactive`, `--nv`, `--max-fps`, `--crf`, `--config`, `--` passthrough
+- [x] `AnalyzeArgs`: `-d/--dir`, `-f/--file`, `-e/--ext`, `-p/--parallel`, `-v/--verbose`, `-o/--output` (default fps_stats.txt)
+- [x] `signal::install_handler()` + `register_partial` / `clear_partial` / `remove_partial` helpers
+  - `ctrlc::set_handler` removes the registered partial file and exits 1
+  - `Arc<Mutex<Option<PathBuf>>>` (parking_lot, no poisoning — per R14)
+  - Module-level `#[allow(dead_code)]`; U11 wires main.rs into the per-batch loop
+- [x] `log::init()` + `log::builder()` (seam for testing)
+  - RUST_LOG env, default filter `info`, no timestamp prefix
+- [x] `main.rs`: parses args, dispatches on subcommand, both `encode_cmd` / `analyze_cmd` are stubs returning Ok — Phase 11 fills in the pipeline
+- [x] Tests (28 new in this CLI crate, all passing):
+  - args: 21 tests covering every flag, format variants, `--` passthrough, subcommand errors
+  - signal: 5 tests for register/clear/replace/remove helpers + install_handler smoke
+  - log: 2 tests for builder construction + init smoke
+- **Verify**: `cargo test --workspace` 173/173 pass (was 145 lib; +28 CLI). `cargo build --workspace --all-targets` clean.
+
 ## U12. Parallel analyze (optional)
 
 - [ ] `analyze_fps_parallel` in `analyzer/fps_stats.rs` behind `#[cfg(feature = "parallel-analyze")]`
