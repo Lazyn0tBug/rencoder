@@ -66,23 +66,29 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
 - [x] Tests: 9 encoder_cache + 7 select_encoder + 8 config + 6 probe = 30 U4-related tests
 - **Verify**: `cargo test -p smart_encode_lib --lib` 45/45 pass; workspace clean
 
-## U5. Command builder + single-file transcode
+## U5. Command builder + single-file transcode — DONE
 
-- [ ] `build_ffmpeg_command(task, params, encoder, src_fps) -> Vec<String>` in `ffmpeg/command.rs`
-- [ ] Audio codec selection (`-c:a copy` if compatible, else `libopus`/`aac`)
-- [ ] CRITICAL: `-r <fps>` placement — AFTER `-i`, BEFORE output path (assert by index in test)
-- [ ] R21: when `src_fps = None`, do NOT inject `-r`
-- [ ] When `max_fps = 0`, do NOT inject `-r`
-- [ ] `should_skip_encoding(codec, format) -> bool` with 3-row decision table (R5)
-- [ ] `transcode_single(task, params, cache, output) -> Result<TranscodeResult, EncodeError>` in `processor/batch.rs`
-- [ ] Single-file flow: existence check → probe → predicate → skip-table → select → build → execute
-- [ ] Tests:
-  - [ ] argv ordering: `-r` index > `-i` index AND `-r` index < output path index
-  - [ ] `src_fps=None` → argv contains no `-r`
-  - [ ] `should_skip_encoding("h264", X264)` → `true`
-  - [ ] `should_skip_encoding("h264", X264)` with reduce needed → `false`
-  - [ ] `transcode_single` on existing output → `SkippedExists`
-- **Verify**: `cargo test -p smart_encode_lib --lib command` passes; manual end-to-end on a 5s sample produces a valid output
+- [x] `should_skip_encoding(codec, format, need_reduce) -> bool` in `command.rs`
+  - 3-row decision table (R5); rejects encoder-name aliases and empty codec
+- [x] `build_ffmpeg_command(task, params, encoder, src_fps) -> Vec<String>` in `command.rs`
+  - argv order: `ffmpeg -y -i <in> -c:v <enc> [-preset 6] -crf X | -b:v Xk -c:a copy [-r X] [...extra] <out>`
+  - CRITICAL: `-r` after `-i`, before output path (asserted by index in test)
+  - R21: `src_fps = None` → no `-r` injection
+  - `max_fps = 0` (disabled) → no `-r` injection
+  - `src_fps` within cap → no `-r` injection
+- [x] `transcode_single(task, params, cache, config, output) -> Result<TranscodeResult, EncodeError>` in `processor/batch.rs`
+  - Pipeline: existence check → probe → predicate → skip-table → select → build → execute
+  - Runner closure seam in `transcode_after_probe` so subprocess is mockable
+  - `run_ffmpeg` honors `ProcessOutput` (Inherit/Piped/Null)
+- [x] `MaxFpsConfig::need_reduce` (U2 long-standing TODO) — strict `>` with eps on right
+  - 6 new tests covering §6 matrix: 25/30/29.97/60/30.06 + zero-eps boundary
+- [x] `MaxFpsConfig::default()`, `VideoFormat::default`, `Target::default`, `EncodeParams::default`
+  - Defaults unlock `..Default::default()` ergonomics in test fixtures
+- [x] Tests added in 4 steps (per-step additions as requested):
+  - Step 1: 7 need_reduce tests + 1 default test in `types.rs` (23 types tests total)
+  - Step 2+3: 19 tests in `command.rs` (7 skip-table + 12 argv-layout)
+  - Step 4: 7 tests in `batch.rs` (skip/reduce/no-r/fail/missing-encoder/exists)
+- **Verify**: `cargo test -p smart_encode_lib --lib` 108/108 pass (was 75; +33 from U5)
 
 ## U6. File collection + batch transcode
 

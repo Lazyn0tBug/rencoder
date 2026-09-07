@@ -7,8 +7,9 @@ use crate::error::EncodeError;
 
 // ===== Target format =====
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum VideoFormat {
+    #[default]
     X264,
     Hevc,
     Vp9,
@@ -55,7 +56,18 @@ impl VideoMetadata {
 #[derive(Clone, Debug)]
 pub struct MaxFpsConfig {
     pub max_fps: f64,
+    /// Tolerance band around `max_fps` (matches `encode.zsh` semantics:
+    /// a 29.97 source at cap=30 is NOT reduced because 29.97 < 30 + 0.05).
     pub eps: f64,
+}
+
+impl Default for MaxFpsConfig {
+    fn default() -> Self {
+        Self {
+            max_fps: 0.0,
+            eps: 0.05,
+        }
+    }
 }
 
 impl MaxFpsConfig {
@@ -69,12 +81,12 @@ impl MaxFpsConfig {
     /// - `src_fps` is positive and finite
     /// - `self.enabled()` is true (i.e. `max_fps > 0`)
     ///
-    /// TODO: implement the predicate. See `CLAUDE.md` (TODO section) for
-    /// design notes -- epsilon tolerance semantics, strict vs. non-strict
-    /// boundary at `src_fps == max_fps`.
-    #[allow(unused_variables)] // remove once the body is implemented
+    /// Semantics (per `encode.zsh` and design doc §6 test matrix):
+    /// - strict `>` so `src_fps == max_fps` is NOT reduced
+    /// - epsilon band `[max_fps, max_fps + eps]` is treated as "no reduce"
+    ///   so a 29.97 source at cap=30 stays untouched
     pub fn need_reduce(&self, src_fps: f64) -> bool {
-        todo!("implement MaxFpsConfig::need_reduce -- see CLAUDE.md")
+        src_fps > self.max_fps + self.eps
     }
 }
 
@@ -111,7 +123,7 @@ impl EncoderCache {
 
 // ===== Encode parameters =====
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct EncodeParams {
     pub format: VideoFormat,
     pub bitrate_or_crf: u32,
@@ -129,6 +141,12 @@ pub struct EncodeParams {
 pub enum Target {
     File(PathBuf),
     Dir(PathBuf),
+}
+
+impl Default for Target {
+    fn default() -> Self {
+        Target::File(PathBuf::new())
+    }
 }
 
 // ===== Single transcode task =====
@@ -288,6 +306,51 @@ mod tests {
     #[test]
     fn max_fps_config_enabled_negative_is_false() {
         assert!(!MaxFpsConfig { max_fps: -30.0, eps: 0.05 }.enabled());
+    }
+
+    // need_reduce: origin §6 matrix.
+    #[test]
+    fn need_reduce_25fps_does_not_reduce() {
+        let c = MaxFpsConfig { max_fps: 30.0, eps: 0.05 };
+        assert!(!c.need_reduce(25.0));
+    }
+
+    #[test]
+    fn need_reduce_30fps_does_not_reduce() {
+        let c = MaxFpsConfig { max_fps: 30.0, eps: 0.05 };
+        assert!(!c.need_reduce(30.0));
+    }
+
+    #[test]
+    fn need_reduce_29_97_does_not_reduce() {
+        let c = MaxFpsConfig { max_fps: 30.0, eps: 0.05 };
+        assert!(!c.need_reduce(29.97));
+    }
+
+    #[test]
+    fn need_reduce_60fps_does_reduce() {
+        let c = MaxFpsConfig { max_fps: 30.0, eps: 0.05 };
+        assert!(c.need_reduce(60.0));
+    }
+
+    #[test]
+    fn need_reduce_just_above_cap_eps_does_reduce() {
+        let c = MaxFpsConfig { max_fps: 30.0, eps: 0.05 };
+        assert!(c.need_reduce(30.06));
+    }
+
+    #[test]
+    fn need_reduce_with_zero_eps_is_strict() {
+        let c = MaxFpsConfig { max_fps: 30.0, eps: 0.0 };
+        assert!(!c.need_reduce(30.0));
+        assert!(c.need_reduce(30.01));
+    }
+
+    #[test]
+    fn max_fps_config_default_is_disabled() {
+        let c = MaxFpsConfig::default();
+        assert!(!c.enabled());
+        assert_eq!(c.eps, 0.05);
     }
 
     #[test]
