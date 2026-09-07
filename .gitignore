@@ -2,4 +2,5 @@
 .DS_Store
 *.swp
 *~
+/smart_encode_cli/log/
 .claude/settings.local.json
