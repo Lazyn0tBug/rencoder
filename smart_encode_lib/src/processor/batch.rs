@@ -192,7 +192,7 @@ mod tests {
         VideoMetadata {
             codec: Some("h264".into()),
             avg_fps: fps,
-            nominal_fps: None,
+            ..Default::default()
         }
     }
 
@@ -200,7 +200,7 @@ mod tests {
         VideoMetadata {
             codec: Some("vp9".into()),
             avg_fps: fps,
-            nominal_fps: None,
+            ..Default::default()
         }
     }
 

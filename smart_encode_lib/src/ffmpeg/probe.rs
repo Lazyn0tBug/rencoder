@@ -88,7 +88,17 @@ fn parse_probe_output(json: &str) -> Result<VideoMetadata, EncodeError> {
         .and_then(Value::as_str)
         .and_then(|s| parse_fps_value(s).ok());
 
-    Ok(VideoMetadata { codec, avg_fps, nominal_fps })
+    let duration_secs = stream
+        .get("duration")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<f64>().ok());
+
+    Ok(VideoMetadata {
+        codec,
+        avg_fps,
+        nominal_fps,
+        duration_secs,
+    })
 }
 
 #[cfg(test)]

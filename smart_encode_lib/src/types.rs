@@ -34,6 +34,9 @@ pub struct VideoMetadata {
     pub codec: Option<String>,
     pub avg_fps: Option<f64>,
     pub nominal_fps: Option<f64>,
+    /// Stream duration in seconds (from ffprobe's `duration` field).
+    /// `None` if the probe didn't report a duration.
+    pub duration_secs: Option<f64>,
 }
 
 impl VideoMetadata {
@@ -176,6 +179,10 @@ pub struct FpsStats {
     pub total_files: usize,
     pub parsed_files: usize,
     pub failed_files: usize,
+    /// Number of files per codec (e.g. "h264" -> 3).
+    pub codec_counts: BTreeMap<String, usize>,
+    /// Sum of `duration_secs` across all successfully parsed files.
+    pub total_duration_secs: f64,
 }
 
 impl FpsStats {
@@ -191,6 +198,19 @@ impl FpsStats {
         self.parsed_files += 1;
     }
 
+    /// Increment the count for the given codec (e.g. "h264", "vp9").
+    pub fn add_codec(&mut self, codec: String) {
+        *self.codec_counts.entry(codec).or_insert(0) += 1;
+    }
+
+    /// Accumulate `secs` into the running duration total. Pass `0.0` or
+    /// negative values harmlessly (clamped to 0 in the display).
+    pub fn add_duration(&mut self, secs: f64) {
+        if secs > 0.0 {
+            self.total_duration_secs += secs;
+        }
+    }
+
     pub fn add_failed(&mut self) {
         self.failed_files += 1;
     }
@@ -201,7 +221,19 @@ impl FpsStats {
         for (fps, files) in &self.groups {
             out.push_str(&format!("{} fps: {} files\n", fps, files.len()));
         }
+        if !self.codec_counts.is_empty() {
+            out.push_str("\nCodec distribution:\n");
+            for (codec, count) in &self.codec_counts {
+                out.push_str(&format!("  {}: {} files\n", codec, count));
+            }
+        }
         out.push_str(&self.totals_line());
+        if self.total_duration_secs > 0.0 {
+            out.push_str(&format!(
+                "Total duration: {}\n",
+                format_duration(self.total_duration_secs)
+            ));
+        }
         out
     }
 
@@ -214,7 +246,19 @@ impl FpsStats {
                 out.push_str(&format!("  {}\n", path.display()));
             }
         }
+        if !self.codec_counts.is_empty() {
+            out.push_str("\nCodec distribution:\n");
+            for (codec, count) in &self.codec_counts {
+                out.push_str(&format!("  {}: {} files\n", codec, count));
+            }
+        }
         out.push_str(&self.totals_line());
+        if self.total_duration_secs > 0.0 {
+            out.push_str(&format!(
+                "Total duration: {}\n",
+                format_duration(self.total_duration_secs)
+            ));
+        }
         out
     }
 
@@ -224,6 +268,16 @@ impl FpsStats {
             self.total_files, self.parsed_files, self.failed_files
         )
     }
+}
+
+/// Format seconds as `H:MM:SS` (always zero-padded minutes and seconds).
+/// Negative inputs are clamped to 0 (defensive against bad ffprobe output).
+fn format_duration(secs: f64) -> String {
+    let total = secs.max(0.0) as u64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    format!("{h}:{m:02}:{s:02}")
 }
 
 // ===== Analyze parameters =====
@@ -255,6 +309,7 @@ mod tests {
             codec: Some("h264".into()),
             avg_fps: Some(60.0),
             nominal_fps: Some(30.0),
+            ..Default::default()
         };
         assert_eq!(m.best_fps(), Some(60.0));
     }
@@ -265,6 +320,7 @@ mod tests {
             codec: Some("h264".into()),
             avg_fps: None,
             nominal_fps: Some(30.0),
+            ..Default::default()
         };
         assert_eq!(m.best_fps(), Some(30.0));
     }
@@ -485,6 +541,85 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- codec + duration tracking ----
+
+    #[test]
+    fn fps_stats_default_has_empty_codec_counts_zero_duration() {
+        let s = FpsStats::default();
+        assert!(s.codec_counts.is_empty());
+        assert_eq!(s.total_duration_secs, 0.0);
+    }
+
+    #[test]
+    fn fps_stats_add_codec_increments_count() {
+        let mut s = FpsStats::default();
+        s.add_codec("h264".into());
+        s.add_codec("h264".into());
+        s.add_codec("vp9".into());
+        assert_eq!(s.codec_counts.get("h264"), Some(&2));
+        assert_eq!(s.codec_counts.get("vp9"), Some(&1));
+    }
+
+    #[test]
+    fn fps_stats_add_duration_accumulates_positive_only() {
+        let mut s = FpsStats::default();
+        s.add_duration(60.0);
+        s.add_duration(30.5);
+        // Negative or zero values are clamped (not subtracted).
+        s.add_duration(-5.0);
+        s.add_duration(0.0);
+        assert!((s.total_duration_secs - 90.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fps_stats_summary_includes_codec_block_when_present() {
+        let mut s = FpsStats::new(3);
+        s.add(30, PathBuf::from("/a.mp4"));
+        s.add_codec("h264".into());
+        s.add_codec("vp9".into());
+        let summary = s.summary();
+        assert!(summary.contains("Codec distribution:"));
+        assert!(summary.contains("h264: 1 files"));
+        assert!(summary.contains("vp9: 1 files"));
+    }
+
+    #[test]
+    fn fps_stats_summary_omits_codec_block_when_empty() {
+        let mut s = FpsStats::new(1);
+        s.add(30, PathBuf::from("/a.mp4"));
+        let summary = s.summary();
+        assert!(!summary.contains("Codec distribution"));
+    }
+
+    #[test]
+    fn fps_stats_summary_includes_total_duration_when_nonzero() {
+        let mut s = FpsStats::new(2);
+        s.add(30, PathBuf::from("/a.mp4"));
+        s.add(30, PathBuf::from("/b.mp4"));
+        s.add_duration(3661.0); // 1h 1m 1s
+        let summary = s.summary();
+        assert!(summary.contains("Total duration: 1:01:01"));
+    }
+
+    #[test]
+    fn fps_stats_summary_omits_duration_when_zero() {
+        let s = FpsStats::new(0);
+        let summary = s.summary();
+        assert!(!summary.contains("Total duration"));
+    }
+
+    #[test]
+    fn fps_stats_detailed_includes_codec_and_duration_blocks() {
+        let mut s = FpsStats::new(3);
+        s.add(24, PathBuf::from("/a.mp4"));
+        s.add_codec("h264".into());
+        s.add_duration(60.0);
+        let detailed = s.detailed();
+        assert!(detailed.contains("Codec distribution:"));
+        assert!(detailed.contains("h264: 1 files"));
+        assert!(detailed.contains("Total duration: 0:01:00"));
     }
 
     #[test]

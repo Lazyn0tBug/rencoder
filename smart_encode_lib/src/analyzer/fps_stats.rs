@@ -31,6 +31,12 @@ where
                 if let Some(fps) = metadata.best_fps() {
                     let rounded = fps.round() as u32;
                     stats.add(rounded, path.to_path_buf());
+                    if let Some(codec) = metadata.codec {
+                        stats.add_codec(codec);
+                    }
+                    if let Some(dur) = metadata.duration_secs {
+                        stats.add_duration(dur);
+                    }
                 } else {
                     log::warn!("no fps reported for {}", path.display());
                     stats.add_failed();
@@ -53,15 +59,14 @@ mod tests {
         VideoMetadata {
             codec: Some("h264".into()),
             avg_fps: Some(fps),
-            nominal_fps: None,
+            ..Default::default()
         }
     }
 
     fn no_fps() -> VideoMetadata {
         VideoMetadata {
             codec: Some("h264".into()),
-            avg_fps: None,
-            nominal_fps: None,
+            ..Default::default()
         }
     }
 
@@ -192,5 +197,86 @@ mod tests {
         let stats = analyze_fps_with(&files, probe).unwrap();
         assert!(stats.groups.contains_key(&24), "23.5 should round to 24");
         assert!(stats.groups.contains_key(&29), "29.4 should round to 29");
+    }
+
+    #[test]
+    fn tracks_codec_distribution() {
+        let files = vec![
+            PathBuf::from("/a.mp4"),
+            PathBuf::from("/b.mp4"),
+            PathBuf::from("/c.webm"),
+            PathBuf::from("/d.mkv"),
+        ];
+        let probe = |path: &Path| -> Result<VideoMetadata, EncodeError> {
+            let codec = match path.extension().and_then(|e| e.to_str()) {
+                Some("mp4") => "h264",
+                Some("webm") => "vp9",
+                Some("mkv") => "av1",
+                _ => "unknown",
+            };
+            Ok(VideoMetadata {
+                codec: Some(codec.into()),
+                avg_fps: Some(30.0),
+                ..Default::default()
+            })
+        };
+        let stats = analyze_fps_with(&files, probe).unwrap();
+        assert_eq!(stats.codec_counts.get("h264").copied(), Some(2));
+        assert_eq!(stats.codec_counts.get("vp9").copied(), Some(1));
+        assert_eq!(stats.codec_counts.get("av1").copied(), Some(1));
+    }
+
+    #[test]
+    fn accumulates_total_duration() {
+        let files = vec![
+            PathBuf::from("/a.mp4"),
+            PathBuf::from("/b.mp4"),
+            PathBuf::from("/c.mp4"),
+        ];
+        let probe = |path: &Path| -> Result<VideoMetadata, EncodeError> {
+            let dur = match path.file_name().unwrap().to_str().unwrap() {
+                "a.mp4" => 60.0,
+                "b.mp4" => 30.5,
+                "c.mp4" => 120.0,
+                _ => 0.0,
+            };
+            Ok(VideoMetadata {
+                codec: Some("h264".into()),
+                avg_fps: Some(30.0),
+                duration_secs: Some(dur),
+                ..Default::default()
+            })
+        };
+        let stats = analyze_fps_with(&files, probe).unwrap();
+        assert!((stats.total_duration_secs - 210.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ignores_missing_duration_and_codec() {
+        // Probe returns metadata with codec=None and duration_secs=None;
+        // neither codec_counts nor total_duration_secs should change.
+        let files = vec![PathBuf::from("/a.mp4")];
+        let probe = |_: &Path| {
+            Ok(VideoMetadata {
+                avg_fps: Some(30.0),
+                ..Default::default()
+            })
+        };
+        let stats = analyze_fps_with(&files, probe).unwrap();
+        assert_eq!(stats.parsed_files, 1);
+        assert!(stats.codec_counts.is_empty());
+        assert_eq!(stats.total_duration_secs, 0.0);
+    }
+
+    #[test]
+    fn failed_probes_dont_contribute_to_codec_or_duration() {
+        let files = vec![PathBuf::from("/bad.mp4")];
+        let probe = |_: &Path| -> Result<VideoMetadata, EncodeError> {
+            Err(EncodeError::Probe("boom".into()))
+        };
+        let stats = analyze_fps_with(&files, probe).unwrap();
+        assert_eq!(stats.failed_files, 1);
+        assert!(stats.codec_counts.is_empty());
+        assert_eq!(stats.total_duration_secs, 0.0);
     }
 }
