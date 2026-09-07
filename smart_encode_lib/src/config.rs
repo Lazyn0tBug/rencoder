@@ -60,8 +60,10 @@ impl EncoderConfig {
 
 impl Config {
     /// Load from a JSON file. Missing file returns `Default::default()`.
-    /// `max_fps` must be non-negative; negative values surface as
-    /// `EncodeError::InvalidParam` rather than silently disabling the cap.
+    /// `max_fps` must be either 0 (capping disabled) or >= 1.0 (a sane
+    /// minimum frame rate). Negative or sub-1.0 positive values surface as
+    /// `EncodeError::InvalidParam` rather than producing nonsensical
+    /// commands (`-r 0.5` would cap output at half a frame per second).
     pub fn load(path: &Path) -> Result<Self, EncodeError> {
         if !path.exists() {
             return Ok(Self::default());
@@ -73,6 +75,12 @@ impl Config {
         if cfg.max_fps < 0.0 {
             return Err(EncodeError::InvalidParam(format!(
                 "max_fps must be >= 0, got {}",
+                cfg.max_fps
+            )));
+        }
+        if cfg.max_fps > 0.0 && cfg.max_fps < 1.0 {
+            return Err(EncodeError::InvalidParam(format!(
+                "max_fps must be 0 (disabled) or >= 1.0, got {}",
                 cfg.max_fps
             )));
         }
@@ -225,6 +233,34 @@ mod tests {
         std::fs::write(&path, r#"{"max_fps": -30}"#).unwrap();
         let err = Config::load(&path).unwrap_err();
         assert!(matches!(err, EncodeError::InvalidParam(_)));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn sub_one_max_fps_rejected_on_load() {
+        // 0.5 would inject `-r 0.5` (half a frame per second) -- almost
+        // certainly a typo. Reject anything in (0, 1).
+        let dir = std::env::temp_dir().join("rencoder_test_subone_fps");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cfg.json");
+        std::fs::write(&path, r#"{"max_fps": 0.5}"#).unwrap();
+        let err = Config::load(&path).unwrap_err();
+        match err {
+            EncodeError::InvalidParam(msg) => assert!(msg.contains("0.5")),
+            other => panic!("expected InvalidParam, got {other:?}"),
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn zero_max_fps_accepted_as_disabled() {
+        let dir = std::env::temp_dir().join("rencoder_test_zero_fps");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cfg.json");
+        std::fs::write(&path, r#"{"max_fps": 0}"#).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.max_fps, 0.0);
+        assert!(!cfg.max_fps_config().enabled());
         std::fs::remove_file(&path).ok();
     }
 }

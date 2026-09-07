@@ -75,7 +75,11 @@ pub fn build_ffmpeg_command(
 
     // Rate control
     if params.is_crf {
-        if matches!(params.format, VideoFormat::Av1) {
+        // `-preset` is libsvtav1-specific. libaom-av1 uses `-cpu-used`;
+        // av1_nvenc ignores `-preset` (and rejects it on some ffmpeg
+        // builds). Gate on the encoder name so non-svt AV1 overrides
+        // produce a clean command.
+        if matches!(params.format, VideoFormat::Av1) && encoder.contains("svt") {
             argv.push("-preset".to_string());
             argv.push("6".to_string());
         }
@@ -299,6 +303,39 @@ mod tests {
         );
         let preset_pos = argv.iter().position(|s| s == "-preset").expect("-preset present");
         assert_eq!(argv[preset_pos + 1], "6");
+    }
+
+    #[test]
+    fn av1_crf_with_libaom_skips_preset() {
+        // libaom-av1 expects -cpu-used, not -preset. build_ffmpeg_command
+        // must not inject -preset when the encoder isn't libsvtav1.
+        let mut params = params_disabled();
+        params.format = VideoFormat::Av1;
+        params.bitrate_or_crf = 45;
+        let argv = build_ffmpeg_command(
+            &task("/in.mp4", "/out.mkv"),
+            &params,
+            "libaom-av1",
+            None,
+        );
+        assert!(!argv.contains(&"-preset".to_string()));
+        assert!(argv.contains(&"-crf".to_string()));
+    }
+
+    #[test]
+    fn av1_crf_with_av1_nvenc_skips_preset() {
+        // NVENC doesn't accept -preset.
+        let mut params = params_disabled();
+        params.format = VideoFormat::Av1;
+        params.bitrate_or_crf = 45;
+        let argv = build_ffmpeg_command(
+            &task("/in.mp4", "/out.mkv"),
+            &params,
+            "av1_nvenc",
+            None,
+        );
+        assert!(!argv.contains(&"-preset".to_string()));
+        assert!(argv.contains(&"-crf".to_string()));
     }
 
     #[test]

@@ -201,10 +201,7 @@ impl FpsStats {
         for (fps, files) in &self.groups {
             out.push_str(&format!("{} fps: {} files\n", fps, files.len()));
         }
-        out.push_str(&format!(
-            "Total: {} files ({} parsed, {} failed)\n",
-            self.total_files, self.parsed_files, self.failed_files
-        ));
+        out.push_str(&self.totals_line());
         out
     }
 
@@ -217,11 +214,15 @@ impl FpsStats {
                 out.push_str(&format!("  {}\n", path.display()));
             }
         }
-        out.push_str(&format!(
+        out.push_str(&self.totals_line());
+        out
+    }
+
+    fn totals_line(&self) -> String {
+        format!(
             "Total: {} files ({} parsed, {} failed)\n",
             self.total_files, self.parsed_files, self.failed_files
-        ));
-        out
+        )
     }
 }
 
