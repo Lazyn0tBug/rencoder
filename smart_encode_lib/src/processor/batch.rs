@@ -1,6 +1,6 @@
-//! Single-file transcode orchestrator.
+//! Single-file and batch transcode orchestration.
 //!
-//! Pipeline (matches origin §3.3):
+//! Per-file pipeline (matches origin §3.3):
 //!   1. Skip if output already exists.
 //!   2. Probe metadata (single `ffprobe` call via `probe_video_metadata_auto`).
 //!   3. Decide whether the source fps exceeds the cap.
@@ -8,8 +8,12 @@
 //!   5. Select an encoder (cache + config).
 //!   6. Build the ffmpeg argv (with `-r` output option placement).
 //!   7. Execute via `Command` with `ProcessOutput`-driven stdio.
+//!
+//! `transcode_batch` iterates over a file list and never short-circuits on
+//! failures -- each file gets its own `TranscodeResult`. Per-file errors
+//! land in `TranscodeResult::Failed(EncodeError)`, not in the batch return.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::config::Config;
@@ -19,10 +23,12 @@ use crate::ffmpeg::{
     encoder::select_encoder,
     probe::probe_video_metadata_auto,
 };
+use crate::path_util::output_path_for;
 use crate::types::{EncoderCache, EncodeParams, ProcessOutput, TranscodeResult, TranscodeTask};
 
 /// Transcode a single file. Returns the result status rather than aborting
-/// on failure -- batch callers collect per-file results.
+/// on `ffmpeg` failure -- that lands in `TranscodeResult::Failed`. Probe
+/// failures (e.g. corrupt/unreadable input) still surface as `Err`.
 pub fn transcode_single(
     task: &TranscodeTask,
     params: &EncodeParams,
@@ -36,6 +42,56 @@ pub fn transcode_single(
     let metadata = probe_video_metadata_auto(&task.input)?;
     let runner = move |argv: &[String]| run_ffmpeg(argv, output);
     transcode_after_probe(task, params, cache, config, metadata, runner)
+}
+
+/// Run a batch over a file list. Failures are captured per-file; the batch
+/// never aborts. `result_callback` (if set) fires once per file, in input
+/// order, after the result is recorded.
+pub fn transcode_batch(
+    params: &EncodeParams,
+    files: &[PathBuf],
+    cache: &EncoderCache,
+    config: &Config,
+    output: ProcessOutput,
+    result_callback: Option<&dyn Fn(&Path, &TranscodeResult)>,
+) -> Vec<(PathBuf, TranscodeResult)> {
+    transcode_batch_with_processor(
+        params,
+        files,
+        |task, params| transcode_single(task, params, cache, config, output),
+        result_callback,
+    )
+}
+
+/// Core batch loop with an injectable per-file processor. Used by
+/// `transcode_batch` in production; tests inject a mock processor that
+/// returns canned results without spawning `ffmpeg`/`ffprobe`.
+fn transcode_batch_with_processor<F>(
+    params: &EncodeParams,
+    files: &[PathBuf],
+    mut processor: F,
+    result_callback: Option<&dyn Fn(&Path, &TranscodeResult)>,
+) -> Vec<(PathBuf, TranscodeResult)>
+where
+    F: FnMut(&TranscodeTask, &EncodeParams) -> Result<TranscodeResult, EncodeError>,
+{
+    let mut results = Vec::with_capacity(files.len());
+    for input in files {
+        let output_path = output_path_for(input, params.format);
+        let task = TranscodeTask {
+            input: input.clone(),
+            output: output_path,
+        };
+        let result = match processor(&task, params) {
+            Ok(r) => r,
+            Err(e) => TranscodeResult::Failed(e),
+        };
+        if let Some(cb) = result_callback {
+            cb(input, &result);
+        }
+        results.push((input.clone(), result));
+    }
+    results
 }
 
 /// Core orchestration after metadata is known. Split out so tests can
@@ -345,5 +401,199 @@ Encoders:
 
         let result = transcode_single(&task, &params, &cache, &config, ProcessOutput::Inherit).unwrap();
         assert!(matches!(result, TranscodeResult::SkippedExists));
+    }
+
+    // ---- transcode_batch / transcode_batch_with_processor ----
+
+    use super::transcode_batch_with_processor;
+    use std::sync::{Arc, Mutex};
+
+    /// Canned processor: returns Success for the first input, Failed for
+    /// the second, Success for the third. Used to verify that one failure
+    /// doesn't abort the batch.
+    fn canned_processor(
+        task: &TranscodeTask,
+        _params: &EncodeParams,
+    ) -> Result<TranscodeResult, EncodeError> {
+        let name = task
+            .input
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        match name {
+            "fail.mp4" => Err(EncodeError::Ffmpeg("canned failure".into())),
+            "ok.mp4" => Ok(TranscodeResult::Success),
+            _ => Ok(TranscodeResult::Success),
+        }
+    }
+
+    #[test]
+    fn batch_processes_all_files_in_order() {
+        let files = vec![
+            PathBuf::from("/d/a.mp4"),
+            PathBuf::from("/d/b.mp4"),
+            PathBuf::from("/d/c.mp4"),
+        ];
+        let params = EncodeParams::default();
+        let results = transcode_batch_with_processor(
+            &params,
+            &files,
+            |task, _params| {
+                let name = task.input.file_name().unwrap().to_str().unwrap();
+                Ok(if name == "b.mp4" {
+                    TranscodeResult::ReducedFps
+                } else {
+                    TranscodeResult::Success
+                })
+            },
+            None,
+        );
+        assert_eq!(results.len(), 3);
+        assert!(matches!(results[0].1, TranscodeResult::Success));
+        assert!(matches!(results[1].1, TranscodeResult::ReducedFps));
+        assert!(matches!(results[2].1, TranscodeResult::Success));
+        // Order preserved: input paths in same order as input list.
+        assert_eq!(results[0].0, PathBuf::from("/d/a.mp4"));
+        assert_eq!(results[1].0, PathBuf::from("/d/b.mp4"));
+        assert_eq!(results[2].0, PathBuf::from("/d/c.mp4"));
+    }
+
+    #[test]
+    fn batch_failure_does_not_abort() {
+        // Canned processor fails on the second file. Batch must still
+        // produce a result for all three, with the middle one Failed.
+        let files = vec![
+            PathBuf::from("/d/ok.mp4"),
+            PathBuf::from("/d/fail.mp4"),
+            PathBuf::from("/d/ok.mp4"),
+        ];
+        let params = EncodeParams::default();
+        let results = transcode_batch_with_processor(
+            &params,
+            &files,
+            canned_processor,
+            None,
+        );
+        assert_eq!(results.len(), 3);
+        assert!(matches!(results[0].1, TranscodeResult::Success));
+        match &results[1].1 {
+            TranscodeResult::Failed(EncodeError::Ffmpeg(msg)) => {
+                assert!(msg.contains("canned failure"));
+            }
+            other => panic!("expected Failed(Ffmpeg), got {other:?}"),
+        }
+        assert!(matches!(results[2].1, TranscodeResult::Success));
+    }
+
+    #[test]
+    fn batch_callback_fires_once_per_file_in_order() {
+        #[derive(Clone)]
+        struct Call {
+            path: PathBuf,
+            is_success: bool,
+        }
+
+        let calls: Arc<Mutex<Vec<Call>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_clone = calls.clone();
+
+        let files = vec![
+            PathBuf::from("/d/a.mp4"),
+            PathBuf::from("/d/fail.mp4"),
+            PathBuf::from("/d/c.mp4"),
+        ];
+        let params = EncodeParams::default();
+
+        let callback: &dyn Fn(&Path, &TranscodeResult) = &|path, result| {
+            calls_clone.lock().unwrap().push(Call {
+                path: path.to_path_buf(),
+                is_success: !matches!(result, TranscodeResult::Failed(_)),
+            });
+        };
+
+        let _ = transcode_batch_with_processor(
+            &params,
+            &files,
+            canned_processor,
+            Some(callback),
+        );
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 3);
+        assert_eq!(recorded[0].path, PathBuf::from("/d/a.mp4"));
+        assert!(recorded[0].is_success);
+        assert_eq!(recorded[1].path, PathBuf::from("/d/fail.mp4"));
+        assert!(!recorded[1].is_success);
+        assert_eq!(recorded[2].path, PathBuf::from("/d/c.mp4"));
+        assert!(recorded[2].is_success);
+    }
+
+    #[test]
+    fn batch_no_callback_still_records_results() {
+        let files = vec![PathBuf::from("/d/a.mp4"), PathBuf::from("/d/b.mp4")];
+        let params = EncodeParams::default();
+        let results = transcode_batch_with_processor(
+            &params,
+            &files,
+            |_, _| Ok(TranscodeResult::Success),
+            None,
+        );
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|(_, r)| matches!(r, TranscodeResult::Success)));
+    }
+
+    #[test]
+    fn batch_empty_files_returns_empty() {
+        let params = EncodeParams::default();
+        let results = transcode_batch_with_processor(
+            &params,
+            &[],
+            |_, _| unreachable!("processor not called for empty list"),
+            None,
+        );
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn batch_uses_output_path_for_to_derive_task_output() {
+        // Verifies the batch builds each TranscodeTask with the right
+        // output path via output_path_for(input, format).
+        let files = vec![PathBuf::from("/d/movie.avi")];
+        let params = EncodeParams {
+            format: VideoFormat::X264,
+            ..Default::default()
+        };
+        let captured_task: Arc<Mutex<Option<TranscodeTask>>> = Arc::new(Mutex::new(None));
+        let cap = captured_task.clone();
+        let results = transcode_batch_with_processor(
+            &params,
+            &files,
+            |task, _| {
+                cap.lock().unwrap().replace(task.clone());
+                Ok(TranscodeResult::Success)
+            },
+            None,
+        );
+        assert_eq!(results.len(), 1);
+        let captured = captured_task.lock().unwrap().clone().unwrap();
+        // AVI -> MP4 for X264 format via the current path_util stub.
+        assert_eq!(captured.input, PathBuf::from("/d/movie.avi"));
+        assert_eq!(captured.output, PathBuf::from("/d/movie.mp4"));
+    }
+
+    #[test]
+    fn batch_public_api_routes_to_with_processor() {
+        // Sanity: transcode_batch (public) wraps with_processor with the
+        // real transcode_single. We can't easily test the ffmpeg path
+        // without fixtures, so just assert the public function returns
+        // the same shape (Vec<...>) and that calling it with an empty
+        // list doesn't error.
+        let params = EncodeParams::default();
+        let cache = EncoderCache {
+            encoders_output: String::new(),
+            has_nvidia: false,
+        };
+        let config = Config::default();
+        let results = transcode_batch(&params, &[], &cache, &config, ProcessOutput::Inherit, None);
+        assert!(results.is_empty());
     }
 }

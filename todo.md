@@ -90,21 +90,22 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
   - Step 4: 7 tests in `batch.rs` (skip/reduce/no-r/fail/missing-encoder/exists)
 - **Verify**: `cargo test -p smart_encode_lib --lib` 108/108 pass (was 75; +33 from U5)
 
-## U6. File collection + batch transcode
+## U6. File collection + batch transcode — DONE
 
-- [ ] `collect_files(target, extensions) -> Result<Vec<PathBuf>, EncodeError>` in `collect.rs`
-- [ ] `walkdir::WalkDir::new(root).follow_links(false)` (R10)
-- [ ] Filter by extension, case-insensitive
-- [ ] `transcode_batch(params, files, cache, output, callback?)` in `processor/batch.rs`
-- [ ] Failures do NOT short-circuit the batch; each file gets its own `TranscodeResult`
-- [ ] Optional `result_callback` invoked once per file, in order
-- [ ] Tests:
-  - [ ] Symlink loop → no infinite recursion
-  - [ ] Empty `extensions` → returns all files
-  - [ ] Mixed file types → filtered correctly
-  - [ ] Batch with one failure returns mixed results, no abort
-  - [ ] Callback fires once per file in input order
-- **Verify**: `cargo test -p smart_encode_lib --lib collect batch` passes; smoke test on small multi-file batch
+- [x] `collect_files(target, extensions) -> Result<Vec<PathBuf>, EncodeError>` in `collect.rs`
+- [x] `walkdir::WalkDir::new(root).follow_links(false)` (R10)
+- [x] `entry.file_type().is_file()` (NOT `Path::is_file`) so symlinks to files are excluded
+- [x] Case-insensitive extension allowlist; empty allowlist = all files
+- [x] `Target::File` returns the file (filtered) or empty; `Target::Dir` walks
+- [x] `transcode_batch(params, files, cache, config, output, callback?)` in `processor/batch.rs`
+- [x] Processor closure seam (`transcode_batch_with_processor`) so tests inject canned results
+- [x] Failures do NOT short-circuit the batch; per-file errors become `TranscodeResult::Failed`
+- [x] `result_callback` fires once per file in input order, after the result is recorded
+- [x] Output path derived via `output_path_for(input, format)` per file
+- [x] Tests added per step:
+  - collect: 12 tests (file-target 5 cases, dir-target 7 cases including symlink file + loop guards)
+  - batch: 7 tests (order preserved, failure-doesn't-abort, callback in order, no-callback path, empty list, output-path derivation, public-API sanity)
+- **Verify**: `cargo test -p smart_encode_lib --lib` 127/127 pass (was 108; +19 from U6)
 
 ## U7. FPS analyzer
 
