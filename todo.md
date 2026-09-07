@@ -107,19 +107,18 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
   - batch: 7 tests (order preserved, failure-doesn't-abort, callback in order, no-callback path, empty list, output-path derivation, public-API sanity)
 - **Verify**: `cargo test -p smart_encode_lib --lib` 127/127 pass (was 108; +19 from U6)
 
-## U7. FPS analyzer
+## U7. FPS analyzer — DONE
 
-- [ ] `analyze_fps(files: &[PathBuf]) -> Result<FpsStats, EncodeError>` in `analyzer/fps_stats.rs`
-- [ ] Per file: `probe_video_metadata_auto` → `best_fps()` → `round` → `u32` → `FpsStats::add`
-- [ ] Failures increment `failed_files`, log `warn!`, do NOT panic
-- [ ] `FpsStats::summary()` — group counts
-- [ ] `FpsStats::detailed()` — file list per group (for `-v` flag)
-- [ ] Tests:
-  - [ ] Empty input → `total_files=0, parsed_files=0`
-  - [ ] Three distinct fps (24, 30, 60) → three groups in `BTreeMap`
-  - [ ] One probe failure → `failed_files=1`, others parsed
-  - [ ] `summary()` and `detailed()` non-empty strings
-- **Verify**: `cargo test -p smart_encode_lib --lib fps_stats` passes; smoke test against fixture directory
+- [x] `FpsStats::summary()` in `types.rs` — group counts plus totals line
+- [x] `FpsStats::detailed()` in `types.rs` — per-file listing grouped by fps
+- [x] `analyze_fps(files) -> Result<FpsStats, EncodeError>` in `analyzer/fps_stats.rs`
+  - Probe seam (`analyze_fps_with<F>(probe: F)`) so tests inject canned metadata
+  - Per-file failures (probe Err OR no fps in metadata) increment `failed_files` with `warn!` log
+  - fps rounded to nearest u32 (NTSC 23.976 -> 24, 29.97 -> 30, 59.94 -> 60)
+- [x] Tests added per step:
+  - Step 1: 5 FpsStats::summary/detailed tests in `types.rs` (group counts, totals, empty, failures, path grouping)
+  - Step 2: 7 analyze_fps tests in `analyzer/fps_stats.rs` (empty input, group-by-fps, integer fps, probe failure, missing fps, mixed success+failure, boundary rounding)
+- **Verify**: `cargo test -p smart_encode_lib --lib` 139/139 pass (was 127; +12 from U7)
 
 ## U8. CLI core
 

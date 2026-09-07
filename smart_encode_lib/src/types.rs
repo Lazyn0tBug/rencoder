@@ -195,14 +195,33 @@ impl FpsStats {
         self.failed_files += 1;
     }
 
+    /// Group counts plus a totals line. Suitable for default CLI output.
     pub fn summary(&self) -> String {
-        // Phase 9: implement per `video_fps_stats.zsh` output format.
-        String::new()
+        let mut out = String::new();
+        for (fps, files) in &self.groups {
+            out.push_str(&format!("{} fps: {} files\n", fps, files.len()));
+        }
+        out.push_str(&format!(
+            "Total: {} files ({} parsed, {} failed)\n",
+            self.total_files, self.parsed_files, self.failed_files
+        ));
+        out
     }
 
+    /// Per-file listing grouped by fps, plus totals. Used with `-v`.
     pub fn detailed(&self) -> String {
-        // Phase 9: implement per-file listing for `-v`.
-        String::new()
+        let mut out = String::new();
+        for (fps, files) in &self.groups {
+            out.push_str(&format!("{} fps ({} files):\n", fps, files.len()));
+            for path in files {
+                out.push_str(&format!("  {}\n", path.display()));
+            }
+        }
+        out.push_str(&format!(
+            "Total: {} files ({} parsed, {} failed)\n",
+            self.total_files, self.parsed_files, self.failed_files
+        ));
+        out
     }
 }
 
@@ -387,6 +406,84 @@ mod tests {
         s.add_failed();
         assert_eq!(s.failed_files, 2);
         assert_eq!(s.parsed_files, 1);
+    }
+
+    #[test]
+    fn fps_stats_summary_lists_each_group_count_and_totals() {
+        let mut s = FpsStats::new(3);
+        s.add(24, PathBuf::from("/a.mp4"));
+        s.add(30, PathBuf::from("/b.mp4"));
+        s.add(30, PathBuf::from("/c.mp4"));
+        let summary = s.summary();
+        assert!(summary.contains("24 fps: 1 files"));
+        assert!(summary.contains("30 fps: 2 files"));
+        assert!(summary.contains("Total: 3 files (3 parsed, 0 failed)"));
+    }
+
+    #[test]
+    fn fps_stats_summary_empty_has_totals_line() {
+        let s = FpsStats::new(0);
+        let summary = s.summary();
+        assert!(summary.contains("Total: 0 files (0 parsed, 0 failed)"));
+        // No groups means no group lines.
+        assert!(!summary.contains("fps:"));
+    }
+
+    #[test]
+    fn fps_stats_summary_reflects_failures() {
+        let mut s = FpsStats::new(4);
+        s.add(30, PathBuf::from("/a.mp4"));
+        s.add(30, PathBuf::from("/b.mp4"));
+        s.add_failed();
+        s.add_failed();
+        let summary = s.summary();
+        assert!(summary.contains("30 fps: 2 files"));
+        assert!(summary.contains("Total: 4 files (2 parsed, 2 failed)"));
+    }
+
+    #[test]
+    fn fps_stats_detailed_lists_every_path_under_its_group() {
+        let mut s = FpsStats::new(3);
+        s.add(24, PathBuf::from("/a.mp4"));
+        s.add(30, PathBuf::from("/b.mp4"));
+        s.add(30, PathBuf::from("/c.mp4"));
+        let detailed = s.detailed();
+        assert!(detailed.contains("/a.mp4"));
+        assert!(detailed.contains("/b.mp4"));
+        assert!(detailed.contains("/c.mp4"));
+        assert!(detailed.contains("24 fps (1 files):"));
+        assert!(detailed.contains("30 fps (2 files):"));
+        assert!(detailed.contains("Total: 3 files (3 parsed, 0 failed)"));
+    }
+
+    #[test]
+    fn fps_stats_detailed_groups_paths_under_correct_fps() {
+        let mut s = FpsStats::new(2);
+        s.add(24, PathBuf::from("/24a.mp4"));
+        s.add(60, PathBuf::from("/60a.mp4"));
+        let detailed = s.detailed();
+        // Find the 24 fps section and check it only contains /24a.mp4.
+        let lines: Vec<&str> = detailed.lines().collect();
+        let mut in_24_section = false;
+        let mut in_60_section = false;
+        for line in &lines {
+            if line.starts_with("24 fps") {
+                in_24_section = true;
+                in_60_section = false;
+            } else if line.starts_with("60 fps") {
+                in_60_section = true;
+                in_24_section = false;
+            } else if let Some(stripped) = line.strip_prefix("  ") {
+                // Path lines are indented with 2 spaces.
+                if in_24_section {
+                    assert!(stripped.contains("/24a.mp4"));
+                    assert!(!stripped.contains("/60a.mp4"));
+                } else if in_60_section {
+                    assert!(stripped.contains("/60a.mp4"));
+                    assert!(!stripped.contains("/24a.mp4"));
+                }
+            }
+        }
     }
 
     #[test]
