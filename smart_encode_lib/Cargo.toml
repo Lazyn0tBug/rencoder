@@ -16,4 +16,5 @@ rayon = { version = "1", optional = true }
 [features]
 default = []
 parallel-analyze = ["dep:rayon"]
-# c-probe added in Phase 16: cc + pkg-config build deps + ffi module.
+# c-probe: declared now to silence cfg warnings; deps + ffi module land in Phase 13.
+c-probe = []

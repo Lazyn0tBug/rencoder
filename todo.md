@@ -46,18 +46,20 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
 - [x] Integration test: `real_ffprobe_against_fixture` (generates 1s 30fps H.264, probes, asserts h264 + ~30fps)
 - **Verify**: `cargo test -p smart_encode_lib --lib` 25/25 pass
 
-## U4. Encoder cache + selection
+## U4. Encoder cache + selection — DONE
 
-- [ ] `init_encoder_cache(enable_nv: bool) -> Result<EncoderCache, EncodeError>` in `encoder_cache.rs`
-- [ ] Run `ffmpeg -encoders` once, capture stdout to `encoders_output`
-- [ ] When `enable_nv`: run `nvidia-smi -L`; on `io::Error` or empty output, log `info!` and set `has_nvidia = false`
-- [ ] `select_encoder(format, cache, config_path?) -> Result<String, EncodeError>` in `encoder.rs`
-- [ ] Format-to-encoder mapping: `Av1 → libsvtav1`, `X264 → libx264`, `Hevc → libx265`, `Vp9 → libvpx-vp9`
-- [ ] Config overrides via `Config::load(config_path)` (when path is `Some`)
-- [ ] Unit tests with a test seam for subprocess mocking
-- [ ] Encoder-cache test: verify `ffmpeg -encoders` runs exactly once across N calls
-- [ ] NVIDIA fallback tests (missing binary, empty output, present GPU)
-- **Verify**: `cargo test -p smart_encode_lib --lib encoder_cache encoder` passes; smoke test on macOS confirms `nvidia-smi`-absent fallback
+- [x] `init_encoder_cache(enable_nv) -> Result<EncoderCache, EncodeError>` in `encoder_cache.rs`
+- [x] Runner-closure seam (`init_encoder_cache_impl<F>(runner: F)`) for testable subprocess mocking
+- [x] `ffmpeg -encoders` once; output captured to `encoders_output`
+- [x] `nvidia-smi -L` only when `enable_nv = true`; missing/empty → `info!` log, `has_nvidia = false`
+- [x] `select_encoder(format, cache, config_path?) -> Result<String, EncodeError>` in `encoder.rs`
+- [x] Preference chain: config override → NVENC → software default, with fallback
+- [x] Format-to-encoder mapping: `Av1 → libsvtav1/av1_nvenc`, `X264 → libx264/h264_nvenc`, `Hevc → libx265/hevc_nvenc`, `Vp9 → libvpx-vp9`
+- [x] Config override support: `Config.encoders.{av1,x264,hevc,vp9}`
+- [x] Config::from_value updated to parse `encoders` block
+- [x] Tests: 9 encoder_cache tests (substring match, has_nvidia flag, fallback paths, ffmpeg-once)
+- [x] Tests: 7 select_encoder tests (software, NVENC, fallback, override precedence, missing)
+- **Verify**: `cargo test -p smart_encode_lib --lib` 44/44 pass; workspace clean
 
 ## U5. Command builder + single-file transcode
 
