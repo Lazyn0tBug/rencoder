@@ -147,6 +147,19 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
                 to_file(&args.output, &body)?;
             }
         }
+        AnalyzeFormatArg::Table => {
+            // Build a DataFrame from the records and use Polars' Display
+            // for the framed box-drawing table. Per-file rows in input
+            // order (rayon's par_iter().collect preserves order).
+            let df = rencoder_lib::analyzer::fps_stats::records_to_dataframe(&records)
+                .map_err(|e| anyhow::anyhow!("dataframe build: {e}"))?;
+            let body = format!("{df}");
+            if args.output == Path::new("-") {
+                to_stdout(&body);
+            } else {
+                to_file(&args.output, &body)?;
+            }
+        }
         AnalyzeFormatArg::Text => {
             let body = stats.summary();
             if args.output == Path::new("-") {

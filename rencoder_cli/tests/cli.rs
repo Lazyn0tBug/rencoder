@@ -205,6 +205,45 @@ fn analyze_text_format_writes_to_file() {
 }
 
 #[test]
+fn analyze_table_format_emits_framed_per_file_table() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+    let dir = fixture_dir("analyze_table");
+    make_video(&dir, "a.mp4", 24);
+    make_video(&dir, "b.mp4", 30);
+
+    let out = run(&[
+        "analyze",
+        "-d",
+        dir.to_str().unwrap(),
+        "--format", "table",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Polars Display produces the framed ASCII table.
+    assert!(
+        stdout.contains("┌") && stdout.contains("└") && stdout.contains("│"),
+        "expected framed table borders, got: {stdout}"
+    );
+    // Per-file rows. Polars truncates long paths with '...' to fit the
+    // terminal width, so we can't assert on the full filename. Verify
+    // the table contains 2 data rows by counting row separators.
+    let row_separator_count = stdout.matches("│").count();
+    assert!(
+        row_separator_count >= 6,
+        "expected at least 6 '|' borders (header + 2 rows + cols), got {row_separator_count} in: {stdout}"
+    );
+    // Column headers.
+    assert!(stdout.contains("path") && stdout.contains("fps") && stdout.contains("codec"));
+}
+
+#[test]
 fn encode_subcommand_produces_output_file() {
     if !ffmpeg_available() {
         eprintln!("skipping: ffmpeg not available");

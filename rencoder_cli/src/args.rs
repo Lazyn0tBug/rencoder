@@ -40,7 +40,11 @@ pub enum AnalyzeFormatArg {
     /// Per-file CSV to stdout (default). One row per input file with
     /// columns `path, fps, codec, duration_secs, file_bytes`. Pipe-friendly.
     Csv,
-    /// Human-readable text summary (legacy behavior).
+    /// Human-readable framed table (per-file rows). Built on Polars'
+    /// Display; one row per input file.
+    Table,
+    /// Human-readable text summary (legacy behavior) -- the cross-tab
+    /// (fps x codec) aggregated view.
     Text,
     /// Per-file JSON objects, one per line. For `jq` and other line-based
     /// JSON consumers.
