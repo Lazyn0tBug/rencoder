@@ -133,23 +133,52 @@ pub fn analyze_fps(files: &[PathBuf]) -> Result<FpsStats, EncodeError> {
     Ok(aggregate_records(&records))
 }
 
-/// Aggregate an already-built record list into `FpsStats`.
+/// Aggregate an already-built record list into `FpsStats` using
+/// Polars expressions: `group_by([fps, codec]).agg([count, sum(duration),
+/// sum(bytes)])` plus manual totals (parsed/failed counts and the
+/// failed-files list).
 pub fn aggregate_records(records: &[AnalysisRecord]) -> FpsStats {
-    let mut stats = FpsStats::new(records.len());
-    for r in records {
-        if let Some(fps) = r.fps {
-            stats.add(fps, r.path.clone());
-        } else {
-            stats.add_failed();
-        }
-        if let Some(c) = &r.codec {
-            stats.add_codec(c.clone());
-        }
-        if let Some(d) = r.duration_secs {
-            stats.add_duration(d);
-        }
+    use polars::prelude::*;
+
+    let total_files = records.len();
+    let parsed = records.iter().filter(|r| r.fps.is_some()).count();
+    let failed = total_files - parsed;
+    let total_duration: f64 = records.iter().filter_map(|r| r.duration_secs).sum();
+    let failed_paths: Vec<PathBuf> = records
+        .iter()
+        .filter(|r| r.fps.is_none())
+        .map(|r| r.path.clone())
+        .collect();
+
+    // Cross-tab aggregation via Polars expressions. Failed probes
+    // (fps = None) are filtered out -- they're tracked in failed_files
+    // and failed_paths instead.
+    let table = if records.is_empty() {
+        FpsStats::new(0).table
+    } else {
+        records_to_dataframe(records)
+            .expect("records_to_dataframe")
+            .lazy()
+            .filter(col("fps").is_not_null())
+            .group_by([col("fps"), col("codec")])
+            .agg([
+                len().alias("files"),
+                col("duration_secs").sum().alias("duration_secs"),
+                col("file_bytes").sum().alias("bytes"),
+            ])
+            .sort(["fps", "codec"], Default::default())
+            .collect()
+            .expect("polars aggregate")
+    };
+
+    FpsStats {
+        table,
+        total_files,
+        parsed_files: parsed,
+        failed_files: failed,
+        total_duration_secs: total_duration,
+        failed_paths,
     }
-    stats
 }
 
 #[cfg(test)]
@@ -206,14 +235,15 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_records_groups_by_fps() {
+    fn aggregate_records_groups_by_fps_and_codec() {
         let records = vec![h264(24.0), h264(30.0), h264(30.0), h264(60.0)];
         let stats = aggregate_records(&records);
         assert_eq!(stats.parsed_files, 4);
         assert_eq!(stats.failed_files, 0);
-        assert_eq!(stats.groups.get(&24).map(|v| v.len()), Some(1));
-        assert_eq!(stats.groups.get(&30).map(|v| v.len()), Some(2));
-        assert_eq!(stats.groups.get(&60).map(|v| v.len()), Some(1));
+        // 3 distinct fps values, each with one (fps, codec) combo.
+        assert_eq!(stats.table.height(), 3);
+        // Total duration: 4 files * 60s = 240s.
+        assert!((stats.total_duration_secs - 240.0).abs() < 1e-9);
     }
 
     #[test]
@@ -230,11 +260,14 @@ mod tests {
         assert_eq!(stats.total_files, 3);
         assert_eq!(stats.parsed_files, 2);
         assert_eq!(stats.failed_files, 1);
-        assert_eq!(stats.groups.get(&30).map(|v| v.len()), Some(2));
+        // Only one row in the table (the (30, h264) bucket); the failed
+        // probe is excluded from the cross-tab.
+        assert_eq!(stats.table.height(), 1);
+        assert_eq!(stats.failed_paths, vec![PathBuf::from("/bad.mp4")]);
     }
 
     #[test]
-    fn aggregate_records_tracks_codec_and_duration() {
+    fn aggregate_records_tracks_codec_distribution() {
         let records = vec![
             AnalysisRecord {
                 path: PathBuf::from("/a"),
@@ -259,8 +292,11 @@ mod tests {
             },
         ];
         let stats = aggregate_records(&records);
-        assert_eq!(stats.codec_counts.get("h264").copied(), Some(2));
-        assert_eq!(stats.codec_counts.get("vp9").copied(), Some(1));
+        // Three distinct (fps, codec) combinations: (30, h264), (60, vp9).
+        // (30, h264) appears once with files=2.
+        let table_str = format!("{}", stats.table);
+        assert!(table_str.contains("h264"));
+        assert!(table_str.contains("vp9"));
         assert!((stats.total_duration_secs - 210.0).abs() < 1e-9);
     }
 
@@ -308,9 +344,6 @@ mod tests {
         let df = records_to_dataframe(&records).expect("df build");
         assert_eq!(df.height(), 2);
         assert_eq!(df.width(), 5);
-        // Path column: ["", "/a.mp4", "/b.mp4"] — first is "" because
-        // PathBuf::from("/a.mp4") can be losslessly converted to &str.
-        // (The empty string test was wrong; remove that assertion.)
         let fps_col = df.column("fps").unwrap();
         assert_eq!(fps_col.len(), 2);
     }
@@ -330,7 +363,8 @@ mod tests {
         let records = analyze_records_with_probe(&files, probe);
         let stats = aggregate_records(&records);
         assert_eq!(stats.parsed_files, 1);
-        assert_eq!(stats.codec_counts.get("vp9").copied(), Some(1));
-        assert_eq!(stats.groups.get(&60).map(|v| v.len()), Some(1));
+        let table_str = format!("{}", stats.table);
+        assert!(table_str.contains("vp9"));
+        assert_eq!(stats.table.height(), 1);
     }
 }

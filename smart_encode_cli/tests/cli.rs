@@ -197,10 +197,11 @@ fn analyze_text_format_writes_to_file() {
     );
     assert!(stats_path.exists(), "expected text file at {}", stats_path.display());
     let content = std::fs::read_to_string(&stats_path).unwrap();
-    assert!(content.contains("30 fps"));
+    // Polars table format: column names + cell values.
+    assert!(content.contains("fps"), "expected Polars table with fps column");
+    assert!(content.contains("30"), "expected 30 fps in table");
+    assert!(content.contains("h264"), "expected codec in table");
     assert!(content.contains("Total:"));
-    // Text format is the summary view (fps distribution + totals); file
-    // paths appear only in CSV mode.
 }
 
 #[test]

@@ -109,9 +109,11 @@ fn analyze_fps_groups_mixed_fixtures() {
     assert_eq!(stats.total_files, 3);
     assert_eq!(stats.parsed_files, 3);
     assert_eq!(stats.failed_files, 0);
-    // 24 fps NTSC is uncommon; 30 and 60 round to themselves.
-    assert!(stats.groups.contains_key(&30));
-    assert!(stats.groups.contains_key(&60));
+    // The Polars cross-tab table has 3 rows: (24, h264), (30, h264),
+    // (60, h264).
+    assert_eq!(stats.table.height(), 3);
+    let table_str = format!("{}", stats.table);
+    assert!(table_str.contains("h264"));
 }
 
 #[test]
@@ -122,7 +124,8 @@ fn analyze_fps_handles_probe_failure_for_missing_file() {
     assert_eq!(stats.total_files, 1);
     assert_eq!(stats.parsed_files, 0);
     assert_eq!(stats.failed_files, 1);
-    assert!(stats.groups.is_empty());
+    assert_eq!(stats.table.height(), 0);
+    assert_eq!(stats.failed_paths, vec![dir.join("does_not_exist.mp4")]);
 }
 
 // ---- transcode_batch ----

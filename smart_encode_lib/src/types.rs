@@ -1,6 +1,5 @@
 //! Public data structures shared across the library.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::error::EncodeError;
@@ -173,100 +172,71 @@ pub enum TranscodeResult {
 
 // ===== FPS statistics (analyzer module) =====
 
-#[derive(Clone, Debug, Default)]
+/// Aggregated analysis output. Holds a Polars `DataFrame` (built via
+/// `group_by([fps, codec]).agg([count, sum(duration), sum(bytes)])`)
+/// plus high-level totals for the CLI summary line and the failed-files
+/// list.
+#[derive(Debug)]
 pub struct FpsStats {
-    pub groups: BTreeMap<u32, Vec<PathBuf>>,
+    /// One row per `(fps, codec)` bucket; columns: `fps, codec, files,
+    /// duration_secs, bytes`. Failed probes (fps=None) are excluded;
+    /// `failed_files` and `failed_paths` track them.
+    pub table: polars::prelude::DataFrame,
     pub total_files: usize,
     pub parsed_files: usize,
     pub failed_files: usize,
-    /// Number of files per codec (e.g. "h264" -> 3).
-    pub codec_counts: BTreeMap<String, usize>,
-    /// Sum of `duration_secs` across all successfully parsed files.
     pub total_duration_secs: f64,
+    pub failed_paths: Vec<PathBuf>,
 }
 
 impl FpsStats {
+    /// Build an empty `FpsStats` with the given total-file count and an
+    /// empty cross-tab table. Tests and early-return paths use this;
+    /// production callers should prefer `aggregate_records` to populate
+    /// the table.
     pub fn new(total_files: usize) -> Self {
+        use polars::prelude::*;
+        let table = df! {
+            "fps" => Vec::<Option<u32>>::new(),
+            "codec" => Vec::<Option<&str>>::new(),
+            "files" => Vec::<u32>::new(),
+            "duration_secs" => Vec::<Option<f64>>::new(),
+            "bytes" => Vec::<u64>::new(),
+        }
+        .expect("empty aggregate df");
         Self {
+            table,
             total_files,
-            ..Default::default()
+            parsed_files: 0,
+            failed_files: 0,
+            total_duration_secs: 0.0,
+            failed_paths: Vec::new(),
         }
     }
 
-    pub fn add(&mut self, fps: u32, path: PathBuf) {
-        self.groups.entry(fps).or_default().push(path);
-        self.parsed_files += 1;
-    }
-
-    /// Increment the count for the given codec (e.g. "h264", "vp9").
-    pub fn add_codec(&mut self, codec: String) {
-        *self.codec_counts.entry(codec).or_insert(0) += 1;
-    }
-
-    /// Accumulate `secs` into the running duration total. Pass `0.0` or
-    /// negative values harmlessly (clamped to 0 in the display).
-    pub fn add_duration(&mut self, secs: f64) {
-        if secs > 0.0 {
-            self.total_duration_secs += secs;
-        }
-    }
-
-    pub fn add_failed(&mut self) {
-        self.failed_files += 1;
-    }
-
-    /// Group counts plus a totals line. Suitable for default CLI output.
+    /// Render as a human-readable summary: a "Total: ..." line, the
+    /// Polars cross-tab table (fps x codec), and the failed-files list
+    /// if any. The table uses Polars' default formatting.
     pub fn summary(&self) -> String {
         let mut out = String::new();
-        for (fps, files) in &self.groups {
-            out.push_str(&format!("{} fps: {} files\n", fps, files.len()));
-        }
-        if !self.codec_counts.is_empty() {
-            out.push_str("\nCodec distribution:\n");
-            for (codec, count) in &self.codec_counts {
-                out.push_str(&format!("  {}: {} files\n", codec, count));
-            }
-        }
-        out.push_str(&self.totals_line());
-        if self.total_duration_secs > 0.0 {
+        if self.total_files > 0 {
             out.push_str(&format!(
-                "Total duration: {}\n",
-                format_duration(self.total_duration_secs)
+                "Total: {} files ({} parsed, {} failed)",
+                self.total_files, self.parsed_files, self.failed_files
             ));
+            if self.total_duration_secs > 0.0 {
+                out.push_str(&format!(", {}", format_duration(self.total_duration_secs)));
+            }
+            out.push_str("\n\n");
+        }
+        out.push_str(&format!("{}\n", self.table));
+        if !self.failed_paths.is_empty() {
+            out.push_str("\nFailed files:\n");
+            for p in &self.failed_paths {
+                out.push_str(&format!("  {}\n", p.display()));
+            }
         }
         out
-    }
-
-    /// Per-file listing grouped by fps, plus totals. Used with `-v`.
-    pub fn detailed(&self) -> String {
-        let mut out = String::new();
-        for (fps, files) in &self.groups {
-            out.push_str(&format!("{} fps ({} files):\n", fps, files.len()));
-            for path in files {
-                out.push_str(&format!("  {}\n", path.display()));
-            }
-        }
-        if !self.codec_counts.is_empty() {
-            out.push_str("\nCodec distribution:\n");
-            for (codec, count) in &self.codec_counts {
-                out.push_str(&format!("  {}: {} files\n", codec, count));
-            }
-        }
-        out.push_str(&self.totals_line());
-        if self.total_duration_secs > 0.0 {
-            out.push_str(&format!(
-                "Total duration: {}\n",
-                format_duration(self.total_duration_secs)
-            ));
-        }
-        out
-    }
-
-    fn totals_line(&self) -> String {
-        format!(
-            "Total: {} files ({} parsed, {} failed)\n",
-            self.total_files, self.parsed_files, self.failed_files
-        )
     }
 }
 
@@ -434,192 +404,133 @@ mod tests {
         assert_eq!(ProcessOutput::default(), ProcessOutput::Inherit);
     }
 
+    // ---- FpsStats (Polars-backed) ----
+
+    fn rec(fps: Option<u32>, codec: &str, dur: Option<f64>) -> crate::analyzer::fps_stats::AnalysisRecord {
+        crate::analyzer::fps_stats::AnalysisRecord {
+            path: PathBuf::from("/x"),
+            fps,
+            codec: Some(codec.into()),
+            duration_secs: dur,
+            file_bytes: 1024,
+        }
+    }
+
+    fn fail_rec() -> crate::analyzer::fps_stats::AnalysisRecord {
+        crate::analyzer::fps_stats::AnalysisRecord {
+            path: PathBuf::from("/bad.mp4"),
+            fps: None,
+            codec: None,
+            duration_secs: None,
+            file_bytes: 0,
+        }
+    }
+
     #[test]
-    fn fps_stats_new_initializes_total() {
+    fn fps_stats_new_initializes_total_with_empty_table() {
         let s = FpsStats::new(100);
         assert_eq!(s.total_files, 100);
         assert_eq!(s.parsed_files, 0);
         assert_eq!(s.failed_files, 0);
-        assert!(s.groups.is_empty());
+        assert_eq!(s.table.height(), 0);
+        assert!(s.failed_paths.is_empty());
     }
 
     #[test]
-    fn fps_stats_add_groups_by_fps() {
-        let mut s = FpsStats::new(3);
-        s.add(30, PathBuf::from("/a.mp4"));
-        s.add(30, PathBuf::from("/b.mp4"));
-        s.add(60, PathBuf::from("/c.mp4"));
-        assert_eq!(s.parsed_files, 3);
-        assert_eq!(s.groups.get(&30).unwrap().len(), 2);
-        assert_eq!(s.groups.get(&60).unwrap().len(), 1);
-        assert!(!s.groups.contains_key(&24));
+    fn aggregate_records_groups_by_fps_and_codec() {
+        let records = vec![
+            rec(Some(24), "h264", Some(60.0)),
+            rec(Some(30), "h264", Some(60.0)),
+            rec(Some(30), "vp9", Some(60.0)),
+            rec(Some(60), "av1", Some(120.0)),
+        ];
+        let stats = crate::analyzer::fps_stats::aggregate_records(&records);
+        assert_eq!(stats.parsed_files, 4);
+        assert_eq!(stats.failed_files, 0);
+        assert_eq!(stats.table.height(), 4); // 4 (fps, codec) combos
+        // Total duration: 60 + 60 + 60 + 120 = 300
+        assert!((stats.total_duration_secs - 300.0).abs() < 1e-9);
     }
 
     #[test]
-    fn fps_stats_add_failed_increments_only_failed() {
-        let mut s = FpsStats::new(5);
-        s.add(30, PathBuf::from("/a.mp4"));
-        s.add_failed();
-        s.add_failed();
-        assert_eq!(s.failed_files, 2);
-        assert_eq!(s.parsed_files, 1);
+    fn aggregate_records_excludes_failed_from_table() {
+        let records = vec![
+            rec(Some(30), "h264", Some(60.0)),
+            rec(Some(30), "h264", Some(60.0)),
+            fail_rec(),
+        ];
+        let stats = crate::analyzer::fps_stats::aggregate_records(&records);
+        assert_eq!(stats.total_files, 3);
+        assert_eq!(stats.parsed_files, 2);
+        assert_eq!(stats.failed_files, 1);
+        assert_eq!(stats.table.height(), 1); // only the (30, h264) row
+        assert_eq!(stats.failed_paths, vec![PathBuf::from("/bad.mp4")]);
     }
 
     #[test]
-    fn fps_stats_summary_lists_each_group_count_and_totals() {
-        let mut s = FpsStats::new(3);
-        s.add(24, PathBuf::from("/a.mp4"));
-        s.add(30, PathBuf::from("/b.mp4"));
-        s.add(30, PathBuf::from("/c.mp4"));
-        let summary = s.summary();
-        assert!(summary.contains("24 fps: 1 files"));
-        assert!(summary.contains("30 fps: 2 files"));
-        assert!(summary.contains("Total: 3 files (3 parsed, 0 failed)"));
+    fn aggregate_records_empty_input() {
+        let stats = crate::analyzer::fps_stats::aggregate_records(&[]);
+        assert_eq!(stats.total_files, 0);
+        assert_eq!(stats.parsed_files, 0);
+        assert_eq!(stats.failed_files, 0);
+        assert_eq!(stats.table.height(), 0);
+        assert_eq!(stats.total_duration_secs, 0.0);
     }
 
     #[test]
-    fn fps_stats_summary_empty_has_totals_line() {
-        let s = FpsStats::new(0);
-        let summary = s.summary();
-        assert!(summary.contains("Total: 0 files (0 parsed, 0 failed)"));
-        // No groups means no group lines.
-        assert!(!summary.contains("fps:"));
+    fn fps_stats_summary_starts_with_totals_line() {
+        let records = vec![
+            rec(Some(30), "h264", Some(60.0)),
+            rec(Some(60), "av1", Some(120.0)),
+        ];
+        let stats = crate::analyzer::fps_stats::aggregate_records(&records);
+        let summary = stats.summary();
+        assert!(summary.contains("Total: 2 files (2 parsed, 0 failed)"));
+        assert!(summary.contains("0:03:00")); // 60 + 120 = 180 = 3:00
     }
 
     #[test]
-    fn fps_stats_summary_reflects_failures() {
-        let mut s = FpsStats::new(4);
-        s.add(30, PathBuf::from("/a.mp4"));
-        s.add(30, PathBuf::from("/b.mp4"));
-        s.add_failed();
-        s.add_failed();
-        let summary = s.summary();
-        assert!(summary.contains("30 fps: 2 files"));
-        assert!(summary.contains("Total: 4 files (2 parsed, 2 failed)"));
+    fn fps_stats_summary_includes_polars_table_with_fps_codec_files() {
+        let records = vec![
+            rec(Some(30), "h264", Some(60.0)),
+            rec(Some(30), "h264", Some(60.0)),
+            rec(Some(60), "av1", Some(120.0)),
+        ];
+        let stats = crate::analyzer::fps_stats::aggregate_records(&records);
+        let summary = stats.summary();
+        // Polars' default Display shows column names.
+        assert!(summary.contains("fps"));
+        assert!(summary.contains("codec"));
+        assert!(summary.contains("files"));
+        assert!(summary.contains("duration_secs"));
+        // Cell values appear in the table.
+        assert!(summary.contains("h264"));
+        assert!(summary.contains("av1"));
     }
 
     #[test]
-    fn fps_stats_detailed_lists_every_path_under_its_group() {
-        let mut s = FpsStats::new(3);
-        s.add(24, PathBuf::from("/a.mp4"));
-        s.add(30, PathBuf::from("/b.mp4"));
-        s.add(30, PathBuf::from("/c.mp4"));
-        let detailed = s.detailed();
-        assert!(detailed.contains("/a.mp4"));
-        assert!(detailed.contains("/b.mp4"));
-        assert!(detailed.contains("/c.mp4"));
-        assert!(detailed.contains("24 fps (1 files):"));
-        assert!(detailed.contains("30 fps (2 files):"));
-        assert!(detailed.contains("Total: 3 files (3 parsed, 0 failed)"));
+    fn fps_stats_summary_lists_failed_files_at_end() {
+        let records = vec![rec(Some(30), "h264", Some(60.0)), fail_rec()];
+        let stats = crate::analyzer::fps_stats::aggregate_records(&records);
+        let summary = stats.summary();
+        assert!(summary.contains("Failed files:"));
+        assert!(summary.contains("/bad.mp4"));
     }
 
     #[test]
-    fn fps_stats_detailed_groups_paths_under_correct_fps() {
-        let mut s = FpsStats::new(2);
-        s.add(24, PathBuf::from("/24a.mp4"));
-        s.add(60, PathBuf::from("/60a.mp4"));
-        let detailed = s.detailed();
-        // Find the 24 fps section and check it only contains /24a.mp4.
-        let lines: Vec<&str> = detailed.lines().collect();
-        let mut in_24_section = false;
-        let mut in_60_section = false;
-        for line in &lines {
-            if line.starts_with("24 fps") {
-                in_24_section = true;
-                in_60_section = false;
-            } else if line.starts_with("60 fps") {
-                in_60_section = true;
-                in_24_section = false;
-            } else if let Some(stripped) = line.strip_prefix("  ") {
-                // Path lines are indented with 2 spaces.
-                if in_24_section {
-                    assert!(stripped.contains("/24a.mp4"));
-                    assert!(!stripped.contains("/60a.mp4"));
-                } else if in_60_section {
-                    assert!(stripped.contains("/60a.mp4"));
-                    assert!(!stripped.contains("/24a.mp4"));
-                }
-            }
-        }
-    }
-
-    // ---- codec + duration tracking ----
-
-    #[test]
-    fn fps_stats_default_has_empty_codec_counts_zero_duration() {
-        let s = FpsStats::default();
-        assert!(s.codec_counts.is_empty());
-        assert_eq!(s.total_duration_secs, 0.0);
-    }
-
-    #[test]
-    fn fps_stats_add_codec_increments_count() {
-        let mut s = FpsStats::default();
-        s.add_codec("h264".into());
-        s.add_codec("h264".into());
-        s.add_codec("vp9".into());
-        assert_eq!(s.codec_counts.get("h264"), Some(&2));
-        assert_eq!(s.codec_counts.get("vp9"), Some(&1));
-    }
-
-    #[test]
-    fn fps_stats_add_duration_accumulates_positive_only() {
-        let mut s = FpsStats::default();
-        s.add_duration(60.0);
-        s.add_duration(30.5);
-        // Negative or zero values are clamped (not subtracted).
-        s.add_duration(-5.0);
-        s.add_duration(0.0);
-        assert!((s.total_duration_secs - 90.5).abs() < 1e-9);
-    }
-
-    #[test]
-    fn fps_stats_summary_includes_codec_block_when_present() {
-        let mut s = FpsStats::new(3);
-        s.add(30, PathBuf::from("/a.mp4"));
-        s.add_codec("h264".into());
-        s.add_codec("vp9".into());
-        let summary = s.summary();
-        assert!(summary.contains("Codec distribution:"));
-        assert!(summary.contains("h264: 1 files"));
-        assert!(summary.contains("vp9: 1 files"));
-    }
-
-    #[test]
-    fn fps_stats_summary_omits_codec_block_when_empty() {
-        let mut s = FpsStats::new(1);
-        s.add(30, PathBuf::from("/a.mp4"));
-        let summary = s.summary();
-        assert!(!summary.contains("Codec distribution"));
-    }
-
-    #[test]
-    fn fps_stats_summary_includes_total_duration_when_nonzero() {
-        let mut s = FpsStats::new(2);
-        s.add(30, PathBuf::from("/a.mp4"));
-        s.add(30, PathBuf::from("/b.mp4"));
-        s.add_duration(3661.0); // 1h 1m 1s
-        let summary = s.summary();
-        assert!(summary.contains("Total duration: 1:01:01"));
+    fn fps_stats_summary_omits_total_line_for_empty_input() {
+        let stats = crate::analyzer::fps_stats::aggregate_records(&[]);
+        let summary = stats.summary();
+        assert!(!summary.contains("Total:"));
     }
 
     #[test]
     fn fps_stats_summary_omits_duration_when_zero() {
-        let s = FpsStats::new(0);
-        let summary = s.summary();
-        assert!(!summary.contains("Total duration"));
-    }
-
-    #[test]
-    fn fps_stats_detailed_includes_codec_and_duration_blocks() {
-        let mut s = FpsStats::new(3);
-        s.add(24, PathBuf::from("/a.mp4"));
-        s.add_codec("h264".into());
-        s.add_duration(60.0);
-        let detailed = s.detailed();
-        assert!(detailed.contains("Codec distribution:"));
-        assert!(detailed.contains("h264: 1 files"));
-        assert!(detailed.contains("Total duration: 0:01:00"));
+        let records = vec![rec(Some(30), "h264", None)];
+        let stats = crate::analyzer::fps_stats::aggregate_records(&records);
+        let summary = stats.summary();
+        assert!(!summary.contains("0:00:00"));
+        // No duration column data displayed in the summary line.
     }
 
     #[test]
