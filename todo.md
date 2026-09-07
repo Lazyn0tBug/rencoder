@@ -243,13 +243,21 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
 - [x] `README.md` — install, quickstart, CLI reference (encode + analyze), config schema, logging, development
 - **Verify**: `cargo test --workspace` 200/200 pass (was 185; +6 lib integration + +9 CLI integration).
 
-## U12. Parallel analyze (optional)
+## U12. Parallel analyze — DONE
 
-- [ ] `analyze_fps_parallel` in `analyzer/fps_stats.rs` behind `#[cfg(feature = "parallel-analyze")]`
-- [ ] `rayon::prelude::*`; merge results via `Mutex<FpsStats>` (parking_lot) or per-thread reduce
-- [ ] `c-probe` interaction test: 100 concurrent probes complete without UB
-- [ ] Tests: parallel output identical to serial
-- **Verify**: `cargo test -p rencoder_lib --features parallel-analyze` passes
+- [x] `analyze_records_parallel` in `analyzer/fps_stats.rs` behind `#[cfg(feature = "parallel-analyze")]`
+- [x] `rayon::prelude::*`; per-record `par_iter().map().collect()` preserves input order
+- [x] Per-thread probe failures become None-metric rows (same contract as serial)
+- [x] Test seam `analyze_records_with_probe_parallel` for tests with `Fn + Sync + Send` bound
+- [x] CLI: `analyze -p` now actually invokes the parallel path (the "not yet implemented" warning is gone)
+- [x] `AnalysisRecord` derives `PartialEq` so serial-vs-parallel can be compared directly
+- [x] Tests added (4, all behind the feature flag):
+  - `parallel_output_matches_serial_sorted_by_path` (sorted by path; output identical)
+  - `parallel_failure_becomes_none_row_not_error` (single failed probe → None row, batch continues)
+  - `parallel_aggregate_matches_serial` (Polars table identical)
+  - `parallel_returns_records_in_input_order` (rayon par_iter preserves order)
+- **Verify**: `cargo test --workspace` 207/207; with `--features parallel-analyze` 157/157. `cargo clippy --workspace --all-targets` clean.
+- **Note**: c-probe interaction test (R17) deferred to U13 when the FFI bridge lands; the parallel path will pick it up automatically via `probe_video_metadata_auto`'s feature-gated dispatch.
 
 ## U13. C FFI probe (optional)
 

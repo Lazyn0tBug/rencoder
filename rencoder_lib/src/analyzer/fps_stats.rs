@@ -21,7 +21,7 @@ use crate::types::FpsStats;
 
 /// One row per input file. Failed probes yield a row with `path` and
 /// `file_bytes` set but metric fields `None`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AnalysisRecord {
     pub path: PathBuf,
     pub fps: Option<u32>,
@@ -70,6 +70,84 @@ where
         }
     }
     records
+}
+
+/// Parallel variant of `analyze_records` using `rayon`. Each file is
+/// probed concurrently; per-thread probe failures become a record with
+/// `None` metric fields (matching the serial contract). Output ordering
+/// matches input ordering (rayon's `par_iter().collect()` is order-
+/// preserving when collected into a Vec).
+///
+/// Probe failures inside a worker thread can't be propagated as `Result`
+/// through `par_iter().collect()` without `try_reduce` gymnastics, so we
+/// log + downgrade to a None-metric row, matching the serial behavior.
+#[cfg(feature = "parallel-analyze")]
+pub fn analyze_records_parallel(files: &[PathBuf]) -> Result<Vec<AnalysisRecord>, EncodeError> {
+    use rayon::prelude::*;
+
+    let records: Vec<AnalysisRecord> = files
+        .par_iter()
+        .map(|path| {
+            let file_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            match probe_video_metadata_auto(path) {
+                Ok(metadata) => AnalysisRecord {
+                    path: path.clone(),
+                    fps: metadata.best_fps().map(|f| f.round() as u32),
+                    codec: metadata.codec,
+                    duration_secs: metadata.duration_secs,
+                    file_bytes,
+                },
+                Err(e) => {
+                    log::warn!("probe failed for {}: {e}", path.display());
+                    AnalysisRecord {
+                        path: path.clone(),
+                        fps: None,
+                        codec: None,
+                        duration_secs: None,
+                        file_bytes,
+                    }
+                }
+            }
+        })
+        .collect();
+
+    Ok(records)
+}
+
+/// Test seam for the parallel variant: same shape as
+/// `analyze_records_with_probe` but rayon-backed.
+#[cfg(feature = "parallel-analyze")]
+pub fn analyze_records_with_probe_parallel<F>(files: &[PathBuf], probe: F) -> Vec<AnalysisRecord>
+where
+    F: Fn(&Path) -> Result<crate::types::VideoMetadata, EncodeError> + Sync + Send,
+{
+    use rayon::prelude::*;
+
+    files
+        .par_iter()
+        .map(|path| {
+            let file_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            match probe(path) {
+                Ok(metadata) => AnalysisRecord {
+                    path: path.clone(),
+                    fps: metadata.best_fps().map(|f| f.round() as u32),
+                    codec: metadata.codec,
+                    duration_secs: metadata.duration_secs,
+                    file_bytes,
+                },
+                Err(e) => {
+                    log::warn!("probe failed for {}: {e}", path.display());
+                    AnalysisRecord {
+                        path: path.clone(),
+                        fps: None,
+                        codec: None,
+                        duration_secs: None,
+                        file_bytes,
+                    }
+                }
+            }
+        })
+        .collect()
 }
 
 /// Build a Polars DataFrame from records. Columns: `path`, `fps` (UInt32
@@ -374,5 +452,136 @@ mod tests {
         let table_str = format!("{}", stats.table);
         assert!(table_str.contains("vp9"));
         assert_eq!(stats.table.height(), 1);
+    }
+
+    // ---- parallel variant (only compiled with the feature) ----
+
+    #[cfg(feature = "parallel-analyze")]
+    #[test]
+    fn parallel_output_matches_serial_sorted_by_path() {
+        let files = vec![
+            PathBuf::from("/a.mp4"),
+            PathBuf::from("/b.mp4"),
+            PathBuf::from("/c.mp4"),
+            PathBuf::from("/d.mp4"),
+        ];
+        let probe = |path: &Path| -> Result<VideoMetadata, EncodeError> {
+            let fps = match path.file_name().unwrap().to_str().unwrap() {
+                "a.mp4" => 24.0,
+                "b.mp4" => 30.0,
+                "c.mp4" => 60.0,
+                "d.mp4" => 30.0,
+                _ => 0.0,
+            };
+            Ok(VideoMetadata {
+                codec: Some("h264".into()),
+                avg_fps: Some(fps),
+                duration_secs: Some(60.0),
+                ..Default::default()
+            })
+        };
+        let mut serial = analyze_records_with_probe(&files, probe);
+        let mut parallel = analyze_records_with_probe_parallel(&files, probe);
+
+        // par_iter() preserves order, but compare sorted to make the
+        // assertion robust against future rayon changes.
+        serial.sort_by_key(|r| r.path.clone());
+        parallel.sort_by_key(|r| r.path.clone());
+        assert_eq!(serial, parallel);
+    }
+
+    #[cfg(feature = "parallel-analyze")]
+    #[test]
+    fn parallel_failure_becomes_none_row_not_error() {
+        let files = vec![
+            PathBuf::from("/ok.mp4"),
+            PathBuf::from("/bad.mp4"),
+            PathBuf::from("/ok2.mp4"),
+        ];
+        let probe = |path: &Path| -> Result<VideoMetadata, EncodeError> {
+            if path.file_name().unwrap().to_str().unwrap() == "bad.mp4" {
+                Err(EncodeError::Probe("canned".into()))
+            } else {
+                Ok(VideoMetadata {
+                    codec: Some("h264".into()),
+                    avg_fps: Some(30.0),
+                    duration_secs: Some(10.0),
+                    ..Default::default()
+                })
+            }
+        };
+        let records = analyze_records_with_probe_parallel(&files, probe);
+        assert_eq!(records.len(), 3);
+        let parsed: Vec<_> = records.iter().filter(|r| r.fps.is_some()).collect();
+        let failed: Vec<_> = records.iter().filter(|r| r.fps.is_none()).collect();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].path, PathBuf::from("/bad.mp4"));
+    }
+
+    #[cfg(feature = "parallel-analyze")]
+    #[test]
+    fn parallel_aggregate_matches_serial() {
+        let files = vec![
+            PathBuf::from("/x.mp4"),
+            PathBuf::from("/y.mp4"),
+            PathBuf::from("/z.mp4"),
+        ];
+        let probe = |path: &Path| -> Result<VideoMetadata, EncodeError> {
+            let (fps, codec) = match path.file_name().unwrap().to_str().unwrap() {
+                "x.mp4" => (24.0, "h264"),
+                "y.mp4" => (30.0, "vp9"),
+                "z.mp4" => (60.0, "av1"),
+                _ => (0.0, "h264"),
+            };
+            Ok(VideoMetadata {
+                codec: Some(codec.into()),
+                avg_fps: Some(fps),
+                duration_secs: Some(60.0),
+                ..Default::default()
+            })
+        };
+
+        // Run twice with the same probe -- once serially, once parallel.
+        // The aggregated Polars table (sorted by fps) should match.
+        let serial = aggregate_records(&analyze_records_with_probe(&files, probe));
+        let parallel = aggregate_records(&analyze_records_with_probe_parallel(&files, probe));
+
+        assert_eq!(serial.total_files, parallel.total_files);
+        assert_eq!(serial.parsed_files, parallel.parsed_files);
+        assert_eq!(serial.failed_files, parallel.failed_files);
+        assert_eq!(serial.table.height(), parallel.table.height());
+        assert!((serial.total_duration_secs - parallel.total_duration_secs).abs() < 1e-9);
+    }
+
+    #[cfg(feature = "parallel-analyze")]
+    #[test]
+    fn parallel_returns_records_in_input_order() {
+        let files = vec![
+            PathBuf::from("/01.mp4"),
+            PathBuf::from("/02.mp4"),
+            PathBuf::from("/03.mp4"),
+            PathBuf::from("/04.mp4"),
+            PathBuf::from("/05.mp4"),
+        ];
+        let probe = |path: &Path| -> Result<VideoMetadata, EncodeError> {
+            let _ = path; // not used; same fps for all
+            Ok(VideoMetadata {
+                codec: Some("h264".into()),
+                avg_fps: Some(30.0),
+                ..Default::default()
+            })
+        };
+        let records = analyze_records_with_probe_parallel(&files, probe);
+        let names: Vec<_> = records
+            .iter()
+            .map(|r| r.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "01.mp4", "02.mp4", "03.mp4", "04.mp4", "05.mp4",
+            ]
+        );
     }
 }

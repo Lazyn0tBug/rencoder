@@ -116,14 +116,13 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
 
     info!("analyzing {} file(s)", files.len());
 
-    // Parallel analysis lands in Phase 12. For now, --parallel prints a
-    // warning and falls back to serial so the CLI surface is stable.
-    if args.parallel {
-        warn!("--parallel not yet implemented; running serially");
-    }
-
-    let records = rencoder_lib::analyzer::fps_stats::analyze_records(&files)
-        .with_context(|| "fps analysis failed")?;
+    let records = if args.parallel {
+        rencoder_lib::analyzer::fps_stats::analyze_records_parallel(&files)
+            .with_context(|| "fps analysis failed")?
+    } else {
+        rencoder_lib::analyzer::fps_stats::analyze_records(&files)
+            .with_context(|| "fps analysis failed")?
+    };
     let stats = rencoder_lib::analyzer::fps_stats::aggregate_records(&records);
 
     // One-line summary to stderr regardless of output format.
