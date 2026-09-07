@@ -76,12 +76,15 @@ where
 /// nullable), `codec` (str nullable), `duration_secs` (Float64
 /// nullable), `file_bytes` (UInt64). Available for downstream queries.
 pub fn records_to_dataframe(records: &[AnalysisRecord]) -> PolarsResult<DataFrame> {
-    let paths: Vec<&str> = records
+    // `to_string_lossy` (not `to_str`) keeps non-UTF-8 path bytes visible
+    // as the Unicode replacement char so downstream tools at least see
+    // *something* instead of an empty path field.
+    let paths: Vec<String> = records
         .iter()
-        .map(|r| r.path.to_str().unwrap_or(""))
+        .map(|r| r.path.to_string_lossy().into_owned())
         .collect();
     let fps: Vec<Option<u32>> = records.iter().map(|r| r.fps).collect();
-    let codecs: Vec<Option<&str>> = records.iter().map(|r| r.codec.as_deref()).collect();
+    let codecs: Vec<Option<String>> = records.iter().map(|r| r.codec.clone()).collect();
     let durations: Vec<Option<f64>> = records.iter().map(|r| r.duration_secs).collect();
     let bytes: Vec<u64> = records.iter().map(|r| r.file_bytes).collect();
 
@@ -138,17 +141,22 @@ pub fn analyze_fps(files: &[PathBuf]) -> Result<FpsStats, EncodeError> {
 /// sum(bytes)])` plus manual totals (parsed/failed counts and the
 /// failed-files list).
 pub fn aggregate_records(records: &[AnalysisRecord]) -> FpsStats {
-    use polars::prelude::*;
-
+    // Single pass: parsed/failed counts, total duration, failed paths.
+    let mut parsed = 0usize;
+    let mut total_duration = 0f64;
+    let mut failed_paths: Vec<PathBuf> = Vec::new();
+    for r in records {
+        if r.fps.is_some() {
+            parsed += 1;
+            if let Some(d) = r.duration_secs {
+                total_duration += d;
+            }
+        } else {
+            failed_paths.push(r.path.clone());
+        }
+    }
     let total_files = records.len();
-    let parsed = records.iter().filter(|r| r.fps.is_some()).count();
     let failed = total_files - parsed;
-    let total_duration: f64 = records.iter().filter_map(|r| r.duration_secs).sum();
-    let failed_paths: Vec<PathBuf> = records
-        .iter()
-        .filter(|r| r.fps.is_none())
-        .map(|r| r.path.clone())
-        .collect();
 
     // Cross-tab aggregation via Polars expressions. Failed probes
     // (fps = None) are filtered out -- they're tracked in failed_files
