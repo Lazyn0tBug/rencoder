@@ -107,7 +107,7 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
   - batch: 7 tests (order preserved, failure-doesn't-abort, callback in order, no-callback path, empty list, output-path derivation, public-API sanity)
 - **Verify**: `cargo test -p smart_encode_lib --lib` 127/127 pass (was 108; +19 from U6)
 
-## U7. FPS analyzer — DONE
+## U7. FPS analyzer — DONE (initial; refactored under U7.5)
 
 - [x] `FpsStats::summary()` in `types.rs` — group counts plus totals line
 - [x] `FpsStats::detailed()` in `types.rs` — per-file listing grouped by fps
@@ -119,6 +119,19 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
   - Step 1: 5 FpsStats::summary/detailed tests in `types.rs` (group counts, totals, empty, failures, path grouping)
   - Step 2: 7 analyze_fps tests in `analyzer/fps_stats.rs` (empty input, group-by-fps, integer fps, probe failure, missing fps, mixed success+failure, boundary rounding)
 - **Verify**: `cargo test -p smart_encode_lib --lib` 139/139 pass (was 127; +12 from U7)
+
+## U7.5. Polars-based analyzer refactor — DONE
+
+- [x] Add `polars = { version = "0.46", features = ["lazy", "csv"] }` to `smart_encode_lib/Cargo.toml`
+- [x] `AnalysisRecord` struct: `path`, `fps: Option<u32>`, `codec: Option<String>`, `duration_secs: Option<f64>`, `file_bytes: u64`
+- [x] `analyze_records(files) -> Result<Vec<AnalysisRecord>, EncodeError>` — per-file probe + record (failed probes still emit a row with None metric fields)
+- [x] `analyze_fps` refactored to call `analyze_records` then aggregate via Polars `group_by + agg` (count, sum duration_secs); FpsStats is the rendered output
+- [x] `records_to_csv(records) -> String` — proper header + CSV-quoted rows
+- [x] Tests: existing 12 analyzer tests still green; new Polars-specific tests confirm aggregation parity
+- [x] Integration: `analyze` CLI now emits per-file CSV to stdout + one-line summary to stderr by default
+- [x] CLI flags: `--format text` for legacy summary; `-o FILE` to redirect CSV
+- [x] `docs/smart_code.md` updated: tech decision table, analyzer design subsection, test matrix
+- **Verify**: `cargo test --workspace` still 200+/200+; `cargo clippy --workspace --all-targets` clean.
 
 ## U8. CLI core
 
