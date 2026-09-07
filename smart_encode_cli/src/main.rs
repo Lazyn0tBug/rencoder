@@ -1,6 +1,7 @@
 //! CLI entry point.
 
 mod args;
+mod file_sink;
 mod interact;
 mod signal;
 mod tracing_init;
@@ -12,7 +13,7 @@ use smart_encode_lib::{
     collect::collect_files,
     types::Target,
 };
-use tracing::{info, warn};
+use tracing::{info, instrument, warn};
 
 fn main() -> Result<()> {
     tracing_init::init();
@@ -26,12 +27,14 @@ fn main() -> Result<()> {
 /// `smart-encode encode ...` -- Phase 11 fills in the full pipeline
 /// (Config::load, init_encoder_cache, signal::install_handler,
 /// collect_files, transcode_batch, per-file progress reporting).
+#[instrument(skip_all, fields(format = ?_args.format))]
 fn encode_cmd(_args: args::EncodeArgs) -> Result<()> {
     Ok(())
 }
 
 /// `smart-encode analyze ...` -- probes each file, groups by rounded fps,
 /// prints summary, optionally writes a detailed file.
+#[instrument(skip_all, fields(dir = ?args.dir, file = ?args.file, parallel = args.parallel))]
 fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
     let target = target_from_analyze_args(&args)
         .with_context(|| "failed to determine target directory")?;
