@@ -12,10 +12,10 @@ use serde_json::Value;
 use crate::error::EncodeError;
 use crate::types::{MaxFpsConfig, VideoFormat};
 
-/// Canonical video frame rates for `max_fps`. Anything else is rejected
-/// at config-load time: arbitrary values like 0.5 or 29.97 aren't
-/// meaningful as caps (the source-rate distinction handles NTSC).
-const ALLOWED_MAX_FPS: &[f64] = &[24.0, 25.0, 30.0, 60.0];
+/// Allowed values for `max_fps`. Includes 0 (capping disabled) plus the
+/// canonical video frame rates. Any other value is rejected at config-load
+/// time: arbitrary rates like 0.5 or 29.97 aren't meaningful as caps.
+const ALLOWED_MAX_FPS: &[f64] = &[0.0, 24.0, 25.0, 30.0, 60.0];
 
 /// Top-level config. Flat scalar knobs plus a nested `encoders` block
 /// (added in Phase 4's `select_encoder` plumbing).
@@ -66,9 +66,9 @@ impl EncoderConfig {
 
 impl Config {
     /// Load from a JSON file. Missing file returns `Default::default()`.
-    /// `max_fps` must be either 0 (capping disabled) or one of the canonical
-    /// video frame rates in `ALLOWED_MAX_FPS` ({24, 25, 30, 60}). Anything
-    /// else surfaces as `EncodeError::InvalidParam`.
+    /// `max_fps` must be one of `ALLOWED_MAX_FPS` (0 for disabled, plus
+    /// the canonical video frame rates). Anything else surfaces as
+    /// `EncodeError::InvalidParam`.
     pub fn load(path: &Path) -> Result<Self, EncodeError> {
         if !path.exists() {
             return Ok(Self::default());
@@ -77,15 +77,9 @@ impl Config {
         let v: Value = serde_json::from_str(&raw)
             .map_err(|e| EncodeError::InvalidParam(format!("config parse: {e}")))?;
         let cfg = Self::from_value(&v);
-        if cfg.max_fps < 0.0 {
+        if !ALLOWED_MAX_FPS.contains(&cfg.max_fps) {
             return Err(EncodeError::InvalidParam(format!(
-                "max_fps must be >= 0, got {}",
-                cfg.max_fps
-            )));
-        }
-        if cfg.max_fps > 0.0 && !ALLOWED_MAX_FPS.contains(&cfg.max_fps) {
-            return Err(EncodeError::InvalidParam(format!(
-                "max_fps must be 0 (disabled) or one of {:?}",
+                "max_fps must be one of {:?} (0 = disabled)",
                 ALLOWED_MAX_FPS
             )));
         }
