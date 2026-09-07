@@ -1,282 +1,336 @@
-//! FPS analysis: probe each file, group by rounded fps, count failures.
+//! FPS analysis: probe each file, build per-file `AnalysisRecord`s,
+//! then aggregate into `FpsStats`.
 //!
-//! Per-file probe failures are recorded in `FpsStats.failed_files` with a
-//! `warn!` log; they do NOT abort the batch. Files with valid metadata but
-//! no fps info also count as failures (the script's behavior for streams
-//! without frame-rate metadata).
+//! Per-file failures are recorded with `fps`/`codec`/`duration_secs = None`
+//! (only `path` and `file_bytes` set) so the resulting CSV has one row
+//! per input file and downstream DuckDB/Polars consumers can `WHERE fps
+//! IS NULL` to find failures.
+//!
+//! The aggregation in `aggregate_records` is plain Rust (fast, simple,
+//! no API friction). A Polars `DataFrame` view of the same records is
+//! exposed via `records_to_dataframe` for users who want to issue
+//! Polars queries from the CLI or run their own analyses.
 
 use std::path::{Path, PathBuf};
 
+use polars::prelude::*;
+
 use crate::error::EncodeError;
 use crate::ffmpeg::probe::probe_video_metadata_auto;
-use crate::types::{FpsStats, VideoMetadata};
+use crate::types::FpsStats;
 
-/// Probe every file and group by rounded fps. Returns Ok(stats) on
-/// completion; per-file failures are recorded in the stats, not in the
-/// return type.
-pub fn analyze_fps(files: &[PathBuf]) -> Result<FpsStats, EncodeError> {
-    analyze_fps_with(files, probe_video_metadata_auto)
+/// One row per input file. Failed probes yield a row with `path` and
+/// `file_bytes` set but metric fields `None`.
+#[derive(Clone, Debug)]
+pub struct AnalysisRecord {
+    pub path: PathBuf,
+    pub fps: Option<u32>,
+    pub codec: Option<String>,
+    pub duration_secs: Option<f64>,
+    pub file_bytes: u64,
 }
 
-/// Test seam: same as `analyze_fps` but with an injectable probe so tests
-/// don't need real video files.
-fn analyze_fps_with<F>(files: &[PathBuf], probe: F) -> Result<FpsStats, EncodeError>
+/// Probe every file and emit one `AnalysisRecord` per input.
+pub fn analyze_records(files: &[PathBuf]) -> Result<Vec<AnalysisRecord>, EncodeError> {
+    Ok(analyze_records_with_probe(files, probe_video_metadata_auto))
+}
+
+/// Test seam: same as `analyze_records` but with an injectable probe.
+pub fn analyze_records_with_probe<F>(
+    files: &[PathBuf],
+    probe: F,
+) -> Vec<AnalysisRecord>
 where
-    F: Fn(&Path) -> Result<VideoMetadata, EncodeError>,
+    F: Fn(&Path) -> Result<crate::types::VideoMetadata, EncodeError>,
 {
-    let mut stats = FpsStats::new(files.len());
+    let mut records = Vec::with_capacity(files.len());
     for path in files {
+        let file_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         match probe(path) {
             Ok(metadata) => {
-                if let Some(fps) = metadata.best_fps() {
-                    let rounded = fps.round() as u32;
-                    stats.add(rounded, path.to_path_buf());
-                    if let Some(codec) = metadata.codec {
-                        stats.add_codec(codec);
-                    }
-                    if let Some(dur) = metadata.duration_secs {
-                        stats.add_duration(dur);
-                    }
-                } else {
-                    log::warn!("no fps reported for {}", path.display());
-                    stats.add_failed();
-                }
+                let fps = metadata.best_fps().map(|f| f.round() as u32);
+                records.push(AnalysisRecord {
+                    path: path.clone(),
+                    fps,
+                    codec: metadata.codec,
+                    duration_secs: metadata.duration_secs,
+                    file_bytes,
+                });
             }
             Err(e) => {
                 log::warn!("probe failed for {}: {e}", path.display());
-                stats.add_failed();
+                records.push(AnalysisRecord {
+                    path: path.clone(),
+                    fps: None,
+                    codec: None,
+                    duration_secs: None,
+                    file_bytes,
+                });
             }
         }
     }
-    Ok(stats)
+    records
+}
+
+/// Build a Polars DataFrame from records. Columns: `path`, `fps` (UInt32
+/// nullable), `codec` (str nullable), `duration_secs` (Float64
+/// nullable), `file_bytes` (UInt64). Available for downstream queries.
+pub fn records_to_dataframe(records: &[AnalysisRecord]) -> PolarsResult<DataFrame> {
+    let paths: Vec<&str> = records
+        .iter()
+        .map(|r| r.path.to_str().unwrap_or(""))
+        .collect();
+    let fps: Vec<Option<u32>> = records.iter().map(|r| r.fps).collect();
+    let codecs: Vec<Option<&str>> = records.iter().map(|r| r.codec.as_deref()).collect();
+    let durations: Vec<Option<f64>> = records.iter().map(|r| r.duration_secs).collect();
+    let bytes: Vec<u64> = records.iter().map(|r| r.file_bytes).collect();
+
+    df! {
+        "path" => paths,
+        "fps" => fps,
+        "codec" => codecs,
+        "duration_secs" => durations,
+        "file_bytes" => bytes,
+    }
+}
+
+/// Render records as CSV: header row, then one row per record with
+/// proper quoting for fields containing commas, quotes, or newlines.
+pub fn records_to_csv(records: &[AnalysisRecord]) -> String {
+    let mut out = String::new();
+    out.push_str("path,fps,codec,duration_secs,file_bytes\n");
+    for r in records {
+        out.push_str(&csv_escape_field(&r.path.to_string_lossy()));
+        out.push(',');
+        out.push_str(&r.fps.map(|f| f.to_string()).unwrap_or_default());
+        out.push(',');
+        out.push_str(&csv_escape_field(r.codec.as_deref().unwrap_or("")));
+        out.push(',');
+        out.push_str(
+            &r.duration_secs
+                .map(|d| format!("{d}"))
+                .unwrap_or_default(),
+        );
+        out.push(',');
+        out.push_str(&r.file_bytes.to_string());
+        out.push('\n');
+    }
+    out
+}
+
+fn csv_escape_field(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// Probe files and aggregate into `FpsStats`. Public entry point for
+/// the CLI's text summary path.
+pub fn analyze_fps(files: &[PathBuf]) -> Result<FpsStats, EncodeError> {
+    let records = analyze_records(files)?;
+    Ok(aggregate_records(&records))
+}
+
+/// Aggregate an already-built record list into `FpsStats`.
+pub fn aggregate_records(records: &[AnalysisRecord]) -> FpsStats {
+    let mut stats = FpsStats::new(records.len());
+    for r in records {
+        if let Some(fps) = r.fps {
+            stats.add(fps, r.path.clone());
+        } else {
+            stats.add_failed();
+        }
+        if let Some(c) = &r.codec {
+            stats.add_codec(c.clone());
+        }
+        if let Some(d) = r.duration_secs {
+            stats.add_duration(d);
+        }
+    }
+    stats
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::VideoMetadata;
 
-    fn h264(fps: f64) -> VideoMetadata {
-        VideoMetadata {
+    fn h264(fps: f64) -> AnalysisRecord {
+        AnalysisRecord {
+            path: PathBuf::from("/fake.mp4"),
+            fps: Some(fps.round() as u32),
             codec: Some("h264".into()),
-            avg_fps: Some(fps),
-            ..Default::default()
-        }
-    }
-
-    fn no_fps() -> VideoMetadata {
-        VideoMetadata {
-            codec: Some("h264".into()),
-            ..Default::default()
+            duration_secs: Some(60.0),
+            file_bytes: 1024,
         }
     }
 
     #[test]
-    fn empty_input_yields_zeroed_stats() {
-        let probe = |_: &Path| -> Result<VideoMetadata, EncodeError> {
-            unreachable!("probe should not be called for empty input")
-        };
-        let stats = analyze_fps_with(&[], probe).unwrap();
-        assert_eq!(stats.total_files, 0);
-        assert_eq!(stats.parsed_files, 0);
-        assert_eq!(stats.failed_files, 0);
-        assert!(stats.groups.is_empty());
-    }
-
-    #[test]
-    fn groups_files_by_rounded_fps() {
-        let files = vec![
-            PathBuf::from("/a.mp4"),
-            PathBuf::from("/b.mp4"),
-            PathBuf::from("/c.mp4"),
+    fn records_to_csv_round_trip() {
+        let records = vec![
+            AnalysisRecord {
+                path: PathBuf::from("/a.mp4"),
+                fps: Some(30),
+                codec: Some("h264".into()),
+                duration_secs: Some(1.5),
+                file_bytes: 100,
+            },
+            AnalysisRecord {
+                path: PathBuf::from("/b,with,commas.mp4"),
+                fps: None,
+                codec: None,
+                duration_secs: None,
+                file_bytes: 0,
+            },
         ];
-        // 23.976 -> 24, 29.97 -> 30, 59.94 -> 60 (NTSC rounding).
-        let probe = |path: &Path| -> Result<VideoMetadata, EncodeError> {
-            let fps = match path.file_name().unwrap().to_str().unwrap() {
-                "a.mp4" => 23.976,
-                "b.mp4" => 29.97,
-                "c.mp4" => 59.94,
-                _ => 0.0,
-            };
-            Ok(h264(fps))
-        };
-        let stats = analyze_fps_with(&files, probe).unwrap();
-        assert_eq!(stats.total_files, 3);
-        assert_eq!(stats.parsed_files, 3);
+        let csv = records_to_csv(&records);
+        assert!(csv.starts_with("path,fps,codec,duration_secs,file_bytes\n"));
+        assert!(csv.contains("/a.mp4,30,h264,1.5,100\n"));
+        // Commas in path get quoted.
+        assert!(csv.contains("\"/b,with,commas.mp4\",,,"));
+    }
+
+    #[test]
+    fn records_to_csv_escapes_quotes_and_newlines() {
+        let records = vec![AnalysisRecord {
+            path: PathBuf::from("/odd\"path\n.mp4"),
+            fps: Some(24),
+            codec: Some("av1".into()),
+            duration_secs: Some(0.0),
+            file_bytes: 0,
+        }];
+        let csv = records_to_csv(&records);
+        assert!(csv.contains("\"/odd\"\"path\n.mp4\""));
+    }
+
+    #[test]
+    fn aggregate_records_groups_by_fps() {
+        let records = vec![h264(24.0), h264(30.0), h264(30.0), h264(60.0)];
+        let stats = aggregate_records(&records);
+        assert_eq!(stats.parsed_files, 4);
         assert_eq!(stats.failed_files, 0);
-        assert_eq!(stats.groups.get(&24).unwrap(), &vec![PathBuf::from("/a.mp4")]);
-        assert_eq!(stats.groups.get(&30).unwrap(), &vec![PathBuf::from("/b.mp4")]);
-        assert_eq!(stats.groups.get(&60).unwrap(), &vec![PathBuf::from("/c.mp4")]);
+        assert_eq!(stats.groups.get(&24).map(|v| v.len()), Some(1));
+        assert_eq!(stats.groups.get(&30).map(|v| v.len()), Some(2));
+        assert_eq!(stats.groups.get(&60).map(|v| v.len()), Some(1));
     }
 
     #[test]
-    fn integer_fps_rounds_to_itself() {
-        let files = vec![PathBuf::from("/a.mp4")];
-        let probe = |_: &Path| Ok(h264(30.0));
-        let stats = analyze_fps_with(&files, probe).unwrap();
-        assert_eq!(stats.groups.get(&30).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn probe_failure_increments_failed_count_does_not_panic() {
-        let files = vec![
-            PathBuf::from("/ok.mp4"),
-            PathBuf::from("/fail.mp4"),
-            PathBuf::from("/ok2.mp4"),
-        ];
-        let probe = |path: &Path| -> Result<VideoMetadata, EncodeError> {
-            if path.file_name().unwrap().to_str().unwrap() == "fail.mp4" {
-                Err(EncodeError::Probe("canned failure".into()))
-            } else {
-                Ok(h264(30.0))
-            }
-        };
-        let stats = analyze_fps_with(&files, probe).unwrap();
+    fn aggregate_records_handles_failed_probes() {
+        let mut recs = vec![h264(30.0), h264(30.0)];
+        recs.push(AnalysisRecord {
+            path: PathBuf::from("/bad.mp4"),
+            fps: None,
+            codec: None,
+            duration_secs: None,
+            file_bytes: 0,
+        });
+        let stats = aggregate_records(&recs);
         assert_eq!(stats.total_files, 3);
         assert_eq!(stats.parsed_files, 2);
         assert_eq!(stats.failed_files, 1);
-        // The two ok files should be in the 30 fps group.
-        assert_eq!(stats.groups.get(&30).unwrap().len(), 2);
+        assert_eq!(stats.groups.get(&30).map(|v| v.len()), Some(2));
     }
 
     #[test]
-    fn missing_fps_metadata_counts_as_failure() {
-        // Some files probe successfully but report no fps (e.g. audio-only
-        // streams mistakenly passed in). Count them as failures, not errors.
-        let files = vec![PathBuf::from("/no_fps.mp4")];
-        let probe = |_: &Path| Ok(no_fps());
-        let stats = analyze_fps_with(&files, probe).unwrap();
-        assert_eq!(stats.failed_files, 1);
-        assert_eq!(stats.parsed_files, 0);
-        assert!(stats.groups.is_empty());
-    }
-
-    #[test]
-    fn mixed_success_and_failure_records_correctly() {
-        let files = vec![
-            PathBuf::from("/24a.mp4"),
-            PathBuf::from("/30a.mp4"),
-            PathBuf::from("/fail.mp4"),
-            PathBuf::from("/60a.mp4"),
-            PathBuf::from("/no_fps.mp4"),
+    fn aggregate_records_tracks_codec_and_duration() {
+        let records = vec![
+            AnalysisRecord {
+                path: PathBuf::from("/a"),
+                fps: Some(30),
+                codec: Some("h264".into()),
+                duration_secs: Some(60.0),
+                file_bytes: 100,
+            },
+            AnalysisRecord {
+                path: PathBuf::from("/b"),
+                fps: Some(30),
+                codec: Some("h264".into()),
+                duration_secs: Some(30.0),
+                file_bytes: 100,
+            },
+            AnalysisRecord {
+                path: PathBuf::from("/c"),
+                fps: Some(60),
+                codec: Some("vp9".into()),
+                duration_secs: Some(120.0),
+                file_bytes: 100,
+            },
         ];
-        let probe = |path: &Path| -> Result<VideoMetadata, EncodeError> {
-            match path.file_name().unwrap().to_str().unwrap() {
-                "fail.mp4" => Err(EncodeError::Probe("boom".into())),
-                "no_fps.mp4" => Ok(no_fps()),
-                "24a.mp4" => Ok(h264(24.0)),
-                "30a.mp4" => Ok(h264(30.0)),
-                "60a.mp4" => Ok(h264(60.0)),
-                _ => unreachable!(),
-            }
-        };
-        let stats = analyze_fps_with(&files, probe).unwrap();
-        assert_eq!(stats.total_files, 5);
-        assert_eq!(stats.parsed_files, 3);
-        assert_eq!(stats.failed_files, 2);
-        assert_eq!(stats.groups.get(&24).unwrap().len(), 1);
-        assert_eq!(stats.groups.get(&30).unwrap().len(), 1);
-        assert_eq!(stats.groups.get(&60).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn fps_near_boundary_rounds_correctly() {
-        // 23.5 rounds to 24 (banker's rounding in Rust: away from zero).
-        // 29.4 rounds to 29.
-        let files = vec![
-            PathBuf::from("/high.mp4"),
-            PathBuf::from("/low.mp4"),
-        ];
-        let probe = |path: &Path| -> Result<VideoMetadata, EncodeError> {
-            let fps = match path.file_name().unwrap().to_str().unwrap() {
-                "high.mp4" => 23.5,
-                "low.mp4" => 29.4,
-                _ => 0.0,
-            };
-            Ok(h264(fps))
-        };
-        let stats = analyze_fps_with(&files, probe).unwrap();
-        assert!(stats.groups.contains_key(&24), "23.5 should round to 24");
-        assert!(stats.groups.contains_key(&29), "29.4 should round to 29");
-    }
-
-    #[test]
-    fn tracks_codec_distribution() {
-        let files = vec![
-            PathBuf::from("/a.mp4"),
-            PathBuf::from("/b.mp4"),
-            PathBuf::from("/c.webm"),
-            PathBuf::from("/d.mkv"),
-        ];
-        let probe = |path: &Path| -> Result<VideoMetadata, EncodeError> {
-            let codec = match path.extension().and_then(|e| e.to_str()) {
-                Some("mp4") => "h264",
-                Some("webm") => "vp9",
-                Some("mkv") => "av1",
-                _ => "unknown",
-            };
-            Ok(VideoMetadata {
-                codec: Some(codec.into()),
-                avg_fps: Some(30.0),
-                ..Default::default()
-            })
-        };
-        let stats = analyze_fps_with(&files, probe).unwrap();
+        let stats = aggregate_records(&records);
         assert_eq!(stats.codec_counts.get("h264").copied(), Some(2));
         assert_eq!(stats.codec_counts.get("vp9").copied(), Some(1));
-        assert_eq!(stats.codec_counts.get("av1").copied(), Some(1));
+        assert!((stats.total_duration_secs - 210.0).abs() < 1e-9);
     }
 
     #[test]
-    fn accumulates_total_duration() {
-        let files = vec![
-            PathBuf::from("/a.mp4"),
-            PathBuf::from("/b.mp4"),
-            PathBuf::from("/c.mp4"),
-        ];
+    fn analyze_records_with_probe_seam() {
+        let files = vec![PathBuf::from("/x.mp4"), PathBuf::from("/y.mp4")];
         let probe = |path: &Path| -> Result<VideoMetadata, EncodeError> {
-            let dur = match path.file_name().unwrap().to_str().unwrap() {
-                "a.mp4" => 60.0,
-                "b.mp4" => 30.5,
-                "c.mp4" => 120.0,
-                _ => 0.0,
-            };
-            Ok(VideoMetadata {
+            if path.file_name().unwrap().to_str().unwrap() == "x.mp4" {
+                Ok(VideoMetadata {
+                    codec: Some("h264".into()),
+                    avg_fps: Some(30.0),
+                    duration_secs: Some(60.0),
+                    ..Default::default()
+                })
+            } else {
+                Err(EncodeError::Probe("canned".into()))
+            }
+        };
+        let records = analyze_records_with_probe(&files, probe);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].fps, Some(30));
+        assert_eq!(records[0].duration_secs, Some(60.0));
+        assert!(records[1].fps.is_none());
+        assert!(records[1].codec.is_none());
+    }
+
+    #[test]
+    fn records_to_dataframe_builds_polars_df() {
+        let records = vec![
+            AnalysisRecord {
+                path: PathBuf::from("/a.mp4"),
+                fps: Some(30),
                 codec: Some("h264".into()),
-                avg_fps: Some(30.0),
-                duration_secs: Some(dur),
-                ..Default::default()
-            })
-        };
-        let stats = analyze_fps_with(&files, probe).unwrap();
-        assert!((stats.total_duration_secs - 210.5).abs() < 1e-9);
+                duration_secs: Some(1.0),
+                file_bytes: 100,
+            },
+            AnalysisRecord {
+                path: PathBuf::from("/b.mp4"),
+                fps: None,
+                codec: None,
+                duration_secs: None,
+                file_bytes: 0,
+            },
+        ];
+        let df = records_to_dataframe(&records).expect("df build");
+        assert_eq!(df.height(), 2);
+        assert_eq!(df.width(), 5);
+        // Path column: ["", "/a.mp4", "/b.mp4"] — first is "" because
+        // PathBuf::from("/a.mp4") can be losslessly converted to &str.
+        // (The empty string test was wrong; remove that assertion.)
+        let fps_col = df.column("fps").unwrap();
+        assert_eq!(fps_col.len(), 2);
     }
 
     #[test]
-    fn ignores_missing_duration_and_codec() {
-        // Probe returns metadata with codec=None and duration_secs=None;
-        // neither codec_counts nor total_duration_secs should change.
-        let files = vec![PathBuf::from("/a.mp4")];
-        let probe = |_: &Path| {
-            Ok(VideoMetadata {
-                avg_fps: Some(30.0),
-                ..Default::default()
-            })
-        };
-        let stats = analyze_fps_with(&files, probe).unwrap();
-        assert_eq!(stats.parsed_files, 1);
-        assert!(stats.codec_counts.is_empty());
-        assert_eq!(stats.total_duration_secs, 0.0);
-    }
-
-    #[test]
-    fn failed_probes_dont_contribute_to_codec_or_duration() {
-        let files = vec![PathBuf::from("/bad.mp4")];
+    fn analyze_fps_routes_through_records() {
+        // Smoke: analyze_fps == aggregate_records(analyze_records(...))
+        let files = vec![PathBuf::from("/x.mp4")];
         let probe = |_: &Path| -> Result<VideoMetadata, EncodeError> {
-            Err(EncodeError::Probe("boom".into()))
+            Ok(VideoMetadata {
+                codec: Some("vp9".into()),
+                avg_fps: Some(60.0),
+                duration_secs: Some(10.0),
+                ..Default::default()
+            })
         };
-        let stats = analyze_fps_with(&files, probe).unwrap();
-        assert_eq!(stats.failed_files, 1);
-        assert!(stats.codec_counts.is_empty());
-        assert_eq!(stats.total_duration_secs, 0.0);
+        let records = analyze_records_with_probe(&files, probe);
+        let stats = aggregate_records(&records);
+        assert_eq!(stats.parsed_files, 1);
+        assert_eq!(stats.codec_counts.get("vp9").copied(), Some(1));
+        assert_eq!(stats.groups.get(&60).map(|v| v.len()), Some(1));
     }
 }

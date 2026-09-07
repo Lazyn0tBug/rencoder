@@ -102,7 +102,7 @@ fn analyze_help_prints_options() {
     let out = run(&["analyze", "--help"]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for opt in ["--dir", "--parallel", "--verbose"] {
+    for opt in ["--dir", "--parallel", "--format", "--output"] {
         assert!(stdout.contains(opt), "expected {opt} in analyze help");
     }
 }
@@ -116,7 +116,7 @@ fn unknown_subcommand_exits_nonzero() {
 // ---- end-to-end (requires ffmpeg) ----
 
 #[test]
-fn analyze_subcommand_produces_stats_for_real_videos() {
+fn analyze_subcommand_produces_csv_for_real_videos() {
     if !ffmpeg_available() {
         eprintln!("skipping: ffmpeg not available");
         return;
@@ -132,27 +132,32 @@ fn analyze_subcommand_produces_stats_for_real_videos() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // Default output is per-file CSV to stdout.
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Total: 3 files"), "expected 'Total: 3 files', got: {stdout}");
-    assert!(stdout.contains("30 fps"));
-    assert!(stdout.contains("60 fps"));
+    assert!(stdout.starts_with("path,fps,codec,duration_secs,file_bytes\n"));
+    assert!(stdout.contains("/a.mp4,24,"));
+    assert!(stdout.contains("/b.mp4,30,"));
+    assert!(stdout.contains("/c.mp4,60,"));
+    assert_eq!(stdout.lines().count(), 4, "expected header + 3 rows, got: {stdout}");
+    // Summary on stderr.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Analyzed 3 file(s) (3 parsed, 0 failed)"));
 }
 
 #[test]
-fn analyze_subcommand_writes_verbose_file() {
+fn analyze_subcommand_writes_csv_to_file() {
     if !ffmpeg_available() {
         eprintln!("skipping: ffmpeg not available");
         return;
     }
-    let dir = fixture_dir("analyze_v");
+    let dir = fixture_dir("analyze_csv");
     make_video(&dir, "x.mp4", 30);
-    let stats_path = dir.join("stats.txt");
+    let stats_path = dir.join("stats.csv");
 
     let out = run(&[
         "analyze",
         "-d",
         dir.to_str().unwrap(),
-        "-v",
         "-o",
         stats_path.to_str().unwrap(),
     ]);
@@ -161,11 +166,41 @@ fn analyze_subcommand_writes_verbose_file() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(stats_path.exists(), "expected stats file at {}", stats_path.display());
+    assert!(stats_path.exists(), "expected CSV at {}", stats_path.display());
+    let content = std::fs::read_to_string(&stats_path).unwrap();
+    assert!(content.starts_with("path,fps,codec,duration_secs,file_bytes\n"));
+    assert!(content.contains("/x.mp4,30,"));
+}
+
+#[test]
+fn analyze_text_format_writes_to_file() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+    let dir = fixture_dir("analyze_text");
+    make_video(&dir, "x.mp4", 30);
+    let stats_path = dir.join("stats.txt");
+
+    let out = run(&[
+        "analyze",
+        "-d",
+        dir.to_str().unwrap(),
+        "--format", "text",
+        "-o",
+        stats_path.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stats_path.exists(), "expected text file at {}", stats_path.display());
     let content = std::fs::read_to_string(&stats_path).unwrap();
     assert!(content.contains("30 fps"));
     assert!(content.contains("Total:"));
-    assert!(content.contains("x.mp4"));
+    // Text format is the summary view (fps distribution + totals); file
+    // paths appear only in CSV mode.
 }
 
 #[test]

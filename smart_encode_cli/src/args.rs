@@ -35,6 +35,18 @@ pub enum FormatArg {
     Av1,
 }
 
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnalyzeFormatArg {
+    /// Per-file CSV to stdout (default). One row per input file with
+    /// columns `path, fps, codec, duration_secs, file_bytes`. Pipe-friendly.
+    Csv,
+    /// Human-readable text summary (legacy behavior).
+    Text,
+    /// Per-file JSON objects, one per line. For `jq` and other line-based
+    /// JSON consumers.
+    Json,
+}
+
 #[derive(Args, Debug)]
 pub struct EncodeArgs {
     /// Target format (lowercase: x264|hevc|vp9|av1). Default: av1.
@@ -96,16 +108,18 @@ pub struct AnalyzeArgs {
     #[arg(short = 'e', long = "ext")]
     pub ext: Vec<String>,
 
-    /// Enable parallel analysis via rayon.
+    /// Enable parallel analysis via rayon (lands in Phase 12).
     #[arg(short = 'p', long = "parallel")]
     pub parallel: bool,
 
-    /// Generate a detailed (per-file) statistics file in addition to the summary.
-    #[arg(short = 'v', long = "verbose")]
-    pub verbose: bool,
+    /// Output format. Default: csv (per-file records, pipe-friendly).
+    #[arg(long = "format", value_enum, default_value_t = AnalyzeFormatArg::Csv)]
+    pub format: AnalyzeFormatArg,
 
-    /// Detailed output file path (default: fps_stats.txt).
-    #[arg(short = 'o', long = "output", default_value = "fps_stats.txt")]
+    /// Output file path. `-` for stdout (default). With `--format text`
+    /// this still writes to stdout; the flag is mostly useful for `csv`
+    /// and `json`.
+    #[arg(short = 'o', long = "output", default_value = "-")]
     pub output: PathBuf,
 }
 
@@ -305,8 +319,8 @@ mod tests {
                 assert_eq!(args.file, None);
                 assert!(args.ext.is_empty());
                 assert!(!args.parallel);
-                assert!(!args.verbose);
-                assert_eq!(args.output, PathBuf::from("fps_stats.txt"));
+                assert_eq!(args.format, AnalyzeFormatArg::Csv);
+                assert_eq!(args.output, PathBuf::from("-"));
             }
             _ => panic!("expected Analyze"),
         }
@@ -316,14 +330,14 @@ mod tests {
     fn analyze_with_all_flags() {
         let cli = parse_ok(&[
             "smart-encode", "analyze",
-            "-d", "/d", "-e", "mp4", "-p", "-v", "-o", "stats.txt",
+            "-d", "/d", "-e", "mp4", "-p", "--format", "text", "-o", "stats.txt",
         ]);
         match cli.command {
             Command::Analyze(args) => {
                 assert_eq!(args.dir, Some(PathBuf::from("/d")));
                 assert_eq!(args.ext, vec!["mp4"]);
                 assert!(args.parallel);
-                assert!(args.verbose);
+                assert_eq!(args.format, AnalyzeFormatArg::Text);
                 assert_eq!(args.output, PathBuf::from("stats.txt"));
             }
             _ => panic!(),

@@ -9,14 +9,16 @@ mod tracing_init;
 use anyhow::{Context, Result};
 use clap::Parser;
 use smart_encode_lib::{
-    analyzer::fps_stats::analyze_fps,
     collect::collect_files,
     config::Config,
     ffmpeg::encoder_cache::init_encoder_cache,
     processor::batch::transcode_batch,
     types::{EncodeParams, ProcessOutput, Target, TranscodeResult, VideoFormat},
 };
+use std::path::Path;
 use tracing::{info, instrument, warn};
+
+use crate::args::AnalyzeFormatArg;
 
 /// Map CLI-side FormatArg to library VideoFormat.
 impl From<args::FormatArg> for VideoFormat {
@@ -119,17 +121,77 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
     if args.parallel {
         warn!("--parallel not yet implemented; running serially");
     }
-    let stats = analyze_fps(&files).with_context(|| "fps analysis failed")?;
 
-    print!("{}", stats.summary());
+    let records = smart_encode_lib::analyzer::fps_stats::analyze_records(&files)
+        .with_context(|| "fps analysis failed")?;
+    let stats = smart_encode_lib::analyzer::fps_stats::aggregate_records(&records);
 
-    if args.verbose {
-        std::fs::write(&args.output, stats.detailed())
-            .with_context(|| format!("failed to write {}", args.output.display()))?;
-        println!("Detailed stats written to {}", args.output.display());
+    // One-line summary to stderr regardless of output format.
+    eprintln!(
+        "Analyzed {} file(s) ({} parsed, {} failed)",
+        stats.total_files, stats.parsed_files, stats.failed_files,
+    );
+
+    // Format-specific output. csv/json respect -o; text always goes to
+    // stdout (the legacy behavior, where -o is ignored).
+    let to_stdout = |s: &str| print!("{s}");
+    let to_file = |path: &std::path::Path, s: &str| -> Result<()> {
+        std::fs::write(path, s).with_context(|| format!("failed to write {}", path.display()))
+    };
+
+    match args.format {
+        AnalyzeFormatArg::Csv => {
+            let body = smart_encode_lib::analyzer::fps_stats::records_to_csv(&records);
+            if args.output == Path::new("-") {
+                to_stdout(&body);
+            } else {
+                to_file(&args.output, &body)?;
+            }
+        }
+        AnalyzeFormatArg::Text => {
+            let body = stats.summary();
+            if args.output == Path::new("-") {
+                to_stdout(&body);
+            } else {
+                to_file(&args.output, &body)?;
+            }
+        }
+        AnalyzeFormatArg::Json => {
+            let body = records_to_jsonl(&records);
+            if args.output == Path::new("-") {
+                to_stdout(&body);
+            } else {
+                to_file(&args.output, &body)?;
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Render records as JSON Lines: one `AnalysisRecord` per line.
+fn records_to_jsonl(records: &[smart_encode_lib::analyzer::fps_stats::AnalysisRecord]) -> String {
+    let mut out = String::new();
+    for r in records {
+        let fps = r
+            .fps
+            .map(|f| f.to_string())
+            .unwrap_or_else(|| "null".into());
+        let codec = r.codec.clone().unwrap_or_else(|| "null".into());
+        let dur = r
+            .duration_secs
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "null".into());
+        out.push_str(&format!(
+            "{{\"path\":\"{}\",\"fps\":{},\"codec\":\"{}\",\"duration_secs\":{},\"file_bytes\":{}}}\n",
+            r.path.display(),
+            fps,
+            codec,
+            dur,
+            r.file_bytes,
+        ));
+    }
+    out
 }
 
 fn print_encode_summary(results: &[(std::path::PathBuf, TranscodeResult)]) {
@@ -197,8 +259,8 @@ mod tests {
             file: file.map(PathBuf::from),
             ext: vec![],
             parallel: false,
-            verbose: false,
-            output: PathBuf::from("fps_stats.txt"),
+            format: args::AnalyzeFormatArg::Csv,
+            output: PathBuf::from("-"),
         }
     }
 

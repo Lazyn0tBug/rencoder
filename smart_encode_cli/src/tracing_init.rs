@@ -30,7 +30,7 @@ pub fn init() {
         .with_target(false)
         .with_thread_ids(false)
         .with_span_events(fmt::format::FmtSpan::CLOSE)
-        .with_writer(std::io::stdout);
+        .with_writer(std::io::stderr);
 
     let file_sink = FileSink::new(log_dir(), 10 * 1024 * 1024, 7)
         .expect("failed to open log file sink");
