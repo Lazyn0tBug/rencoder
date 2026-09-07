@@ -152,7 +152,7 @@ mod tests {
         assert!(files.iter().all(|p| {
             p.extension()
                 .and_then(|e| e.to_str())
-                .map_or(false, |e| e == "mp4" || e == "mkv")
+                .is_some_and(|e| e == "mp4" || e == "mkv")
         }));
     }
 

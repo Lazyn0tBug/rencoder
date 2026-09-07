@@ -396,7 +396,7 @@ mod tests {
         assert_eq!(s.parsed_files, 3);
         assert_eq!(s.groups.get(&30).unwrap().len(), 2);
         assert_eq!(s.groups.get(&60).unwrap().len(), 1);
-        assert!(s.groups.get(&24).is_none());
+        assert!(!s.groups.contains_key(&24));
     }
 
     #[test]

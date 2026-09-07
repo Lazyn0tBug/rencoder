@@ -194,7 +194,6 @@ mod tests {
 
         let mut w = sink.make_writer();
         writeln!(w, "hello").unwrap();
-        drop(w);
 
         let files = list_log_files(&dir);
         assert_eq!(files.len(), 1);
@@ -207,13 +206,15 @@ mod tests {
         let dir = fixture_dir();
         let sink = FileSink::new(&dir, 100, 7).unwrap();
 
-        let mut w = sink.make_writer();
-        w.write_all(&vec![b'a'; 50]).unwrap();
-        drop(w);
+        {
+            let mut w = sink.make_writer();
+            w.write_all(&[b'a'; 50]).unwrap();
+        }
 
-        let mut w = sink.make_writer();
-        w.write_all(&vec![b'b'; 60]).unwrap();
-        drop(w);
+        {
+            let mut w = sink.make_writer();
+            w.write_all(&[b'b'; 60]).unwrap();
+        }
 
         let files = list_log_files(&dir);
         assert_eq!(files.len(), 2, "expected rotation, got {files:?}");
@@ -227,7 +228,6 @@ mod tests {
         let sink = FileSink::new(&dir, 1024, 7).unwrap();
         let mut w = sink.make_writer();
         writeln!(w, "x").unwrap();
-        drop(w);
 
         let file = list_log_files(&dir).into_iter().next().unwrap();
         let today = Local::now().format("%Y-%m-%d").to_string();
@@ -287,13 +287,15 @@ mod tests {
         let dir = fixture_dir();
         let sink = FileSink::new(&dir, 1024, 7).unwrap();
 
-        let mut w = sink.make_writer();
-        writeln!(w, "first").unwrap();
-        drop(w);
+        {
+            let mut w = sink.make_writer();
+            writeln!(w, "first").unwrap();
+        }
 
-        let mut w = sink.make_writer();
-        writeln!(w, "second").unwrap();
-        drop(w);
+        {
+            let mut w = sink.make_writer();
+            writeln!(w, "second").unwrap();
+        }
 
         let path = dir.join(list_log_files(&dir).into_iter().next().unwrap());
         let content = fs::read_to_string(&path).unwrap();

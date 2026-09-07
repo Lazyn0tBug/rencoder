@@ -26,6 +26,11 @@ use crate::ffmpeg::{
 use crate::path_util::output_path_for;
 use crate::types::{EncoderCache, EncodeParams, ProcessOutput, TranscodeResult, TranscodeTask};
 
+/// Per-file callback fired after the result is recorded. Used by callers
+/// (CLI, GUI) to stream progress events instead of waiting for the
+/// whole batch.
+type ResultCallback = dyn Fn(&Path, &TranscodeResult);
+
 /// Transcode a single file. Returns the result status rather than aborting
 /// on `ffmpeg` failure -- that lands in `TranscodeResult::Failed`. Probe
 /// failures (e.g. corrupt/unreadable input) still surface as `Err`.
@@ -53,7 +58,7 @@ pub fn transcode_batch(
     cache: &EncoderCache,
     config: &Config,
     output: ProcessOutput,
-    result_callback: Option<&dyn Fn(&Path, &TranscodeResult)>,
+    result_callback: Option<&ResultCallback>,
 ) -> Vec<(PathBuf, TranscodeResult)> {
     transcode_batch_with_processor(
         params,
@@ -70,7 +75,7 @@ fn transcode_batch_with_processor<F>(
     params: &EncodeParams,
     files: &[PathBuf],
     mut processor: F,
-    result_callback: Option<&dyn Fn(&Path, &TranscodeResult)>,
+    result_callback: Option<&ResultCallback>,
 ) -> Vec<(PathBuf, TranscodeResult)>
 where
     F: FnMut(&TranscodeTask, &EncodeParams) -> Result<TranscodeResult, EncodeError>,
@@ -211,11 +216,14 @@ Encoders:
         }
     }
 
-    /// Runner that records the argv it was called with.
-    fn recording_runner() -> (
-        impl Fn(&[String]) -> Result<(), EncodeError> + Send + 'static,
+    /// Runner type alias: closure + shared buffer of captured argv.
+    type RecordingRunner = (
+        Box<dyn Fn(&[String]) -> Result<(), EncodeError> + Send + 'static>,
         std::sync::Arc<StdMutex<Vec<String>>>,
-    ) {
+    );
+
+    /// Runner that records the argv it was called with.
+    fn recording_runner() -> RecordingRunner {
         use std::sync::{Arc, Mutex};
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let cap = captured.clone();
@@ -223,7 +231,7 @@ Encoders:
             cap.lock().unwrap().extend_from_slice(argv);
             Ok(())
         };
-        (runner, captured)
+        (Box::new(runner), captured)
     }
 
     // ---- transcode_after_probe ----
@@ -503,7 +511,7 @@ Encoders:
         ];
         let params = EncodeParams::default();
 
-        let callback: &dyn Fn(&Path, &TranscodeResult) = &|path, result| {
+        let callback: &dyn Fn(&Path, &TranscodeResult) = &move |path, result| {
             calls_clone.lock().unwrap().push(Call {
                 path: path.to_path_buf(),
                 is_success: !matches!(result, TranscodeResult::Failed(_)),
