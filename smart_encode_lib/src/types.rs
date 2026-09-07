@@ -120,9 +120,9 @@ pub struct EncodeParams {
     pub extensions: Vec<String>,
     pub extra_args: Vec<String>,
     pub max_fps: MaxFpsConfig,
-    /// Whether the user passed `--nv`. NVIDIA activation requires both this
-    /// AND a successful `nvidia-smi -L` probe.
-    pub enable_nv: bool,
+    // Note: NVIDIA enablement lives on `EncoderCache.has_nvidia` after
+    // `init_encoder_cache(enable_nv)` consumes the `--nv` flag. Keeping a
+    // separate `enable_nv` field here would be dead state.
 }
 
 #[derive(Clone, Debug)]

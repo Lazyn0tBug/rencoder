@@ -1,34 +1,30 @@
 //! Encoder selection: maps a `VideoFormat` + `EncoderCache` to a concrete
-//! encoder name, with optional config-file overrides and NVENC fallback.
+//! encoder name, with config overrides and NVENC fallback.
 //!
 //! Selection priority (highest first):
-//! 1. Config override from `--config` (if `config_path` is `Some`)
+//! 1. Config override (from the supplied `Config`)
 //! 2. NVENC variant (when `cache.has_nvidia` is true and the format has one)
 //! 3. Software default
 //!
 //! Each candidate is verified against `cache.encoders_output`. If a
 //! preferred encoder isn't compiled into ffmpeg, the chain falls through
 //! to the next entry. Errors only when no candidate is reachable.
-
-use std::path::Path;
+//!
+//! The caller loads `Config` once per batch and passes `&Config` here,
+//! avoiding a per-file file read.
 
 use crate::config::Config;
 use crate::error::EncodeError;
 use crate::types::{EncoderCache, VideoFormat};
 
 /// Choose an encoder for `format`. Never spawns subprocesses -- consults
-/// the pre-built cache and (optionally) the config file only.
+/// the pre-built cache and the supplied config only.
 pub fn select_encoder(
     format: VideoFormat,
     cache: &EncoderCache,
-    config_path: Option<&Path>,
+    config: &Config,
 ) -> Result<String, EncodeError> {
-    let config = match config_path {
-        Some(path) => Config::load(path)?,
-        None => Config::default(),
-    };
-
-    let preference = preference_for(format, cache.has_nvidia, &config);
+    let preference = preference_for(format, cache.has_nvidia, config);
 
     for encoder in preference {
         if cache.has_encoder(&encoder) {
@@ -89,6 +85,7 @@ fn format_name(format: VideoFormat) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::EncoderConfig;
 
     const ENCODERS_WITH_NVENC: &str = "\
 Encoders:
@@ -108,23 +105,28 @@ Encoders:
         }
     }
 
+    fn defaults() -> Config {
+        Config::default()
+    }
+
     #[test]
     fn select_software_defaults_without_nvidia() {
         let cache = cache_with(false);
+        let cfg = defaults();
         assert_eq!(
-            select_encoder(VideoFormat::Av1, &cache, None).unwrap(),
+            select_encoder(VideoFormat::Av1, &cache, &cfg).unwrap(),
             "libsvtav1"
         );
         assert_eq!(
-            select_encoder(VideoFormat::X264, &cache, None).unwrap(),
+            select_encoder(VideoFormat::X264, &cache, &cfg).unwrap(),
             "libx264"
         );
         assert_eq!(
-            select_encoder(VideoFormat::Hevc, &cache, None).unwrap(),
+            select_encoder(VideoFormat::Hevc, &cache, &cfg).unwrap(),
             "libx265"
         );
         assert_eq!(
-            select_encoder(VideoFormat::Vp9, &cache, None).unwrap(),
+            select_encoder(VideoFormat::Vp9, &cache, &cfg).unwrap(),
             "libvpx-vp9"
         );
     }
@@ -132,21 +134,22 @@ Encoders:
     #[test]
     fn select_nvenc_when_available() {
         let cache = cache_with(true);
+        let cfg = defaults();
         assert_eq!(
-            select_encoder(VideoFormat::Av1, &cache, None).unwrap(),
+            select_encoder(VideoFormat::Av1, &cache, &cfg).unwrap(),
             "av1_nvenc"
         );
         assert_eq!(
-            select_encoder(VideoFormat::X264, &cache, None).unwrap(),
+            select_encoder(VideoFormat::X264, &cache, &cfg).unwrap(),
             "h264_nvenc"
         );
         assert_eq!(
-            select_encoder(VideoFormat::Hevc, &cache, None).unwrap(),
+            select_encoder(VideoFormat::Hevc, &cache, &cfg).unwrap(),
             "hevc_nvenc"
         );
         // VP9 has no NVENC variant; falls through to software.
         assert_eq!(
-            select_encoder(VideoFormat::Vp9, &cache, None).unwrap(),
+            select_encoder(VideoFormat::Vp9, &cache, &cfg).unwrap(),
             "libvpx-vp9"
         );
     }
@@ -162,8 +165,9 @@ Encoders:
             encoders_output: stripped,
             has_nvidia: true,
         };
+        let cfg = defaults();
         assert_eq!(
-            select_encoder(VideoFormat::Av1, &cache, None).unwrap(),
+            select_encoder(VideoFormat::Av1, &cache, &cfg).unwrap(),
             "libsvtav1"
         );
     }
@@ -174,17 +178,9 @@ Encoders:
             encoders_output: String::new(),
             has_nvidia: false,
         };
-        let result = select_encoder(VideoFormat::Av1, &cache, None);
+        let cfg = defaults();
+        let result = select_encoder(VideoFormat::Av1, &cache, &cfg);
         assert!(matches!(result, Err(EncodeError::EncoderNotFound(_))));
-    }
-
-    #[test]
-    fn missing_config_path_uses_defaults() {
-        let cache = cache_with(false);
-        let result =
-            select_encoder(VideoFormat::Av1, &cache, Some(Path::new("/nonexistent/cfg.json")))
-                .unwrap();
-        assert_eq!(result, "libsvtav1");
     }
 
     #[test]
@@ -198,41 +194,39 @@ Encoders:
             .to_string(),
             has_nvidia: false,
         };
-
-        let dir = std::env::temp_dir().join("rencoder_test_encoder_override");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("cfg.json");
-        std::fs::write(&path, r#"{"encoders": {"av1": "libaom-av1"}}"#).unwrap();
-
-        let result = select_encoder(VideoFormat::Av1, &cache, Some(&path)).unwrap();
-        assert_eq!(result, "libaom-av1");
-
-        std::fs::remove_file(&path).ok();
+        let cfg = Config {
+            encoders: EncoderConfig {
+                av1: Some("libaom-av1".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            select_encoder(VideoFormat::Av1, &cache, &cfg).unwrap(),
+            "libaom-av1"
+        );
     }
 
     #[test]
     fn config_override_falls_back_when_not_in_cache() {
         // Override specifies an encoder the build doesn't have.
-        let cache = EncoderCache {
-            encoders_output: ENCODERS_WITH_NVENC.to_string(),
-            has_nvidia: false,
+        let cache = cache_with(false);
+        let cfg = Config {
+            encoders: EncoderConfig {
+                av1: Some("libdav1d".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
         };
-
-        let dir = std::env::temp_dir().join("rencoder_test_encoder_fallback");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("cfg.json");
-        std::fs::write(&path, r#"{"encoders": {"av1": "libdav1d"}}"#).unwrap();
-
         // libdav1d not in cache, so chain falls through to default.
-        let result = select_encoder(VideoFormat::Av1, &cache, Some(&path)).unwrap();
-        assert_eq!(result, "libsvtav1");
-
-        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            select_encoder(VideoFormat::Av1, &cache, &cfg).unwrap(),
+            "libsvtav1"
+        );
     }
 
     #[test]
     fn config_override_preferred_over_nvenc() {
-        // Override should beat NVENC even when both are available.
         let cache = EncoderCache {
             encoders_output: "\
 Encoders:
@@ -243,15 +237,16 @@ Encoders:
             .to_string(),
             has_nvidia: true,
         };
-
-        let dir = std::env::temp_dir().join("rencoder_test_override_beats_nvenc");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("cfg.json");
-        std::fs::write(&path, r#"{"encoders": {"av1": "libaom-av1"}}"#).unwrap();
-
-        let result = select_encoder(VideoFormat::Av1, &cache, Some(&path)).unwrap();
-        assert_eq!(result, "libaom-av1");
-
-        std::fs::remove_file(&path).ok();
+        let cfg = Config {
+            encoders: EncoderConfig {
+                av1: Some("libaom-av1".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            select_encoder(VideoFormat::Av1, &cache, &cfg).unwrap(),
+            "libaom-av1"
+        );
     }
 }

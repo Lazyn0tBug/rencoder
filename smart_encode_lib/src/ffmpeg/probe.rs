@@ -41,15 +41,23 @@ pub fn probe_video_metadata(input: &Path) -> Result<VideoMetadata, EncodeError> 
     parse_probe_output(&json)
 }
 
-/// Auto-dispatch: `c-probe` feature (Phase 13) uses C FFI; default uses CLI.
+/// Auto-dispatch: `c-probe` feature (Phase 13) prefers C FFI but falls
+/// back to the CLI probe if the FFI call fails. Without `c-probe`, the
+/// CLI probe is the only path.
 pub fn probe_video_metadata_auto(input: &Path) -> Result<VideoMetadata, EncodeError> {
     #[cfg(feature = "c-probe")]
     {
-        return crate::ffi::probe_video_metadata_fast(input);
+        match crate::ffi::probe_video_metadata_fast(input) {
+            Ok(m) => Ok(m),
+            Err(e) => {
+                log::warn!("c-probe failed for {}, falling back to ffprobe CLI: {}", input.display(), e);
+                probe_video_metadata(input)
+            }
+        }
     }
     #[cfg(not(feature = "c-probe"))]
     {
-        return probe_video_metadata(input);
+        probe_video_metadata(input)
     }
 }
 

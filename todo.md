@@ -46,20 +46,25 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
 - [x] Integration test: `real_ffprobe_against_fixture` (generates 1s 30fps H.264, probes, asserts h264 + ~30fps)
 - **Verify**: `cargo test -p smart_encode_lib --lib` 25/25 pass
 
-## U4. Encoder cache + selection — DONE
+## U4. Encoder cache + selection — DONE (post-review fixes applied)
 
 - [x] `init_encoder_cache(enable_nv) -> Result<EncoderCache, EncodeError>` in `encoder_cache.rs`
 - [x] Runner-closure seam (`init_encoder_cache_impl<F>(runner: F)`) for testable subprocess mocking
 - [x] `ffmpeg -encoders` once; output captured to `encoders_output`
 - [x] `nvidia-smi -L` only when `enable_nv = true`; missing/empty → `info!` log, `has_nvidia = false`
-- [x] `select_encoder(format, cache, config_path?) -> Result<String, EncodeError>` in `encoder.rs`
+- [x] `select_encoder(format, cache, config: &Config) -> Result<String, EncodeError>` in `encoder.rs`
+  - **API change from plan**: plan had `config_path: Option<&Path>`; changed to `&Config` so callers load once per batch instead of per file
 - [x] Preference chain: config override → NVENC → software default, with fallback
 - [x] Format-to-encoder mapping: `Av1 → libsvtav1/av1_nvenc`, `X264 → libx264/h264_nvenc`, `Hevc → libx265/hevc_nvenc`, `Vp9 → libvpx-vp9`
 - [x] Config override support: `Config.encoders.{av1,x264,hevc,vp9}`
 - [x] Config::from_value updated to parse `encoders` block
-- [x] Tests: 9 encoder_cache tests (substring match, has_nvidia flag, fallback paths, ffmpeg-once)
-- [x] Tests: 7 select_encoder tests (software, NVENC, fallback, override precedence, missing)
-- **Verify**: `cargo test -p smart_encode_lib --lib` 44/44 pass; workspace clean
+- [x] **Post-review fixes**:
+  - `parse_encoders` rejects empty-string overrides (would otherwise match any cache via `str::contains("") == true`)
+  - `Config::load` rejects negative `max_fps` with `EncodeError::InvalidParam`
+  - Removed dead `EncodeParams.enable_nv` field; `cache.has_nvidia` is the source of truth
+  - `probe_video_metadata_auto` falls back from c-probe FFI to CLI on failure (defensive, c-probe lands in Phase 13)
+- [x] Tests: 9 encoder_cache + 7 select_encoder + 8 config + 6 probe = 30 U4-related tests
+- **Verify**: `cargo test -p smart_encode_lib --lib` 45/45 pass; workspace clean
 
 ## U5. Command builder + single-file transcode
 

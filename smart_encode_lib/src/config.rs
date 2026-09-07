@@ -60,6 +60,8 @@ impl EncoderConfig {
 
 impl Config {
     /// Load from a JSON file. Missing file returns `Default::default()`.
+    /// `max_fps` must be non-negative; negative values surface as
+    /// `EncodeError::InvalidParam` rather than silently disabling the cap.
     pub fn load(path: &Path) -> Result<Self, EncodeError> {
         if !path.exists() {
             return Ok(Self::default());
@@ -67,7 +69,14 @@ impl Config {
         let raw = std::fs::read_to_string(path)?;
         let v: Value = serde_json::from_str(&raw)
             .map_err(|e| EncodeError::InvalidParam(format!("config parse: {e}")))?;
-        Ok(Self::from_value(&v))
+        let cfg = Self::from_value(&v);
+        if cfg.max_fps < 0.0 {
+            return Err(EncodeError::InvalidParam(format!(
+                "max_fps must be >= 0, got {}",
+                cfg.max_fps
+            )));
+        }
+        Ok(cfg)
     }
 
     fn from_value(v: &Value) -> Self {
@@ -98,11 +107,20 @@ fn parse_encoders(v: Option<&Value>) -> EncoderConfig {
     let Some(obj) = v.and_then(Value::as_object) else {
         return EncoderConfig::default();
     };
+    // Empty strings are rejected: `cache.has_encoder("")` would otherwise
+    // always return true (str::contains with empty needle), causing
+    // select_encoder to forward "" as the chosen encoder name.
+    let parse = |k: &str| -> Option<String> {
+        obj.get(k)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
     EncoderConfig {
-        av1: obj.get("av1").and_then(Value::as_str).map(String::from),
-        x264: obj.get("x264").and_then(Value::as_str).map(String::from),
-        hevc: obj.get("hevc").and_then(Value::as_str).map(String::from),
-        vp9: obj.get("vp9").and_then(Value::as_str).map(String::from),
+        av1: parse("av1"),
+        x264: parse("x264"),
+        hevc: parse("hevc"),
+        vp9: parse("vp9"),
     }
 }
 
@@ -187,5 +205,26 @@ mod tests {
             serde_json::from_str(r#"{"encoders": {"av1": 123}}"#).unwrap();
         let cfg = Config::from_value(&v);
         assert!(cfg.encoders.av1.is_none());
+    }
+
+    #[test]
+    fn empty_encoder_string_is_rejected() {
+        // Empty string would otherwise pass through to select_encoder and
+        // match any cache via str::contains("") == true.
+        let v: Value =
+            serde_json::from_str(r#"{"encoders": {"av1": ""}}"#).unwrap();
+        let cfg = Config::from_value(&v);
+        assert!(cfg.encoders.av1.is_none());
+    }
+
+    #[test]
+    fn negative_max_fps_rejected_on_load() {
+        let dir = std::env::temp_dir().join("rencoder_test_negative_fps");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cfg.json");
+        std::fs::write(&path, r#"{"max_fps": -30}"#).unwrap();
+        let err = Config::load(&path).unwrap_err();
+        assert!(matches!(err, EncodeError::InvalidParam(_)));
+        std::fs::remove_file(&path).ok();
     }
 }
