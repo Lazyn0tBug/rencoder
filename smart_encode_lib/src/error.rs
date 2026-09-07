@@ -24,3 +24,52 @@ pub enum EncodeError {
     #[error("User cancelled")]
     UserCancel,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn io_error_via_from_conversion() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
+        let err: EncodeError = io_err.into();
+        assert!(matches!(err, EncodeError::Io(_)));
+        assert!(err.to_string().contains("I/O error"));
+    }
+
+    #[test]
+    fn ffmpeg_error_display() {
+        let err = EncodeError::Ffmpeg("crashed".into());
+        assert_eq!(err.to_string(), "FFmpeg error: crashed");
+    }
+
+    #[test]
+    fn probe_error_display() {
+        let err = EncodeError::Probe("bad json".into());
+        assert_eq!(err.to_string(), "Probe error: bad json");
+    }
+
+    #[test]
+    fn invalid_param_error_display() {
+        let err = EncodeError::InvalidParam("missing field".into());
+        assert_eq!(err.to_string(), "Invalid parameter: missing field");
+    }
+
+    #[test]
+    fn encoder_not_found_display() {
+        let err = EncodeError::EncoderNotFound("h264".into());
+        assert_eq!(err.to_string(), "Encoder not found: h264");
+    }
+
+    #[test]
+    fn fps_parse_error_display() {
+        let err = EncodeError::FpsParse("bad input".into());
+        assert_eq!(err.to_string(), "FPS parse error: bad input");
+    }
+
+    #[test]
+    fn user_cancel_display() {
+        let err = EncodeError::UserCancel;
+        assert_eq!(err.to_string(), "User cancelled");
+    }
+}

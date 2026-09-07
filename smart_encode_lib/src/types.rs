@@ -198,3 +198,152 @@ pub struct AnalyzeParams {
     pub verbose: bool,
     pub output_file: PathBuf,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn video_format_default_extension() {
+        assert_eq!(VideoFormat::X264.default_extension(), "mp4");
+        assert_eq!(VideoFormat::Hevc.default_extension(), "mp4");
+        assert_eq!(VideoFormat::Vp9.default_extension(), "webm");
+        assert_eq!(VideoFormat::Av1.default_extension(), "mkv");
+    }
+
+    #[test]
+    fn video_metadata_best_fps_prefers_avg() {
+        let m = VideoMetadata {
+            codec: Some("h264".into()),
+            avg_fps: Some(60.0),
+            nominal_fps: Some(30.0),
+        };
+        assert_eq!(m.best_fps(), Some(60.0));
+    }
+
+    #[test]
+    fn video_metadata_best_fps_falls_back_to_nominal() {
+        let m = VideoMetadata {
+            codec: Some("h264".into()),
+            avg_fps: None,
+            nominal_fps: Some(30.0),
+        };
+        assert_eq!(m.best_fps(), Some(30.0));
+    }
+
+    #[test]
+    fn video_metadata_best_fps_none_when_both_missing() {
+        let m = VideoMetadata::default();
+        assert_eq!(m.best_fps(), None);
+    }
+
+    #[test]
+    fn video_metadata_is_valid_when_empty() {
+        assert!(!VideoMetadata::default().is_valid());
+    }
+
+    #[test]
+    fn video_metadata_is_valid_with_codec() {
+        assert!(
+            VideoMetadata {
+                codec: Some("h264".into()),
+                ..Default::default()
+            }
+            .is_valid()
+        );
+    }
+
+    #[test]
+    fn video_metadata_is_valid_with_avg_fps() {
+        assert!(
+            VideoMetadata {
+                avg_fps: Some(30.0),
+                ..Default::default()
+            }
+            .is_valid()
+        );
+    }
+
+    #[test]
+    fn video_metadata_is_valid_with_nominal_fps() {
+        assert!(
+            VideoMetadata {
+                nominal_fps: Some(30.0),
+                ..Default::default()
+            }
+            .is_valid()
+        );
+    }
+
+    #[test]
+    fn max_fps_config_enabled_zero_is_false() {
+        assert!(!MaxFpsConfig { max_fps: 0.0, eps: 0.05 }.enabled());
+    }
+
+    #[test]
+    fn max_fps_config_enabled_positive_is_true() {
+        assert!(MaxFpsConfig { max_fps: 30.0, eps: 0.05 }.enabled());
+    }
+
+    #[test]
+    fn max_fps_config_enabled_negative_is_false() {
+        assert!(!MaxFpsConfig { max_fps: -30.0, eps: 0.05 }.enabled());
+    }
+
+    #[test]
+    fn process_output_default_is_inherit() {
+        assert_eq!(ProcessOutput::default(), ProcessOutput::Inherit);
+    }
+
+    #[test]
+    fn fps_stats_new_initializes_total() {
+        let s = FpsStats::new(100);
+        assert_eq!(s.total_files, 100);
+        assert_eq!(s.parsed_files, 0);
+        assert_eq!(s.failed_files, 0);
+        assert!(s.groups.is_empty());
+    }
+
+    #[test]
+    fn fps_stats_add_groups_by_fps() {
+        let mut s = FpsStats::new(3);
+        s.add(30, PathBuf::from("/a.mp4"));
+        s.add(30, PathBuf::from("/b.mp4"));
+        s.add(60, PathBuf::from("/c.mp4"));
+        assert_eq!(s.parsed_files, 3);
+        assert_eq!(s.groups.get(&30).unwrap().len(), 2);
+        assert_eq!(s.groups.get(&60).unwrap().len(), 1);
+        assert!(s.groups.get(&24).is_none());
+    }
+
+    #[test]
+    fn fps_stats_add_failed_increments_only_failed() {
+        let mut s = FpsStats::new(5);
+        s.add(30, PathBuf::from("/a.mp4"));
+        s.add_failed();
+        s.add_failed();
+        assert_eq!(s.failed_files, 2);
+        assert_eq!(s.parsed_files, 1);
+    }
+
+    #[test]
+    fn encoder_cache_has_encoder_substring() {
+        let cache = EncoderCache {
+            encoders_output: "libx264 libsvtav1".to_string(),
+            has_nvidia: false,
+        };
+        assert!(cache.has_encoder("libx264"));
+        assert!(cache.has_encoder("libsvtav1"));
+        assert!(!cache.has_encoder("libdav1d"));
+        // Empty cache returns false for any non-empty needle.
+        let empty = EncoderCache {
+            encoders_output: String::new(),
+            has_nvidia: false,
+        };
+        assert!(!empty.has_encoder("libx264"));
+        // Empty needle matches even empty cache (str::contains("") == true).
+        // This is the property the parser filters against, not has_encoder
+        // itself.
+        assert!(empty.has_encoder(""));
+    }
+}
