@@ -19,6 +19,10 @@ struct ProbeResult {
     avg_frame_rate: *mut c_char,
     r_frame_rate: *mut c_char,
     duration: f64,
+    container: *mut c_char,
+    width: i32,
+    height: i32,
+    bit_rate: i64,
 }
 
 extern "C" {
@@ -67,12 +71,32 @@ pub fn probe_video_metadata_fast(input: &Path) -> Result<VideoMetadata, EncodeEr
     } else {
         Some(result.duration)
     };
+    let container = read_cstr(result.container);
+    let width = if result.width > 0 {
+        Some(result.width as u32)
+    } else {
+        None
+    };
+    let height = if result.height > 0 {
+        Some(result.height as u32)
+    } else {
+        None
+    };
+    let bit_rate = if result.bit_rate > 0 {
+        Some(result.bit_rate as u64)
+    } else {
+        None
+    };
 
     Ok(VideoMetadata {
         codec,
         avg_fps: avg_fps.or(r_frame_rate),
         nominal_fps: r_frame_rate,
         duration_secs: duration,
+        container,
+        width,
+        height,
+        bit_rate,
     })
 }
 

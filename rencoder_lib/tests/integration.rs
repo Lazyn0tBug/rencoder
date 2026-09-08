@@ -161,17 +161,21 @@ fn transcode_batch_end_to_end_produces_output_files() {
     let results = transcode_batch(&params, &files, &cache, &config, ProcessOutput::Null, None);
 
     assert_eq!(results.len(), 2);
-    for (path, result) in &results {
-        match result {
-            rencoder_lib::types::TranscodeResult::Success
-            | rencoder_lib::types::TranscodeResult::ReducedFps => {
+    for record in &results {
+        match &record.outcome {
+            rencoder_lib::types::EncodingOutcome::Succeeded
+            | rencoder_lib::types::EncodingOutcome::ReducedFps => {
                 // Output path is derived from input; for AV1 -> mkv,
                 // the file should be at <stem>.mkv.
-                let stem = path.file_stem().unwrap().to_str().unwrap();
+                let stem = std::path::Path::new(&record.source_path)
+                    .file_stem().unwrap().to_str().unwrap();
                 let expected = dir.join(format!("{stem}.mkv"));
                 assert!(expected.exists(), "expected output at {}", expected.display());
             }
-            other => panic!("expected Success/ReducedFps for {}, got {:?}", path.display(), other),
+            other => panic!(
+                "expected Succeeded/ReducedFps for {}, got {:?}",
+                record.source_path, other
+            ),
         }
     }
 }
@@ -209,8 +213,10 @@ fn transcode_batch_skips_when_output_exists() {
     let result = transcode_single(&task, &params, &cache, &config, ProcessOutput::Null)
         .expect("transcode_single should succeed");
     assert!(matches!(
-        result,
-        rencoder_lib::types::TranscodeResult::SkippedExists
+        result.outcome,
+        rencoder_lib::types::EncodingOutcome::Skipped(
+            rencoder_lib::types::SkippedReason::OutputExists
+        )
     ));
 }
 

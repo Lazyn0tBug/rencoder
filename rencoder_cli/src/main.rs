@@ -13,7 +13,9 @@ use rencoder_lib::{
     config::Config,
     ffmpeg::encoder_cache::init_encoder_cache,
     processor::batch::transcode_batch,
-    types::{EncodeParams, ProcessOutput, Target, TranscodeResult, VideoFormat},
+    types::{
+        EncodeParams, EncodingOutcome, ProcessOutput, SkippedReason, Target, VideoFormat,
+    },
 };
 use std::path::Path;
 use tracing::{info, instrument, warn};
@@ -190,28 +192,30 @@ fn records_to_jsonl(records: &[rencoder_lib::analyzer::fps_stats::AnalysisRecord
     out
 }
 
-fn print_encode_summary(results: &[(std::path::PathBuf, TranscodeResult)]) {
+fn print_encode_summary(results: &[rencoder_lib::types::EncodingRecord]) {
     let total = results.len();
     let success = results
         .iter()
-        .filter(|(_, r)| matches!(r, TranscodeResult::Success))
+        .filter(|r| matches!(r.outcome, EncodingOutcome::Succeeded))
         .count();
     let reduced = results
         .iter()
-        .filter(|(_, r)| matches!(r, TranscodeResult::ReducedFps))
+        .filter(|r| matches!(r.outcome, EncodingOutcome::ReducedFps))
         .count();
     let skipped = results
         .iter()
-        .filter(|(_, r)| {
+        .filter(|r| {
             matches!(
-                r,
-                TranscodeResult::SkippedExists | TranscodeResult::SkippedSameCodec
+                r.outcome,
+                EncodingOutcome::Skipped(
+                    SkippedReason::OutputExists | SkippedReason::SameCodec
+                )
             )
         })
         .count();
     let failed = results
         .iter()
-        .filter(|(_, r)| matches!(r, TranscodeResult::Failed(_)))
+        .filter(|r| matches!(r.outcome, EncodingOutcome::Failed))
         .count();
 
     println!();

@@ -2,8 +2,6 @@
 
 use std::path::PathBuf;
 
-use crate::error::EncodeError;
-
 // ===== Target format =====
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -36,6 +34,15 @@ pub struct VideoMetadata {
     /// Stream duration in seconds (from ffprobe's `duration` field).
     /// `None` if the probe didn't report a duration.
     pub duration_secs: Option<f64>,
+    /// Container format (e.g. `"mov,mp4,m4a"`, `"matroska,webm"`).
+    /// Distinguishes e.g. `.mp4` containing h264 vs `.mkv` containing h264.
+    pub container: Option<String>,
+    /// Frame width in pixels.
+    pub width: Option<u32>,
+    /// Frame height in pixels.
+    pub height: Option<u32>,
+    /// Video bit rate in bits per second.
+    pub bit_rate: Option<u64>,
 }
 
 impl VideoMetadata {
@@ -159,16 +166,102 @@ pub struct TranscodeTask {
     pub output: PathBuf,
 }
 
-// ===== Transcode result status =====
+// ===== Work-analysis record (encode pipeline output) =====
 
-#[derive(Debug)]
-pub enum TranscodeResult {
-    Success,
-    SkippedSameCodec,
-    SkippedExists,
-    ReducedFps,
-    Failed(EncodeError),
+/// Encoder settings used for one encode: CRF/bitrate mode + optional
+/// preset (libsvtav1 takes a numeric preset, libx264 takes a string).
+#[derive(Clone, Debug, Default)]
+pub struct EncoderSettings {
+    pub is_crf: bool,
+    pub crf_or_bitrate: u32,
+    pub preset: Option<String>,
+    pub max_fps_target: Option<f32>,
 }
+
+/// Reason a file was skipped (no work performed).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkippedReason {
+    SameCodec,
+    OutputExists,
+}
+
+/// Outcome of a single encode. `Succeeded` and `ReducedFps` produced
+/// output; `Skipped` did not; `Failed` did not and has an error context.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EncodingOutcome {
+    Succeeded,
+    ReducedFps,
+    Skipped(SkippedReason),
+    Failed,
+}
+
+/// Failure categorization for the monitoring dimension (independent of
+/// the source/process/result dimensions, which are about a single encode).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorCategory {
+    ProbeFailed,
+    EncoderSelectionFailed,
+    FfmpegSpawnFailed,
+    FfmpegNonzeroExit,
+    ConfigError,
+    Cancelled,
+    IoError,
+}
+
+/// Context captured when an encode fails. Used for monitoring and
+/// failure-mode analysis.
+#[derive(Clone, Debug)]
+pub struct ErrorContext {
+    pub category: ErrorCategory,
+    pub message: String,
+    pub ffmpeg_stderr_tail: String,
+}
+
+/// One row per input file, structured for work analysis (not video
+/// analysis). Four dimensions:
+///
+/// 1. **Source** (input): what we started with
+/// 2. **Process** (work): timing and encoder choice
+/// 3. **Result** (output): what we produced
+/// 4. **Status** (independent monitoring): outcome + error context
+#[derive(Clone, Debug)]
+pub struct EncodingRecord {
+    // === 1. Source ===
+    pub source_path: String,
+    pub source_size_bytes: u64,
+    pub source_codec: Option<String>,
+    pub source_container: Option<String>,
+    pub source_width: Option<u32>,
+    pub source_height: Option<u32>,
+    pub source_fps: Option<f64>,
+    pub source_duration_secs: Option<f64>,
+    pub source_bit_rate_bps: Option<u64>,
+
+    // === 2. Process ===
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub ended_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub encoding_duration_secs: Option<f64>,
+    pub encoder_selected: Option<String>,
+    pub encoder_settings: EncoderSettings,
+    pub ffmpeg_argv: Vec<String>,
+    pub ffmpeg_stderr_tail: String,
+
+    // === 3. Result ===
+    pub output_path: Option<String>,
+    pub output_size_bytes: Option<u64>,
+    pub output_duration_secs: Option<f64>,
+    pub output_codec: Option<String>,
+    pub compression_ratio: Option<f64>,
+
+    // === 4. Status (independent monitoring) ===
+    pub outcome: EncodingOutcome,
+    pub error: Option<ErrorContext>,
+}
+
+// Re-export for backwards compat with existing call sites (the encode
+// pipeline currently uses `TranscodeResult`).
+pub use crate::types::EncodingOutcome as _EncodingOutcomeReexport;
+pub type TranscodeResult = EncodingOutcome;
 
 // ===== FPS statistics (analyzer module) =====
 

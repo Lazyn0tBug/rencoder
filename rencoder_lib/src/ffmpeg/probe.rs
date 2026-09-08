@@ -102,11 +102,43 @@ fn parse_probe_output(json: &str) -> Result<VideoMetadata, EncodeError> {
                 .and_then(|s| s.parse::<f64>().ok())
         });
 
+    let container = v
+        .get("format")
+        .and_then(|f| f.get("format_name"))
+        .and_then(Value::as_str)
+        .map(String::from);
+
+    let width = stream
+        .get("width")
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok());
+    let height = stream
+        .get("height")
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok());
+
+    let bit_rate = stream
+        .get("bit_rate")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<u64>().ok())
+        // Stream-level bit_rate missing on some fixtures; fall back to
+        // format-level bit_rate (overall file bitrate).
+        .or_else(|| {
+            v.get("format")
+                .and_then(|f| f.get("bit_rate"))
+                .and_then(Value::as_str)
+                .and_then(|s| s.parse::<u64>().ok())
+        });
+
     Ok(VideoMetadata {
         codec,
         avg_fps,
         nominal_fps,
         duration_secs,
+        container,
+        width,
+        height,
+        bit_rate,
     })
 }
 
