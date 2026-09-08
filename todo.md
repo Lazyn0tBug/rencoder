@@ -284,7 +284,87 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
 - [ ] macOS + Linux build verified
 - **Verify**: `cargo build --features c-probe` clean; `cargo test --features c-probe` passes
 
-## U14. GUI prototype (DEFERRED)
+## U15. EncodingRecord data model + storage layer — IN PROGRESS (branch: feat/encoding-record-and-storage)
+
+User asked for work-analysis output (not video-analysis). The data model
+restructures around four workflow dimensions, and storage moves to
+Parquet-as-canonical with JSONL streaming.
+
+### Data model (4 dimensions)
+
+- **Source** (input): source_path, source_size_bytes, source_codec,
+  source_container, source_resolution, source_fps, source_duration_secs,
+  source_bit_rate_bps
+- **Process** (work): started_at, ended_at, encoding_duration_secs,
+  encoder_selected, encoder_settings (is_crf, crf_or_bitrate, preset,
+  max_fps_target), ffmpeg_argv, ffmpeg_stderr_tail
+- **Result** (output): output_path, output_size_bytes, output_duration_secs,
+  output_codec, compression_ratio (output_size/source_size, stored column)
+- **Status** (independent): outcome (Succeeded | ReducedFps | Skipped(*)
+  | Failed), error_category, error_message
+
+### Storage strategy
+
+- **Default stdout**: JSONL (one full record per line, all fields, nulls
+  omitted) — stream-friendly, pipe to jq/duckdb.
+- **`-o path.parquet`**: Parquet with Snappy compression, embedded schema;
+  one file per CLI run, named `./logs/encoding-<UTC-ISO8601>Z.parquet`
+  (auto-generated if `-o` omitted).
+- **`-o path.jsonl`**: NDJSON, also file-per-run.
+- **`-o path.csv`**: legacy compat (subset of columns).
+
+### Single DataFrame intermediate, thin writers
+
+`records_to_dataframe(records) → DataFrame` is the schema anchor.
+Three writers consume the DataFrame (not the records):
+
+- `dataframe_to_csv(df) → String`
+- `dataframe_to_jsonl(df) → String`
+- `dataframe_to_parquet(df) → Vec<u8>`
+
+No JSONL → Parquet round-trip (wasteful parse + loses Polars column types).
+Schema evolution: edit `records_to_dataframe` once.
+
+### Implementation steps (Pass 1 = data + writers; Pass 2 = integration)
+
+**Pass 1 — data model + writers**:
+- [ ] Add `EncodingRecord`, `EncoderSettings`, `EncodingOutcome`,
+      `SkippedReason`, `ErrorContext`, `ErrorCategory` to `rencoder_lib/src/types.rs`
+- [ ] Extend `VideoMetadata` with the source fields (resolution,
+      container, bit_rate, mtime)
+- [ ] Update `probe_video_metadata_fast` (lib/ffmpeg/video_probe.c) and
+      `parse_probe_output` (lib/ffmpeg/probe.rs) to extract the new ffprobe
+      fields
+- [ ] Refactor `transcode_single` and `transcode_batch` to capture
+      timing (start/end), encoder settings used, output size, ffmpeg stderr
+      tail; return `Vec<EncodingRecord>` instead of
+      `Vec<(PathBuf, TranscodeResult)>`
+- [ ] Refactor `records_to_csv` and `records_to_jsonl` to consume
+      `DataFrame` (not records directly) — single canonical schema path
+- [ ] Add `records_to_parquet` via `dataframe_to_parquet` (Polars
+      `ParquetWriter` with Snappy compression)
+- [ ] Update CLI: `-o PATH` extension determines format; default
+      timestamped Parquet in `./logs/`
+- [ ] Update CLI summary: end-of-batch aggregate (total files, total
+      bytes in/out, throughput, failure rate by category)
+- [ ] Tests: new EncodingRecord field capture; DataFrame writer
+      round-trip (Parquet can be read back with same values);
+      timestamp default naming; legacy tests still pass
+- [ ] Document in `docs/smart_code.md` (already updated §2.4 decision;
+      needs §3 type/API listings too)
+
+**Pass 2 — observability & archival**:
+- [ ] `--log-file PATH` flag for append-mode NDJSON monitoring log
+      (NDJSON is append-friendly; Parquet isn't)
+- [ ] Multi-batch query examples in README (DuckDB glob over
+      `./logs/*.parquet`)
+- [ ] README updates: replace CSV-default examples with JSONL or
+      Parquet per use case
+
+**Verify**: `cargo test --workspace` 200+/200+; with
+`cargo build --release` binary size still reasonable (Polars + parquet
+writer adds ~5-10 MB); `cargo clippy --workspace --all-targets` clean.
+
 
 - [ ] Framework decision (Tauri / egui / Slint) — separate decision, separate crate
 - [ ] New crate `rencoder_gui` consuming `rencoder_lib`

@@ -69,6 +69,9 @@ Rencoder 是一个智能视频转码与分析工具，支持：
 | 配置 | `serde_json` | 替代 `jq` |
 | 分析聚合 | `polars`（DataFrame `group_by` + `agg`） | 复用 Polars 生态；不再手写 BTreeMap 遍历 |
 | 分析输出（默认） | per-file CSV 到 stdout + 一行 summary 到 stderr | 原始数据可管道到 DuckDB/Polars 二次分析；摘要与数据流分离 |
+| 转码工作记录 | `EncodingRecord`（4 维度：source / process / result / status） | 工作分析（吞吐、压缩率、失败率），不是视频分析 |
+| 工作记录存储 | `./logs/encoding-YYYY-MM-DDTHH-MM-SSZ.parquet`（按运行分文件） | 每跑一次产出一个自包含文件，多批分析用 `read_parquet(['./logs/*.parquet'])` glob |
+| 工作记录序列化 | 单 DataFrame 中转（`records_to_dataframe`）+ 三种 writer（CSV / JSONL / Parquet） | schema 在 `records_to_dataframe` 一处定义；writer 都是 thin wrapper |
 | Rust 版本 | 2021 Edition | 稳定 |
 | 目标平台 | Linux / macOS（Windows 后续） | 跨平台 |
 
@@ -127,6 +130,42 @@ Rencoder 是一个智能视频转码与分析工具，支持：
 **为什么不用 `colored` crate**：
 
 - 颜色化是终端能力，`tracing-subscriber` 的 `fmt` 层默认不染色，且 ANSI 颜色在重定向到文件时会变成噪音；如需彩色输出，让终端通过 `RUST_LOG_STYLE=always` 等环境变量启用，避免库内硬编码。
+
+### 2.4 关于工作记录数据模型与存储的决策
+
+**这是工作分析工具，不是视频分析工具。** 用户问的是「这次跑得怎么样？哪几条慢？哪些失败？」——这是工作流问题，不是媒体属性问题。数据模型按四个维度组织：
+
+1. **Source（输入）**：source_path、source_size_bytes、source_codec、source_container、source_resolution、source_fps、source_duration_secs、source_bit_rate_bps
+2. **Process（工作过程）**：started_at、ended_at、encoding_duration_secs、encoder_selected、encoder_settings、ffmpeg_argv、ffmpeg_stderr_tail
+3. **Result（输出）**：output_path、output_size_bytes、output_duration_secs、output_codec、compression_ratio
+4. **Status（独立监测）**：outcome、error_category、error_message
+
+前三个维度基于工作流（每次跑一个文件产出一条记录）；最后一个是独立的监测数据。
+
+**存储格式按场景选**：
+
+- **JSONL（默认 stdout）**：每条记录一行 JSON，stream-friendly，所有字段保留，可直接 pipe 到 `jq` 或 `duckdb`。
+- **Parquet（`-o file.parquet`）**：列式压缩格式，schema 内嵌，Snappy 压缩；原生 DuckDB / Polars 输入。多批分析：`SELECT * FROM read_parquet('./logs/*.parquet')`。
+- **CSV（`-o file.csv`，兼容旧脚本）**：仅保留最常用的列（path、fps、codec、resolution、duration、file_bytes、outcome）。
+
+**单一 DataFrame 中转，writer 是 thin wrapper**：
+
+```
+records → records_to_dataframe（schema 在这一处定义）
+                ↓
+    ┌───────────┼──────────┐
+    ↓           ↓          ↓
+df_to_csv  df_to_jsonl  df_to_parquet
+```
+
+`records_to_dataframe` 是唯一的 schema 定义点。writer 都是 2-5 行的 thin wrapper，schema 变化时只改一处。不做 `records_to_jsonl → records_from_jsonl_to_parquet` 这种 round-trip（浪费一次 parse，且丢失 Polars 的列类型信息）。
+
+**每跑一次产出一个文件**（`./logs/encoding-<UTC-timestamp>Z.parquet`）：
+
+- ISO 8601 UTC（`Z` 后缀避免时区歧义），`:` 替换为 `-`（macOS / Windows 文件系统兼容）
+- 时间戳文件名可字典序排序 = 时间顺序，`ls -t | head -1` 拿到最近一次
+- 多批分析用 glob：`read_parquet(['./logs/*.parquet'])`
+- 进程 ID 后缀（`a3f`）避免同一秒内并发冲突
 
 > 注：`nvidia-smi` 的 `io::Error`（找不到可执行文件）和"执行成功但无 GPU"都归为同一降级路径，`init_encoder_cache` 不应因此返回 `EncodeError`。
 
