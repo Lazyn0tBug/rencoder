@@ -430,8 +430,8 @@ Rationale (key points from the design conversation):
 - [x] Update callers in `pipeline/batch.rs`
 - [x] Verify: `cargo test -p rencoder_lib --lib` passes
 
-**Stage 4 — utils/ module**:
-- [ ] Create `utils/fs.rs` from `path_util.rs` (normalize,
+**Stage 4 — utils/ module**: [x] DONE (commit a256169)
+- [x] Create `utils/fs.rs` from `path_util.rs` (normalize,
       output_path_for, plus any helpers used in collect.rs)
 - [ ] Create `utils/time.rs` (UTC timestamp formatting helper)
 - [ ] `lib.rs`: register `pub mod utils;` with `mod fs; mod time;` and
