@@ -131,21 +131,20 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
         stats.total_files, stats.parsed_files, stats.failed_files,
     );
 
-    // Format-specific output. csv/json respect -o; text always goes to
-    // stdout (the legacy behavior, where -o is ignored).
-    let to_stdout = |s: &str| print!("{s}");
-    let to_file = |path: &std::path::Path, s: &str| -> Result<()> {
-        std::fs::write(path, s).with_context(|| format!("failed to write {}", path.display()))
+    // Format-specific body, then dispatch to stdout-or-file based on -o.
+    let render = |body: String| -> Result<()> {
+        if args.output == Path::new("-") {
+            print!("{body}");
+            Ok(())
+        } else {
+            std::fs::write(&args.output, body)
+                .with_context(|| format!("failed to write {}", args.output.display()))
+        }
     };
 
     match args.format {
         AnalyzeFormatArg::Csv => {
-            let body = rencoder_lib::analyzer::fps_stats::records_to_csv(&records);
-            if args.output == Path::new("-") {
-                to_stdout(&body);
-            } else {
-                to_file(&args.output, &body)?;
-            }
+            render(rencoder_lib::analyzer::fps_stats::records_to_csv(&records))?;
         }
         AnalyzeFormatArg::Table => {
             // Build a DataFrame from the records and use Polars' Display
@@ -153,28 +152,13 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
             // order (rayon's par_iter().collect preserves order).
             let df = rencoder_lib::analyzer::fps_stats::records_to_dataframe(&records)
                 .map_err(|e| anyhow::anyhow!("dataframe build: {e}"))?;
-            let body = format!("{df}");
-            if args.output == Path::new("-") {
-                to_stdout(&body);
-            } else {
-                to_file(&args.output, &body)?;
-            }
+            render(format!("{df}"))?;
         }
         AnalyzeFormatArg::Text => {
-            let body = stats.summary();
-            if args.output == Path::new("-") {
-                to_stdout(&body);
-            } else {
-                to_file(&args.output, &body)?;
-            }
+            render(stats.summary())?;
         }
         AnalyzeFormatArg::Json => {
-            let body = records_to_jsonl(&records);
-            if args.output == Path::new("-") {
-                to_stdout(&body);
-            } else {
-                to_file(&args.output, &body)?;
-            }
+            render(records_to_jsonl(&records))?;
         }
     }
 
