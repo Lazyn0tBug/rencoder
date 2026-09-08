@@ -10,6 +10,7 @@ pub mod collect;
 pub mod config;
 pub mod data;
 pub mod encoding;
+pub mod encoder;
 pub mod error;
 pub mod ffmpeg;
 pub mod fps;

@@ -3,8 +3,6 @@
 //! The cache helper (`init_encoder_cache`) moved to `pipeline/cache`
 //! in the U16 refactor. Re-exported here for backward compatibility.
 
-pub mod command;
-pub mod encoder;
 pub mod probe;
 
 pub use crate::pipeline::cache::init_encoder_cache;

@@ -22,9 +22,8 @@ use chrono::Utc;
 
 use crate::config::Config;
 use crate::error::EncodeError;
+use crate::encoder::{command::{build_ffmpeg_command, should_skip_encoding}, select::select_encoder};
 use crate::ffmpeg::{
-    command::{build_ffmpeg_command, should_skip_encoding},
-    encoder::select_encoder,
     probe::probe_video_metadata_auto,
 };
 use crate::path_util::output_path_for;
