@@ -14,7 +14,7 @@ pub mod encoder;
 pub mod error;
 pub mod ffmpeg;
 pub mod fps;
-pub mod path_util;
+pub mod utils;
 pub mod pipeline;
 pub mod types;
 

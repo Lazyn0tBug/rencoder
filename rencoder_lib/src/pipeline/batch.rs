@@ -26,7 +26,7 @@ use crate::encoder::{command::{build_ffmpeg_command, should_skip_encoding}, sele
 use crate::ffmpeg::{
     probe::probe_video_metadata_auto,
 };
-use crate::path_util::output_path_for;
+use crate::utils::fs::output_path_for;
 use crate::types::{
     EncoderCache, EncodeParams, EncodingOutcome, EncodingRecord, EncoderSettings,
     ErrorCategory, ErrorContext, ProcessOutput, SkippedReason, TranscodeTask, VideoMetadata,
