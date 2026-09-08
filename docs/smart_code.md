@@ -179,34 +179,71 @@ df_to_csv  df_to_jsonl  df_to_parquet
 
 #### 核心库（`rencoder_lib`）
 
+模块划分按工作流组织。`data/` 是工作记录层（不是视频分析层），`encoder/` 是 ffmpeg
+构建与执行层，`pipeline/` 是 CLI→任务→记录的编排层，`utils/` 是跨模块的共享工具。
+`ffmpeg/` 这一层消失 —— 它的内容拆进 `data/extract.rs`（probe 是数据采集）和
+`pipeline/{cache,batch}.rs`（cache 和 batch 执行是工作流），以及 `encoder/{command,select}.rs`。
+原 `processor/batch.rs` 和 `ffmpeg/encoder_cache.rs` 合并为 `pipeline/`；原 `fps/` 拆入
+`data/record.rs` 和 `pipeline/batch.rs`。
+
 ```
 rencoder_lib/
-├── lib.rs                # 库入口
-├── error.rs              # EncodeError（#[non_exhaustive]）
-├── config.rs             # 配置结构
-├── types.rs              # 公共数据结构
-├── path_util.rs          # 路径规范化、输出路径生成
-├── collect.rs            # 文件收集（walkdir，不跟随符号链接）
-├── ffmpeg/
+├── lib.rs                       # 库入口，pub mod 声明
+├── config/
+│   └── mod.rs                   # Config + load() + max_fps_config()
+├── utils/
+│   ├── mod.rs                   # 重导出
+│   ├── fs.rs                    # 路径规范化、文件收集辅助
+│   └── time.rs                  # UTC 时间戳格式化（ISO 8601）
+├── data/
+│   ├── mod.rs                   # EncodingRecord 类型 + 跨子模块重导出
+│   ├── extract.rs               # 数据采集：probe_video_metadata、stderr 捕获、output size 捕获
+│   ├── record.rs                # 记录构建：probe + 过程 + 结果 → EncodingRecord
+│   └── store.rs                 # 存储：records → DataFrame → CSV / JSONL / Parquet
+├── pipeline/
 │   ├── mod.rs
-│   ├── probe.rs          # 元数据探测（ffprobe 命令行，默认）
-│   ├── encoder.rs        # 编码器选择
-│   ├── encoder_cache.rs  # 编码器缓存 + NVIDIA 检测
-│   └── command.rs        # FFmpeg 命令构建（含 MAX_FPS 参数映射）
-├── fps/
-│   ├── mod.rs
-│   ├── parse.rs          # 帧率原始值解析
-│   └── limit.rs          # MaxFpsConfig
-├── analyzer/
-│   ├── mod.rs
-│   └── fps_stats.rs      # 分析器：probe → AnalysisRecord → Polars 聚合 → FpsStats / CSV
-├── processor/
-│   ├── mod.rs
-│   └── batch.rs          # 批量处理（失败不中断）
-└── ffi/                  # 可选：C 桥接层（c-probe 特性）
+│   ├── batch.rs                 # 编排：collect_files → transcode_batch（按文件循环，写记录+日志）
+│   └── cache.rs                 # init_encoder_cache（ffmpeg -encoders + nvidia-smi）
+└── encoder/
+    ├── mod.rs
+    ├── command.rs               # build_ffmpeg_command（参数映射，含 -r 输出选项位置）
+    └── select.rs                # select_encoder（cache + Config → 编码器名）
+
+# 仍在 c-probe feature 门控下（独立于上面的分层）：
+└── c-probe/                     # 旧 ffi/ 重命名；C 桥接层 + Rust 包装
     ├── mod.rs
     └── video_probe.c
 ```
+
+**为什么这样分层**：
+
+- **data/** 是工作记录层（work-record layer）。四种状态（source / process / result / status）
+  都是工作分析的维度，不是视频分析。`extract` 拿到原始数据，`record` 把它组装成 `EncodingRecord`，
+  `store` 把它写到 `data/` 目录供下游 DuckDB / Polars 查询。
+- **encoder/** 是 ffmpeg 特定的实现细节。`command` 把 `EncodeParams` 转成 argv，`select` 选编码器。
+  这层**只**对 ffmpeg 关心；不包含 cache（cache 是工作流层的事）。
+- **pipeline/** 是 CLI → 任务 → 记录的编排。它收集文件、循环每个文件、调用 encoder、
+  收集 capture 写入 record、调 log。`batch.rs` 是这一层的主要实现，`cache.rs` 是辅助。
+- **utils/** 是跨模块共享的最小工具集。`fs` 路径规范化，`time` UTC 时间戳。
+  配置（`config/`）和日志（CLI 端 `tracing_init`）**不**在这一层 —— 配置是数据驱动的，
+  日志是跨切的关注点，不应该被当成数据层依赖。
+
+**为什么去掉 `analyzer/` 和 `fps/`**：
+
+- `analyzer/fps_stats.rs` 是历史遗留的「按 fps 分组」分析，跟 `data/` 的工作记录不是一回事。
+  当真有 `--query "SELECT fps, COUNT(*) ..."` 这种 CLI 时再回来；目前 Pass 1-2 没有这条路径。
+- `fps/` 拆为 `fps::parse`（数字解析）和 `fps::limit`（max-fps 谓词），都已经在 `data/record.rs`
+  和 `pipeline/batch.rs` 里使用了（probe 阶段解析 fps，batch 阶段判断需不需要降帧）。
+  单独抽一层意义不大。
+- **Probe (`ffmpeg/probe.rs`) 不再是顶层** —— 它是 `data::extract::probe_video_metadata` 的
+  实现细节。CLI 用 `data::extract::probe_video_metadata` 即可，配置层不再直接调 ffmpeg。
+
+**当前不在分层里的概念（按需再加）**：
+
+- `data engine/{express, process, I/O}` —— Pass 2 之前的占位符，YAGNI。Polars 本身
+  就是引擎；我们不需要自己的 wrapper 直到有 CLI 查询接口（`rencoder analyze-query` 之类）。
+- `validation/` —— 配置校验逻辑足够小，跟着 `config/` 走就好。
+- `c-probe/` 的拆分 —— 旧 `ffi/` 重命名即可，不要再分。
 
 #### CLI 前端（`rencoder_cli`）
 

@@ -378,3 +378,102 @@ writer adds ~5-10 MB); `cargo clippy --workspace --all-targets` clean.
 - **Q1**: Should `Config::load` validate negative `max_fps` and reject, or clamp to 0? (deferred to implementation — leaning toward reject with `InvalidParam`)
 - **Q2**: For `analyze_fps`, should the analyzer also output the codec alongside the fps in detailed mode? (deferred — current design only outputs fps; codec tracking would extend `FpsStats.groups` value type)
 - **Q3**: Does Phase 11's CI need macOS runners in addition to Linux? (deferred — depends on whether `c-probe` is gated to Linux-only)
+
+---
+
+## U16. Refactor: data / encoder / pipeline split — PENDING CONFIRMATION (branch: refactor/data-encoder-pipeline)
+
+Design agreed (U16 split). Five top-level modules after the refactor:
+`config/`, `utils/`, `data/`, `pipeline/`, `encoder/`. Old `ffmpeg/`,
+`analyzer/`, `fps/` fold into the new modules. `c-probe/` is renamed from
+`ffi/`. Public API stays stable (renames + module paths only); all
+existing tests keep passing.
+
+Rationale (key points from the design conversation):
+- **data/** is the work-record layer (work-analysis, not video-analysis)
+- **encoder/** is the ffmpeg-specific work (build argv, select codec)
+- **pipeline/** is orchestration (collect → batch loop → record + log)
+- **utils/** is shared infrastructure (fs, time)
+- YAGNI: no `data engine/` until there's an actual query surface
+
+### Staged checklist (each step keeps `cargo test --workspace` green)
+
+**Stage 1 — data/ module extraction**:
+- [ ] Create `data/extract.rs` from `processor/batch.rs` (probe_video_metadata
+      call, stderr capture, output size capture)
+- [ ] Create `data/record.rs` from `processor/batch.rs` (EncodingRecord
+      assembly, encoding_settings_from_params helper, make_skipped_record
+      / make_failed_probe_record constructors)
+- [ ] Create `data/store.rs` from `encoding/output.rs` (records_to_dataframe,
+      records_to_csv / jsonl / parquet, dataframe_to_* helpers)
+- [ ] `lib.rs`: register `pub mod data;` with `mod extract; mod record;
+      mod store;` and re-export `data::EncodingRecord` at crate root
+- [ ] Verify: `cargo test -p rencoder_lib --lib` passes (existing tests
+      still pass; only module paths change)
+
+**Stage 2 — pipeline/ module**:
+- [ ] Create `pipeline/cache.rs` from `ffmpeg/encoder_cache.rs`
+      (`init_encoder_cache` + private runner seam)
+- [ ] Create `pipeline/batch.rs` from `processor/batch.rs` (transcode_batch,
+      transcode_single, build_argv / run_ffmpeg_with_stderr helpers,
+      transcode_batch_with_processor test seam)
+- [ ] `lib.rs`: register `pub mod pipeline;` with `mod batch; mod cache;`
+- [ ] Update `processor/batch.rs` → `pipeline/batch.rs` callers
+- [ ] Verify: `cargo test -p rencoder_lib --lib` passes; integration
+      tests still pass
+
+**Stage 3 — encoder/ module**:
+- [ ] Create `encoder/command.rs` from `ffmpeg/command.rs`
+      (`build_ffmpeg_command`, `should_skip_encoding`)
+- [ ] Create `encoder/select.rs` from `ffmpeg/encoder.rs` (`select_encoder`)
+- [ ] `lib.rs`: register `pub mod encoder;` with `mod command; mod select;`
+- [ ] Update callers in `pipeline/batch.rs`
+- [ ] Verify: `cargo test -p rencoder_lib --lib` passes
+
+**Stage 4 — utils/ module**:
+- [ ] Create `utils/fs.rs` from `path_util.rs` (normalize,
+      output_path_for, plus any helpers used in collect.rs)
+- [ ] Create `utils/time.rs` (UTC timestamp formatting helper)
+- [ ] `lib.rs`: register `pub mod utils;` with `mod fs; mod time;` and
+      re-export `utils::normalize` at crate root if needed
+- [ ] Verify: `cargo test --workspace` passes
+
+**Stage 5 — cleanup**:
+- [ ] Delete old modules: `ffmpeg/`, `analyzer/`, `fps/`, `processor/`,
+      `path_util.rs` (when all references are migrated)
+- [ ] Rename `ffi/` → `c-probe/`
+- [ ] `lib.rs`: remove old `pub mod` declarations; ensure only new modules
+      remain
+- [ ] Verify: `cargo build --workspace --all-targets` clean;
+      `cargo test --workspace` passes; `cargo clippy --workspace
+      --all-targets` clean
+
+**Stage 6 — finalize**:
+- [ ] Update README with the new layout diagram
+- [ ] Verify no public API rename (callers should still work)
+- [ ] Final test sweep across all features
+- [ ] Tag the refactor commit
+
+### Constraints (apply to every stage)
+
+- **No public API rename.** Internal file moves are OK; pub use re-exports
+  keep the same paths for downstream callers.
+- **`cargo test --workspace` green after each commit.** Don't accumulate
+  failures across stages.
+- **One commit per stage** (or per logical chunk within a stage).
+- **Clippy clean** at each commit.
+
+### Migration safety
+
+- Each `git mv` is tracked by git's rename detection (1 commit = move +
+  edits, not delete + add).
+- Test runners (`tests/integration.rs`, `tests/cli.rs`) use module paths
+  like `crate::types::EncodingRecord` — those work regardless of file
+  location; only `use crate::ffmpeg::probe_video_metadata_auto` style imports
+  need updating.
+- C bridge (`src/ffi/`) is renamed to `src/c-probe/` in Stage 5 only
+  (the feature flag wiring in `Cargo.toml` updates once).
+
+**Verify (final)**: `cargo test --workspace` 200+/200+;
+`cargo clippy --workspace --all-targets` clean; `cargo build --release`
+binary size stable; public API unchanged.
