@@ -422,13 +422,13 @@ Rationale (key points from the design conversation):
 - [x] Verify: `cargo test -p rencoder_lib --lib` passes; integration
       tests still pass
 
-**Stage 3 — encoder/ module**:
-- [ ] Create `encoder/command.rs` from `ffmpeg/command.rs`
+**Stage 3 — encoder/ module**: [x] DONE (commit a4ede96)
+- [x] Create `encoder/command.rs` from `ffmpeg/command.rs`
       (`build_ffmpeg_command`, `should_skip_encoding`)
-- [ ] Create `encoder/select.rs` from `ffmpeg/encoder.rs` (`select_encoder`)
-- [ ] `lib.rs`: register `pub mod encoder;` with `mod command; mod select;`
-- [ ] Update callers in `pipeline/batch.rs`
-- [ ] Verify: `cargo test -p rencoder_lib --lib` passes
+- [x] Create `encoder/select.rs` from `ffmeg/encoder.rs` (`select_encoder`)
+- [x] `lib.rs`: register `pub mod encoder;` with `mod command; mod select;`
+- [x] Update callers in `pipeline/batch.rs`
+- [x] Verify: `cargo test -p rencoder_lib --lib` passes
 
 **Stage 4 — utils/ module**:
 - [ ] Create `utils/fs.rs` from `path_util.rs` (normalize,
