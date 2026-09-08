@@ -411,15 +411,15 @@ Rationale (key points from the design conversation):
 - [x] Verify: `cargo test -p rencoder_lib --lib` passes (existing tests
       still pass; only module paths change)
 
-**Stage 2 — pipeline/ module**:
-- [ ] Create `pipeline/cache.rs` from `ffmpeg/encoder_cache.rs`
+**Stage 2 — pipeline/ module**: [x] DONE (commit 21927d8)
+- [x] Create `pipeline/cache.rs` from `ffmpeg/encoder_cache.rs`
       (`init_encoder_cache` + private runner seam)
-- [ ] Create `pipeline/batch.rs` from `processor/batch.rs` (transcode_batch,
+- [x] Create `pipeline/batch.rs` from `processor/batch.rs` (transcode_batch,
       transcode_single, build_argv / run_ffmpeg_with_stderr helpers,
       transcode_batch_with_processor test seam)
-- [ ] `lib.rs`: register `pub mod pipeline;` with `mod batch; mod cache;`
-- [ ] Update `processor/batch.rs` → `pipeline/batch.rs` callers
-- [ ] Verify: `cargo test -p rencoder_lib --lib` passes; integration
+- [x] `lib.rs`: register `pub mod pipeline;` with `mod batch; mod cache;`
+- [x] Update `processor/batch.rs` → `pipeline/batch.rs` callers
+- [x] Verify: `cargo test -p rencoder_lib --lib` passes; integration
       tests still pass
 
 **Stage 3 — encoder/ module**:
