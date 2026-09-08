@@ -5,3 +5,4 @@
 /log/
 /rencoder_cli/log/
 .claude/settings.local.json
+rencoder_cli/data/

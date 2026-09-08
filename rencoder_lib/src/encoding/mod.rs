@@ -5,7 +5,7 @@
 //! `output` produces CSV / JSONL / Parquet via a single canonical
 //! `DataFrame` schema.
 
-mod output;
+pub mod output;
 
 pub use output::{
     dataframe_to_csv, dataframe_to_jsonl, dataframe_to_parquet, records_to_csv,
