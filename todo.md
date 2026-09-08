@@ -308,7 +308,7 @@ Parquet-as-canonical with JSONL streaming.
 - **Default stdout**: JSONL (one full record per line, all fields, nulls
   omitted) — stream-friendly, pipe to jq/duckdb.
 - **`-o path.parquet`**: Parquet with Snappy compression, embedded schema;
-  one file per CLI run, named `./logs/encoding-<UTC-ISO8601>Z.parquet`
+  one file per CLI run, named `./data/encoding-<UTC-ISO8601>Z.parquet`
   (auto-generated if `-o` omitted).
 - **`-o path.jsonl`**: NDJSON, also file-per-run.
 - **`-o path.csv`**: legacy compat (subset of columns).
@@ -344,7 +344,7 @@ Schema evolution: edit `records_to_dataframe` once.
 - [ ] Add `records_to_parquet` via `dataframe_to_parquet` (Polars
       `ParquetWriter` with Snappy compression)
 - [ ] Update CLI: `-o PATH` extension determines format; default
-      timestamped Parquet in `./logs/`
+      timestamped Parquet in `./data/`
 - [ ] Update CLI summary: end-of-batch aggregate (total files, total
       bytes in/out, throughput, failure rate by category)
 - [ ] Tests: new EncodingRecord field capture; DataFrame writer
@@ -357,7 +357,7 @@ Schema evolution: edit `records_to_dataframe` once.
 - [ ] `--log-file PATH` flag for append-mode NDJSON monitoring log
       (NDJSON is append-friendly; Parquet isn't)
 - [ ] Multi-batch query examples in README (DuckDB glob over
-      `./logs/*.parquet`)
+      `./data/*.parquet`)
 - [ ] README updates: replace CSV-default examples with JSONL or
       Parquet per use case
 

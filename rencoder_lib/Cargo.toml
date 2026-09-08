@@ -13,7 +13,7 @@ thiserror = "1"
 num_cpus = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 rayon = { version = "1", optional = true }
-polars = { version = "0.53", default-features = false, features = ["csv", "lazy", "fmt", "parquet", "json"] }
+polars = { version = "0.53", default-features = false, features = ["csv", "lazy", "fmt", "parquet", "json", "dtype-datetime", "temporal"] }
 
 [features]
 default = []

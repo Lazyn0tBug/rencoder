@@ -8,6 +8,7 @@
 pub mod analyzer;
 pub mod collect;
 pub mod config;
+pub mod encoding;
 pub mod error;
 pub mod ffmpeg;
 pub mod fps;
