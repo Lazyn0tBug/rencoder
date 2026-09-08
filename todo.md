@@ -398,17 +398,17 @@ Rationale (key points from the design conversation):
 
 ### Staged checklist (each step keeps `cargo test --workspace` green)
 
-**Stage 1 — data/ module extraction**:
-- [ ] Create `data/extract.rs` from `processor/batch.rs` (probe_video_metadata
+**Stage 1 — data/ module extraction**: [x] DONE (commit b62463e)
+- [x] Create `data/extract.rs` from `processor/batch.rs` (probe_video_metadata
       call, stderr capture, output size capture)
-- [ ] Create `data/record.rs` from `processor/batch.rs` (EncodingRecord
+- [x] Create `data/record.rs` from `processor/batch.rs` (EncodingRecord
       assembly, encoding_settings_from_params helper, make_skipped_record
       / make_failed_probe_record constructors)
-- [ ] Create `data/store.rs` from `encoding/output.rs` (records_to_dataframe,
+- [x] Create `data/store.rs` from `encoding/output.rs` (records_to_dataframe,
       records_to_csv / jsonl / parquet, dataframe_to_* helpers)
-- [ ] `lib.rs`: register `pub mod data;` with `mod extract; mod record;
+- [x] `lib.rs`: register `pub mod data;` with `mod extract; mod record;
       mod store;` and re-export `data::EncodingRecord` at crate root
-- [ ] Verify: `cargo test -p rencoder_lib --lib` passes (existing tests
+- [x] Verify: `cargo test -p rencoder_lib --lib` passes (existing tests
       still pass; only module paths change)
 
 **Stage 2 — pipeline/ module**:
