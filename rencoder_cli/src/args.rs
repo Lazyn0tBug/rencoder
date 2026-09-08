@@ -93,6 +93,11 @@ pub struct EncodeArgs {
     #[arg(long = "config")]
     pub config: Option<PathBuf>,
 
+    /// Output path. Extension picks the format (.parquet, .jsonl, .csv).
+    /// Default: timestamped Parquet in `./data/encoding-<UTC-ISO8601>Z.parquet`.
+    #[arg(short = 'o', long = "output")]
+    pub output: Option<PathBuf>,
+
     /// Pass-through args to ffmpeg (everything after `--`).
     #[arg(last = true)]
     pub extra_args: Vec<String>,

@@ -12,9 +12,6 @@ pub use output::{
     records_to_dataframe, records_to_jsonl, records_to_parquet,
 };
 
-use chrono::{DateTime, Utc};
-use std::path::PathBuf;
-
 pub use crate::types::{
     EncodingOutcome, EncodingRecord, EncoderSettings, ErrorCategory, ErrorContext, SkippedReason,
 };
@@ -23,6 +20,7 @@ pub use crate::types::{
 mod tests {
     use super::*;
     use crate::types::{EncodingOutcome, EncoderSettings, ErrorCategory, ErrorContext};
+    use chrono::{DateTime, Utc};
 
     fn sample_record() -> EncodingRecord {
         EncodingRecord {

@@ -44,8 +44,8 @@ fn main() -> Result<()> {
 }
 
 /// `rencoder encode ...` -- full pipeline: load config, init encoder
-/// cache, install SIGINT handler, collect files, run the batch, print
-/// per-file + summary lines.
+/// cache, install SIGINT handler, collect files, run the batch,
+/// write per-file records to the default `./data/encoding-*.parquet`.
 #[instrument(skip_all, fields(format = ?_args.format, files = tracing::field::Empty))]
 fn encode_cmd(_args: args::EncodeArgs) -> Result<()> {
     let config = match &_args.config {
@@ -92,7 +92,7 @@ fn encode_cmd(_args: args::EncodeArgs) -> Result<()> {
     // the current output path so a SIGINT cleans up the partial file.
     let _current_output = signal::install_handler();
 
-    let results = transcode_batch(
+    let records = transcode_batch(
         &params,
         &files,
         &cache,
@@ -101,8 +101,51 @@ fn encode_cmd(_args: args::EncodeArgs) -> Result<()> {
         None,
     );
 
-    print_encode_summary(&results);
+    // Default output: timestamped Parquet in ./data/. Extension of -o
+    // picks the format: .parquet | .jsonl | .csv.
+    let output_path = match &_args.output {
+        Some(p) => p.clone(),
+        None => default_data_path(),
+    };
+    write_records(&records, &output_path)?;
+    print_encode_summary(&records);
 
+    Ok(())
+}
+
+/// `data/encoding-<UTC-ISO8601>Z.parquet` -- one file per run, named by
+/// start time. ISO 8601 UTC (no localtime surprises); `:` replaced
+/// with `-` for filesystem safety on macOS / Windows.
+fn default_data_path() -> std::path::PathBuf {
+    let ts = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ").to_string();
+    std::path::PathBuf::from("data").join(format!("encoding-{ts}.parquet"))
+}
+
+/// Write the records to the given path. Extension determines format.
+fn write_records(
+    records: &[rencoder_lib::types::EncodingRecord],
+    path: &std::path::Path,
+) -> Result<()> {
+    use rencoder_lib::encoding;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create directory {}", parent.display()))?;
+        }
+    }
+    let bytes = match path.extension().and_then(|e| e.to_str()) {
+        Some("parquet") => encoding::records_to_parquet(records)
+            .with_context(|| "parquet encode failed")?,
+        Some("jsonl") | Some("ndjson") => encoding::records_to_jsonl(records).into_bytes(),
+        Some("csv") => encoding::records_to_csv(records).into_bytes(),
+        other => anyhow::bail!(
+            "unsupported output extension {:?}; use .parquet, .jsonl, or .csv",
+            other
+        ),
+    };
+    std::fs::write(path, bytes)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    eprintln!("Wrote {} record(s) to {}", records.len(), path.display());
     Ok(())
 }
 
