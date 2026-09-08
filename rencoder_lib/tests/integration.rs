@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use rencoder_lib::{
     analyzer::fps_stats::analyze_fps,
     config::Config,
-    ffmpeg::{encoder_cache::init_encoder_cache, probe::probe_video_metadata},
-    processor::batch::{transcode_batch, transcode_single},
+    ffmpeg::probe::probe_video_metadata,
+    pipeline::{cache::init_encoder_cache, batch::{transcode_batch, transcode_single}},
     types::{
         EncodeParams, EncoderCache, ProcessOutput, Target, TranscodeTask, VideoFormat,
     },

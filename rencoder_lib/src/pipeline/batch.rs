@@ -581,7 +581,7 @@ Encoders:
         // processor seam (`transcode_batch_with_processor`) with a
         // canned success path that mimics what a real successful
         // transcode_with_argv would produce.
-        let records = crate::processor::batch::transcode_batch_with_processor_for_test(
+        let records = super::transcode_batch_with_processor_for_test(
             &params,
             std::slice::from_ref(&task.input),
             |_, _| Ok(test_succeeded_record(&task, &params)),

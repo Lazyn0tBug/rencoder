@@ -11,8 +11,7 @@ use clap::Parser;
 use rencoder_lib::{
     collect::collect_files,
     config::Config,
-    ffmpeg::encoder_cache::init_encoder_cache,
-    processor::batch::transcode_batch,
+    pipeline::{batch::transcode_batch, cache::init_encoder_cache},
     types::{
         EncodeParams, EncodingOutcome, ProcessOutput, SkippedReason, Target, VideoFormat,
     },

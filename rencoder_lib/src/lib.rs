@@ -14,7 +14,7 @@ pub mod error;
 pub mod ffmpeg;
 pub mod fps;
 pub mod path_util;
-pub mod processor;
+pub mod pipeline;
 pub mod types;
 
 /// Optional C FFI bridge to libavformat for high-performance probing.
