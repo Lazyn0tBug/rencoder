@@ -37,6 +37,29 @@ cargo build --release
 # Binary: target/release/rencoder
 ```
 
+### Distribution build
+
+For a packaged release (binary + LICENSE + README bundled into a
+versioned tarball plus an extracted copy at a stable path):
+
+```sh
+# One-time prereq
+cargo install cargo-dist
+
+# Build for the host target
+./scripts/dist.sh
+# Outputs:
+#   dist/rencoder_cli-<target>.tar.xz   versioned archive
+#   dist/rencoder_cli-<target>/         extracted: rencoder + LICENSE + README
+#   dist/*.sha256                       checksums
+```
+
+The script wraps `dist build` (cargo-dist) and stages its output into
+`./dist/`. Build for a different target with
+`./scripts/dist.sh --target <triple>`. Full multi-target CI builds use
+`dist build` directly; see `dist-workspace.toml` for the configured
+target list.
+
 ## Quickstart
 
 A copyable reference config ships at
