@@ -131,6 +131,17 @@ fn parse_encoders(v: Option<&Value>) -> EncoderConfig {
     }
 }
 
+impl From<&project::EncodersConfig> for EncoderConfig {
+    fn from(e: &project::EncodersConfig) -> Self {
+        Self {
+            av1: e.av1.clone(),
+            x264: e.x264.clone(),
+            hevc: e.hevc.clone(),
+            vp9: e.vp9.clone(),
+        }
+    }
+}
+
 /// Build a runtime `Config` from a `ProjectConfig`'s `encode` section.
 /// Missing fields fall back to `Config::default()`. The CLI uses this
 /// after loading `rencoder.toml` to feed `batch::transcode_batch` and
@@ -143,12 +154,11 @@ impl Config {
         Self {
             max_fps: enc.max_fps.unwrap_or(0) as f64,
             max_fps_eps: 0.05,
-            encoders: EncoderConfig {
-                av1: enc.encoders.as_ref().and_then(|e| e.av1.clone()),
-                x264: enc.encoders.as_ref().and_then(|e| e.x264.clone()),
-                hevc: enc.encoders.as_ref().and_then(|e| e.hevc.clone()),
-                vp9: enc.encoders.as_ref().and_then(|e| e.vp9.clone()),
-            },
+            encoders: enc
+                .encoders
+                .as_ref()
+                .map(EncoderConfig::from)
+                .unwrap_or_default(),
         }
     }
 }

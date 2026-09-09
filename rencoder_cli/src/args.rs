@@ -78,9 +78,11 @@ pub struct AnalyzeArgs {
     #[arg(long = "config")]
     pub config: Option<PathBuf>,
 
-    /// Output file path. `-` for stdout (default).
-    #[arg(short = 'o', long = "output", default_value = "-")]
-    pub output: PathBuf,
+    /// Output file path. No default — without `-o`, the value comes from
+    /// `[analyze].output` in `rencoder.toml` (falling back to stdout `-`).
+    /// Explicit `-o -` means "stdout, ignore any `[analyze].output` setting".
+    #[arg(short = 'o', long = "output")]
+    pub output: Option<PathBuf>,
 }
 
 #[cfg(test)]
@@ -247,7 +249,7 @@ mod tests {
                 assert_eq!(args.dir, None);
                 assert_eq!(args.file, None);
                 assert_eq!(args.config, None);
-                assert_eq!(args.output, PathBuf::from("-"));
+                assert_eq!(args.output, None);
             }
             _ => panic!("expected Analyze"),
         }
@@ -269,7 +271,7 @@ mod tests {
             Command::Analyze(args) => {
                 assert_eq!(args.dir, Some(PathBuf::from("/d")));
                 assert_eq!(args.config, Some(PathBuf::from("rencoder.toml")));
-                assert_eq!(args.output, PathBuf::from("stats.txt"));
+                assert_eq!(args.output, Some(PathBuf::from("stats.txt")));
             }
             _ => panic!(),
         }

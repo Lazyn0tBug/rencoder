@@ -126,11 +126,14 @@ fn encode_cmd(args: args::EncodeArgs) -> Result<()> {
 }
 
 /// `data/encoding-<UTC-ISO8601>Z.parquet` -- one file per run, named by
-/// start time. ISO 8601 UTC (no localtime surprises); `:` replaced
-/// with `-` for filesystem safety on macOS / Windows.
+/// start time. Uses the canonical UTC timestamp formatter from
+/// `rencoder_lib::utils::time` so the format stays in sync with the
+/// library's docs.
 fn default_data_path() -> PathBuf {
-    let ts = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ").to_string();
-    PathBuf::from("data").join(format!("encoding-{ts}.parquet"))
+    PathBuf::from("data").join(format!(
+        "encoding-{}.parquet",
+        rencoder_lib::utils::time::utc_timestamp_filename()
+    ))
 }
 
 /// Write the records to the given path. Extension determines format.
@@ -183,6 +186,7 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
     info!("analyzing {} file(s)", files.len());
 
     let parallel = an.and_then(|a| a.parallel).unwrap_or(false);
+    tracing::Span::current().record("parallel", parallel);
 
     let records = if parallel {
         rencoder_lib::analyzer::fps_stats::analyze_records_parallel(&files)
@@ -199,17 +203,18 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
         stats.total_files, stats.parsed_files, stats.failed_files,
     );
 
-    // Format precedence: CLI `-o` wins; else `analyze.output` from config;
-    // else the default `-` (stdout).
-    let output_path: PathBuf = if args.output != Path::new("-") {
-        args.output.clone()
-    } else if let Some(p) = an.and_then(|a| a.output.clone()) {
-        p
-    } else {
-        PathBuf::from("-")
-    };
+    // Output precedence: explicit `-o` (any value, including `-`) wins;
+    // else `[analyze].output` from config; else `-` (stdout). This works
+    // because CLI parses `output: Option<PathBuf>` with no default — no `-o`
+    // means `None`, distinct from explicit `-o -`.
+    let output_path: PathBuf = args
+        .output
+        .clone()
+        .or_else(|| an.and_then(|a| a.output.clone()))
+        .unwrap_or_else(|| PathBuf::from("-"));
 
-    // Format-specific body, then dispatch to stdout-or-file based on -o.
+    // Format-specific body, then dispatch to stdout-or-file based on the
+    // resolved output path. `output_path == "-"` means stdout.
     let render = |body: String| -> Result<()> {
         if output_path == Path::new("-") {
             print!("{body}");
@@ -388,7 +393,7 @@ mod tests {
             dir: Some(PathBuf::from("/ignored")),
             file: Some(PathBuf::from("/single.mp4")),
             config: None,
-            output: PathBuf::from("-"),
+            output: None,
         };
         let target = target_from_analyze_args(&args).unwrap();
         match target {
@@ -403,7 +408,7 @@ mod tests {
             dir: Some(PathBuf::from("/some/dir")),
             file: None,
             config: None,
-            output: PathBuf::from("-"),
+            output: None,
         };
         let target = target_from_analyze_args(&args).unwrap();
         match target {
@@ -418,7 +423,7 @@ mod tests {
             dir: None,
             file: None,
             config: None,
-            output: PathBuf::from("-"),
+            output: None,
         };
         let target = target_from_analyze_args(&args).unwrap();
         match target {
@@ -443,8 +448,9 @@ mod tests {
     }
 
     #[test]
-    fn analyze_format_default_is_csv() {
-        // No config section -> default format is CSV.
+    fn analyze_format_field_defaults_to_none() {
+        // No config section -> `analyze.format` is None. main.rs then
+        // resolves None -> AnalyzeFormatArg::Csv (the CLI-level default).
         let an = AnalyzeConfig::default();
         assert!(an.format.is_none());
     }

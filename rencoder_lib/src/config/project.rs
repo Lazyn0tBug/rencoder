@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::types::{MaxFpsConfig, VideoFormat};
+use crate::types::VideoFormat;
 
 /// Top-level user-facing config. Both sections are optional; missing
 /// sections fall back to their per-action defaults.
@@ -90,8 +90,8 @@ impl ProjectConfig {
     }
 
     /// Validate that all set values are sensible. Today this checks
-    /// `max_fps` is in the canonical set; other fields are
-    /// type-validated at parse time.
+    /// `max_fps` is in the canonical set and `bitrate` is non-zero;
+    /// other fields are type-validated at parse time.
     fn validate(&self) -> Result<(), ConfigError> {
         if let Some(enc) = &self.encode {
             if let Some(m) = enc.max_fps {
@@ -102,45 +102,16 @@ impl ProjectConfig {
                     });
                 }
             }
-        }
-        Ok(())
-    }
-
-    /// Build a `MaxFpsConfig` from this project's encode config (if
-    /// set) merged with the CLI override (if any).
-    pub fn max_fps(&self, cli_override: Option<u32>) -> MaxFpsConfig {
-        let m = cli_override
-            .or_else(|| self.encode.as_ref()?.max_fps)
-            .unwrap_or(0);
-        MaxFpsConfig {
-            max_fps: m as f64,
-            eps: 0.05,
-        }
-    }
-
-    /// Build the per-format encoder override map, merging CLI overrides
-    /// on top of the project's encoder config. CLI takes precedence.
-    pub fn encoders(
-        &self,
-        cli_overrides: &std::collections::HashMap<FormatArg, String>,
-    ) -> std::collections::HashMap<FormatArg, String> {
-        let mut out = std::collections::HashMap::new();
-        if let Some(enc) = self.encode.as_ref().and_then(|e| e.encoders.as_ref()) {
-            for (k, v) in [
-                (FormatArg::Av1, enc.av1.clone()),
-                (FormatArg::X264, enc.x264.clone()),
-                (FormatArg::Hevc, enc.hevc.clone()),
-                (FormatArg::Vp9, enc.vp9.clone()),
-            ] {
-                if let Some(v) = v {
-                    out.insert(k, v);
+            if let Some(b) = enc.bitrate {
+                if b == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "encode.bitrate".into(),
+                        value: "0".into(),
+                    });
                 }
             }
         }
-        for (k, v) in cli_overrides {
-            out.insert(*k, v.clone());
-        }
-        out
+        Ok(())
     }
 }
 
@@ -221,23 +192,13 @@ mod tests {
     }
 
     #[test]
-    fn max_fps_merges_cli_over_default() {
-        let cfg = ProjectConfig::default();
-        let m = cfg.max_fps(Some(60));
-        assert_eq!(m.max_fps as u32, 60);
-    }
-
-    #[test]
-    fn max_fps_uses_config_value() {
-        let cfg = ProjectConfig {
-            encode: Some(EncodeConfig {
-                max_fps: Some(30),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let m = cfg.max_fps(None);
-        assert_eq!(m.max_fps as u32, 30);
+    fn zero_bitrate_rejected() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("rencoder_zero_bitrate.toml");
+        std::fs::write(&path, "[encode]\nbitrate = 0\n").unwrap();
+        let err = ProjectConfig::load(&path).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue { .. }));
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
