@@ -438,13 +438,13 @@ Rationale (key points from the design conversation):
       re-export `utils::normalize` at crate root if needed
 - [ ] Verify: `cargo test --workspace` passes
 
-**Stage 5 — cleanup**:
-- [ ] Delete old modules: `ffmpeg/`, `analyzer/`, `fps/`, `processor/`,
+**Stage 5 — cleanup**: [x] DONE (commit 941a01e)
+- [x] Delete old modules: `ffmeg/`, `analyzer/`, `fps/`, `processor/`,
       `path_util.rs` (when all references are migrated)
-- [ ] Rename `ffi/` → `c-probe/`
-- [ ] `lib.rs`: remove old `pub mod` declarations; ensure only new modules
+- [x] Rename `ffi/` → `c-probe/`
+- [x] `lib.rs`: remove old `pub mod` declarations; ensure only new modules
       remain
-- [ ] Verify: `cargo build --workspace --all-targets` clean;
+- [x] Verify: `cargo build --workspace --all-targets` clean;
       `cargo test --workspace` passes; `cargo clippy --workspace
       --all-targets` clean
 
