@@ -1,0 +1,60 @@
+# Rencoder project config (TOML).
+#
+# Place this file at the project root as `./rencoder.toml` (default path)
+# or pass `--config /path/to/rencoder.toml` to override.
+#
+# U17 split: only `target` (-f/-d) and `action` (encode/analyze) live on
+# the CLI. Everything else (format, bitrate, max-fps, crf, nv,
+# extensions, encoder overrides, analyze format, parallel) belongs here.
+# A missing file is not an error; missing fields fall back to defaults.
+# Unknown keys are rejected so typos surface immediately.
+
+[encode]
+# Target format. One of: x264 | hevc | vp9 | av1. Default: av1.
+format = "av1"
+
+# Bitrate in Kbps (default mode). Ignored when `crf = true`.
+bitrate = 5000
+
+# Use CRF mode instead of bitrate. The `bitrate` field is then the CRF value.
+crf = false
+
+# Cap source FPS at this canonical value. Strict `>` with a 0.05 epsilon:
+# a 29.97 source at cap=30 stays as-is. Must be 0 (disabled) or one of
+# 24, 25, 30, 60. Other values are rejected at load time.
+max_fps = 0
+
+# Enable NVIDIA hardware acceleration via NVENC. Falls back silently
+# when nvidia-smi is missing or no NVENC encoders are compiled into ffmpeg.
+nv = false
+
+# Extension filter for `encode -d DIR`. Empty = all files.
+extensions = ["mp4", "mov", "mkv"]
+
+# Optional: directory where encoded outputs land. Not wired yet (output
+# paths are computed per-input via `output_path_for`); reserved for a
+# future stage where batch output lands in a single project directory.
+# output_dir = "encoded"
+
+[encode.encoders]
+# Per-format encoder overrides. Each entry replaces the built-in default
+# (libsvtav1, libx264, libx265, libvpx-vp9). If the named encoder isn't
+# compiled into ffmpeg, the selection chain falls through to the default.
+# av1 = "libsvtav1"
+# x264 = "libx264"
+# hevc = "libx265"
+# vp9 = "libvpx-vp9"
+
+[analyze]
+# Output format. One of: csv | table | text | json. Default: csv.
+format = "csv"
+
+# Parallel analysis via rayon (Phase 12 feature; opt in per-project).
+parallel = false
+
+# Extension filter for `analyze -d DIR`. Empty = all files.
+# extensions = ["mp4", "mov", "mkv"]
+
+# Optional: write the analyze output to this path instead of stdout.
+# The CLI `-o` flag overrides this per-run; `-` means stdout (default).
+# output = "fps_stats.txt"

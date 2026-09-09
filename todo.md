@@ -477,3 +477,72 @@ Rationale (key points from the design conversation):
 **Verify (final)**: `cargo test --workspace` 200+/200+;
 `cargo clippy --workspace --all-targets` clean; `cargo build --release`
 binary size stable; public API unchanged.
+
+## U17. CLI / config split — DONE (branch: feat/cli-config-split)
+
+User asked: keep only `target` (`-f`/`-d`) and `action` (`encode` /
+`analyze`) on the CLI; everything else moves to a TOML config file. A
+new `ProjectConfig` schema replaces the old JSON `Config` as the
+user-facing surface; the runtime `Config` (used by `batch::transcode_batch`
+and `encoder::select::select_encoder`) is now built from
+`ProjectConfig.encode` via `Config::from_project`.
+
+### Schema (TOML)
+
+```toml
+[encode]
+format = "av1"             # x264 | hevc | vp9 | av1
+bitrate = 5000             # Kbps in bitrate mode; CRF value when crf=true
+crf = false
+max_fps = 0                # 0 disables; else 24, 25, 30, 60
+nv = false
+extensions = ["mp4", "mov", "mkv"]
+
+[encode.encoders]
+av1 = "libsvtav1"          # per-format override (optional)
+x264 = "libx264"
+hevc = "libx265"
+vp9 = "libvpx-vp9"
+
+[analyze]
+format = "csv"             # csv | table | text | json
+parallel = false
+extensions = []
+output = "fps_stats.txt"   # CLI -o wins per-run
+```
+
+### CLI surface (U17)
+
+```
+rencoder encode   -f FILE | -d DIR [-i] [--config PATH] [-o OUT] [-- EXTRA...]
+rencoder analyze  -d DIR  | -f FILE      [--config PATH] [-o OUT]
+```
+
+Stripped from CLI (now in config): `-c`/`--format`, `-b`/`--bitrate`,
+`--max-fps`, `--crf`, `--nv`, `-e`/`--ext`, `-p`/`--parallel`.
+
+### Files touched
+
+- `rencoder_lib/Cargo.toml` — added `toml = "0.8"` + `serde` derive
+- `rencoder_lib/src/config/project.rs` — new: `ProjectConfig`,
+  `EncodeConfig`, `AnalyzeConfig`, `EncodersConfig`, `FormatArg`,
+  `AnalyzeFormatArg`, `ConfigError`, `load` / `validate` / `max_fps` /
+  `encoders`
+- `rencoder_lib/src/config/mod.rs` — added `Config::from_project` and
+  re-exports of the project module's public types
+- `rencoder_cli/src/args.rs` — stripped moved flags; tests cover both
+  the kept surface and the explicit rejections of removed flags
+- `rencoder_cli/src/main.rs` — loads `ProjectConfig`, merges into
+  `EncodeParams` / analyze command; default config path
+  `./rencoder.toml`
+- `examples/rencoder.toml` — reference config (every field documented)
+
+### Verify
+
+- `cargo test --workspace` green
+- `cargo clippy --all-targets -- -D warnings` clean
+- `cargo fmt --check` clean
+- New unit tests cover: missing config file → defaults, minimal TOML
+  parsing, invalid `max_fps` rejection, CLI merge precedence (CLI >
+  config > defaults), unknown-keys rejection, and removed-flag
+  rejections at the clap layer.

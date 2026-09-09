@@ -21,16 +21,17 @@ use std::time::Instant;
 use chrono::Utc;
 
 use crate::config::Config;
+use crate::data::extract::probe_video_metadata_auto;
+use crate::encoder::{
+    command::{build_ffmpeg_command, should_skip_encoding},
+    select::select_encoder,
+};
 use crate::error::EncodeError;
-use crate::encoder::{command::{build_ffmpeg_command, should_skip_encoding}, select::select_encoder};
-use crate::ffmpeg::{
-    probe::probe_video_metadata_auto,
+use crate::types::{
+    EncodeParams, EncoderCache, EncoderSettings, EncodingOutcome, EncodingRecord, ErrorCategory,
+    ErrorContext, ProcessOutput, SkippedReason, TranscodeTask, VideoMetadata,
 };
 use crate::utils::fs::output_path_for;
-use crate::types::{
-    EncoderCache, EncodeParams, EncodingOutcome, EncodingRecord, EncoderSettings,
-    ErrorCategory, ErrorContext, ProcessOutput, SkippedReason, TranscodeTask, VideoMetadata,
-};
 
 /// Per-file callback fired after the record is built.
 type ResultCallback = dyn Fn(&EncodingRecord);
@@ -95,9 +96,12 @@ pub fn transcode_batch(
     output: ProcessOutput,
     result_callback: Option<&ResultCallback>,
 ) -> Vec<EncodingRecord> {
-    transcode_batch_with_processor(params, files, |task, params| {
-        transcode_single(task, params, cache, config, output)
-    }, result_callback)
+    transcode_batch_with_processor(
+        params,
+        files,
+        |task, params| transcode_single(task, params, cache, config, output),
+        result_callback,
+    )
 }
 
 /// Core batch loop with an injectable per-file processor. Used by
@@ -218,9 +222,7 @@ fn transcode_with_argv(
             let output_size_bytes = std::fs::metadata(&task.output)
                 .map(|m| m.len())
                 .unwrap_or(0);
-            let source_size_bytes = std::fs::metadata(&task.input)
-                .map(|m| m.len())
-                .unwrap_or(0);
+            let source_size_bytes = std::fs::metadata(&task.input).map(|m| m.len()).unwrap_or(0);
             let compression_ratio = if source_size_bytes > 0 {
                 Some(output_size_bytes as f64 / source_size_bytes as f64)
             } else {
@@ -258,47 +260,42 @@ fn transcode_with_argv(
                 output_codec: encoder_selected,
                 compression_ratio,
 
-
                 outcome,
                 error: None,
             })
         }
-        Err((category, message, stderr_tail)) => {
-            Ok(EncodingRecord {
-                source_path: task.input.to_string_lossy().into_owned(),
-                source_size_bytes: std::fs::metadata(&task.input)
-                    .map(|m| m.len())
-                    .unwrap_or(0),
-                source_codec: metadata.codec.clone(),
-                source_container: metadata.container.clone(),
-                source_width: metadata.width,
-                source_height: metadata.height,
-                source_fps: src_fps,
-                source_duration_secs: metadata.duration_secs,
-                source_bit_rate_bps: metadata.bit_rate,
+        Err((category, message, stderr_tail)) => Ok(EncodingRecord {
+            source_path: task.input.to_string_lossy().into_owned(),
+            source_size_bytes: std::fs::metadata(&task.input).map(|m| m.len()).unwrap_or(0),
+            source_codec: metadata.codec.clone(),
+            source_container: metadata.container.clone(),
+            source_width: metadata.width,
+            source_height: metadata.height,
+            source_fps: src_fps,
+            source_duration_secs: metadata.duration_secs,
+            source_bit_rate_bps: metadata.bit_rate,
 
-                started_at: started_at_meta,
-                ended_at: Some(ended_at_meta),
-                encoding_duration_secs: Some(encoding_duration),
-                encoder_selected,
-                encoder_settings: encoder_settings_from_params(params),
-                ffmpeg_argv: argv,
-                ffmpeg_stderr_tail: stderr_tail.clone(),
+            started_at: started_at_meta,
+            ended_at: Some(ended_at_meta),
+            encoding_duration_secs: Some(encoding_duration),
+            encoder_selected,
+            encoder_settings: encoder_settings_from_params(params),
+            ffmpeg_argv: argv,
+            ffmpeg_stderr_tail: stderr_tail.clone(),
 
-                output_path: None,
-                output_size_bytes: None,
-                output_duration_secs: None,
-                output_codec: None,
-                compression_ratio: None,
+            output_path: None,
+            output_size_bytes: None,
+            output_duration_secs: None,
+            output_codec: None,
+            compression_ratio: None,
 
-                outcome: EncodingOutcome::Failed,
-                error: Some(ErrorContext {
-                    category,
-                    message,
-                    ffmpeg_stderr_tail: stderr_tail,
-                }),
-            })
-        }
+            outcome: EncodingOutcome::Failed,
+            error: Some(ErrorContext {
+                category,
+                message,
+                ffmpeg_stderr_tail: stderr_tail,
+            }),
+        }),
     }
 }
 
@@ -311,9 +308,7 @@ fn make_skipped_record(
     encoding_duration_secs: Option<f64>,
     reason: SkippedReason,
 ) -> EncodingRecord {
-    let source_size_bytes = std::fs::metadata(&task.input)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let source_size_bytes = std::fs::metadata(&task.input).map(|m| m.len()).unwrap_or(0);
     let source_meta = probe_video_metadata_quick(task);
     EncodingRecord {
         source_path: task.input.to_string_lossy().into_owned(),
@@ -354,9 +349,7 @@ fn make_failed_probe_record(
     encoding_duration_secs: Option<f64>,
     err: &EncodeError,
 ) -> EncodingRecord {
-    let source_size_bytes = std::fs::metadata(&task.input)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let source_size_bytes = std::fs::metadata(&task.input).map(|m| m.len()).unwrap_or(0);
     EncodingRecord {
         source_path: task.input.to_string_lossy().into_owned(),
         source_size_bytes,
@@ -544,8 +537,10 @@ Encoders:
         let argv = vec![
             "ffmpeg".into(),
             "-y".into(),
-            "-i".into(), "in.mp4".into(),
-            "-c:v".into(), "libsvtav1".into(),
+            "-i".into(),
+            "in.mp4".into(),
+            "-c:v".into(),
+            "libsvtav1".into(),
             "out.mkv".into(),
         ];
         assert_eq!(extract_encoder_from_argv(&argv), Some("libsvtav1".into()));
@@ -673,16 +668,17 @@ Encoders:
         let output = dir.join("out.mkv");
         std::fs::write(&input, b"x").unwrap();
 
-        let task = TranscodeTask {
-            input,
-            output,
-        };
+        let task = TranscodeTask { input, output };
         let params = params_x264_crf();
         let _cache = cache_with_libx264_and_svtav1(false);
         let _config = Config::default();
 
         // Run with a stub ffmpeg-like program that doesn't exist.
-        let argv = vec!["/nonexistent-ffmpeg-binary".to_string(), "-i".into(), "x".into()];
+        let argv = vec![
+            "/nonexistent-ffmpeg-binary".to_string(),
+            "-i".into(),
+            "x".into(),
+        ];
         let record = transcode_with_argv(
             &task,
             &params,

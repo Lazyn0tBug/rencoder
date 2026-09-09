@@ -8,9 +8,10 @@
 
 use chrono::Utc;
 
-use crate::encoding::EncodingRecord;
+use crate::data::extract::probe_video_metadata_auto;
 use crate::types::{
-    EncodingOutcome, EncoderSettings, ErrorCategory, ErrorContext, SkippedReason, TranscodeTask,
+    EncoderSettings, EncodingOutcome, EncodingRecord, ErrorCategory, ErrorContext, SkippedReason,
+    TranscodeTask,
 };
 
 /// Build a record for the skip path: no work was performed.
@@ -21,10 +22,8 @@ pub fn make_skipped_record(
     encoding_duration_secs: Option<f64>,
     reason: SkippedReason,
 ) -> EncodingRecord {
-    let source_size_bytes = std::fs::metadata(&task.input)
-        .map(|m| m.len())
-        .unwrap_or(0);
-    let source_meta = crate::ffmpeg::probe::probe_video_metadata_auto(&task.input).ok();
+    let source_size_bytes = std::fs::metadata(&task.input).map(|m| m.len()).unwrap_or(0);
+    let source_meta = probe_video_metadata_auto(&task.input).ok();
     EncodingRecord {
         source_path: task.input.to_string_lossy().into_owned(),
         source_size_bytes,
@@ -64,9 +63,7 @@ pub fn make_failed_probe_record(
     encoding_duration_secs: Option<f64>,
     err: &crate::error::EncodeError,
 ) -> EncodingRecord {
-    let source_size_bytes = std::fs::metadata(&task.input)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let source_size_bytes = std::fs::metadata(&task.input).map(|m| m.len()).unwrap_or(0);
     EncodingRecord {
         source_path: task.input.to_string_lossy().into_owned(),
         source_size_bytes,

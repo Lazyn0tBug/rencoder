@@ -39,6 +39,10 @@ cargo build --release
 
 ## Quickstart
 
+A copyable reference config ships at
+[`examples/rencoder.toml`](examples/rencoder.toml). Drop it at the
+project root as `rencoder.toml` and edit per your workflow.
+
 ### Analyze a directory of videos
 
 ```sh
@@ -54,38 +58,54 @@ Sample output:
 Total: 8 files (8 parsed, 0 failed)
 ```
 
-Add `-v` to write per-file details to `fps_stats.txt`:
-
-```sh
-rencoder analyze -d ./my_videos/ -v
-```
+Output format is set via `[analyze].format` in `rencoder.toml` (`csv`
+is the default; `table`, `text`, and `json` are also available).
 
 ### Transcode a single file
 
 ```sh
-rencoder encode -f movie.mp4 -c av1
+rencoder encode -f movie.mp4
 # Output: movie.av1.mkv
 ```
 
-CRF mode for AV1 (quality-based):
+The target format comes from `[encode].format` in `rencoder.toml`
+(default `av1`). To switch to H.264, edit the config — no flag needed.
 
-```sh
-rencoder encode -f movie.mp4 -c av1 --crf -b 45
+CRF mode (set in config):
+
+```toml
+[encode]
+format = "av1"
+crf = true
+bitrate = 45   # CRF value
 ```
 
 Cap frame rate to 30 fps (60 fps source gets downsampled):
 
-```sh
-rencoder encode -d ./highfps/ -c av1 --max-fps 30
+```toml
+[encode]
+max_fps = 30
 ```
 
 ### Transcode a directory recursively
 
+```toml
+[encode]
+format = "x264"
+bitrate = 5000
+extensions = ["mp4", "mov"]
+```
+
 ```sh
-rencoder encode -d ./input/ -c x264 -b 5000 -e mp4 -e mov
+rencoder encode -d ./input/
 ```
 
 ## CLI reference
+
+U17 split: only `target` (`-f`/`-d`) and the action (`encode` /
+`analyze`) plus a few per-run overrides (`-i`, `--config`, `-o`,
+passthrough args) remain on the CLI. Everything else lives in
+`rencoder.toml`.
 
 ### `rencoder encode`
 
@@ -93,16 +113,12 @@ rencoder encode -d ./input/ -c x264 -b 5000 -e mp4 -e mov
 rencoder encode [OPTIONS] [--] [EXTRA_FFMPEG_ARGS]
 
 Options:
-  -c, --format FORMAT         Target format: x264|hevc|vp9|av1 (default: av1)
-  -b, --bitrate K             Bitrate in Kbps, or CRF value with --crf
   -f, --file FILE             Single input file
   -d, --dir DIR               Input directory (recursive)
-  -e, --ext EXT               Extension filter (repeatable, default: all)
-  -i, --interactive           Launch interactive wizard (Phase 12)
-      --nv                    Enable NVIDIA hardware acceleration
-      --max-fps FPS           Max FPS cap: 24 | 25 | 30 | 60 | 0 (= disabled, default)
-      --crf                   Use CRF mode (AV1 only)
-      --config PATH           Path to JSON config file
+  -i, --interactive           Launch interactive wizard
+      --config PATH           Path to TOML config file (default: ./rencoder.toml)
+  -o, --output PATH           Per-run data path (.parquet|.jsonl|.csv).
+                              Default: ./data/encoding-<UTC-ISO8601>Z.parquet
       --                      All subsequent args pass through to ffmpeg
   -h, --help                  Print help
 ```
@@ -115,10 +131,8 @@ rencoder analyze [OPTIONS]
 Options:
   -d, --dir DIR               Input directory (recursive, default: cwd)
   -f, --file FILE             Single input file
-  -e, --ext EXT               Extension filter (repeatable)
-  -p, --parallel              Parallel analysis (rayon; lands in Phase 12)
-  -v, --verbose               Write per-file details to -o file
-  -o, --output PATH           Output file for -v (default: fps_stats.txt)
+      --config PATH           Path to TOML config file (default: ./rencoder.toml)
+  -o, --output PATH           Output file path; `-` for stdout (default)
   -h, --help                  Print help
 ```
 
@@ -129,32 +143,49 @@ Options:
   -h, --help                  Print help (top-level)
 ```
 
-## Config schema (JSON)
+## Config schema (TOML)
 
-```json
-{
-  "max_fps": 30,
-  "max_fps_eps": 0.05,
-  "encoders": {
-    "av1": "libsvtav1",
-    "x264": "libx264",
-    "hevc": "libx265",
-    "vp9": "libvpx-vp9"
-  }
-}
+```toml
+[encode]
+format = "av1"             # x264 | hevc | vp9 | av1
+bitrate = 5000             # Kbps (default mode)
+crf = false                # use CRF; `bitrate` then becomes the CRF value
+max_fps = 0                # 0 disables; else one of 24, 25, 30, 60
+nv = false                 # enable NVIDIA hardware acceleration
+extensions = ["mp4", "mov", "mkv"]   # extension filter (empty = all)
+
+[encode.encoders]
+av1 = "libsvtav1"          # override the AV1 encoder (optional)
+x264 = "libx264"           # ...
+hevc = "libx265"
+vp9 = "libvpx-vp9"
+
+[analyze]
+format = "csv"             # csv | table | text | json
+parallel = false           # parallel analysis via rayon
+extensions = []            # extension filter (empty = all)
+output = "fps_stats.txt"   # optional; CLI `-o` overrides per-run
 ```
 
-| Field | Type | Constraint | Effect |
+| Section / field | Type | Constraint | Effect |
 |---|---|---|---|
-| `max_fps` | number | one of `0`, `24`, `25`, `30`, `60` | `0` disables capping; others enforce strict-`>` with epsilon `max_fps_eps` |
-| `max_fps_eps` | number | (optional, default `0.05`) | tolerance band around `max_fps` for the strict comparison |
-| `encoders` | object | (optional) | per-format override; missing keys fall back to the built-in default (libsvtav1, libx264, libx265, libvpx-vp9) |
-| `encoders.av1` | string | (optional) | override the AV1 encoder (e.g. `libaom-av1`, `av1_nvenc`) |
+| `[encode].format` | string | one of `x264`, `hevc`, `vp9`, `av1` | target codec; default `av1` |
+| `[encode].bitrate` | integer | (optional) | Kbps in bitrate mode, CRF value in CRF mode; default 5000/28 |
+| `[encode].crf` | bool | (optional) | use CRF rate control instead of bitrate |
+| `[encode].max_fps` | integer | one of `0`, `24`, `25`, `30`, `60` | `0` disables capping; others enforce strict-`>` with epsilon `0.05` |
+| `[encode].nv` | bool | (optional) | enable NVIDIA acceleration; falls back silently when unavailable |
+| `[encode].extensions` | array of strings | (optional) | file extension filter; empty = all |
+| `[encode].encoders.<format>` | string | (optional) | per-format encoder override; missing keys fall back to the built-in default (libsvtav1, libx264, libx265, libvpx-vp9) |
+| `[analyze].format` | string | one of `csv`, `table`, `text`, `json` | output format; default `csv` |
+| `[analyze].parallel` | bool | (optional) | parallel analysis via rayon |
+| `[analyze].extensions` | array of strings | (optional) | file extension filter; empty = all |
+| `[analyze].output` | path | (optional) | write analyze output here; CLI `-o` overrides per-run |
 
 A missing config file is equivalent to all defaults; only present fields
-override the built-ins. Per-format encoder overrides are tried first; if
-the named encoder isn't compiled into ffmpeg, falls back to the default
-for that format.
+override the built-ins. Unknown keys are rejected at load time so typos
+surface immediately. Per-format encoder overrides are tried first; if
+the named encoder isn't compiled into ffmpeg, the selection chain falls
+through to the default.
 
 ## Logging
 

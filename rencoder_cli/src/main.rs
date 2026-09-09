@@ -1,4 +1,11 @@
 //! CLI entry point.
+//!
+//! U17: loads `ProjectConfig` from `--config` (default `./rencoder.toml`)
+//! and merges its `encode` / `analyze` sections into the CLI args. CLI
+//! keeps only `target` (`-f`/`-d`), `action` (subcommand), and a few
+//! per-run overrides (`-i`, `-o`, passthrough args). All other knobs
+//! (format, bitrate, max-fps, crf, nv, extensions, analyze format,
+//! parallel, encoder overrides) come from the TOML config file.
 
 mod args;
 mod file_sink;
@@ -10,28 +17,15 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use rencoder_lib::{
     collect::collect_files,
-    config::Config,
+    config::{AnalyzeFormatArg, Config, ProjectConfig},
     pipeline::{batch::transcode_batch, cache::init_encoder_cache},
-    types::{
-        EncodeParams, EncodingOutcome, ProcessOutput, SkippedReason, Target, VideoFormat,
-    },
+    types::{EncodeParams, EncodingOutcome, ProcessOutput, SkippedReason, Target, VideoFormat},
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::{info, instrument, warn};
 
-use crate::args::AnalyzeFormatArg;
-
-/// Map CLI-side FormatArg to library VideoFormat.
-impl From<args::FormatArg> for VideoFormat {
-    fn from(f: args::FormatArg) -> Self {
-        match f {
-            args::FormatArg::X264 => VideoFormat::X264,
-            args::FormatArg::Hevc => VideoFormat::Hevc,
-            args::FormatArg::Vp9 => VideoFormat::Vp9,
-            args::FormatArg::Av1 => VideoFormat::Av1,
-        }
-    }
-}
+/// Default config path searched when `--config` is not given.
+const DEFAULT_CONFIG_PATH: &str = "rencoder.toml";
 
 fn main() -> Result<()> {
     tracing_init::init();
@@ -45,47 +39,66 @@ fn main() -> Result<()> {
 /// `rencoder encode ...` -- full pipeline: load config, init encoder
 /// cache, install SIGINT handler, collect files, run the batch,
 /// write per-file records to the default `./data/encoding-*.parquet`.
-#[instrument(skip_all, fields(format = ?_args.format, files = tracing::field::Empty))]
-fn encode_cmd(_args: args::EncodeArgs) -> Result<()> {
-    let config = match &_args.config {
-        Some(path) => Config::load(path)
-            .with_context(|| format!("failed to load config from {}", path.display()))?,
-        None => Config::default(),
-    };
+#[instrument(skip_all, fields(files = tracing::field::Empty))]
+fn encode_cmd(args: args::EncodeArgs) -> Result<()> {
+    let project = load_project_config(args.config.as_deref())?;
 
-    let target = if let Some(file) = &_args.file {
+    let enc = project.encode.as_ref();
+
+    let target = if let Some(file) = &args.file {
         Target::File(file.clone())
-    } else if let Some(dir) = &_args.dir {
+    } else if let Some(dir) = &args.dir {
         Target::Dir(dir.clone())
     } else {
         anyhow::bail!("either --file or --dir must be provided (or use --interactive)");
     };
 
-    let files = collect_files(&target, &_args.ext)
-        .with_context(|| format!("failed to collect files from {}", target_path(&target).display()))?;
+    let extensions = enc.and_then(|e| e.extensions.clone()).unwrap_or_default();
+
+    let files = collect_files(&target, &extensions).with_context(|| {
+        format!(
+            "failed to collect files from {}",
+            target_path(&target).display()
+        )
+    })?;
 
     if files.is_empty() {
         warn!("no files matched; nothing to do");
         return Ok(());
     }
 
-    let format: VideoFormat = _args.format.into();
-    let bitrate_or_crf = _args.bitrate.unwrap_or(if _args.crf { 28 } else { 5000 });
+    let format: VideoFormat = enc
+        .and_then(|e| e.format)
+        .map(Into::into)
+        .unwrap_or(VideoFormat::Av1);
+
+    let is_crf = enc.and_then(|e| e.crf).unwrap_or(false);
+    let bitrate_or_crf = enc
+        .and_then(|e| e.bitrate)
+        .unwrap_or(if is_crf { 28 } else { 5000 });
+
+    let enable_nv = enc.and_then(|e| e.nv).unwrap_or(false);
+
+    let config = Config::from_project(project.encode.as_ref());
 
     let params = EncodeParams {
         format,
         bitrate_or_crf,
-        is_crf: _args.crf,
+        is_crf,
         target: target.clone(),
-        extensions: _args.ext.clone(),
-        extra_args: _args.extra_args.clone(),
+        extensions: extensions.clone(),
+        extra_args: args.extra_args.clone(),
         max_fps: config.max_fps_config(),
     };
 
-    info!("collected {} file(s), target format: {:?}", files.len(), format);
+    info!(
+        "collected {} file(s), target format: {:?}",
+        files.len(),
+        format
+    );
 
-    let cache = init_encoder_cache(_args.enable_nv)
-        .with_context(|| "failed to initialize encoder cache")?;
+    let cache =
+        init_encoder_cache(enable_nv).with_context(|| "failed to initialize encoder cache")?;
 
     // Install signal handler; the per-batch loop registers/unregisters
     // the current output path so a SIGINT cleans up the partial file.
@@ -102,7 +115,7 @@ fn encode_cmd(_args: args::EncodeArgs) -> Result<()> {
 
     // Default output: timestamped Parquet in ./data/. Extension of -o
     // picks the format: .parquet | .jsonl | .csv.
-    let output_path = match &_args.output {
+    let output_path = match &args.output {
         Some(p) => p.clone(),
         None => default_data_path(),
     };
@@ -115,9 +128,9 @@ fn encode_cmd(_args: args::EncodeArgs) -> Result<()> {
 /// `data/encoding-<UTC-ISO8601>Z.parquet` -- one file per run, named by
 /// start time. ISO 8601 UTC (no localtime surprises); `:` replaced
 /// with `-` for filesystem safety on macOS / Windows.
-fn default_data_path() -> std::path::PathBuf {
+fn default_data_path() -> PathBuf {
     let ts = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ").to_string();
-    std::path::PathBuf::from("data").join(format!("encoding-{ts}.parquet"))
+    PathBuf::from("data").join(format!("encoding-{ts}.parquet"))
 }
 
 /// Write the records to the given path. Extension determines format.
@@ -125,7 +138,7 @@ fn write_records(
     records: &[rencoder_lib::types::EncodingRecord],
     path: &std::path::Path,
 ) -> Result<()> {
-    use rencoder_lib::encoding;
+    use rencoder_lib::data::store;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
@@ -133,34 +146,45 @@ fn write_records(
         }
     }
     let bytes = match path.extension().and_then(|e| e.to_str()) {
-        Some("parquet") => encoding::records_to_parquet(records)
-            .with_context(|| "parquet encode failed")?,
-        Some("jsonl") | Some("ndjson") => encoding::records_to_jsonl(records).into_bytes(),
-        Some("csv") => encoding::records_to_csv(records).into_bytes(),
+        Some("parquet") => {
+            store::records_to_parquet(records).with_context(|| "parquet encode failed")?
+        }
+        Some("jsonl") | Some("ndjson") => store::records_to_jsonl(records).into_bytes(),
+        Some("csv") => store::records_to_csv(records).into_bytes(),
         other => anyhow::bail!(
             "unsupported output extension {:?}; use .parquet, .jsonl, or .csv",
             other
         ),
     };
-    std::fs::write(path, bytes)
-        .with_context(|| format!("failed to write {}", path.display()))?;
+    std::fs::write(path, bytes).with_context(|| format!("failed to write {}", path.display()))?;
     eprintln!("Wrote {} record(s) to {}", records.len(), path.display());
     Ok(())
 }
 
 /// `rencoder analyze ...` -- probes each file, groups by rounded fps,
 /// prints summary, optionally writes a detailed file.
-#[instrument(skip_all, fields(dir = ?args.dir, file = ?args.file, parallel = args.parallel))]
+#[instrument(skip_all, fields(dir = ?args.dir, file = ?args.file, parallel = tracing::field::Empty))]
 fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
-    let target = target_from_analyze_args(&args)
-        .with_context(|| "failed to determine target directory")?;
+    let project = load_project_config(args.config.as_deref())?;
+    let an = project.analyze.as_ref();
 
-    let files = collect_files(&target, &args.ext)
-        .with_context(|| format!("failed to collect files from {}", target_path(&target).display()))?;
+    let target =
+        target_from_analyze_args(&args).with_context(|| "failed to determine target directory")?;
+
+    let extensions = an.and_then(|a| a.extensions.clone()).unwrap_or_default();
+
+    let files = collect_files(&target, &extensions).with_context(|| {
+        format!(
+            "failed to collect files from {}",
+            target_path(&target).display()
+        )
+    })?;
 
     info!("analyzing {} file(s)", files.len());
 
-    let records = if args.parallel {
+    let parallel = an.and_then(|a| a.parallel).unwrap_or(false);
+
+    let records = if parallel {
         rencoder_lib::analyzer::fps_stats::analyze_records_parallel(&files)
             .with_context(|| "fps analysis failed")?
     } else {
@@ -175,25 +199,34 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
         stats.total_files, stats.parsed_files, stats.failed_files,
     );
 
+    // Format precedence: CLI `-o` wins; else `analyze.output` from config;
+    // else the default `-` (stdout).
+    let output_path: PathBuf = if args.output != Path::new("-") {
+        args.output.clone()
+    } else if let Some(p) = an.and_then(|a| a.output.clone()) {
+        p
+    } else {
+        PathBuf::from("-")
+    };
+
     // Format-specific body, then dispatch to stdout-or-file based on -o.
     let render = |body: String| -> Result<()> {
-        if args.output == Path::new("-") {
+        if output_path == Path::new("-") {
             print!("{body}");
             Ok(())
         } else {
-            std::fs::write(&args.output, body)
-                .with_context(|| format!("failed to write {}", args.output.display()))
+            std::fs::write(&output_path, body)
+                .with_context(|| format!("failed to write {}", output_path.display()))
         }
     };
 
-    match args.format {
+    let format = an.and_then(|a| a.format).unwrap_or(AnalyzeFormatArg::Csv);
+
+    match format {
         AnalyzeFormatArg::Csv => {
             render(rencoder_lib::analyzer::fps_stats::records_to_csv(&records))?;
         }
         AnalyzeFormatArg::Table => {
-            // Build a DataFrame from the records and use Polars' Display
-            // for the framed box-drawing table. Per-file rows in input
-            // order (rayon's par_iter().collect preserves order).
             let df = rencoder_lib::analyzer::fps_stats::records_to_dataframe(&records)
                 .map_err(|e| anyhow::anyhow!("dataframe build: {e}"))?;
             render(format!("{df}"))?;
@@ -249,9 +282,7 @@ fn print_encode_summary(results: &[rencoder_lib::types::EncodingRecord]) {
         .filter(|r| {
             matches!(
                 r.outcome,
-                EncodingOutcome::Skipped(
-                    SkippedReason::OutputExists | SkippedReason::SameCodec
-                )
+                EncodingOutcome::Skipped(SkippedReason::OutputExists | SkippedReason::SameCodec)
             )
         })
         .count();
@@ -283,32 +314,82 @@ fn target_from_analyze_args(args: &args::AnalyzeArgs) -> Result<Target> {
 }
 
 /// Best-effort path display for a Target (used in error messages).
-fn target_path(target: &Target) -> &std::path::Path {
+fn target_path(target: &Target) -> &Path {
     match target {
         Target::File(p) => p,
         Target::Dir(p) => p,
     }
 }
 
+/// Load `ProjectConfig` from `--config`, falling back to
+/// `./rencoder.toml`. Missing file is not an error; the schema
+/// validation in `ProjectConfig::load` rejects malformed TOML.
+fn load_project_config(path: Option<&Path>) -> Result<ProjectConfig> {
+    let resolved = path.unwrap_or_else(|| Path::new(DEFAULT_CONFIG_PATH));
+    ProjectConfig::load(resolved)
+        .with_context(|| format!("failed to load config from {}", resolved.display()))
+}
+
+// ---------------------------------------------------------------------------
+// ProjectConfig -> Config conversion lives in `rencoder_lib::config`
+// (`Config::from_project`) so the inherent impl stays in the same crate
+// as `Config`.
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rencoder_lib::config::{AnalyzeConfig, EncodeConfig, EncodersConfig};
     use std::path::PathBuf;
 
-    fn args_with(file: Option<&str>, dir: Option<&str>) -> args::AnalyzeArgs {
-        args::AnalyzeArgs {
-            dir: dir.map(PathBuf::from),
-            file: file.map(PathBuf::from),
-            ext: vec![],
-            parallel: false,
-            format: args::AnalyzeFormatArg::Csv,
-            output: PathBuf::from("-"),
-        }
+    #[test]
+    fn config_from_project_uses_defaults_when_no_encode_section() {
+        let cfg = Config::from_project(None);
+        assert_eq!(cfg.max_fps, 0.0);
+        assert_eq!(cfg.max_fps_eps, 0.05);
+        assert!(cfg.encoders.av1.is_none());
+    }
+
+    #[test]
+    fn config_from_project_picks_up_max_fps_and_encoders() {
+        let enc = EncodeConfig {
+            max_fps: Some(30),
+            encoders: Some(EncodersConfig {
+                av1: Some("libaom-av1".into()),
+                vp9: Some("libvpx-vp9".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cfg = Config::from_project(Some(&enc));
+        assert_eq!(cfg.max_fps, 30.0);
+        assert_eq!(cfg.encoders.av1.as_deref(), Some("libaom-av1"));
+        assert_eq!(cfg.encoders.vp9.as_deref(), Some("libvpx-vp9"));
+        assert!(cfg.encoders.x264.is_none());
+    }
+
+    #[test]
+    fn load_project_config_missing_file_returns_default() {
+        let cfg = load_project_config(Some(Path::new("/nonexistent/never.toml"))).unwrap();
+        assert_eq!(cfg, ProjectConfig::default());
+    }
+
+    #[test]
+    fn load_project_config_default_path_when_none() {
+        // ./rencoder.toml almost certainly doesn't exist in a test run;
+        // the loader is supposed to swallow a missing file silently.
+        let cfg = load_project_config(None).unwrap();
+        assert_eq!(cfg, ProjectConfig::default());
     }
 
     #[test]
     fn target_from_file_flag_wins() {
-        let args = args_with(Some("/single.mp4"), Some("/ignored"));
+        let args = args::AnalyzeArgs {
+            dir: Some(PathBuf::from("/ignored")),
+            file: Some(PathBuf::from("/single.mp4")),
+            config: None,
+            output: PathBuf::from("-"),
+        };
         let target = target_from_analyze_args(&args).unwrap();
         match target {
             Target::File(p) => assert_eq!(p, PathBuf::from("/single.mp4")),
@@ -318,7 +399,12 @@ mod tests {
 
     #[test]
     fn target_from_dir_flag() {
-        let args = args_with(None, Some("/some/dir"));
+        let args = args::AnalyzeArgs {
+            dir: Some(PathBuf::from("/some/dir")),
+            file: None,
+            config: None,
+            output: PathBuf::from("-"),
+        };
         let target = target_from_analyze_args(&args).unwrap();
         match target {
             Target::Dir(p) => assert_eq!(p, PathBuf::from("/some/dir")),
@@ -328,12 +414,15 @@ mod tests {
 
     #[test]
     fn target_defaults_to_current_dir() {
-        let args = args_with(None, None);
+        let args = args::AnalyzeArgs {
+            dir: None,
+            file: None,
+            config: None,
+            output: PathBuf::from("-"),
+        };
         let target = target_from_analyze_args(&args).unwrap();
         match target {
             Target::Dir(p) => {
-                // Compare to std::env::current_dir() directly so the test
-                // is robust to chdir during test runs.
                 let cwd = std::env::current_dir().unwrap();
                 assert_eq!(p, cwd);
             }
@@ -343,9 +432,20 @@ mod tests {
 
     #[test]
     fn target_path_helper_returns_inner_path() {
-        let file_target = Target::File(PathBuf::from("/x.mp4"));
-        assert_eq!(target_path(&file_target), PathBuf::from("/x.mp4"));
-        let dir_target = Target::Dir(PathBuf::from("/y"));
-        assert_eq!(target_path(&dir_target), PathBuf::from("/y"));
+        assert_eq!(
+            target_path(&Target::File(PathBuf::from("/x.mp4"))),
+            PathBuf::from("/x.mp4")
+        );
+        assert_eq!(
+            target_path(&Target::Dir(PathBuf::from("/y"))),
+            PathBuf::from("/y")
+        );
+    }
+
+    #[test]
+    fn analyze_format_default_is_csv() {
+        // No config section -> default format is CSV.
+        let an = AnalyzeConfig::default();
+        assert!(an.format.is_none());
     }
 }

@@ -15,5 +15,5 @@ pub mod record;
 pub mod store;
 
 pub use crate::types::{
-    EncodingOutcome, EncodingRecord, EncoderSettings, ErrorCategory, ErrorContext, SkippedReason,
+    EncoderSettings, EncodingOutcome, EncodingRecord, ErrorCategory, ErrorContext, SkippedReason,
 };

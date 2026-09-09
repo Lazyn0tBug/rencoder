@@ -35,11 +35,7 @@ impl FileSink {
     /// Create a sink that writes to `log_dir`, rotating when the current
     /// file exceeds `max_size` bytes or the date rolls over. Files older
     /// than `max_age_days` are deleted on construction (0 = no cap).
-    pub fn new<P: Into<PathBuf>>(
-        log_dir: P,
-        max_size: u64,
-        max_age_days: u32,
-    ) -> io::Result<Self> {
+    pub fn new<P: Into<PathBuf>>(log_dir: P, max_size: u64, max_age_days: u32) -> io::Result<Self> {
         let log_dir = log_dir.into();
         fs::create_dir_all(&log_dir)?;
         Self::cleanup_old(&log_dir, max_age_days)?;
@@ -92,9 +88,7 @@ impl Write for FileSinkHandle<'_> {
 impl<'a> MakeWriter<'a> for FileSink {
     type Writer = FileSinkHandle<'a>;
     fn make_writer(&'a self) -> Self::Writer {
-        FileSinkHandle {
-            inner: &self.inner,
-        }
+        FileSinkHandle { inner: &self.inner }
     }
 }
 
@@ -113,16 +107,9 @@ impl Inner {
     }
 
     fn open_writer(log_dir: &Path, date: NaiveDate, suffix: u32) -> io::Result<File> {
-        let filename = format!(
-            "rencoder.{}.{:02}.log",
-            date.format("%Y-%m-%d"),
-            suffix
-        );
+        let filename = format!("rencoder.{}.{:02}.log", date.format("%Y-%m-%d"), suffix);
         let path = log_dir.join(filename);
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
+        OpenOptions::new().create(true).append(true).open(&path)
     }
 
     /// Rotate when the date has changed (midnight). Called at the start
@@ -166,11 +153,8 @@ mod tests {
 
     fn fixture_dir() -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!(
-            "rencoder_file_sink_{}_{}",
-            std::process::id(),
-            n
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rencoder_file_sink_{}_{}", std::process::id(), n));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir

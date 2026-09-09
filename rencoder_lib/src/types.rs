@@ -401,86 +401,110 @@ mod tests {
 
     #[test]
     fn video_metadata_is_valid_with_codec() {
-        assert!(
-            VideoMetadata {
-                codec: Some("h264".into()),
-                ..Default::default()
-            }
-            .is_valid()
-        );
+        assert!(VideoMetadata {
+            codec: Some("h264".into()),
+            ..Default::default()
+        }
+        .is_valid());
     }
 
     #[test]
     fn video_metadata_is_valid_with_avg_fps() {
-        assert!(
-            VideoMetadata {
-                avg_fps: Some(30.0),
-                ..Default::default()
-            }
-            .is_valid()
-        );
+        assert!(VideoMetadata {
+            avg_fps: Some(30.0),
+            ..Default::default()
+        }
+        .is_valid());
     }
 
     #[test]
     fn video_metadata_is_valid_with_nominal_fps() {
-        assert!(
-            VideoMetadata {
-                nominal_fps: Some(30.0),
-                ..Default::default()
-            }
-            .is_valid()
-        );
+        assert!(VideoMetadata {
+            nominal_fps: Some(30.0),
+            ..Default::default()
+        }
+        .is_valid());
     }
 
     #[test]
     fn max_fps_config_enabled_zero_is_false() {
-        assert!(!MaxFpsConfig { max_fps: 0.0, eps: 0.05 }.enabled());
+        assert!(!MaxFpsConfig {
+            max_fps: 0.0,
+            eps: 0.05
+        }
+        .enabled());
     }
 
     #[test]
     fn max_fps_config_enabled_positive_is_true() {
-        assert!(MaxFpsConfig { max_fps: 30.0, eps: 0.05 }.enabled());
+        assert!(MaxFpsConfig {
+            max_fps: 30.0,
+            eps: 0.05
+        }
+        .enabled());
     }
 
     #[test]
     fn max_fps_config_enabled_negative_is_false() {
-        assert!(!MaxFpsConfig { max_fps: -30.0, eps: 0.05 }.enabled());
+        assert!(!MaxFpsConfig {
+            max_fps: -30.0,
+            eps: 0.05
+        }
+        .enabled());
     }
 
     // need_reduce: origin §6 matrix.
     #[test]
     fn need_reduce_25fps_does_not_reduce() {
-        let c = MaxFpsConfig { max_fps: 30.0, eps: 0.05 };
+        let c = MaxFpsConfig {
+            max_fps: 30.0,
+            eps: 0.05,
+        };
         assert!(!c.need_reduce(25.0));
     }
 
     #[test]
     fn need_reduce_30fps_does_not_reduce() {
-        let c = MaxFpsConfig { max_fps: 30.0, eps: 0.05 };
+        let c = MaxFpsConfig {
+            max_fps: 30.0,
+            eps: 0.05,
+        };
         assert!(!c.need_reduce(30.0));
     }
 
     #[test]
     fn need_reduce_29_97_does_not_reduce() {
-        let c = MaxFpsConfig { max_fps: 30.0, eps: 0.05 };
+        let c = MaxFpsConfig {
+            max_fps: 30.0,
+            eps: 0.05,
+        };
         assert!(!c.need_reduce(29.97));
     }
 
     #[test]
     fn need_reduce_60fps_does_reduce() {
-        let c = MaxFpsConfig { max_fps: 30.0, eps: 0.05 };
+        let c = MaxFpsConfig {
+            max_fps: 30.0,
+            eps: 0.05,
+        };
         assert!(c.need_reduce(60.0));
     }
 
     #[test]
     fn need_reduce_just_above_cap_eps_does_reduce() {
-        let c = MaxFpsConfig { max_fps: 30.0, eps: 0.05 };
+        let c = MaxFpsConfig {
+            max_fps: 30.0,
+            eps: 0.05,
+        };
         assert!(c.need_reduce(30.06));
     }
 
     #[test]
     fn need_reduce_with_zero_eps_is_strict() {
-        let c = MaxFpsConfig { max_fps: 30.0, eps: 0.0 };
+        let c = MaxFpsConfig {
+            max_fps: 30.0,
+            eps: 0.0,
+        };
         assert!(!c.need_reduce(30.0));
         assert!(c.need_reduce(30.01));
     }
@@ -499,7 +523,11 @@ mod tests {
 
     // ---- FpsStats (Polars-backed) ----
 
-    fn rec(fps: Option<u32>, codec: &str, dur: Option<f64>) -> crate::analyzer::fps_stats::AnalysisRecord {
+    fn rec(
+        fps: Option<u32>,
+        codec: &str,
+        dur: Option<f64>,
+    ) -> crate::analyzer::fps_stats::AnalysisRecord {
         crate::analyzer::fps_stats::AnalysisRecord {
             path: PathBuf::from("/x"),
             fps,
@@ -541,7 +569,7 @@ mod tests {
         assert_eq!(stats.parsed_files, 4);
         assert_eq!(stats.failed_files, 0);
         assert_eq!(stats.table.height(), 4); // 4 (fps, codec) combos
-        // Total duration: 60 + 60 + 60 + 120 = 300
+                                             // Total duration: 60 + 60 + 60 + 120 = 300
         assert!((stats.total_duration_secs - 300.0).abs() < 1e-9);
     }
 

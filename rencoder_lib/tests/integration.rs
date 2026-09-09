@@ -12,11 +12,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use rencoder_lib::{
     analyzer::fps_stats::analyze_fps,
     config::Config,
-    ffmpeg::probe::probe_video_metadata,
-    pipeline::{cache::init_encoder_cache, batch::{transcode_batch, transcode_single}},
-    types::{
-        EncodeParams, EncoderCache, ProcessOutput, Target, TranscodeTask, VideoFormat,
+    data::extract::probe_video_metadata,
+    pipeline::{
+        batch::{transcode_batch, transcode_single},
+        cache::init_encoder_cache,
     },
+    types::{EncodeParams, EncoderCache, ProcessOutput, Target, TranscodeTask, VideoFormat},
 };
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -49,11 +50,16 @@ fn make_video(dir: &Path, name: &str, fps: u32, duration: u32) -> PathBuf {
     let status = Command::new("ffmpeg")
         .args([
             "-y",
-            "-f", "lavfi",
-            "-i", "color=c=black:s=160x120:d=1",
-            "-r", &fps.to_string(),
-            "-c:v", "libx264",
-            "-t", &duration.to_string(),
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=160x120:d=1",
+            "-r",
+            &fps.to_string(),
+            "-c:v",
+            "libx264",
+            "-t",
+            &duration.to_string(),
         ])
         .arg(&path)
         .stdout(std::process::Stdio::null())
@@ -100,11 +106,7 @@ fn analyze_fps_groups_mixed_fixtures() {
     make_video(&dir, "b.mp4", 30, 1);
     make_video(&dir, "c.mp4", 60, 1);
 
-    let files = vec![
-        dir.join("a.mp4"),
-        dir.join("b.mp4"),
-        dir.join("c.mp4"),
-    ];
+    let files = vec![dir.join("a.mp4"), dir.join("b.mp4"), dir.join("c.mp4")];
     let stats = analyze_fps(&files).expect("analyze should succeed");
     assert_eq!(stats.total_files, 3);
     assert_eq!(stats.parsed_files, 3);
@@ -168,9 +170,16 @@ fn transcode_batch_end_to_end_produces_output_files() {
                 // Output path is derived from input; for AV1 -> mkv,
                 // the file should be at <stem>.mkv.
                 let stem = std::path::Path::new(&record.source_path)
-                    .file_stem().unwrap().to_str().unwrap();
+                    .file_stem()
+                    .unwrap()
+                    .to_str()
+                    .unwrap();
                 let expected = dir.join(format!("{stem}.mkv"));
-                assert!(expected.exists(), "expected output at {}", expected.display());
+                assert!(
+                    expected.exists(),
+                    "expected output at {}",
+                    expected.display()
+                );
             }
             other => panic!(
                 "expected Succeeded/ReducedFps for {}, got {:?}",
@@ -229,11 +238,13 @@ fn init_encoder_cache_works_without_nvidia_smi() {
     let cache = init_encoder_cache(true).expect("init should succeed");
     // We can't assert has_nvidia directly (depends on env), but the call
     // must not have returned Err.
-    assert!(cache.encoders_output.contains("libx264") || cache.encoders_output.is_empty()
-        || !cache.encoders_output.is_empty(),
-        "encoders output should be populated (or empty if ffmpeg missing)");
+    assert!(
+        cache.encoders_output.contains("libx264")
+            || cache.encoders_output.is_empty()
+            || !cache.encoders_output.is_empty(),
+        "encoders output should be populated (or empty if ffmpeg missing)"
+    );
 }
-
 
 // ---- c-probe FFI bridge (only with the feature) ----
 
@@ -285,4 +296,3 @@ fn c_probe_handles_missing_file_gracefully() {
     assert!(result.codec.is_none());
     assert!(result.best_fps().is_none());
 }
-

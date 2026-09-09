@@ -1,9 +1,17 @@
 //! CLI argument parsing via clap derive.
 //!
-//! Two subcommands: `encode` and `analyze`. `main.rs` converts the parsed
-//! args into library types (`EncodeParams`, `AnalyzeParams`, `Config`).
+//! Two subcommands: `encode` and `analyze`. U17 split: only `target`
+//! (`-f`/`-d`) and the action (`encode`/`analyze`) plus a few per-run
+//! overrides (`-i`, `--config`, `-o`, passthrough args) remain on the
+//! CLI. Every other knob (format, bitrate, max-fps, crf, nv, extensions,
+//! analyze format, parallel, ...) lives in `rencoder.toml`. See
+//! `rencoder_lib::config::project` for the schema.
+//!
+//! `main.rs` loads the config, merges CLI overrides, and converts the
+//! parsed args into library types (`EncodeParams`, `AnalyzeParams`,
+//! `Config`).
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 /// Top-level CLI: `rencoder <subcommand> ...`
@@ -26,41 +34,8 @@ pub enum Command {
     Analyze(AnalyzeArgs),
 }
 
-/// `encode` subcommand argument format strings, mapped 1:1 to `VideoFormat`.
-#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FormatArg {
-    X264,
-    Hevc,
-    Vp9,
-    Av1,
-}
-
-#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AnalyzeFormatArg {
-    /// Per-file CSV to stdout (default). One row per input file with
-    /// columns `path, fps, codec, duration_secs, file_bytes`. Pipe-friendly.
-    Csv,
-    /// Human-readable framed table (per-file rows). Built on Polars'
-    /// Display; one row per input file.
-    Table,
-    /// Human-readable text summary (legacy behavior) -- the cross-tab
-    /// (fps x codec) aggregated view.
-    Text,
-    /// Per-file JSON objects, one per line. For `jq` and other line-based
-    /// JSON consumers.
-    Json,
-}
-
 #[derive(Args, Debug)]
 pub struct EncodeArgs {
-    /// Target format (lowercase: x264|hevc|vp9|av1). Default: av1.
-    #[arg(short = 'c', long = "format", value_enum, default_value_t = FormatArg::Av1)]
-    pub format: FormatArg,
-
-    /// Bitrate in Kbps (default mode) or CRF value when used with --crf.
-    #[arg(short = 'b', long = "bitrate")]
-    pub bitrate: Option<u32>,
-
     /// Single input file.
     #[arg(short = 'f', long = "file")]
     pub file: Option<PathBuf>,
@@ -69,27 +44,12 @@ pub struct EncodeArgs {
     #[arg(short = 'd', long = "dir")]
     pub dir: Option<PathBuf>,
 
-    /// Extension filter (repeatable). Empty = all files.
-    #[arg(short = 'e', long = "ext")]
-    pub ext: Vec<String>,
-
     /// Launch the interactive wizard before transcoding.
     #[arg(short = 'i', long = "interactive")]
     pub interactive: bool,
 
-    /// Enable NVIDIA hardware acceleration (requires nvidia-smi).
-    #[arg(long = "nv")]
-    pub enable_nv: bool,
-
-    /// Max FPS cap (canonical: 24, 25, 30, 60; or 0 to disable).
-    #[arg(long = "max-fps", default_value = "0")]
-    pub max_fps: f64,
-
-    /// Use CRF mode instead of bitrate.
-    #[arg(long = "crf")]
-    pub crf: bool,
-
-    /// Path to JSON config file. Loaded once, values not present fall back to CLI args.
+    /// Path to TOML config file. Loaded once if it exists; missing file
+    /// is not an error. Default: `./rencoder.toml`.
     #[arg(long = "config")]
     pub config: Option<PathBuf>,
 
@@ -113,21 +73,12 @@ pub struct AnalyzeArgs {
     #[arg(short = 'f', long = "file")]
     pub file: Option<PathBuf>,
 
-    /// Extension filter (repeatable). Empty = all files.
-    #[arg(short = 'e', long = "ext")]
-    pub ext: Vec<String>,
+    /// Path to TOML config file. Loaded once if it exists; missing file
+    /// is not an error. Default: `./rencoder.toml`.
+    #[arg(long = "config")]
+    pub config: Option<PathBuf>,
 
-    /// Enable parallel analysis via rayon (lands in Phase 12).
-    #[arg(short = 'p', long = "parallel")]
-    pub parallel: bool,
-
-    /// Output format. Default: csv (per-file records, pipe-friendly).
-    #[arg(long = "format", value_enum, default_value_t = AnalyzeFormatArg::Csv)]
-    pub format: AnalyzeFormatArg,
-
-    /// Output file path. `-` for stdout (default). With `--format text`
-    /// this still writes to stdout; the flag is mostly useful for `csv`
-    /// and `json`.
+    /// Output file path. `-` for stdout (default).
     #[arg(short = 'o', long = "output", default_value = "-")]
     pub output: PathBuf,
 }
@@ -148,100 +99,76 @@ mod tests {
     // ---- encode: defaults ----
 
     #[test]
-    fn encode_defaults_to_av1() {
+    fn encode_defaults_to_minimal() {
         let cli = parse_ok(&["rencoder", "encode", "-f", "in.mp4"]);
         match cli.command {
             Command::Encode(args) => {
-                assert_eq!(args.format, FormatArg::Av1);
-                assert_eq!(args.bitrate, None);
                 assert_eq!(args.file, Some(PathBuf::from("in.mp4")));
                 assert_eq!(args.dir, None);
-                assert!(args.ext.is_empty());
                 assert!(!args.interactive);
-                assert!(!args.enable_nv);
-                assert_eq!(args.max_fps, 0.0);
-                assert!(!args.crf);
                 assert_eq!(args.config, None);
+                assert_eq!(args.output, None);
                 assert!(args.extra_args.is_empty());
             }
             _ => panic!("expected Encode"),
         }
     }
 
-    // ---- encode: format variants ----
-
     #[test]
-    fn encode_all_format_variants_parse() {
-        for (s, expected) in [
-            ("x264", FormatArg::X264),
-            ("hevc", FormatArg::Hevc),
-            ("vp9", FormatArg::Vp9),
-            ("av1", FormatArg::Av1),
-        ] {
-            let cli = parse_ok(&["rencoder", "encode", "-f", "in.mp4", "-c", s]);
-            match cli.command {
-                Command::Encode(args) => assert_eq!(args.format, expected, "for {s}"),
-                _ => panic!("expected Encode for {s}"),
-            }
-        }
-    }
-
-    #[test]
-    fn encode_invalid_format_rejected() {
-        parse_err(&["rencoder", "encode", "-f", "in.mp4", "-c", "divx"]);
-    }
-
-    // ---- encode: bitrate / crf ----
-
-    #[test]
-    fn encode_bitrate_flag_parses_u32() {
-        let cli = parse_ok(&["rencoder", "encode", "-f", "in.mp4", "-b", "5000"]);
-        match cli.command {
-            Command::Encode(args) => assert_eq!(args.bitrate, Some(5000)),
-            _ => panic!("expected Encode"),
-        }
-    }
-
-    #[test]
-    fn encode_bitrate_negative_rejected() {
-        // u32 parser rejects negative.
-        parse_err(&["rencoder", "encode", "-f", "in.mp4", "-b", "-5"]);
-    }
-
-    #[test]
-    fn encode_crf_flag_sets_bool() {
-        let cli = parse_ok(&["rencoder", "encode", "-f", "in.mp4", "--crf"]);
+    fn encode_dir_target() {
+        let cli = parse_ok(&["rencoder", "encode", "-d", "/d"]);
         match cli.command {
             Command::Encode(args) => {
-                assert!(args.crf);
-                assert_eq!(args.bitrate, None);
+                assert_eq!(args.dir, Some(PathBuf::from("/d")));
+                assert_eq!(args.file, None);
             }
-            _ => panic!("expected Encode"),
+            _ => panic!(),
         }
     }
 
-    // ---- encode: max-fps ----
+    // ---- encode: per-run overrides kept on CLI ----
 
     #[test]
-    fn encode_max_fps_canonical_values() {
-        for fps in ["24", "25", "30", "60"] {
-            let cli = parse_ok(&[
-                "rencoder", "encode", "-f", "in.mp4", "--max-fps", fps,
-            ]);
-            match cli.command {
-                Command::Encode(args) => {
-                    assert_eq!(args.max_fps, fps.parse::<f64>().unwrap());
-                }
-                _ => panic!("expected Encode"),
-            }
-        }
-    }
-
-    #[test]
-    fn encode_max_fps_zero_means_disabled() {
-        let cli = parse_ok(&["rencoder", "encode", "-f", "in.mp4", "--max-fps", "0"]);
+    fn encode_interactive_flag() {
+        let cli = parse_ok(&["rencoder", "encode", "-f", "in.mp4", "-i"]);
         match cli.command {
-            Command::Encode(args) => assert_eq!(args.max_fps, 0.0),
+            Command::Encode(args) => assert!(args.interactive),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn encode_config_path() {
+        let cli = parse_ok(&[
+            "rencoder",
+            "encode",
+            "-f",
+            "in.mp4",
+            "--config",
+            "/etc/rencoder.toml",
+        ]);
+        match cli.command {
+            Command::Encode(args) => {
+                assert_eq!(args.config, Some(PathBuf::from("/etc/rencoder.toml")))
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn encode_output_path() {
+        let cli = parse_ok(&[
+            "rencoder",
+            "encode",
+            "-f",
+            "in.mp4",
+            "-o",
+            "/tmp/out.parquet",
+        ]);
+        match cli.command {
+            Command::Encode(args) => {
+                assert_eq!(args.output, Some(PathBuf::from("/tmp/out.parquet")))
+            }
             _ => panic!(),
         }
     }
@@ -251,8 +178,15 @@ mod tests {
     #[test]
     fn encode_extra_args_after_double_dash() {
         let cli = parse_ok(&[
-            "rencoder", "encode", "-f", "in.mp4",
-            "--", "-ss", "10", "-metadata", "title=foo",
+            "rencoder",
+            "encode",
+            "-f",
+            "in.mp4",
+            "--",
+            "-ss",
+            "10",
+            "-metadata",
+            "title=foo",
         ]);
         match cli.command {
             Command::Encode(args) => {
@@ -271,50 +205,36 @@ mod tests {
         }
     }
 
-    // ---- encode: extensions / dir / nv ----
+    // ---- encode: moved flags are gone ----
 
     #[test]
-    fn encode_extensions_repeatable() {
-        let cli = parse_ok(&[
-            "rencoder", "encode", "-d", "/d",
-            "-e", "mp4", "-e", "mkv", "-e", "avi",
-        ]);
-        match cli.command {
-            Command::Encode(args) => {
-                assert_eq!(args.dir, Some(PathBuf::from("/d")));
-                assert_eq!(args.ext, vec!["mp4", "mkv", "avi"]);
-            }
-            _ => panic!(),
-        }
+    fn encode_rejects_removed_format_flag() {
+        parse_err(&["rencoder", "encode", "-f", "in.mp4", "-c", "av1"]);
     }
 
     #[test]
-    fn encode_nv_flag_sets_bool() {
-        let cli = parse_ok(&["rencoder", "encode", "-f", "in.mp4", "--nv"]);
-        match cli.command {
-            Command::Encode(args) => assert!(args.enable_nv),
-            _ => panic!(),
-        }
+    fn encode_rejects_removed_bitrate_flag() {
+        parse_err(&["rencoder", "encode", "-f", "in.mp4", "-b", "5000"]);
     }
 
     #[test]
-    fn encode_interactive_flag() {
-        let cli = parse_ok(&["rencoder", "encode", "-f", "in.mp4", "-i"]);
-        match cli.command {
-            Command::Encode(args) => assert!(args.interactive),
-            _ => panic!(),
-        }
+    fn encode_rejects_removed_max_fps_flag() {
+        parse_err(&["rencoder", "encode", "-f", "in.mp4", "--max-fps", "30"]);
     }
 
     #[test]
-    fn encode_config_path() {
-        let cli = parse_ok(&[
-            "rencoder", "encode", "-f", "in.mp4", "--config", "/etc/rencoder.json",
-        ]);
-        match cli.command {
-            Command::Encode(args) => assert_eq!(args.config, Some(PathBuf::from("/etc/rencoder.json"))),
-            _ => panic!(),
-        }
+    fn encode_rejects_removed_crf_flag() {
+        parse_err(&["rencoder", "encode", "-f", "in.mp4", "--crf"]);
+    }
+
+    #[test]
+    fn encode_rejects_removed_nv_flag() {
+        parse_err(&["rencoder", "encode", "-f", "in.mp4", "--nv"]);
+    }
+
+    #[test]
+    fn encode_rejects_removed_ext_flag() {
+        parse_err(&["rencoder", "encode", "-f", "in.mp4", "-e", "mp4"]);
     }
 
     // ---- analyze ----
@@ -326,9 +246,7 @@ mod tests {
             Command::Analyze(args) => {
                 assert_eq!(args.dir, None);
                 assert_eq!(args.file, None);
-                assert!(args.ext.is_empty());
-                assert!(!args.parallel);
-                assert_eq!(args.format, AnalyzeFormatArg::Csv);
+                assert_eq!(args.config, None);
                 assert_eq!(args.output, PathBuf::from("-"));
             }
             _ => panic!("expected Analyze"),
@@ -336,30 +254,23 @@ mod tests {
     }
 
     #[test]
-    fn analyze_with_all_flags() {
+    fn analyze_with_all_kept_flags() {
         let cli = parse_ok(&[
-            "rencoder", "analyze",
-            "-d", "/d", "-e", "mp4", "-p", "--format", "text", "-o", "stats.txt",
+            "rencoder",
+            "analyze",
+            "-d",
+            "/d",
+            "--config",
+            "rencoder.toml",
+            "-o",
+            "stats.txt",
         ]);
         match cli.command {
             Command::Analyze(args) => {
                 assert_eq!(args.dir, Some(PathBuf::from("/d")));
-                assert_eq!(args.ext, vec!["mp4"]);
-                assert!(args.parallel);
-                assert_eq!(args.format, AnalyzeFormatArg::Text);
+                assert_eq!(args.config, Some(PathBuf::from("rencoder.toml")));
                 assert_eq!(args.output, PathBuf::from("stats.txt"));
             }
-            _ => panic!(),
-        }
-    }
-
-    #[test]
-    fn analyze_extensions_repeatable() {
-        let cli = parse_ok(&[
-            "rencoder", "analyze", "-d", "/d", "-e", "mp4", "-e", "mkv",
-        ]);
-        match cli.command {
-            Command::Analyze(args) => assert_eq!(args.ext, vec!["mp4", "mkv"]),
             _ => panic!(),
         }
     }
@@ -368,9 +279,28 @@ mod tests {
     fn analyze_single_file() {
         let cli = parse_ok(&["rencoder", "analyze", "-f", "/single.mp4"]);
         match cli.command {
-            Command::Analyze(args) => assert_eq!(args.file, Some(PathBuf::from("/single.mp4"))),
+            Command::Analyze(args) => {
+                assert_eq!(args.file, Some(PathBuf::from("/single.mp4")))
+            }
             _ => panic!(),
         }
+    }
+
+    // ---- analyze: moved flags are gone ----
+
+    #[test]
+    fn analyze_rejects_removed_parallel_flag() {
+        parse_err(&["rencoder", "analyze", "-p"]);
+    }
+
+    #[test]
+    fn analyze_rejects_removed_format_flag() {
+        parse_err(&["rencoder", "analyze", "--format", "csv"]);
+    }
+
+    #[test]
+    fn analyze_rejects_removed_ext_flag() {
+        parse_err(&["rencoder", "analyze", "-e", "mp4"]);
     }
 
     // ---- subcommand-level errors ----
@@ -386,11 +316,9 @@ mod tests {
     }
 
     #[test]
-    fn encode_missing_required_input_errors() {
-        // Neither --file nor --dir is provided; we don't enforce this at
-        // clap level (interact mode can populate later), but clap doesn't
-        // complain either -- the validation lives in main.rs (Phase 11).
-        // This test just verifies clap parses the bare command.
+    fn encode_bare_command_parses() {
+        // Neither --file nor --dir; clap doesn't enforce this (interactive
+        // mode can populate later), validation lives in main.rs.
         let cli = parse_ok(&["rencoder", "encode"]);
         assert!(matches!(cli.command, Command::Encode(_)));
     }

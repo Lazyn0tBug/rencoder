@@ -8,8 +8,8 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::path::Path;
 
+use crate::data::extract::parse_fps_value;
 use crate::error::EncodeError;
-use crate::fps::parse::parse_fps_value;
 use crate::types::VideoMetadata;
 
 /// C-side result struct; field order and types must match `video_probe.c`.
@@ -62,10 +62,8 @@ pub fn probe_video_metadata_fast(input: &Path) -> Result<VideoMetadata, EncodeEr
     let result = unsafe { &*raw };
 
     let codec = read_cstr(result.codec_name);
-    let avg_fps = read_cstr(result.avg_frame_rate)
-        .and_then(|s| parse_fps_value(&s).ok());
-    let r_frame_rate = read_cstr(result.r_frame_rate)
-        .and_then(|s| parse_fps_value(&s).ok());
+    let avg_fps = read_cstr(result.avg_frame_rate).and_then(|s| parse_fps_value(&s).ok());
+    let r_frame_rate = read_cstr(result.r_frame_rate).and_then(|s| parse_fps_value(&s).ok());
     let duration = if result.duration.is_nan() {
         None
     } else {

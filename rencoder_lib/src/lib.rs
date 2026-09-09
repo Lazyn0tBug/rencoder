@@ -9,14 +9,11 @@ pub mod analyzer;
 pub mod collect;
 pub mod config;
 pub mod data;
-pub mod encoding;
 pub mod encoder;
 pub mod error;
-pub mod ffmpeg;
-pub mod fps;
-pub mod utils;
 pub mod pipeline;
 pub mod types;
+pub mod utils;
 
 /// Optional C FFI bridge to libavformat for high-performance probing.
 /// Compiled only when the `c-probe` feature is enabled.

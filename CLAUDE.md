@@ -4,10 +4,20 @@ Rust rewrite of `encode.zsh` and `video_fps_stats.zsh`: smart video transcoding 
 
 ## Workspace
 
-- `rencoder_lib` -- core library (`thiserror`, `walkdir`, `rayon`)
+- `rencoder_lib` -- core library (`thiserror`, `walkdir`, `rayon`, `toml`)
 - `rencoder_cli` -- CLI frontend (`clap`, `dialoguer`, `ctrlc`, `parking_lot`)
 
 Design source of truth: `docs/smart_code.md`. Update the doc first when behavior changes.
+
+## CLI / config split (U17)
+
+Only `target` (`-f`/`-d`) and `action` (`encode`/`analyze`) plus per-run
+overrides (`-i`, `--config`, `-o`, passthrough args) stay on the CLI.
+Everything else (format, bitrate, max-fps, crf, nv, extensions, encoder
+overrides, analyze format, parallel) lives in `rencoder.toml`. See
+`rencoder_lib::config::project` for the schema and `examples/rencoder.toml`
+for a reference. Unknown TOML keys are rejected so typos surface
+immediately.
 
 ## Build
 
@@ -31,7 +41,7 @@ cargo fmt --check
 |--------------|----------|-------|
 | `ffmpeg`     | yes      | always |
 | `ffprobe`    | yes      | always |
-| `nvidia-smi` | optional | only consulted when `--nv` is passed; missing or no GPUs = silent fallback to software encoding |
+| `nvidia-smi` | optional | only consulted when `[encode].nv = true` in `rencoder.toml`; missing or no GPUs = silent fallback to software encoding |
 
 ## Conventions
 

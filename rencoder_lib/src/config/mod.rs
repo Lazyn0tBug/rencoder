@@ -131,6 +131,28 @@ fn parse_encoders(v: Option<&Value>) -> EncoderConfig {
     }
 }
 
+/// Build a runtime `Config` from a `ProjectConfig`'s `encode` section.
+/// Missing fields fall back to `Config::default()`. The CLI uses this
+/// after loading `rencoder.toml` to feed `batch::transcode_batch` and
+/// `encoder::select::select_encoder`.
+impl Config {
+    pub fn from_project(encode: Option<&project::EncodeConfig>) -> Self {
+        let Some(enc) = encode else {
+            return Self::default();
+        };
+        Self {
+            max_fps: enc.max_fps.unwrap_or(0) as f64,
+            max_fps_eps: 0.05,
+            encoders: EncoderConfig {
+                av1: enc.encoders.as_ref().and_then(|e| e.av1.clone()),
+                x264: enc.encoders.as_ref().and_then(|e| e.x264.clone()),
+                hevc: enc.encoders.as_ref().and_then(|e| e.hevc.clone()),
+                vp9: enc.encoders.as_ref().and_then(|e| e.vp9.clone()),
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,8 +183,7 @@ mod tests {
 
     #[test]
     fn unknown_keys_are_ignored() {
-        let v: Value =
-            serde_json::from_str(r#"{"max_fps": 60, "future_field": true}"#).unwrap();
+        let v: Value = serde_json::from_str(r#"{"max_fps": 60, "future_field": true}"#).unwrap();
         let cfg = Config::from_value(&v);
         assert_eq!(cfg.max_fps, 60.0);
     }
@@ -192,8 +213,14 @@ mod tests {
         )
         .unwrap();
         let cfg = Config::from_value(&v);
-        assert_eq!(cfg.encoders.for_format(VideoFormat::Av1), Some("libaom-av1"));
-        assert_eq!(cfg.encoders.for_format(VideoFormat::Vp9), Some("libvpx-vp9"));
+        assert_eq!(
+            cfg.encoders.for_format(VideoFormat::Av1),
+            Some("libaom-av1")
+        );
+        assert_eq!(
+            cfg.encoders.for_format(VideoFormat::Vp9),
+            Some("libvpx-vp9")
+        );
         assert_eq!(cfg.encoders.for_format(VideoFormat::X264), None);
         assert_eq!(cfg.encoders.for_format(VideoFormat::Hevc), None);
         assert_eq!(cfg.max_fps, 30.0);
@@ -208,8 +235,7 @@ mod tests {
 
     #[test]
     fn encoder_field_must_be_string() {
-        let v: Value =
-            serde_json::from_str(r#"{"encoders": {"av1": 123}}"#).unwrap();
+        let v: Value = serde_json::from_str(r#"{"encoders": {"av1": 123}}"#).unwrap();
         let cfg = Config::from_value(&v);
         assert!(cfg.encoders.av1.is_none());
     }
@@ -218,8 +244,7 @@ mod tests {
     fn empty_encoder_string_is_rejected() {
         // Empty string would otherwise pass through to select_encoder and
         // match any cache via str::contains("") == true.
-        let v: Value =
-            serde_json::from_str(r#"{"encoders": {"av1": ""}}"#).unwrap();
+        let v: Value = serde_json::from_str(r#"{"encoders": {"av1": ""}}"#).unwrap();
         let cfg = Config::from_value(&v);
         assert!(cfg.encoders.av1.is_none());
     }
@@ -293,3 +318,11 @@ mod tests {
         }
     }
 }
+
+pub mod project;
+
+// Re-exports for ergonomics: callers can write `rencoder_lib::config::ProjectConfig`
+// instead of `rencoder_lib::config::project::ProjectConfig`.
+pub use project::{
+    AnalyzeConfig, AnalyzeFormatArg, EncodeConfig, EncodersConfig, FormatArg, ProjectConfig,
+};

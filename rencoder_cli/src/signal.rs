@@ -74,10 +74,7 @@ mod tests {
         let current: CurrentOutput = Arc::new(Mutex::new(None));
         assert!(current.lock().is_none());
 
-        assert_eq!(
-            register_partial(&current, PathBuf::from("/a.mkv")),
-            None
-        );
+        assert_eq!(register_partial(&current, PathBuf::from("/a.mkv")), None);
         assert_eq!(*current.lock(), Some(PathBuf::from("/a.mkv")));
 
         clear_partial(&current);

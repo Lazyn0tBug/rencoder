@@ -18,10 +18,7 @@ use crate::types::Target;
 ///
 /// `extensions` is a case-insensitive allowlist; an empty slice means "all
 /// files".
-pub fn collect_files(
-    target: &Target,
-    extensions: &[String],
-) -> Result<Vec<PathBuf>, EncodeError> {
+pub fn collect_files(target: &Target, extensions: &[String]) -> Result<Vec<PathBuf>, EncodeError> {
     match target {
         Target::File(p) => Ok(collect_single_file(p, extensions)),
         Target::Dir(root) => collect_dir(root, extensions),
@@ -147,7 +144,8 @@ mod tests {
         touch(&dir, "a.mp4");
         touch(&dir, "b.txt");
         touch(&dir, "c.mkv");
-        let files = collect_files(&Target::Dir(dir.clone()), &["mp4".into(), "mkv".into()]).unwrap();
+        let files =
+            collect_files(&Target::Dir(dir.clone()), &["mp4".into(), "mkv".into()]).unwrap();
         assert_eq!(files.len(), 2);
         assert!(files.iter().all(|p| {
             p.extension()

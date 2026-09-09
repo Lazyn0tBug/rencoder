@@ -2,6 +2,12 @@
 //! subprocess and verifies exit codes, stdout/stderr shape, and file
 //! outputs. Tests skip (with a logged warning) when `ffmpeg` is not
 //! available so the suite stays CI-friendly.
+//!
+//! U17 split: the CLI keeps only `target` (`-f`/`-d`) and `action`
+//! (`encode`/`analyze`) plus per-run overrides (`-i`, `--config`, `-o`,
+//! passthrough args). Everything else lives in a TOML config file that
+//! tests pass via `--config`. `write_config()` is the helper that
+//! materializes that file for the integration tests.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -45,16 +51,30 @@ fn fixture_dir(label: &str) -> PathBuf {
     dir
 }
 
+/// Write a TOML config file into `dir` and return its path. Tests use
+/// this to express what would previously have been CLI flags; the
+/// `--config` flag wires it into the run.
+fn write_config(dir: &Path, contents: &str) -> PathBuf {
+    let path = dir.join("rencoder.toml");
+    std::fs::write(&path, contents).unwrap();
+    path
+}
+
 fn make_video(dir: &Path, name: &str, fps: u32) -> PathBuf {
     let path = dir.join(name);
     let status = Command::new("ffmpeg")
         .args([
             "-y",
-            "-f", "lavfi",
-            "-i", "color=c=black:s=160x120:d=1",
-            "-r", &fps.to_string(),
-            "-c:v", "libx264",
-            "-t", "1",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=160x120:d=1",
+            "-r",
+            &fps.to_string(),
+            "-c:v",
+            "libx264",
+            "-t",
+            "1",
         ])
         .arg(&path)
         .stdout(Stdio::null())
@@ -70,7 +90,11 @@ fn make_video(dir: &Path, name: &str, fps: u32) -> PathBuf {
 #[test]
 fn version_prints_and_exits_zero() {
     let out = run(&["--version"]);
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("rencoder"),
@@ -89,11 +113,27 @@ fn top_level_help_prints_subcommands() {
 
 #[test]
 fn encode_help_prints_options() {
+    // U17 CLI surface: target (-f/-d), interactive, config path,
+    // output path, passthrough. Format / bitrate / max-fps / crf /
+    // nv / ext have moved to the config file.
     let out = run(&["encode", "--help"]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for opt in ["--format", "--bitrate", "--max-fps", "--nv"] {
+    for opt in ["--file", "--dir", "--config", "--output"] {
         assert!(stdout.contains(opt), "expected {opt} in encode help");
+    }
+    for removed in [
+        "--format",
+        "--bitrate",
+        "--max-fps",
+        "--nv",
+        "--crf",
+        "--ext",
+    ] {
+        assert!(
+            !stdout.contains(removed),
+            "{removed} should have moved to config"
+        );
     }
 }
 
@@ -102,8 +142,14 @@ fn analyze_help_prints_options() {
     let out = run(&["analyze", "--help"]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for opt in ["--dir", "--parallel", "--format", "--output"] {
+    for opt in ["--dir", "--file", "--config", "--output"] {
         assert!(stdout.contains(opt), "expected {opt} in analyze help");
+    }
+    for removed in ["--format", "--parallel", "--ext"] {
+        assert!(
+            !stdout.contains(removed),
+            "{removed} should have moved to config"
+        );
     }
 }
 
@@ -138,7 +184,11 @@ fn analyze_subcommand_produces_csv_for_real_videos() {
     assert!(stdout.contains("/a.mp4,24,"));
     assert!(stdout.contains("/b.mp4,30,"));
     assert!(stdout.contains("/c.mp4,60,"));
-    assert_eq!(stdout.lines().count(), 4, "expected header + 3 rows, got: {stdout}");
+    assert_eq!(
+        stdout.lines().count(),
+        4,
+        "expected header + 3 rows, got: {stdout}"
+    );
     // Summary on stderr.
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("Analyzed 3 file(s) (3 parsed, 0 failed)"));
@@ -166,7 +216,11 @@ fn analyze_subcommand_writes_csv_to_file() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(stats_path.exists(), "expected CSV at {}", stats_path.display());
+    assert!(
+        stats_path.exists(),
+        "expected CSV at {}",
+        stats_path.display()
+    );
     let content = std::fs::read_to_string(&stats_path).unwrap();
     assert!(content.starts_with("path,fps,codec,duration_secs,file_bytes\n"));
     assert!(content.contains("/x.mp4,30,"));
@@ -181,12 +235,14 @@ fn analyze_text_format_writes_to_file() {
     let dir = fixture_dir("analyze_text");
     make_video(&dir, "x.mp4", 30);
     let stats_path = dir.join("stats.txt");
+    let cfg = write_config(&dir, "[analyze]\nformat = \"text\"\n");
 
     let out = run(&[
         "analyze",
         "-d",
         dir.to_str().unwrap(),
-        "--format", "text",
+        "--config",
+        cfg.to_str().unwrap(),
         "-o",
         stats_path.to_str().unwrap(),
     ]);
@@ -195,10 +251,16 @@ fn analyze_text_format_writes_to_file() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(stats_path.exists(), "expected text file at {}", stats_path.display());
+    assert!(
+        stats_path.exists(),
+        "expected text file at {}",
+        stats_path.display()
+    );
     let content = std::fs::read_to_string(&stats_path).unwrap();
-    // Polars table format: column names + cell values.
-    assert!(content.contains("fps"), "expected Polars table with fps column");
+    assert!(
+        content.contains("fps"),
+        "expected Polars table with fps column"
+    );
     assert!(content.contains("30"), "expected 30 fps in table");
     assert!(content.contains("h264"), "expected codec in table");
     assert!(content.contains("Total:"));
@@ -213,12 +275,14 @@ fn analyze_table_format_emits_framed_per_file_table() {
     let dir = fixture_dir("analyze_table");
     make_video(&dir, "a.mp4", 24);
     make_video(&dir, "b.mp4", 30);
+    let cfg = write_config(&dir, "[analyze]\nformat = \"table\"\n");
 
     let out = run(&[
         "analyze",
         "-d",
         dir.to_str().unwrap(),
-        "--format", "table",
+        "--config",
+        cfg.to_str().unwrap(),
     ]);
     assert!(
         out.status.success(),
@@ -226,20 +290,15 @@ fn analyze_table_format_emits_framed_per_file_table() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // Polars Display produces the framed ASCII table.
     assert!(
         stdout.contains("┌") && stdout.contains("└") && stdout.contains("│"),
         "expected framed table borders, got: {stdout}"
     );
-    // Per-file rows. Polars truncates long paths with '...' to fit the
-    // terminal width, so we can't assert on the full filename. Verify
-    // the table contains 2 data rows by counting row separators.
     let row_separator_count = stdout.matches("│").count();
     assert!(
         row_separator_count >= 6,
         "expected at least 6 '|' borders (header + 2 rows + cols), got {row_separator_count} in: {stdout}"
     );
-    // Column headers.
     assert!(stdout.contains("path") && stdout.contains("fps") && stdout.contains("codec"));
 }
 
@@ -251,13 +310,18 @@ fn encode_subcommand_produces_output_file() {
     }
     let dir = fixture_dir("encode_e2e");
     let input = make_video(&dir, "movie.mp4", 30);
+    // U17: format / crf / bitrate live in config now.
+    let cfg = write_config(
+        &dir,
+        "[encode]\nformat = \"av1\"\ncrf = true\nbitrate = 45\n",
+    );
+
     let out = run(&[
         "encode",
         "-f",
         input.to_str().unwrap(),
-        "-c", "av1",
-        "--crf",
-        "-b", "45",
+        "--config",
+        cfg.to_str().unwrap(),
     ]);
     assert!(
         out.status.success(),
@@ -265,15 +329,22 @@ fn encode_subcommand_produces_output_file() {
         String::from_utf8_lossy(&out.stderr)
     );
     let expected_output = dir.join("movie.mkv");
-    assert!(expected_output.exists(), "expected output at {}", expected_output.display());
+    assert!(
+        expected_output.exists(),
+        "expected output at {}",
+        expected_output.display()
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Summary"), "expected Summary block in stdout, got: {stdout}");
+    assert!(
+        stdout.contains("Summary"),
+        "expected Summary block in stdout, got: {stdout}"
+    );
 }
 
 #[test]
 fn encode_rejects_missing_target() {
     // No --file, no --dir -> should error with a clear message.
-    let out = run(&["encode", "-c", "av1"]);
+    let out = run(&["encode"]);
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(

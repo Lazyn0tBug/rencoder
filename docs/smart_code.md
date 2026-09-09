@@ -180,34 +180,48 @@ df_to_csv  df_to_jsonl  df_to_parquet
 #### 核心库（`rencoder_lib`）
 
 模块划分按工作流组织。`data/` 是工作记录层（不是视频分析层），`encoder/` 是 ffmpeg
-构建与执行层，`pipeline/` 是 CLI→任务→记录的编排层，`utils/` 是跨模块的共享工具。
-`ffmpeg/` 这一层消失 —— 它的内容拆进 `data/extract.rs`（probe 是数据采集）和
-`pipeline/{cache,batch}.rs`（cache 和 batch 执行是工作流），以及 `encoder/{command,select}.rs`。
-原 `processor/batch.rs` 和 `ffmpeg/encoder_cache.rs` 合并为 `pipeline/`；原 `fps/` 拆入
-`data/record.rs` 和 `pipeline/batch.rs`。
+构建与执行层，`pipeline/` 是 CLI→任务→记录的编排层，`utils/` 是跨模块的共享工具，
+`config/` 是数据驱动的配置层。
+
+**最终状态**（U16 + U17 之后）：
+
+- `data/extract.rs` 拥有 probe 实现 + fps 解析（`probe_video_metadata*`、`parse_fps_value`）
+- `data/store.rs` 拥有 Polars DataFrame writers（`records_to_dataframe`、`records_to_csv/jsonl/parquet`、`dataframe_to_*`）
+- `data/record.rs` 拥有 `EncodingRecord` 组装 helpers（`make_skipped_record`、`make_failed_probe_record`、`encoder_settings_from_params`）
+- `encoder/{command,select}.rs` 拥有 `build_ffmpeg_command` + `select_encoder`
+- `pipeline/{batch,cache}.rs` 拥有 `transcode_batch` + `init_encoder_cache`
+- `utils/{fs,time}.rs` 拥有 `output_path_for` + `utc_timestamp_filename`
+- `config/mod.rs` 拥有 runtime `Config`（JSON 加载 → `from_project` 转换）
+- `config/project.rs` 拥有 user-facing `ProjectConfig`（TOML 加载，U17 新增）
 
 ```
 rencoder_lib/
 ├── lib.rs                       # 库入口，pub mod 声明
+├── analyzer/
+│   └── fps_stats.rs             # FPS 聚合分析（保留：CLI analyze 子命令用）
+├── collect.rs                   # 文件收集（按目录 / 单文件 / 扩展名过滤）
 ├── config/
-│   └── mod.rs                   # Config + load() + max_fps_config()
-├── utils/
-│   ├── mod.rs                   # 重导出
-│   ├── fs.rs                    # 路径规范化、文件收集辅助
-│   └── time.rs                  # UTC 时间戳格式化（ISO 8601）
+│   ├── mod.rs                   # runtime Config + Config::from_project + 重导出
+│   └── project.rs               # ProjectConfig + Encode/Analyze/Encoders/FormatArg/AnalyzeFormatArg
 ├── data/
-│   ├── mod.rs                   # EncodingRecord 类型 + 跨子模块重导出
-│   ├── extract.rs               # 数据采集：probe_video_metadata、stderr 捕获、output size 捕获
-│   ├── record.rs                # 记录构建：probe + 过程 + 结果 → EncodingRecord
-│   └── store.rs                 # 存储：records → DataFrame → CSV / JSONL / Parquet
+│   ├── mod.rs
+│   ├── extract.rs               # probe_video_metadata*, parse_fps_value, stderr_tail, output_size, output_duration
+│   ├── record.rs                # make_skipped_record, make_failed_probe_record, encoder_settings_from_params
+│   └── store.rs                 # records_to_dataframe, records_to_csv/jsonl/parquet, dataframe_to_*
+├── encoder/
+│   ├── mod.rs
+│   ├── command.rs               # build_ffmpeg_command（参数映射，含 -r 输出选项位置）
+│   └── select.rs                # select_encoder（cache + Config → 编码器名）
+├── error.rs                     # EncodeError（thiserror）
 ├── pipeline/
 │   ├── mod.rs
 │   ├── batch.rs                 # 编排：collect_files → transcode_batch（按文件循环，写记录+日志）
 │   └── cache.rs                 # init_encoder_cache（ffmpeg -encoders + nvidia-smi）
-└── encoder/
+├── types.rs                     # 跨模块共享类型（VideoFormat、EncodingRecord、MaxFpsConfig 等）
+└── utils/
     ├── mod.rs
-    ├── command.rs               # build_ffmpeg_command（参数映射，含 -r 输出选项位置）
-    └── select.rs                # select_encoder（cache + Config → 编码器名）
+    ├── fs.rs                    # 路径规范化、output_path_for
+    └── time.rs                  # UTC 时间戳格式化（ISO 8601）
 
 # 仍在 c-probe feature 门控下（独立于上面的分层）：
 └── c-probe/                     # 旧 ffi/ 重命名；C 桥接层 + Rust 包装
@@ -218,31 +232,44 @@ rencoder_lib/
 **为什么这样分层**：
 
 - **data/** 是工作记录层（work-record layer）。四种状态（source / process / result / status）
-  都是工作分析的维度，不是视频分析。`extract` 拿到原始数据，`record` 把它组装成 `EncodingRecord`，
-  `store` 把它写到 `data/` 目录供下游 DuckDB / Polars 查询。
+  都是工作分析的维度，不是视频分析。`extract` 拿到原始数据（probe + fps parse + stderr），
+  `record` 把它组装成 `EncodingRecord`，`store` 把它写到 `data/` 目录供下游 DuckDB / Polars 查询。
 - **encoder/** 是 ffmpeg 特定的实现细节。`command` 把 `EncodeParams` 转成 argv，`select` 选编码器。
   这层**只**对 ffmpeg 关心；不包含 cache（cache 是工作流层的事）。
 - **pipeline/** 是 CLI → 任务 → 记录的编排。它收集文件、循环每个文件、调用 encoder、
   收集 capture 写入 record、调 log。`batch.rs` 是这一层的主要实现，`cache.rs` 是辅助。
 - **utils/** 是跨模块共享的最小工具集。`fs` 路径规范化，`time` UTC 时间戳。
-  配置（`config/`）和日志（CLI 端 `tracing_init`）**不**在这一层 —— 配置是数据驱动的，
-  日志是跨切的关注点，不应该被当成数据层依赖。
+  日志（CLI 端 `tracing_init`）**不**在这一层 —— 日志是跨切的关注点。
+- **config/** 分两层：`project.rs`（user-facing TOML schema）+ `mod.rs`（runtime `Config`，
+  由 `project::EncodeConfig` 经 `Config::from_project` 转换而来）。CLI 加载 TOML，构造
+  runtime `Config` 喂给 pipeline；batch 和 select 看到的 `Config` 是窄的 runtime 形态。
 
-**为什么去掉 `analyzer/` 和 `fps/`**：
+**为什么 `analyzer/` 还在，`fps/` 已删除**：
 
-- `analyzer/fps_stats.rs` 是历史遗留的「按 fps 分组」分析，跟 `data/` 的工作记录不是一回事。
-  当真有 `--query "SELECT fps, COUNT(*) ..."` 这种 CLI 时再回来；目前 Pass 1-2 没有这条路径。
-- `fps/` 拆为 `fps::parse`（数字解析）和 `fps::limit`（max-fps 谓词），都已经在 `data/record.rs`
-  和 `pipeline/batch.rs` 里使用了（probe 阶段解析 fps，batch 阶段判断需不需要降帧）。
-  单独抽一层意义不大。
-- **Probe (`ffmpeg/probe.rs`) 不再是顶层** —— 它是 `data::extract::probe_video_metadata` 的
-  实现细节。CLI 用 `data::extract::probe_video_metadata` 即可，配置层不再直接调 ffmpeg。
+- `analyzer/fps_stats.rs` 是历史遗留的「按 fps 分组」分析，CLI 的 `analyze` 子命令直接用。
+  当真有 `--query "SELECT fps, COUNT(*) ..."` 这种 CLI 时再考虑迁移到 `data engine/`；目前
+  Pass 1-2 没有这条路径。
+- `fps/` 已删除（option B）。`parse_fps_value` 移入 `data/extract.rs`（probe 时用 fps
+  字符串解析，逻辑上属于「数据采集」层）；`fps/limit` 是空壳，整个 `fps::limit` 概念已不存在
+  （`MaxFpsConfig::need_reduce` 直接放在 `types.rs`）。
+
+**U16 Stage 6（已完成）**：`ffmpeg/` 和 `encoding/` 模块已删除。
+
+- 这两个模块是 U16 重构的「implementation 旧址」，option B 时保留了 `pub use` 桥接以
+  避免破坏潜在的下游消费者。U16 Stage 6 确认内部已无外部引用后彻底删除。
+- `pub use` 桥接完成历史使命；唯一一处曾用 `rencoder_lib::encoding::*` 的内部 caller
+  （`cli/main.rs::write_records`）已改用 `rencoder_lib::data::store::*`。
+- 现在的 public API 没有 `ffmpeg/` / `encoding/`；probe 实现是
+  `data::extract::{probe_video_metadata, probe_video_metadata_auto, parse_fps_value}`，
+  writers 是 `data::store::{records_to_csv, records_to_jsonl, records_to_parquet, records_to_dataframe, ...}`，
+  记录类型是 `types::{EncodingRecord, EncodingOutcome, ...}`。这是 breaking change —
+  任何使用旧路径的外部代码必须迁移。
 
 **当前不在分层里的概念（按需再加）**：
 
 - `data engine/{express, process, I/O}` —— Pass 2 之前的占位符，YAGNI。Polars 本身
   就是引擎；我们不需要自己的 wrapper 直到有 CLI 查询接口（`rencoder analyze-query` 之类）。
-- `validation/` —— 配置校验逻辑足够小，跟着 `config/` 走就好。
+- `validation/` —— 配置校验逻辑足够小，跟着 `config/project.rs` 的 `validate()` 走就好。
 - `c-probe/` 的拆分 —— 旧 `ffi/` 重命名即可，不要再分。
 
 #### CLI 前端（`rencoder_cli`）
@@ -600,23 +627,24 @@ pub fn probe_video_metadata_auto(input: &Path) -> Result<VideoMetadata, EncodeEr
 
 ### 3.4 CLI 前端职责
 
-#### 转码模式参数
+#### 转码模式参数（U17：CLI / config split 后）
 
 ```
 rencoder encode [选项] [--] [额外FFmpeg参数]
 
-选项：
-  -c, --format FORMAT     目标格式: x264|hevc|vp9|av1 (默认: av1)
-  -b, --bitrate VALUE     码率(Kbps)或CRF(仅AV1)
+选项（CLI 上只剩 target + action + 少数 per-run 覆盖）：
   -f, --file FILE         指定单个文件
   -d, --dir DIR           指定目录（递归）
-  -e, --ext EXT           扩展名过滤（可多次）
   -i, --interactive       启动交互模式
-  --nv, --enable-nv       启用 NVIDIA 硬件加速
+  --config PATH           TOML 配置路径（默认 ./rencoder.toml）
+  -o, --output FILE       详细输出文件路径（默认 ./data/encoding-<UTC-ISO8601>Z.parquet）
   --                      之后的所有参数作为FFmpeg原生参数透传
+
+剩余的 format / bitrate / max-fps / crf / nv / extensions / encoders 全部在
+`rencoder.toml` 的 `[encode]` 段。详见 §3.5 CLI / config split。
 ```
 
-#### 分析模式参数
+#### 分析模式参数（U17：CLI / config split 后）
 
 ```
 rencoder analyze [选项]
@@ -624,10 +652,10 @@ rencoder analyze [选项]
 选项：
   -d, --dir DIR           指定目录（递归），默认当前目录
   -f, --file FILE         指定单个文件
-  -e, --ext EXT           扩展名过滤（可多次）
-  -p, --parallel          启用并行分析
-  -v, --verbose           生成详细统计文件
-  -o, --output FILE       详细输出文件路径（默认 fps_stats.txt）
+  --config PATH           TOML 配置路径（默认 ./rencoder.toml）
+  -o, --output FILE       详细输出文件路径（默认 - 即 stdout）
+
+`format` / `parallel` / `extensions` 在 `rencoder.toml` 的 `[analyze]` 段。
 ```
 
 #### 交互模式
@@ -665,6 +693,22 @@ ctrlc::set_handler(move || {
     std::process::exit(1);
 }).unwrap();
 ```
+
+#### CLI / config split（U17）
+
+**设计意图**：CLI 只承载「per-run」语义（目标文件 / 目录 + 一次性 override），所有
+「per-project」的偏好（格式、码率、最大帧率、CRF、NV、扩展名、编码器覆盖、分析子命令
+的格式/并行/扩展名）都在 `rencoder.toml` 里。
+
+**为什么这样分**：
+- 同一个项目的批量转码任务用同一份配置；不同项目 / 阶段的偏好用不同 TOML；切换无需
+  拼长命令行。
+- 配置文件可以进 git，命令行参数不能；偏好用配置文件能跨机器同步。
+- 未知 TOML key 立即报错（`#[serde(deny_unknown_fields)]`），避免拼写错误静默生效。
+
+**schema**：见 `rencoder_lib::config::project::ProjectConfig` 和 `examples/rencoder.toml`。
+schema 校验在 `ProjectConfig::load`；CLI 调用 `Config::from_project` 把 TOML 的
+`encode` 段转成 runtime `Config` 喂给 `batch::transcode_batch` 和 `select::select_encoder`。
 
 ---
 

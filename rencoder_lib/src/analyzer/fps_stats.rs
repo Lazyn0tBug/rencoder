@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 
 use polars::prelude::*;
 
+use crate::data::extract::probe_video_metadata_auto;
 use crate::error::EncodeError;
-use crate::ffmpeg::probe::probe_video_metadata_auto;
 use crate::types::FpsStats;
 
 /// One row per input file. Failed probes yield a row with `path` and
@@ -36,10 +36,7 @@ pub fn analyze_records(files: &[PathBuf]) -> Result<Vec<AnalysisRecord>, EncodeE
 }
 
 /// Test seam: same as `analyze_records` but with an injectable probe.
-pub fn analyze_records_with_probe<F>(
-    files: &[PathBuf],
-    probe: F,
-) -> Vec<AnalysisRecord>
+pub fn analyze_records_with_probe<F>(files: &[PathBuf], probe: F) -> Vec<AnalysisRecord>
 where
     F: Fn(&Path) -> Result<crate::types::VideoMetadata, EncodeError>,
 {
@@ -187,11 +184,7 @@ pub fn records_to_csv(records: &[AnalysisRecord]) -> String {
         out.push(',');
         out.push_str(&csv_escape_field(r.codec.as_deref().unwrap_or("")));
         out.push(',');
-        out.push_str(
-            &r.duration_secs
-                .map(|d| format!("{d}"))
-                .unwrap_or_default(),
-        );
+        out.push_str(&r.duration_secs.map(|d| format!("{d}")).unwrap_or_default());
         out.push(',');
         out.push_str(&r.file_bytes.to_string());
         out.push('\n');
@@ -582,9 +575,7 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec![
-                "01.mp4", "02.mp4", "03.mp4", "04.mp4", "05.mp4",
-            ]
+            vec!["01.mp4", "02.mp4", "03.mp4", "04.mp4", "05.mp4",]
         );
     }
 }
