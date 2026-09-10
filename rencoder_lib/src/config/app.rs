@@ -445,4 +445,58 @@ mod tests {
         assert!(AppConfig::load(&path).is_err());
         std::fs::remove_file(&path).ok();
     }
+
+    #[test]
+    fn crf_defaults_to_45_when_field_missing() {
+        // U18 step 6: `crf: u32` with serde default = 45 (libsvtav1 medium).
+        // A config that omits `crf` entirely must still load — the field
+        // is non-Option with a default, so deserialization fills in 45.
+        let dir = std::env::temp_dir();
+        let path = dir.join("rencoder_crf_default.toml");
+        std::fs::write(&path, "[encode]\nformat = \"av1\"\n").unwrap();
+        let cfg = AppConfig::load(&path).expect("load should succeed");
+        let enc = cfg.encode.as_ref().expect("encode section");
+        assert_eq!(enc.crf, 45, "default crf must be 45");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn crf_explicit_value_accepted() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("rencoder_crf_explicit.toml");
+        std::fs::write(&path, "[encode]\ncrf = 25\n").unwrap();
+        let cfg = AppConfig::load(&path).expect("load should succeed");
+        assert_eq!(cfg.encode.unwrap().crf, 25);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn crf_zero_accepted_as_bitrate_sentinel() {
+        // crf = 0 is the sentinel for bitrate mode (uses the `bitrate` field).
+        // Validation must allow it; the runtime semantics are CLI-side.
+        let dir = std::env::temp_dir();
+        let path = dir.join("rencoder_crf_zero.toml");
+        std::fs::write(&path, "[encode]\ncrf = 0\nbitrate = 8000\n").unwrap();
+        let cfg = AppConfig::load(&path).expect("load should succeed");
+        assert_eq!(cfg.encode.unwrap().crf, 0);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn crf_out_of_range_rejected() {
+        // libsvtav1 max is 63; values above are silently accepted by ffmpeg
+        // but produce undefined behavior, so we reject them at load time.
+        let dir = std::env::temp_dir();
+        let path = dir.join("rencoder_crf_oor.toml");
+        std::fs::write(&path, "[encode]\ncrf = 64\n").unwrap();
+        let err = AppConfig::load(&path).unwrap_err();
+        match err {
+            ConfigError::InvalidValue { field, value } => {
+                assert_eq!(field, "encode.crf");
+                assert_eq!(value, "64");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+        std::fs::remove_file(&path).ok();
+    }
 }
