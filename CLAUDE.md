@@ -23,7 +23,7 @@ Rencoder is delivered and runs as a single self-contained directory:
 
 - All persistent state lives in `<app_dir>`; CWD is reserved for input files only.
 - `$RENENCODER_CONFIG` / `$RENENCODER_LOG_DIR` / `$RENENCODER_DATA_DIR` override defaults.
-- dist (via `scripts/build-dist.sh`) mirrors this layout — extract a tarball, get a ready-to-run app dir.
+- dist (via `scripts/dist.sh`) mirrors this layout — extract a tarball, get a ready-to-run app dir.
 
 ## App-level config (U18)
 

@@ -118,13 +118,13 @@ fs_perms::set_config_file_mode(&tmp)?;
 | 日志（文件 sink） | `<app_dir>/log/rencoder.YYYY-MM-DD.NN.log`（U18） | 日滚 + 10MB 大小滚（NN 自增），7 天保留（`max_age_days=0` 不限）；自定义 `MakeWriter` 实现；`RENENCODER_LOG_DIR` 覆盖 |
 | 日志（span） | `#[instrument]` + `FmtSpan::CLOSE` | 关键函数（`encode_cmd` / `analyze_cmd`）记录 span 上下文，便于排障 |
 | 配置（用户面） | TOML via `AppConfig`（U18） | 替代 jq + 自写 JSON schema；unknown keys 立即报错（`#[serde(deny_unknown_fields)]`） |
-| 配置（runtime 派生） | `Config` 由 `AppConfig::encode` 经 `Config::from_project` 派生（U18） | JSON `Config::load` 路径仅保留在 lib 内部测试 |
+| 配置（runtime 派生） | `Config` 由 `AppConfig::encode` 经 `Config::from_encode_config` 派生（U18） | JSON `Config::load` 路径仅保留在 lib 内部测试 |
 | 分析聚合 | `polars`（DataFrame `group_by` + `agg`） | 复用 Polars 生态；不再手写 BTreeMap 遍历 |
 | 分析输出（默认） | per-file CSV 到 stdout + 一行 summary 到 stderr | 原始数据可管道到 DuckDB/Polars 二次分析；摘要与数据流分离 |
 | 转码工作记录 | `EncodingRecord`（4 维度：source / process / result / status） | 工作分析（吞吐、压缩率、失败率），不是视频分析 |
 | 工作记录存储 | `<app_dir>/data/encoding-YYYY-MM-DDTHH-MM-SSZ.parquet`（按运行分文件，U18） | 每跑一次产出一个自包含文件，多批分析用 `read_parquet(['<app_dir>/data/*.parquet'])` glob；`RENENCODER_DATA_DIR` 覆盖 |
 | 工作记录序列化 | 单 DataFrame 中转（`records_to_dataframe`）+ 三种 writer（CSV / JSONL / Parquet） | schema 在 `records_to_dataframe` 一处定义；writer 都是 thin wrapper |
-| 单目录应用部署 | `scripts/build-dist.sh` 把 target 产物 + LICENSE + README + 配置种子装配成单目录应用（U18） | 跨平台一致；解压即用；放弃 `cargo install` 的共享 `~/.cargo/bin/` 模式 |
+| 单目录应用部署 | `scripts/dist.sh` 把 target 产物 + LICENSE + README + 配置种子装配成单目录应用（U18） | 跨平台一致；解压即用；放弃 `cargo install` 的共享 `~/.cargo/bin/` 模式 |
 | `rencoder_lib` publish 策略 | `publish = false`（U18） | 内部 lib，不发布到 crates.io；防止内部 API 泄露锁死 schema |
 | 配置路径解析 | `$RENENCODER_CONFIG` > `<app_dir>/rencoder.toml`（U18） | 二级解析；env 覆盖用于 read-only fs / 调试 |
 | 跨平台代码封装 | cfg 只在定义处（`fs_perms.rs`），调用处 uniform signature（U18） | 平台差异集中单文件维护；非 Unix 平台尚未实现（future work） |
@@ -247,7 +247,7 @@ df_to_csv  df_to_jsonl  df_to_parquet
 - `encoder/{command,select}.rs` 拥有 `build_ffmpeg_command` + `select_encoder`
 - `pipeline/{batch,cache}.rs` 拥有 `transcode_batch` + `init_encoder_cache`
 - `utils/{fs,time}.rs` 拥有 `output_path_for` + `utc_timestamp_filename`
-- `config/mod.rs` 拥有 runtime `Config`（JSON 加载 → `from_project` 转换）
+- `config/mod.rs` 拥有 runtime `Config`（JSON 加载 → `from_value` 转换；U17+ 由 `from_encode_config` 从 `AppConfig` 派生）
 - `config/app.rs` 拥有 user-facing `AppConfig`（U18 重命名自 `project.rs`；TOML 加载在 U17 新增）
 
 ```
@@ -257,7 +257,7 @@ rencoder_lib/
 │   └── fps_stats.rs             # FPS 聚合分析（保留：CLI analyze 子命令用）
 ├── collect.rs                   # 文件收集（按目录 / 单文件 / 扩展名过滤）
 ├── config/
-│   ├── mod.rs                   # runtime Config + Config::from_project + 重导出
+│   ├── mod.rs                   # runtime Config + Config::from_encode_config + 重导出
 │   └── app.rs               # AppConfig + Encode/Analyze/Encoders/FormatArg/AnalyzeFormatArg
 ├── data/
 │   ├── mod.rs
@@ -297,7 +297,7 @@ rencoder_lib/
 - **utils/** 是跨模块共享的最小工具集。`fs` 路径规范化，`time` UTC 时间戳。
   日志（CLI 端 `tracing_init`）**不**在这一层 —— 日志是跨切的关注点。
 - **config/** 分两层：`app.rs`（user-facing TOML schema）+ `mod.rs`（runtime `Config`，
-  由 `app::EncodeConfig` 经 `Config::from_project` 转换而来）。CLI 加载 TOML，构造
+  由 `app::EncodeConfig` 经 `Config::from_encode_config` 转换而来）。CLI 加载 TOML，构造
   runtime `Config` 喂给 pipeline；batch 和 select 看到的 `Config` 是窄的 runtime 形态。
 
 **为什么 `analyzer/` 还在，`fps/` 已删除**：
@@ -767,7 +767,7 @@ ctrlc::set_handler(move || {
 - **运行时是单目录应用**：binary 自己 resolve 出父目录（`current_exe().parent()`），
   所有持久化状态（config / log / data）从 `<app_dir>` 派生。U17 的 `./rencoder.toml`
   / `./log/` / `./data/` CWD 相对路径不再是默认行为。
-- **dist 镜像运行时布局**：`scripts/build-dist.sh` 把 target 产物 + LICENSE +
+- **dist 镜像运行时布局**：`scripts/dist.sh` 把 target 产物 + LICENSE +
   README + config 模板拷进 `dist/<app>-<triple>/`，形成 ready-to-run 单目录应用。
   解压后直接 `./rencoder ...`，无需 mkdir 或额外配置。
 
@@ -786,7 +786,7 @@ ctrlc::set_handler(move || {
 
 **schema**：见 `rencoder_lib::config::app::AppConfig` 和 `examples/rencoder.toml.example`
 （dev-only 参考，dist 用户无需手动拷贝）。schema 校验在 `AppConfig::load`；runtime
-`Config` 通过 `Config::from_project(&app_config.encode)` 派生。
+`Config` 通过 `Config::from_encode_config(&app_config.encode)` 派生。
 
 **CRF 字段**（U18）：`crf: u32`，默认 `45`（libsvtav1 中等质量），`0` = 退回
 bitrate 模式（用 `bitrate` 字段的 Kbps 值）。范围 `0..=63`（libsvtav1 max=63，
@@ -857,12 +857,12 @@ rencoder/
 ├── examples/
 │   └── rencoder.toml          # dev-only 参考；dist 用户无需
 ├── scripts/
-│   └── build-dist.sh          # 把 target 产物 + assets 装配成单目录应用
+│   └── dist.sh                # 把 target 产物 + assets 装配成单目录应用（augment tarball with rencoder.toml + log/ + data/）
 └── docs/
     └── smart_code.md          # 设计契约（本文件）
 ```
 
-**dist 视图**（`scripts/build-dist.sh` 产出，按目标平台一份）：
+**dist 视图**（`scripts/dist.sh` 产出，按目标平台一份）：
 
 ```
 rencoder-cli-<triple>/
@@ -884,7 +884,7 @@ rencoder-cli-<triple>/
 └── data/                      # 工作记录：encoding-<ISO8601>Z.parquet
 ```
 
-**scripts/build-dist.sh 职责**：
+**scripts/dist.sh 职责**：
 
 1. `cargo build --release --target <triple>`
 2. 创建 `dist/<app>-<triple>/`

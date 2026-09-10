@@ -485,7 +485,7 @@ User asked: keep only `target` (`-f`/`-d`) and `action` (`encode` /
 new `ProjectConfig` schema replaces the old JSON `Config` as the
 user-facing surface; the runtime `Config` (used by `batch::transcode_batch`
 and `encoder::select::select_encoder`) is now built from
-`ProjectConfig.encode` via `Config::from_project`.
+`ProjectConfig.encode` via `Config::from_encode_config`.
 
 ### Schema (TOML)
 
@@ -528,7 +528,7 @@ Stripped from CLI (now in config): `-c`/`--format`, `-b`/`--bitrate`,
   `EncodeConfig`, `AnalyzeConfig`, `EncodersConfig`, `FormatArg`,
   `AnalyzeFormatArg`, `ConfigError`, `load` / `validate` / `max_fps` /
   `encoders`
-- `rencoder_lib/src/config/mod.rs` — added `Config::from_project` and
+- `rencoder_lib/src/config/mod.rs` — added `Config::from_encode_config` and
   re-exports of the project module's public types
 - `rencoder_cli/src/args.rs` — stripped moved flags; tests cover both
   the kept surface and the explicit rejections of removed flags
@@ -573,7 +573,7 @@ marked `publish = false`.
   comments, stderr notice; existing-but-invalid → error, never overwrite.
 - **CRF schema**: `Option<bool>` → `Option<u32>`, default `Some(45)`,
   sentinel `0` = bitrate mode. Aligns 1:1 with ffmpeg `-crf N`.
-- **dist**: `scripts/build-dist.sh` assembles `dist/<app>-<triple>/` with
+- **dist**: `scripts/dist.sh` assembles `dist/<app>-<triple>/` with
   binary + LICENSE + README + `rencoder.toml` seed + empty `log/` + `data/`.
   Mirrors runtime layout — extract and run.
 
@@ -597,7 +597,7 @@ marked `publish = false`.
 - [ ] `rencoder_lib/src/config/app.rs` — `crf: Option<bool>` →
   `Option<u32>` (default `Some(45)`, validate `0..=63`)
 - [ ] `rencoder_lib/src/config/mod.rs` — update re-exports
-  (`AppConfig` (renamed from `ProjectConfig`)); `Config::from_project` adapts crf
+  (`AppConfig` (renamed from `ProjectConfig`)); `Config::from_encode_config` adapts crf
   semantics (crf > 0 → pass as `-crf N`; crf == 0 → use `bitrate` for
   `-b:v`)
 - [x] `rencoder_cli/src/main.rs` — `load_app_config` (renamed from
@@ -612,7 +612,7 @@ marked `publish = false`.
   `build_ffmpeg_command` lives) — crf semantics updated for new schema
 - [ ] `examples/rencoder.toml.example` — header updated: "dev-only reference;
   dist users don't need this"; crf value updated to `45`
-- [ ] `scripts/build-dist.sh` — new: cargo build + assemble dist tree +
+- [ ] `scripts/dist.sh` — new: cargo build + assemble dist tree +
   empty log/data placeholders + cargo-dist tarball
 - [ ] `docs/smart_code.md` — already updated (§1.2, §2, §3.4.5, §3.6)
 - [ ] `CLAUDE.md` — already updated (workspace note, single-directory
