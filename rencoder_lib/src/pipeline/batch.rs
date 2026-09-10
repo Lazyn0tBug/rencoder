@@ -384,8 +384,13 @@ fn make_failed_probe_record(
     }
 }
 
-/// Run ffmpeg with stderr captured. The stderr tail (last ~20 lines)
-/// is included in the error context for failure debugging.
+/// Run ffmpeg. Stream redirection follows the `ProcessOutput` variant:
+///
+/// - `Inherit` (default per design §2): both stdout AND stderr pass through
+///   to the terminal so ffmpeg's progress bars are visible (ffmpeg writes
+///   progress to stderr). On failure, ffmpeg's error message was already
+///   printed to terminal in real-time -- `output_run.stderr` is empty
+///   here but the user has seen the error.
 fn run_ffmpeg_with_stderr(
     argv: &[String],
     output: ProcessOutput,
@@ -401,12 +406,19 @@ fn run_ffmpeg_with_stderr(
     let args = &argv[1..];
     let mut cmd = Command::new(program);
     cmd.args(args);
-    // Always capture stderr so we have it for failure analysis.
-    cmd.stderr(Stdio::piped());
     match output {
-        ProcessOutput::Inherit => cmd.stdout(Stdio::inherit()),
-        ProcessOutput::Piped => cmd.stdout(Stdio::piped()),
-        ProcessOutput::Null => cmd.stdout(Stdio::null()),
+        ProcessOutput::Inherit => {
+            cmd.stdout(Stdio::inherit());
+            cmd.stderr(Stdio::inherit());
+        }
+        ProcessOutput::Piped => {
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
+        }
+        ProcessOutput::Null => {
+            cmd.stdout(Stdio::null());
+            cmd.stderr(Stdio::null());
+        }
     };
     let output_run = cmd.output();
     let output_run = match output_run {
