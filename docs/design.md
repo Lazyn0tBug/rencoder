@@ -748,7 +748,17 @@ NVIDIA 加速: 未启用
 
 **意图**：用户按 Ctrl-C 中断转码时，handler 读取当前正在写入的 output path，删除半成品
 文件，避免留下损坏的 `.mkv`/`.mp4`。这跟 `encode.zsh` 里的 `trap _cleanup INT TERM HUP`
-是同一类行为（zsh script line 142）。
+是同一类行为（zsh script line 142）。`signal-hook` crate 让一个 iterator thread 同时监听
+SIGINT / SIGTERM / SIGHUP 三个信号，跟 zsh 的 `trap _cleanup INT TERM HUP` 完全对齐。
+
+**信号覆盖**：
+- `SIGINT`（Ctrl-C / 中断键）
+- `SIGTERM`（`kill <pid>` 默认 / 进程管理器 / 容器 orchestrator）
+- `SIGHUP`（SSH 断开 / 终端关闭）
+
+三者触发同一段 cleanup 逻辑（读 `current_output` → `fs::remove_file` → `exit(1)`）。**单次
+process 只有一个 listener thread**（在 `install_handler()` 里 spawn 一次），跟 `Arc<Mutex>` 共享
+state。
 
 **Cross-platform story**：源码无 platform-specific 调用 —— `ctrlc` crate 内部统一处理
 Unix signal / Windows console event，`Arc<Mutex<PathBuf>>` + `std::fs::remove_file` +

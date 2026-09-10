@@ -649,8 +649,42 @@ Fix scope:
   module docstring ("fully wired up" not "Phase 11 placeholder")
 - [ ] `rencoder_cli/src/main.rs::encode_cmd` — pass the handler through
   to `transcode_batch`
-- [ ] tests: register/clear lifecycle in transcode_batch (one new test
-  verifying the guard's drop semantics)
+- [x] tests: register/clear lifecycle in partial_output (5 unit tests)
+  + batch_lifecycle_registers_and_clears_partial_output (Guard type contract)
+- [x] `cargo test --workspace` → 240 passed (5 suites; was 239 +1 net)
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` clean
+- [x] `cargo fmt --check` clean
+
+## U18.1.1 Review-delta fixes for signal handling (audit 2026-09-11)
+
+Findings from `/code-review-graph:review-delta` on U18.1 commit 534ba24:
+
+1. **HIGH: SIGTERM + SIGHUP not covered** — `ctrlc::set_handler` only handles
+   SIGINT. `kill <pid>` (default SIGTERM) and SSH disconnect (SIGHUP) bypass
+   cleanup, leaving partial files. encode.zsh's `trap _cleanup INT TERM HUP`
+   covered all three. Replace `ctrlc` with `signal-hook` for SIGINT + SIGTERM
+   + SIGHUP in a single iterator thread.
+2. **MED: integration test gap** — `batch_lifecycle_registers_and_clears_partial_output`
+   only tests Guard type contract, not the actual `transcode_batch` integration.
+   Add a mock-processor test that asserts handle state between iterations
+   (proves Guard really drops).
+3. **LOW: implicit single-batch constraint** — `transcode_batch`'s `Arc<Mutex>`
+   handle is process-wide; concurrent batches would race. Add a docstring
+   note.
+
+Fix scope:
+- [x] `docs/design.md` §3.4.5 — document SIGINT + SIGTERM + SIGHUP coverage
+- [x] `docs/todo.md` U18.1.1 entry added
+- [ ] `rencoder_cli/Cargo.toml` — drop `ctrlc`, add `signal-hook`
+- [ ] `rencoder_cli/src/signal.rs` — replace `ctrlc::set_handler` with
+  `signal_hook::iterator::Signals::new(&[SIGINT, SIGTERM, SIGHUP])` + thread
+- [ ] `rencoder_lib/src/pipeline/batch.rs` — add mock-processor integration
+  test for Guard lifecycle
+- [ ] `rencoder_lib/src/pipeline/batch.rs::transcode_batch` — doc comment
+  "single batch per process; current_output is process-singleton"
+- [ ] `cargo test --workspace` green
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings` clean
+- [ ] `cargo fmt --check` clean
 
 ### Verify
 
