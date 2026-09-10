@@ -56,7 +56,8 @@ pub struct EncodeArgs {
     pub config: Option<PathBuf>,
 
     /// Output path. Extension picks the format (.parquet, .jsonl, .csv).
-    /// Default: timestamped Parquet in `./data/encoding-<UTC-ISO8601>Z.parquet`.
+    /// Default: timestamped Parquet in `<app_dir>/data/encoding-<UTC-ISO8601>Z.parquet`
+    /// (U18; honors `$RENENCODER_DATA_DIR`).
     #[arg(short = 'o', long = "output")]
     pub output: Option<PathBuf>,
 

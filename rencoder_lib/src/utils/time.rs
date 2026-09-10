@@ -1,8 +1,9 @@
 //! UTC timestamp formatting for record filenames and log prefixes.
 //!
-//! The CLI's default data path (`./data/encoding-<UTC-ISO8601>Z.parquet`)
-//! is the primary consumer; centralizing the format here keeps
-//! `data/store.rs` and the CLI's `default_data_path` consistent.
+//! The CLI's default data path (`<app_dir>/data/encoding-<UTC-ISO8601>Z.parquet`,
+//! U18; honors `$RENENCODER_DATA_DIR`) is the primary consumer;
+//! centralizing the format here keeps `data/store.rs` and the CLI's
+//! `default_data_path` consistent.
 
 use chrono::Utc;
 
