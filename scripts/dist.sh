@@ -5,6 +5,11 @@
 # `target/distrib/`) into the project-root `dist/` so the binary, LICENSE,
 # and README land at the path documented in the README and expected by CI.
 #
+# U18 (single-directory app, smart_code.md §3.6): every tarball is
+# augmented with the app-dir layout (rencoder.toml template + empty log/
+# + data/ subdirs) so the extracted binary is ready to run -- no `mkdir`,
+# no surprise auto-create file on first invocation.
+#
 # Usage:
 #   ./scripts/dist.sh             # build for the host target only
 #   ./scripts/dist.sh --release   # pass-through to dist build
@@ -37,13 +42,62 @@ for f in target/distrib/*.tar.xz target/distrib/*.tar.gz \
     cp "$f" dist/
 done
 
-# Also extract the host tarball so ./dist/rencoder is directly runnable
-# without unpacking by hand.
-if [ -f "target/distrib/rencoder_cli-$TARGET.tar.xz" ]; then
-    tar -xJf "target/distrib/rencoder_cli-$TARGET.tar.xz" -C dist/
-    echo "Extracted ./dist/rencoder_cli-$TARGET/rencoder"
+# Augment each tarball with the U18 single-directory app layout
+# (rencoder.toml template + empty log/ + data/). This matches the
+# runtime layout described in docs/smart_code.md §3.6, so the extracted
+# binary is ready to run with no further setup.
+#
+# We re-pack each tarball in place rather than re-deriving from scratch,
+# so cargo-dist's SHA256 (covering binary + LICENSE + README) stays
+# authoritative for the binary contents. The added files (config +
+# dirs) are deterministic and live outside the binary's hash surface.
+augmented=0
+for tarball in dist/rencoder_cli-*.tar.xz; do
+    [ -f "$tarball" ] || continue
+
+    workdir=$(mktemp -d)
+    tar -xJf "$tarball" -C "$workdir"
+
+    # cargo-dist lays out: <workdir>/rencoder_cli-<triple>/<files>
+    app_dir=$(find "$workdir" -mindepth 1 -maxdepth 1 -type d \
+              -name 'rencoder_cli-*' | head -1)
+    if [ -z "$app_dir" ]; then
+        echo "warn: no rencoder_cli-* dir inside $tarball, skipping augment" >&2
+        rm -rf "$workdir"
+        continue
+    fi
+
+    # Config template (matches DEFAULT_CONFIG_TOML in app.rs; dev-only
+    # reference copy stays in examples/rencoder.toml.example).
+    cp examples/rencoder.toml.example "$app_dir/rencoder.toml"
+
+    # Empty log/ + data/ subdirs with .gitkeep so they survive the tar
+    # roundtrip. Real files appear here on first use (auto-create in
+    # the lib, write_records in main).
+    mkdir -p "$app_dir/log" "$app_dir/data"
+    : > "$app_dir/log/.gitkeep"
+    : > "$app_dir/data/.gitkeep"
+
+    # Re-pack in place. Use --transform so the leading workdir/ is
+    # stripped and we preserve the cargo-dist `rencoder_cli-<triple>/`
+    # top-level layout.
+    inner_name=$(basename "$app_dir")
+    (cd "$workdir" && tar -cJf "$tarball.new" "$inner_name")
+    mv "$tarball.new" "$tarball"
+    rm -rf "$workdir"
+    augmented=$((augmented + 1))
+done
+
+# Also extract the host tarball so ./dist/rencoder_cli-<target>/ is
+# directly runnable without unpacking by hand.
+host_tarball="dist/rencoder_cli-$TARGET.tar.xz"
+if [ -f "$host_tarball" ]; then
+    tar -xJf "$host_tarball" -C dist/
+    echo "Extracted ./dist/rencoder_cli-$TARGET/ (with U18 app_dir layout)"
 fi
 
+echo
+echo "Augmented $augmented tarball(s) with rencoder.toml + log/ + data/"
 echo
 echo "Artifacts in dist/:"
 ls -la dist/
