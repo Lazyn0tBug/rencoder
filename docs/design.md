@@ -82,6 +82,19 @@ Rencoder 是一个独立的第三方应用，不是发布到 crates.io 的通用
 |------|----------------------|---------|------|
 | config 文件 mode bits | `0o644` | no-op（TBD future work） | `rencoder_lib::config::fs_perms::set_config_file_mode` |
 | log / data 目录 mode bits | `0o755` | no-op（TBD future work） | `rencoder_lib::config::fs_perms::set_app_dir_mode` |
+| SIGINT → 清理半成品文件（§3.4.5） | 跨平台（`ctrlc` crate 抽象） | 跨平台（同） | `rencoder_cli::signal` + `rencoder_lib::pipeline::partial_output` |
+
+**信号处理为什么不需要 `#[cfg]`**：本节列出的 fs_perms 调用的是 Unix-only Rust stdlib
+API（`PermissionsExt::from_mode`），所以需要 `#[cfg(unix)]` 切到 no-op 分支。信号处理不同：
+`ctrlc::set_handler` 在内部统一处理 Unix signal 和 Windows console event；`Arc<Mutex<PathBuf>>`、
+`std::fs::remove_file`、`std::process::exit`、`eprintln!` 都是 stdlib 跨平台 API。源码里
+**没有任何 platform-specific 调用**——不需要 `#[cfg]`。
+
+**为什么不预先加防御性 `#[cfg]`**：加 `#[cfg(unix)]` + `#[cfg(not(unix))]` 重复 no-op 模式是
+cargo-cult —— 真正的 platform divergence 在 `ctrlc` 内部已经被它处理。如果未来加 GUI/Tauri
+build，**不复用** `rencoder_cli::signal`（webview 有自己的 beforeunload / IPC 机制），
+会单独写。**所以这个 module 的 cross-platform story 是 "lib 内置 + CLI-only 作用域 + 不复用"，不是
+"加 `#[cfg]` 防御"**。
 
 #### 调用范式
 
@@ -736,6 +749,13 @@ NVIDIA 加速: 未启用
 **意图**：用户按 Ctrl-C 中断转码时，handler 读取当前正在写入的 output path，删除半成品
 文件，避免留下损坏的 `.mkv`/`.mp4`。这跟 `encode.zsh` 里的 `trap _cleanup INT TERM HUP`
 是同一类行为（zsh script line 142）。
+
+**Cross-platform story**：源码无 platform-specific 调用 —— `ctrlc` crate 内部统一处理
+Unix signal / Windows console event，`Arc<Mutex<PathBuf>>` + `std::fs::remove_file` +
+`std::process::exit` + `eprintln!` 都是 stdlib 跨平台 API。所以本节代码**不需要 `#[cfg]` 分支**，
+跟 §1.3 表里 `fs_perms`（有 `#[cfg(unix)]`）不同。详细原因见 §1.3 末尾的"为什么信号处理不需要
+`#[cfg]`"小节。未来 Tauri/GUI build **不复用** `rencoder_cli::signal`（webview 有自己的
+beforeunload / IPC 机制），会单独写。
 
 **完整 lifecycle**（U18 wiring fix）：
 
