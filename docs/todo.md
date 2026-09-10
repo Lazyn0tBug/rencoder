@@ -615,8 +615,42 @@ marked `publish = false`.
 - [ ] `scripts/dist.sh` — new: cargo build + assemble dist tree +
   empty log/data placeholders + cargo-dist tarball
 - [ ] `docs/design.md` — already updated (§1.2, §2, §3.4.5, §3.6)
+- [x] `docs/design.md` — extended §3.4.5 信号处理 with full lifecycle
+  (install → register per file → clear after ffmpeg → SIGINT) +
+  `PartialOutputHandle` lib type
 - [ ] `CLAUDE.md` — already updated (workspace note, single-directory
   section, U18 wording)
+- [x] `docs/design.md` — added design doc for the signal handling bug
+  found at U18 verify: `signal.rs` had install_handler/clear_partial/
+  register_partial/remove_partial but only install_handler was
+  called from production code; SIGINT handler read None and never
+  cleaned up partial files (regression vs encode.zsh's `trap _cleanup
+  INT TERM HUP`)
+
+## U18.1 Wire signal handling for partial output cleanup (U18 verify bug)
+
+Bug found during U18 audit: `signal.rs` has `install_handler()` /
+`register_partial()` / `clear_partial()` / `remove_partial()`. Only
+`install_handler()` is called from production code (`main.rs::encode_cmd`).
+The other 3 are `#[allow(dead_code)]` and only used in tests. Result:
+SIGINT handler reads `None` and never cleans up partial files — a
+regression vs `encode.zsh`'s working `trap _cleanup INT TERM HUP`.
+
+Fix scope:
+- [x] `docs/design.md` §3.4.5 — full lifecycle + `PartialOutputHandle` lib type
+- [ ] `rencoder_lib/src/pipeline/partial_output.rs` — new module with
+  `PartialOutputHandle = Arc<Mutex<Option<PathBuf>>>` + `set` / `clear` +
+  RAII `Guard` that auto-clears on drop
+- [ ] `rencoder_lib/src/pipeline/batch.rs` — `transcode_batch` +
+  `transcode_single` accept `current_output: Option<&PartialOutputHandle>`;
+  wrap ffmpeg call with the guard
+- [ ] `rencoder_cli/src/signal.rs` — type-alias `CurrentOutput` to lib's
+  `PartialOutputHandle`; remove `#![allow(dead_code)]`; update
+  module docstring ("fully wired up" not "Phase 11 placeholder")
+- [ ] `rencoder_cli/src/main.rs::encode_cmd` — pass the handler through
+  to `transcode_batch`
+- [ ] tests: register/clear lifecycle in transcode_batch (one new test
+  verifying the guard's drop semantics)
 
 ### Verify
 

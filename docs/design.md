@@ -733,22 +733,113 @@ NVIDIA 加速: 未启用
 
 #### 信号处理
 
+**意图**：用户按 Ctrl-C 中断转码时，handler 读取当前正在写入的 output path，删除半成品
+文件，避免留下损坏的 `.mkv`/`.mp4`。这跟 `encode.zsh` 里的 `trap _cleanup INT TERM HUP`
+是同一类行为（zsh script line 142）。
+
+**完整 lifecycle**（U18 wiring fix）：
+
+1. **install**（`main` 启动时一次）：
+   - `signal::install_handler()` → 装 `ctrlc` SIGINT handler + 返回 `CurrentOutput` handle
+2. **register per file**（`transcode_batch` 每个文件 ffmpeg 调用前）：
+   - `partial_output::set(handle, task.output.clone())` → 写入当前 output path
+3. **clear after ffmpeg**（`transcode_batch` 每个文件 ffmpeg 返回后）：
+   - `partial_output::clear(handle)` → 清空（成功时避免下一次 SIGINT 误删好文件；失败时
+     下一次 register 会覆盖当前 path）
+4. **SIGINT**（用户中断）：
+   - handler `take()` 当前 path → `fs::remove_file` → eprintln → `exit(1)`
+
+**Shared type**（在 lib，CLI 只用 type alias）：
+
+```rust
+// rencoder_lib/src/pipeline/partial_output.rs
+use std::path::PathBuf;
+use std::sync::Arc;
+use parking_lot::Mutex;
+
+/// Per-process handle for the in-flight ffmpeg output path. The signal
+/// handler reads this on SIGINT; the per-file batch loop writes to it.
+pub type PartialOutputHandle = Arc<Mutex<Option<PathBuf>>>;
+
+/// Set the current partial output path. Returns the previous value
+/// (or None), letting the batch loop detect file transitions.
+pub fn set(handle: &PartialOutputHandle, path: PathBuf) -> Option<PathBuf> {
+    handle.lock().replace(path)
+}
+
+/// Clear the current partial output (called after ffmpeg exits so a
+/// subsequent SIGINT doesn't remove a successfully-written file).
+pub fn clear(handle: &PartialOutputHandle) {
+    handle.lock().take();
+}
+```
+
+**Why the type lives in lib, not CLI**：lib的 `transcode_batch` 需要接受 `current_output`
+参数（不能依赖 CLI 的 signal module，否则 lib 反向依赖 CLI）。CLI 的 `signal.rs` 只
+保留 `install_handler()` + `ctrlc` 依赖，type 重新声明为 `pub type CurrentOutput =
+rencoder_lib::pipeline::partial_output::PartialOutputHandle;`。
+
+**Handler 安装**（CLI `signal.rs`）：
+
 ```rust
 use parking_lot::Mutex;
 use std::sync::Arc;
+use std::path::PathBuf;
 
-let current_output: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
-let signal_output = current_output.clone();
+pub type CurrentOutput = rencoder_lib::pipeline::partial_output::PartialOutputHandle;
 
-ctrlc::set_handler(move || {
-    // parking_lot::Mutex 无中毒语义
-    if let Some(path) = signal_output.lock().take() {
-        let _ = std::fs::remove_file(&path);
-        eprintln!("⚠️  中断，已删除不完整文件：{}", path.display());
-    }
-    std::process::exit(1);
-}).unwrap();
+pub fn install_handler() -> CurrentOutput {
+    let current: CurrentOutput = Arc::new(Mutex::new(None));
+    let signal_output = current.clone();
+
+    ctrlc::set_handler(move || {
+        // parking_lot::Mutex 无中毒语义
+        if let Some(path) = signal_output.lock().take() {
+            match std::fs::remove_file(&path) {
+                Ok(()) => eprintln!("⚠️  中断，已删除不完整文件：{}", path.display()),
+                Err(e) => eprintln!("warning: failed to remove partial output {}: {e}", path.display()),
+            }
+        }
+        std::process::exit(1);
+    })
+    .expect("failed to install SIGINT handler");
+
+    current
+}
 ```
+
+**Batch integration**（lib `pipeline/batch.rs`）：
+
+```rust
+pub fn transcode_batch(
+    params: &EncodeParams,
+    files: &[PathBuf],
+    cache: &EncoderCache,
+    config: &Config,
+    output: ProcessOutput,
+    current_output: Option<&PartialOutputHandle>,  // ← U18 新增
+    result_callback: Option<&ResultCallback>,
+) -> Vec<EncodingRecord> {
+    transcode_batch_with_processor(
+        params,
+        files,
+        |task, params| transcode_single(task, params, cache, config, output, current_output),
+        result_callback,
+    )
+}
+```
+
+`transcode_single` 在 `transcode_with_argv` 调用前后用 RAII guard 包裹：
+```rust
+let _guard = partial_output::Guard::new(current_output, task.output.clone());
+let record = transcode_with_argv(...);
+// _guard drops here, calling partial_output::clear
+```
+
+**Bug 修史**（U18 audit 发现）：`signal.rs` 早期实现了 install + clear + register + remove 四个
+pub fn，但 `register_partial` / `clear_partial` 只在 tests 里被调用，production 代码
+只调了 `install_handler` —— `current_output` 永远是 `None`，SIGINT handler 读到 `None` 啥也不做，
+**比 zsh 脚本的行为还差**（zsh 的 `trap _cleanup` 至少能删半成品）。修法是上述 lifecycle wiring。
 
 #### App-level config + single-directory app（U18）
 
