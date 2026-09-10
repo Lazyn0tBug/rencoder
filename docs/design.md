@@ -859,7 +859,7 @@ rencoder/
 ├── scripts/
 │   └── dist.sh                # 把 target 产物 + assets 装配成单目录应用（augment tarball with rencoder.toml + log/ + data/）
 └── docs/
-    └── smart_code.md          # 设计契约（本文件）
+    └── design.md              # 设计契约（本文件）
 ```
 
 **dist 视图**（`scripts/dist.sh` 产出，按目标平台一份）：

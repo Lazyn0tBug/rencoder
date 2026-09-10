@@ -7,7 +7,7 @@ Rust rewrite of `encode.zsh` and `video_fps_stats.zsh`: smart video transcoding 
 - `rencoder_lib` -- core library (`thiserror`, `walkdir`, `rayon`, `toml`); `publish = false` (U18, internal lib not on crates.io)
 - `rencoder_cli` -- CLI frontend (`clap`, `dialoguer`, `ctrlc`, `parking_lot`)
 
-Design source of truth: `docs/smart_code.md`. Update the doc first when behavior changes.
+Design source of truth: `docs/design.md`. Update the doc first when behavior changes.
 
 ## Single-directory app (U18)
 
@@ -86,7 +86,7 @@ cargo fmt --check
 - Library errors: `thiserror`. CLI errors: `anyhow`. `EncodeError` is `#[non_exhaustive]`.
 - `EncoderCache` is passed by `&` -- never cloned.
 - `-r <fps>` is an FFmpeg output option: `build_ffmpeg_command` must place it after `-i`, before the output path.
-- Phase 2 (this commit) covers workspace + base data structures. Subsequent phases per `docs/smart_code.md` §7.
+- Phase 2 (this commit) covers workspace + base data structures. Subsequent phases per `docs/design.md` §7.
 
 ## TODO
 

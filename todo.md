@@ -130,7 +130,7 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
 - [x] Tests: existing 12 analyzer tests still green; new Polars-specific tests confirm aggregation parity
 - [x] Integration: `analyze` CLI now emits per-file CSV to stdout + one-line summary to stderr by default
 - [x] CLI flags: `--format text` for legacy summary; `-o FILE` to redirect CSV
-- [x] `docs/smart_code.md` updated: tech decision table, analyzer design subsection, test matrix
+- [x] `docs/design.md` updated: tech decision table, analyzer design subsection, test matrix
 - **Verify**: `cargo test --workspace` still 200+/200+; `cargo clippy --workspace --all-targets` clean.
 
 ## U8. CLI core
@@ -350,7 +350,7 @@ Schema evolution: edit `records_to_dataframe` once.
 - [ ] Tests: new EncodingRecord field capture; DataFrame writer
       round-trip (Parquet can be read back with same values);
       timestamp default naming; legacy tests still pass
-- [ ] Document in `docs/smart_code.md` (already updated §2.4 decision;
+- [ ] Document in `docs/design.md` (already updated §2.4 decision;
       needs §3 type/API listings too)
 
 **Pass 2 — observability & archival**:
@@ -614,7 +614,7 @@ marked `publish = false`.
   dist users don't need this"; crf value updated to `45`
 - [ ] `scripts/dist.sh` — new: cargo build + assemble dist tree +
   empty log/data placeholders + cargo-dist tarball
-- [ ] `docs/smart_code.md` — already updated (§1.2, §2, §3.4.5, §3.6)
+- [ ] `docs/design.md` — already updated (§1.2, §2, §3.4.5, §3.6)
 - [ ] `CLAUDE.md` — already updated (workspace note, single-directory
   section, U18 wording)
 

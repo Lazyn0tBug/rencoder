@@ -257,7 +257,7 @@ cargo test --workspace                   # everything
 
 ## Architecture
 
-See `docs/smart_code.md` for the full design (architecture, KTDs, R-IDs,
+See `docs/design.md` for the full design (architecture, KTDs, R-IDs,
 test matrix).
 
 - `rencoder_lib/` — core library. All business logic.
