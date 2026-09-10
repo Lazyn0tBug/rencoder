@@ -48,8 +48,10 @@ pub struct EncodeArgs {
     #[arg(short = 'i', long = "interactive")]
     pub interactive: bool,
 
-    /// Path to TOML config file. Loaded once if it exists; missing file
-    /// is not an error. Default: `./rencoder.toml`.
+    /// Path to TOML config file. When not given, resolves via
+    /// `$RENENCODER_CONFIG` (if set) or `<app_dir>/rencoder.toml` (binary's
+    /// parent dir). Missing file at the resolved path triggers auto-create
+    /// of a starter config with mode bits 0o644 (Unix).
     #[arg(long = "config")]
     pub config: Option<PathBuf>,
 
@@ -73,8 +75,10 @@ pub struct AnalyzeArgs {
     #[arg(short = 'f', long = "file")]
     pub file: Option<PathBuf>,
 
-    /// Path to TOML config file. Loaded once if it exists; missing file
-    /// is not an error. Default: `./rencoder.toml`.
+    /// Path to TOML config file. When not given, resolves via
+    /// `$RENENCODER_CONFIG` (if set) or `<app_dir>/rencoder.toml` (binary's
+    /// parent dir). Missing file at the resolved path triggers auto-create
+    /// of a starter config with mode bits 0o644 (Unix).
     #[arg(long = "config")]
     pub config: Option<PathBuf>,
 

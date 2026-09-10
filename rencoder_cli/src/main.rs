@@ -78,7 +78,7 @@ fn encode_cmd(args: args::EncodeArgs) -> Result<()> {
 
     let enable_nv = enc.and_then(|e| e.nv).unwrap_or(false);
 
-    let config = Config::from_project(app_config.encode.as_ref());
+    let config = Config::from_encode_config(app_config.encode.as_ref());
 
     let params = EncodeParams {
         format,
@@ -350,7 +350,7 @@ fn load_app_config(path: Option<&Path>) -> Result<AppConfig> {
 
 // ---------------------------------------------------------------------------
 // AppConfig -> Config conversion lives in `rencoder_lib::config`
-// (`Config::from_project`) so the inherent impl stays in the same crate
+// (`Config::from_encode_config`) so the inherent impl stays in the same crate
 // as `Config`.
 // ---------------------------------------------------------------------------
 
@@ -361,15 +361,15 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn config_from_project_uses_defaults_when_no_encode_section() {
-        let cfg = Config::from_project(None);
+    fn config_from_encode_config_uses_defaults_when_no_encode_section() {
+        let cfg = Config::from_encode_config(None);
         assert_eq!(cfg.max_fps, 0.0);
         assert_eq!(cfg.max_fps_eps, 0.05);
         assert!(cfg.encoders.av1.is_none());
     }
 
     #[test]
-    fn config_from_project_picks_up_max_fps_and_encoders() {
+    fn config_from_encode_config_picks_up_max_fps_and_encoders() {
         let enc = EncodeConfig {
             max_fps: Some(30),
             encoders: Some(EncodersConfig {
@@ -379,7 +379,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let cfg = Config::from_project(Some(&enc));
+        let cfg = Config::from_encode_config(Some(&enc));
         assert_eq!(cfg.max_fps, 30.0);
         assert_eq!(cfg.encoders.av1.as_deref(), Some("libaom-av1"));
         assert_eq!(cfg.encoders.vp9.as_deref(), Some("libvpx-vp9"));

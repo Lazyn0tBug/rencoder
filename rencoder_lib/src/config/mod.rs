@@ -147,7 +147,7 @@ impl From<&app::EncodersConfig> for EncoderConfig {
 /// after loading `rencoder.toml` to feed `batch::transcode_batch` and
 /// `encoder::select::select_encoder`.
 impl Config {
-    pub fn from_project(encode: Option<&app::EncodeConfig>) -> Self {
+    pub fn from_encode_config(encode: Option<&app::EncodeConfig>) -> Self {
         let Some(enc) = encode else {
             return Self::default();
         };
