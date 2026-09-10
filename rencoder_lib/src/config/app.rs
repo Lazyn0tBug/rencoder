@@ -15,7 +15,7 @@
 //! ```toml
 //! [encode]
 //! format = "av1"
-//! crf = true
+//! crf = 45   # 0 = bitrate mode; default 45 (libsvtav1 medium)
 //! max_fps = 30
 //! nv = true
 //! extensions = ["mp4", "mov", "mkv"]
@@ -63,13 +63,14 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# Rencoder user config (TOML).
 # Target format. One of: x264 | hevc | vp9 | av1. Default: av1.
 format = "av1"
 
-# Bitrate in Kbps (used when crf = false). Ignored in CRF mode.
+# Bitrate in Kbps (used when crf = 0). Ignored in CRF mode.
 # Default: 5000.
 bitrate = 5000
 
-# Use CRF mode instead of bitrate. When true, `bitrate` carries the
-# CRF value (not kb/s). Default: false.
-crf = false
+# CRF quality value (libsvtav1 scale, 0..=63). Aligns 1:1 with ffmpeg's
+# `-crf N`. Sentinel `0` switches to bitrate mode (uses `bitrate` field).
+# Default: 45 (libsvtav1 medium quality).
+crf = 45
 
 # Cap source FPS at canonical values (0, 24, 25, 30, 60). 0 disables.
 # Default: 0.
@@ -119,12 +120,26 @@ pub struct AppConfig {
     pub analyze: Option<AnalyzeConfig>,
 }
 
+/// Default CRF value (libsvtav1 medium quality). Sentinel `0` switches
+/// to bitrate mode at the ffmpeg CLI layer; this default keeps the
+/// quality mode unless the user explicitly opts out.
+fn default_crf() -> u32 {
+    45
+}
+
 #[derive(Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct EncodeConfig {
     pub format: Option<FormatArg>,
     pub bitrate: Option<u32>,
-    pub crf: Option<bool>,
+    /// CRF quality value (libsvtav1 scale, 0..=63).
+    ///
+    /// `0` is the sentinel for bitrate mode (uses `bitrate` field).
+    /// `>0` is the CRF quality (aligns 1:1 with ffmpeg's `-crf N`).
+    ///
+    /// Default: 45 (libsvtav1 medium quality).
+    #[serde(default = "default_crf")]
+    pub crf: u32,
     /// Cap source FPS at this canonical value. Must be 0 (disabled)
     /// or one of the documented set (24, 25, 30, 60). Other values are
     /// rejected at config-load time.
@@ -188,7 +203,8 @@ impl AppConfig {
     }
 
     /// Validate that all set values are sensible. Today this checks
-    /// `max_fps` is in the canonical set and `bitrate` is non-zero;
+    /// `max_fps` is in the canonical set, `bitrate` is non-zero when
+    /// set, and `crf` is within libsvtav1's documented 0..=63 range;
     /// other fields are type-validated at parse time.
     fn validate(&self) -> Result<(), ConfigError> {
         if let Some(enc) = &self.encode {
@@ -207,6 +223,12 @@ impl AppConfig {
                         value: "0".into(),
                     });
                 }
+            }
+            if enc.crf > 63 {
+                return Err(ConfigError::InvalidValue {
+                    field: "encode.crf".into(),
+                    value: enc.crf.to_string(),
+                });
             }
         }
         Ok(())

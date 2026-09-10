@@ -71,10 +71,17 @@ fn encode_cmd(args: args::EncodeArgs) -> Result<()> {
         .map(Into::into)
         .unwrap_or(VideoFormat::Av1);
 
-    let is_crf = enc.and_then(|e| e.crf).unwrap_or(false);
-    let bitrate_or_crf = enc
-        .and_then(|e| e.bitrate)
-        .unwrap_or(if is_crf { 28 } else { 5000 });
+    // CRF field semantics (U18 step 6): `u32` aligned with ffmpeg's `-crf N`.
+    // Sentinel `0` switches to bitrate mode; any other value is the CRF
+    // quality. Default is 45 (libsvtav1 medium) when no [encode] section
+    // is present at all.
+    let crf_value = enc.map(|e| e.crf).unwrap_or(45);
+    let (is_crf, bitrate_or_crf) = if crf_value == 0 {
+        let bitrate = enc.and_then(|e| e.bitrate).unwrap_or(5000);
+        (false, bitrate)
+    } else {
+        (true, crf_value)
+    };
 
     let enable_nv = enc.and_then(|e| e.nv).unwrap_or(false);
 

@@ -313,7 +313,7 @@ fn encode_subcommand_produces_output_file() {
     // U17: format / crf / bitrate live in config now.
     let cfg = write_config(
         &dir,
-        "[encode]\nformat = \"av1\"\ncrf = true\nbitrate = 45\n",
+        "[encode]\nformat = \"av1\"\ncrf = 45\nbitrate = 5000\n",
     );
 
     let out = run(&[
