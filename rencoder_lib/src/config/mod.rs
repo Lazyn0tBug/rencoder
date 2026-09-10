@@ -329,6 +329,7 @@ mod tests {
     }
 }
 
+pub mod path;
 pub mod project;
 
 // Re-exports for ergonomics: callers can write `rencoder_lib::config::ProjectConfig`
