@@ -4,20 +4,58 @@ Rust rewrite of `encode.zsh` and `video_fps_stats.zsh`: smart video transcoding 
 
 ## Workspace
 
-- `rencoder_lib` -- core library (`thiserror`, `walkdir`, `rayon`, `toml`)
+- `rencoder_lib` -- core library (`thiserror`, `walkdir`, `rayon`, `toml`); `publish = false` (U18, internal lib not on crates.io)
 - `rencoder_cli` -- CLI frontend (`clap`, `dialoguer`, `ctrlc`, `parking_lot`)
 
 Design source of truth: `docs/smart_code.md`. Update the doc first when behavior changes.
 
-## CLI / config split (U17)
+## Single-directory app (U18)
+
+Rencoder is delivered and runs as a single self-contained directory:
+
+```
+<app_dir>/                    # = current_exe().parent()
+├── rencoder                  # binary
+├── rencoder.toml             # config (auto-created on first run if missing)
+├── log/                      # runtime logs
+└── data/                     # runtime data (Parquet, etc.)
+```
+
+- All persistent state lives in `<app_dir>`; CWD is reserved for input files only.
+- `$RENENCODER_CONFIG` / `$RENENCODER_LOG_DIR` / `$RENENCODER_DATA_DIR` override defaults.
+- dist (via `scripts/build-dist.sh`) mirrors this layout — extract a tarball, get a ready-to-run app dir.
+
+## App-level config (U18)
 
 Only `target` (`-f`/`-d`) and `action` (`encode`/`analyze`) plus per-run
 overrides (`-i`, `--config`, `-o`, passthrough args) stay on the CLI.
 Everything else (format, bitrate, max-fps, crf, nv, extensions, encoder
-overrides, analyze format, parallel) lives in `rencoder.toml`. See
-`rencoder_lib::config::project` for the schema and `examples/rencoder.toml`
-for a reference. Unknown TOML keys are rejected so typos surface
-immediately.
+overrides, analyze format, parallel) lives in `rencoder.toml` at the
+app-level location (binary dir by default; `$RENENCODER_CONFIG` overrides).
+See `rencoder_lib::config::app::AppConfig` for the schema and
+`examples/rencoder.toml` for a dev-only reference. Unknown TOML keys are
+rejected so typos surface immediately.
+
+CRF is a `u32` (default 45, sentinel 0 = bitrate mode), not a bool — this
+aligns 1:1 with ffmpeg's `-crf N`.
+
+## Cross-platform encapsulation (U18)
+
+Platform-specific behavior follows the **"cfg at definition, uniform
+signature at call"** principle:
+
+- `#[cfg(...)]` lives only inside the function body that does the
+  platform-specific work.
+- Callers see one stable signature; no cfg at the call site.
+- **Current implementation is Unix only** (built and tested on macOS;
+  Linux shares the `#[cfg(unix)]` branch and will be verified when
+  we cross-compile or run on Linux). Non-Unix platforms are not yet
+  implemented — future work.
+- Adding a new platform later = edit one file (the definition site).
+
+Concrete: `rencoder_lib::config::fs_perms` exposes
+`set_config_file_mode` (Unix: `0o644`) and `set_app_dir_mode` (Unix:
+`0o755`); non-Unix is a no-op placeholder.
 
 ## Build
 

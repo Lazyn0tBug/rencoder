@@ -1,12 +1,12 @@
-//! Project-level configuration file (TOML) — U18: app-level location
-//! (binary's parent dir; `$RENENCODER_CONFIG` overrides).
+//! App-level configuration file (TOML) — U18: lives at the app-level
+//! location (binary's parent dir; `$RENENCODER_CONFIG` overrides).
 //!
 //! CLI args override file values; file values override built-in defaults.
 //! Replaces the per-invocation flags that the U17 CLI/config split moved
 //! off the command line.
 //!
 //! **Auto-create**: when the resolved path doesn't exist,
-//! [`ProjectConfig::load`] writes [`DEFAULT_CONFIG_TOML`] (atomic
+//! [`AppConfig::load`] writes [`DEFAULT_CONFIG_TOML`] (atomic
 //! tmp+rename; mode bits `0o644` on Unix), stderr-notices, then returns
 //! the parsed config. Existing-but-invalid files are **never** touched.
 //!
@@ -46,7 +46,7 @@ use crate::types::VideoFormat;
 ///
 /// When schema fields change (e.g., U18 step 6's `crf` u32 redesign),
 /// this string is updated in lockstep with `EncodeConfig` /
-/// `AnalyzeConfig` definitions. The `ProjectConfig::load` round-trip
+/// `AnalyzeConfig` definitions. The `AppConfig::load` round-trip
 /// test (`missing_file_auto_creates_and_returns_parsed_config`) catches
 /// drift between this constant and the schema.
 pub const DEFAULT_CONFIG_TOML: &str = r#"# Rencoder user config (TOML).
@@ -112,7 +112,7 @@ parallel = false
 /// sections fall back to their per-action defaults.
 #[derive(Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct ProjectConfig {
+pub struct AppConfig {
     #[serde(default)]
     pub encode: Option<EncodeConfig>,
     #[serde(default)]
@@ -153,7 +153,7 @@ pub struct EncodersConfig {
     pub vp9: Option<String>,
 }
 
-impl ProjectConfig {
+impl AppConfig {
     /// Load a project config from a TOML file.
     ///
     /// Behavior:
@@ -317,12 +317,12 @@ mod tests {
         let path = dir.join("rencoder.toml");
         assert!(!path.exists(), "precondition: file must not exist");
 
-        let cfg = ProjectConfig::load(&path).expect("auto-create load should succeed");
+        let cfg = AppConfig::load(&path).expect("auto-create load should succeed");
         assert!(path.exists(), "auto-create must write the file");
 
         // Re-read the file and verify it's parseable + valid.
         let raw = std::fs::read_to_string(&path).unwrap();
-        let re_parsed: ProjectConfig = toml::from_str(&raw).unwrap();
+        let re_parsed: AppConfig = toml::from_str(&raw).unwrap();
         re_parsed.validate().expect("re-parse must validate");
 
         // The auto-generated content has explicit values (bitrate=5000
@@ -346,7 +346,7 @@ mod tests {
         let original_content = "[encode]\nthis_is_a_typo = true\n";
         std::fs::write(&path, original_content).unwrap();
 
-        let result = ProjectConfig::load(&path);
+        let result = AppConfig::load(&path);
         assert!(result.is_err(), "should reject unknown keys");
 
         // Existing file MUST NOT be overwritten — only missing triggers
@@ -369,7 +369,7 @@ mod tests {
         let custom_content = "[encode]\nformat = \"hevc\"\nmax_fps = 30\n";
         std::fs::write(&path, custom_content).unwrap();
 
-        let cfg = ProjectConfig::load(&path).unwrap();
+        let cfg = AppConfig::load(&path).unwrap();
         let enc = cfg.encode.as_ref().expect("encode section present");
         assert_eq!(enc.format, Some(FormatArg::Hevc));
         assert_eq!(enc.max_fps, Some(30));
@@ -387,7 +387,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join("rencoder_minimal.toml");
         std::fs::write(&path, "[encode]\nformat = \"av1\"\n").unwrap();
-        let cfg = ProjectConfig::load(&path).unwrap();
+        let cfg = AppConfig::load(&path).unwrap();
         assert_eq!(
             cfg.encode.as_ref().and_then(|e| e.format),
             Some(FormatArg::Av1)
@@ -400,7 +400,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join("rencoder_bad_fps.toml");
         std::fs::write(&path, "[encode]\nmax_fps = 15\n").unwrap();
-        let err = ProjectConfig::load(&path).unwrap_err();
+        let err = AppConfig::load(&path).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidValue { .. }));
         std::fs::remove_file(&path).ok();
     }
@@ -410,7 +410,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join("rencoder_zero_bitrate.toml");
         std::fs::write(&path, "[encode]\nbitrate = 0\n").unwrap();
-        let err = ProjectConfig::load(&path).unwrap_err();
+        let err = AppConfig::load(&path).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidValue { .. }));
         std::fs::remove_file(&path).ok();
     }
@@ -420,7 +420,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join("rencoder_unknown.toml");
         std::fs::write(&path, "[encode]\nthis_is_a_typo = true\n").unwrap();
-        assert!(ProjectConfig::load(&path).is_err());
+        assert!(AppConfig::load(&path).is_err());
         std::fs::remove_file(&path).ok();
     }
 }

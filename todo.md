@@ -524,7 +524,7 @@ Stripped from CLI (now in config): `-c`/`--format`, `-b`/`--bitrate`,
 ### Files touched
 
 - `rencoder_lib/Cargo.toml` — added `toml = "0.8"` + `serde` derive
-- `rencoder_lib/src/config/project.rs` — new: `ProjectConfig`,
+- `rencoder_lib/src/config/app.rs` — new: `ProjectConfig`,
   `EncodeConfig`, `AnalyzeConfig`, `EncodersConfig`, `FormatArg`,
   `AnalyzeFormatArg`, `ConfigError`, `load` / `validate` / `max_fps` /
   `encoders`
@@ -546,3 +546,89 @@ Stripped from CLI (now in config): `-c`/`--format`, `-b`/`--bitrate`,
   parsing, invalid `max_fps` rejection, CLI merge precedence (CLI >
   config > defaults), unknown-keys rejection, and removed-flag
   rejections at the clap layer.
+
+---
+
+## U18. Single-directory app + app-level config — PENDING CONFIRMATION (branch: refactor/single-dir-app)
+
+User asked: pivot from project-level config (U17) to app-level config that
+lives in the same directory as the binary. All persistent state (config,
+log, data) lives under `<app_dir>`; the deployed artifact is a single
+self-contained directory per target triple. Workspace structure kept
+(lib + cli as thin wrappers; future gui/tauri follow same pattern); lib
+marked `publish = false`.
+
+### Architecture contract
+
+- **Source**: workspace unchanged (`rencoder_lib` + `rencoder_cli`).
+  `rencoder_lib/Cargo.toml` adds `publish = false` (internal lib, not on
+  crates.io).
+- **Runtime**: binary resolves `app_dir = current_exe().parent()`. Config,
+  log, data all derive from `app_dir` by default.
+- **Env overrides** (priority highest → lowest):
+  `RENENCODER_CONFIG` > `<app_dir>/rencoder.toml`,
+  `RENENCODER_LOG_DIR` > `<app_dir>/log/`,
+  `RENENCODER_DATA_DIR` > `<app_dir>/data/`.
+- **Auto-create**: missing config → atomic write of defaults + inline
+  comments, stderr notice; existing-but-invalid → error, never overwrite.
+- **CRF schema**: `Option<bool>` → `Option<u32>`, default `Some(45)`,
+  sentinel `0` = bitrate mode. Aligns 1:1 with ffmpeg `-crf N`.
+- **dist**: `scripts/build-dist.sh` assembles `dist/<app>-<triple>/` with
+  binary + LICENSE + README + `rencoder.toml` seed + empty `log/` + `data/`.
+  Mirrors runtime layout — extract and run.
+
+### Tasks
+
+- [ ] `rencoder_lib/Cargo.toml` — add `publish = false`
+- [ ] `rencoder_lib/src/config/path.rs` — new module: `resolve()` =
+  `$RENENCODER_CONFIG` or `<app_dir>/rencoder.toml`
+- [ ] `rencoder_lib/src/config/fs_perms.rs` — new module with
+  `cfg`-at-definition pattern: `set_config_file_mode` (Unix: `0o644`;
+  non-Unix: no-op, TBD future work) and `set_app_dir_mode`
+  (Unix: `0o755`; non-Unix: no-op, TBD future work). Currently built
+  and tested on macOS only; Linux shares `#[cfg(unix)]` branch and
+  will be verified when we cross-compile / run on Linux. Non-Unix
+  placeholder is `let _ = path; Ok(())` so missing impl is a
+  compile-time fact, not a runtime surprise.
+- [ ] `rencoder_lib/src/config/app.rs` — `AppConfig` (renamed from `ProjectConfig`);
+  `load` adds auto-create dance (write defaults with atomic tmp+rename
+  if missing; error if existing-but-invalid; calls `fs_perms::set_config_file_mode`
+  on the tmp file before rename)
+- [ ] `rencoder_lib/src/config/app.rs` — `crf: Option<bool>` →
+  `Option<u32>` (default `Some(45)`, validate `0..=63`)
+- [ ] `rencoder_lib/src/config/mod.rs` — update re-exports
+  (`AppConfig` (renamed from `ProjectConfig`)); `Config::from_project` adapts crf
+  semantics (crf > 0 → pass as `-crf N`; crf == 0 → use `bitrate` for
+  `-b:v`)
+- [x] `rencoder_cli/src/main.rs` — `load_app_config` (renamed from
+  `load_project_config`); `DEFAULT_CONFIG_PATH` removed
+  (`path::resolve_config` owns it); `--config` semantics unchanged;
+  tests updated for new behavior
+- [ ] `rencoder_cli/src/tracing_init.rs` — `./log/` → `<app_dir>/log/`
+  (via `RENENCODER_LOG_DIR` override)
+- [ ] `rencoder_cli/src/main.rs` — `./data/` encoding output →
+  `<app_dir>/data/` (via `RENENCODER_DATA_DIR` override)
+- [ ] `rencoder_lib/src/encoder/command.rs` (or wherever
+  `build_ffmpeg_command` lives) — crf semantics updated for new schema
+- [ ] `examples/rencoder.toml` — header updated: "dev-only reference;
+  dist users don't need this"; crf value updated to `45`
+- [ ] `scripts/build-dist.sh` — new: cargo build + assemble dist tree +
+  empty log/data placeholders + cargo-dist tarball
+- [ ] `docs/smart_code.md` — already updated (§1.2, §2, §3.4.5, §3.6)
+- [ ] `CLAUDE.md` — already updated (workspace note, single-directory
+  section, U18 wording)
+
+### Verify
+
+- `cargo test --workspace` green (existing tests + new auto-create coverage)
+- `cargo clippy --all-targets -- -D warnings` clean
+- `cargo fmt --check` clean
+- Manual: `cargo dist build --target aarch64-apple-darwin` produces
+  tarball with `rencoder`, `rencoder.toml`, `log/`, `data/`, `LICENSE`,
+  `README.md`. Extract → `./rencoder --help` works from any CWD.
+- Manual: `rm <app_dir>/rencoder.toml && <app_dir>/rencoder encode -d
+  /some/videos` re-creates config + processes videos.
+- Manual: `RENENCODER_CONFIG=/tmp/c.toml <app_dir>/rencoder ...` uses
+  override; `RENENCODER_LOG_DIR=/tmp/log <app_dir>/rencoder ...` writes
+  logs to `/tmp/log`.
+- Existing examples/rencoder.toml parses with new u32 crf.

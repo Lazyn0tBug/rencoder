@@ -45,6 +45,57 @@ Rencoder 是一个智能视频转码与分析工具，支持：
 
 ---
 
+### 1.2 部署模型：单目录应用（U18）
+
+Rencoder 是一个独立的第三方应用，不是发布到 crates.io 的通用库。交付与运行时都
+采用**单目录应用（single-directory app）** 模式：
+
+- **发布形态**：target 平台一份自包含目录，包含 binary + 配置 + 运行时资源（log /
+  data 占位）。用户解压即用，不依赖系统路径、XDG 约定或 CWD。
+- **运行时约束**：binary 自己 resolve 出父目录（`current_exe().parent()`）作为
+  `app_dir`。所有持久化状态（config / log / data）从 `app_dir` 派生。CWD 只承载
+  用户输入的视频文件，与应用状态无关。
+- **Source 仍是 workspace**：`rencoder_lib` 完成核心工作（业务逻辑、配置加载、
+  ffmpeg 命令构造），`rencoder_cli`（及未来的 `rencoder_gui` / `rencoder_tauri`）
+  是 thin wrapper。
+- **Lib 内部约束**：`rencoder_lib` 加 `publish = false`，明确"不要 `cargo publish`"。
+
+详见 §3.4.5 "App-level config + single-directory app" 和 §3.6 "部署布局"。
+
+---
+
+### 1.3 跨平台代码封装约定（U18）
+
+涉及平台特定行为的代码（file mode bits 等）遵循"**定义处条件编译，使用处统一接口**"原则：
+
+- **cfg 只出现在定义处**——写出平台特定逻辑的函数内部。
+- **调用处只看到 uniform signature**——一个名字、一个签名，跨平台一致。
+- **当前实现：Unix only**——我们目前只在 macOS 上构建和测试；Linux 路径
+  跟 macOS 共享 `#[cfg(unix)]` 分支，覆盖到时一并验证。非 Unix 平台的
+  等价行为**尚未实现**（future work）。
+- **新增平台行为只改一个文件**——后续要落非 Unix 平台特定特性时，只改
+  定义处的实现，调用方零改动。
+
+#### 当前实现（Unix，macOS 已验证）
+
+| 操作 | Unix (macOS / Linux) | 非 Unix | 模块 |
+|------|----------------------|---------|------|
+| config 文件 mode bits | `0o644` | no-op（TBD future work） | `rencoder_lib::config::fs_perms::set_config_file_mode` |
+| log / data 目录 mode bits | `0o755` | no-op（TBD future work） | `rencoder_lib::config::fs_perms::set_app_dir_mode` |
+
+#### 调用范式
+
+```rust
+// 跨平台统一调用，调用方零 cfg
+fs_perms::set_config_file_mode(&tmp)?;
+```
+
+非 Unix 分支显式写 `let _ = path; Ok(())` 而非省略——让"该平台未实现"
+成为**编译期事实**，而不是运行期才发现调用缺失。落地非 Unix 平台
+行为时只改 `fs_perms.rs` 一个文件，调用方零改动。
+
+---
+
 ## 2. 技术决策
 
 | 决策点 | 选择 | 理由 |
@@ -64,14 +115,19 @@ Rencoder 是一个智能视频转码与分析工具，支持：
 | 错误处理 | `anyhow`（CLI）+ `thiserror`（核心库） | 分层清晰 |
 | 日志（核心库） | `log` | 核心库用 `log` 宏，保持库 API 稳定 |
 | 日志（CLI 前端） | `tracing` + `tracing-subscriber` + `tracing-log` | CLI 用结构化 tracing；`tracing-log` 桥接库内 `log` 事件 |
-| 日志（文件 sink） | `./log/rencoder.YYYY-MM-DD.NN.log` | 日滚 + 10MB 大小滚（NN 自增），7 天保留（`max_age_days=0` 不限）；自定义 `MakeWriter` 实现 |
+| 日志（文件 sink） | `<app_dir>/log/rencoder.YYYY-MM-DD.NN.log`（U18） | 日滚 + 10MB 大小滚（NN 自增），7 天保留（`max_age_days=0` 不限）；自定义 `MakeWriter` 实现；`RENENCODER_LOG_DIR` 覆盖 |
 | 日志（span） | `#[instrument]` + `FmtSpan::CLOSE` | 关键函数（`encode_cmd` / `analyze_cmd`）记录 span 上下文，便于排障 |
-| 配置 | `serde_json` | 替代 `jq` |
+| 配置（用户面） | TOML via `AppConfig`（U18） | 替代 jq + 自写 JSON schema；unknown keys 立即报错（`#[serde(deny_unknown_fields)]`） |
+| 配置（runtime 派生） | `Config` 由 `AppConfig::encode` 经 `Config::from_project` 派生（U18） | JSON `Config::load` 路径仅保留在 lib 内部测试 |
 | 分析聚合 | `polars`（DataFrame `group_by` + `agg`） | 复用 Polars 生态；不再手写 BTreeMap 遍历 |
 | 分析输出（默认） | per-file CSV 到 stdout + 一行 summary 到 stderr | 原始数据可管道到 DuckDB/Polars 二次分析；摘要与数据流分离 |
 | 转码工作记录 | `EncodingRecord`（4 维度：source / process / result / status） | 工作分析（吞吐、压缩率、失败率），不是视频分析 |
-| 工作记录存储 | `./data/encoding-YYYY-MM-DDTHH-MM-SSZ.parquet`（按运行分文件） | 每跑一次产出一个自包含文件，多批分析用 `read_parquet(['./data/*.parquet'])` glob |
+| 工作记录存储 | `<app_dir>/data/encoding-YYYY-MM-DDTHH-MM-SSZ.parquet`（按运行分文件，U18） | 每跑一次产出一个自包含文件，多批分析用 `read_parquet(['<app_dir>/data/*.parquet'])` glob；`RENENCODER_DATA_DIR` 覆盖 |
 | 工作记录序列化 | 单 DataFrame 中转（`records_to_dataframe`）+ 三种 writer（CSV / JSONL / Parquet） | schema 在 `records_to_dataframe` 一处定义；writer 都是 thin wrapper |
+| 单目录应用部署 | `scripts/build-dist.sh` 把 target 产物 + LICENSE + README + 配置种子装配成单目录应用（U18） | 跨平台一致；解压即用；放弃 `cargo install` 的共享 `~/.cargo/bin/` 模式 |
+| `rencoder_lib` publish 策略 | `publish = false`（U18） | 内部 lib，不发布到 crates.io；防止内部 API 泄露锁死 schema |
+| 配置路径解析 | `$RENENCODER_CONFIG` > `<app_dir>/rencoder.toml`（U18） | 二级解析；env 覆盖用于 read-only fs / 调试 |
+| 跨平台代码封装 | cfg 只在定义处（`fs_perms.rs`），调用处 uniform signature（U18） | 平台差异集中单文件维护；非 Unix 平台尚未实现（future work） |
 | Rust 版本 | 2021 Edition | 稳定 |
 | 目标平台 | Linux / macOS（Windows 后续） | 跨平台 |
 
@@ -192,7 +248,7 @@ df_to_csv  df_to_jsonl  df_to_parquet
 - `pipeline/{batch,cache}.rs` 拥有 `transcode_batch` + `init_encoder_cache`
 - `utils/{fs,time}.rs` 拥有 `output_path_for` + `utc_timestamp_filename`
 - `config/mod.rs` 拥有 runtime `Config`（JSON 加载 → `from_project` 转换）
-- `config/project.rs` 拥有 user-facing `ProjectConfig`（TOML 加载，U17 新增）
+- `config/app.rs` 拥有 user-facing `AppConfig`（U18 重命名自 `project.rs`；TOML 加载在 U17 新增）
 
 ```
 rencoder_lib/
@@ -202,7 +258,7 @@ rencoder_lib/
 ├── collect.rs                   # 文件收集（按目录 / 单文件 / 扩展名过滤）
 ├── config/
 │   ├── mod.rs                   # runtime Config + Config::from_project + 重导出
-│   └── project.rs               # ProjectConfig + Encode/Analyze/Encoders/FormatArg/AnalyzeFormatArg
+│   └── app.rs               # AppConfig + Encode/Analyze/Encoders/FormatArg/AnalyzeFormatArg
 ├── data/
 │   ├── mod.rs
 │   ├── extract.rs               # probe_video_metadata*, parse_fps_value, stderr_tail, output_size, output_duration
@@ -240,8 +296,8 @@ rencoder_lib/
   收集 capture 写入 record、调 log。`batch.rs` 是这一层的主要实现，`cache.rs` 是辅助。
 - **utils/** 是跨模块共享的最小工具集。`fs` 路径规范化，`time` UTC 时间戳。
   日志（CLI 端 `tracing_init`）**不**在这一层 —— 日志是跨切的关注点。
-- **config/** 分两层：`project.rs`（user-facing TOML schema）+ `mod.rs`（runtime `Config`，
-  由 `project::EncodeConfig` 经 `Config::from_project` 转换而来）。CLI 加载 TOML，构造
+- **config/** 分两层：`app.rs`（user-facing TOML schema）+ `mod.rs`（runtime `Config`，
+  由 `app::EncodeConfig` 经 `Config::from_project` 转换而来）。CLI 加载 TOML，构造
   runtime `Config` 喂给 pipeline；batch 和 select 看到的 `Config` 是窄的 runtime 形态。
 
 **为什么 `analyzer/` 还在，`fps/` 已删除**：
@@ -269,7 +325,7 @@ rencoder_lib/
 
 - `data engine/{express, process, I/O}` —— Pass 2 之前的占位符，YAGNI。Polars 本身
   就是引擎；我们不需要自己的 wrapper 直到有 CLI 查询接口（`rencoder analyze-query` 之类）。
-- `validation/` —— 配置校验逻辑足够小，跟着 `config/project.rs` 的 `validate()` 走就好。
+- `validation/` —— 配置校验逻辑足够小，跟着 `config/app.rs` 的 `validate()` 走就好。
 - `c-probe/` 的拆分 —— 旧 `ffi/` 重命名即可，不要再分。
 
 #### CLI 前端（`rencoder_cli`）
@@ -636,12 +692,12 @@ rencoder encode [选项] [--] [额外FFmpeg参数]
   -f, --file FILE         指定单个文件
   -d, --dir DIR           指定目录（递归）
   -i, --interactive       启动交互模式
-  --config PATH           TOML 配置路径（默认 ./rencoder.toml）
-  -o, --output FILE       详细输出文件路径（默认 ./data/encoding-<UTC-ISO8601>Z.parquet）
+  --config PATH           TOML 配置路径（默认 `<app_dir>/rencoder.toml`；`$RENENCODER_CONFIG` 覆盖）
+  -o, --output FILE       详细输出文件路径（默认 `<app_dir>/data/encoding-<UTC-ISO8601>Z.parquet`；`$RENENCODER_DATA_DIR` 覆盖）
   --                      之后的所有参数作为FFmpeg原生参数透传
 
 剩余的 format / bitrate / max-fps / crf / nv / extensions / encoders 全部在
-`rencoder.toml` 的 `[encode]` 段。详见 §3.5 CLI / config split。
+`rencoder.toml` 的 `[encode]` 段。详见 §3.4.5 App-level config + single-directory app。
 ```
 
 #### 分析模式参数（U17：CLI / config split 后）
@@ -652,8 +708,8 @@ rencoder analyze [选项]
 选项：
   -d, --dir DIR           指定目录（递归），默认当前目录
   -f, --file FILE         指定单个文件
-  --config PATH           TOML 配置路径（默认 ./rencoder.toml）
-  -o, --output FILE       详细输出文件路径（默认 - 即 stdout）
+  --config PATH           TOML 配置路径（默认 `<app_dir>/rencoder.toml`；`$RENENCODER_CONFIG` 覆盖）
+  -o, --output FILE       详细输出文件路径（默认 - 即 stdout；`-o file.parquet` 时写入 `<app_dir>/data/`）
 
 `format` / `parallel` / `extensions` 在 `rencoder.toml` 的 `[analyze]` 段。
 ```
@@ -694,21 +750,48 @@ ctrlc::set_handler(move || {
 }).unwrap();
 ```
 
-#### CLI / config split（U17）
+#### App-level config + single-directory app（U18）
 
-**设计意图**：CLI 只承载「per-run」语义（目标文件 / 目录 + 一次性 override），所有
-「per-project」的偏好（格式、码率、最大帧率、CRF、NV、扩展名、编码器覆盖、分析子命令
-的格式/并行/扩展名）都在 `rencoder.toml` 里。
+**设计意图**：CLI 只承载「per-run」语义（目标文件 / 目录 + 一次性 override）；所有
+「per-app」的偏好（格式、码率、最大帧率、CRF、NV、扩展名、编码器覆盖、分析子命令的
+格式/并行/扩展名）都在应用专属位置的 `rencoder.toml` 里。应用以**单目录**方式交付
+与部署——binary、config、log、data 全部在 `<app_dir>` 下，不依赖 CWD 或系统路径。
 
-**为什么这样分**：
-- 同一个项目的批量转码任务用同一份配置；不同项目 / 阶段的偏好用不同 TOML；切换无需
-  拼长命令行。
-- 配置文件可以进 git，命令行参数不能；偏好用配置文件能跨机器同步。
-- 未知 TOML key 立即报错（`#[serde(deny_unknown_fields)]`），避免拼写错误静默生效。
+**架构契约**：
+- **Source 仍是 workspace**（`rencoder_lib` + `rencoder_cli`；未来 `rencoder_gui` /
+  `rencoder_tauri`）。`rencoder_lib` 加 `publish = false`——明确"内部 lib，不要
+  `cargo publish`"。
+- **lib 完成核心工作**：业务逻辑、配置加载、FFmpeg 命令构造全部在 `rencoder_lib`；
+  `rencoder_cli`（及未来的 GUI / Tauri）是 thin wrapper，只负责 args 解析 + 编排。
+  CLI / GUI / Tauri 共享同一份 `rencoder.toml`，UX 一致。
+- **运行时是单目录应用**：binary 自己 resolve 出父目录（`current_exe().parent()`），
+  所有持久化状态（config / log / data）从 `<app_dir>` 派生。U17 的 `./rencoder.toml`
+  / `./log/` / `./data/` CWD 相对路径不再是默认行为。
+- **dist 镜像运行时布局**：`scripts/build-dist.sh` 把 target 产物 + LICENSE +
+  README + config 模板拷进 `dist/<app>-<triple>/`，形成 ready-to-run 单目录应用。
+  解压后直接 `./rencoder ...`，无需 mkdir 或额外配置。
 
-**schema**：见 `rencoder_lib::config::project::ProjectConfig` 和 `examples/rencoder.toml`。
-schema 校验在 `ProjectConfig::load`；CLI 调用 `Config::from_project` 把 TOML 的
-`encode` 段转成 runtime `Config` 喂给 `batch::transcode_batch` 和 `select::select_encoder`。
+**配置文件路径解析顺序**（`config_path::resolve`）：
+1. `$RENENCODER_CONFIG`（最高优先级）—— 显式覆盖，read-only fs / 调试用
+2. `<app_dir>/rencoder.toml`（默认）—— `current_exe().parent().join("rencoder.toml")`
+
+**log / data 路径解析**（同理）：
+- `$RENENCODER_LOG_DIR` > `<app_dir>/log/`
+- `$RENENCODER_DATA_DIR` > `<app_dir>/data/`
+
+**Auto-create 行为**（`AppConfig::load`）：
+- 路径不存在 → 写入默认 `rencoder.toml`（所有字段 = `Default::default()`，每个字段
+  有 inline 注释），atomic write（tmp + rename），stderr 日志提示
+- 路径存在但 parse / validate 失败 → 报错（**绝不覆盖**用户已有文件）
+
+**schema**：见 `rencoder_lib::config::app::AppConfig` 和 `examples/rencoder.toml`
+（dev-only 参考，dist 用户无需手动拷贝）。schema 校验在 `AppConfig::load`；runtime
+`Config` 通过 `Config::from_project(&app_config.encode)` 派生。
+
+**CRF 字段**（U18）：`crf: u32`，默认 `45`（libsvtav1 中等质量），`0` = 退回
+bitrate 模式（用 `bitrate` 字段的 Kbps 值）。范围 `0..=63`（libsvtav1 max=63，
+x264 max=51）。这跟 ffmpeg 的 `-crf N` 1:1 对齐，避免 U17 那种"bool 切换 + bitrate
+字段复用为 crf 值"的隐式 context-dependent typing。
 
 ---
 
@@ -759,6 +842,79 @@ CLI 输出 summary
     ↓
 若 -v：detailed() → 写入输出文件
 ```
+
+---
+
+### 3.6 部署布局（U18）
+
+**Source 视图**（workspace，单一 git 仓库）：
+
+```
+rencoder/
+├── Cargo.toml                 # workspace root
+├── rencoder_lib/              # 核心库（publish = false）
+├── rencoder_cli/              # CLI 前端（thin wrapper）
+├── examples/
+│   └── rencoder.toml          # dev-only 参考；dist 用户无需
+├── scripts/
+│   └── build-dist.sh          # 把 target 产物 + assets 装配成单目录应用
+└── docs/
+    └── smart_code.md          # 设计契约（本文件）
+```
+
+**dist 视图**（`scripts/build-dist.sh` 产出，按目标平台一份）：
+
+```
+rencoder-cli-<triple>/
+├── rencoder                   # 编译产物
+├── rencoder.toml              # 默认配置（auto-create 模板的种子）
+├── LICENSE
+├── README.md
+├── log/                       # 占位，首次运行写入时自动创建
+└── data/                      # 占位，首次运行写入时自动创建
+```
+
+**运行时视图**（用户解压 + 首次运行后）：
+
+```
+<user-chosen-install-dir>/     # = app_dir = current_exe().parent()
+├── rencoder                   # 用户调用的入口
+├── rencoder.toml              # 用户编辑的偏好（auto-create 后存在）
+├── log/                       # 日志：rencoder.YYYY-MM-DD.NN.log
+└── data/                      # 工作记录：encoding-<ISO8601>Z.parquet
+```
+
+**scripts/build-dist.sh 职责**：
+
+1. `cargo build --release --target <triple>`
+2. 创建 `dist/<app>-<triple>/`
+3. 拷贝 `target/<triple>/release/rencoder` + `LICENSE` + `README.md` +
+   `examples/rencoder.toml`（作为默认配置种子）→ `dist/<app>-<triple>/`
+4. 创建 `dist/<app>-<triple>/log/` 和 `dist/<app>-<triple>/data/`（占位目录）
+5. 打包成 `.tar.xz`（cargo-dist 完成最后一步）
+
+**Auto-create 流程**（`AppConfig::load` 内部）：
+
+```
+AppConfig::load(path)
+    │
+    ├─ path 存在？ ─→ 读 + parse + validate
+    │                   └─ 失败 → 报错（绝不覆盖用户已有文件）
+    │
+    └─ path 不存在？ ─→ 写默认配置（atomic tmp + rename）
+                        ├─ 父目录创建（如需要）
+                        ├─ 写所有 Default 字段 + inline 注释
+                        └─ stderr 提示：created <path>
+                       然后继续 parse 流程
+```
+
+**env var override 矩阵**（优先级从高到低）：
+
+| 变量 | 用途 | 默认 |
+|------|------|------|
+| `RENENCODER_CONFIG` | 显式指定 config 文件路径 | `<app_dir>/rencoder.toml` |
+| `RENENCODER_LOG_DIR` | 日志目录 | `<app_dir>/log/` |
+| `RENENCODER_DATA_DIR` | 数据/工作记录目录 | `<app_dir>/data/` |
 
 ---
 

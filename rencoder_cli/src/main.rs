@@ -1,11 +1,13 @@
 //! CLI entry point.
 //!
-//! U17: loads `ProjectConfig` from `--config` (default `./rencoder.toml`)
-//! and merges its `encode` / `analyze` sections into the CLI args. CLI
-//! keeps only `target` (`-f`/`-d`), `action` (subcommand), and a few
-//! per-run overrides (`-i`, `-o`, passthrough args). All other knobs
-//! (format, bitrate, max-fps, crf, nv, extensions, analyze format,
-//! parallel, encoder overrides) come from the TOML config file.
+//! U18: loads `AppConfig` from `--config` (explicit path) or, when not
+//! given, resolves via `rencoder_lib::config::path::resolve_config()`
+//! (`$RENENCODER_CONFIG` > `<app_dir>/rencoder.toml`). Merges the
+//! `encode` / `analyze` sections into the CLI args. CLI keeps only
+//! `target` (`-f`/`-d`), `action` (subcommand), and a few per-run
+//! overrides (`-i`, `-o`, passthrough args). All other knobs (format,
+//! bitrate, max-fps, crf, nv, extensions, analyze format, parallel,
+//! encoder overrides) come from the TOML config file.
 
 mod args;
 mod file_sink;
@@ -17,15 +19,12 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use rencoder_lib::{
     collect::collect_files,
-    config::{AnalyzeFormatArg, Config, ProjectConfig},
+    config::{AnalyzeFormatArg, AppConfig, Config},
     pipeline::{batch::transcode_batch, cache::init_encoder_cache},
     types::{EncodeParams, EncodingOutcome, ProcessOutput, SkippedReason, Target, VideoFormat},
 };
 use std::path::{Path, PathBuf};
 use tracing::{info, instrument, warn};
-
-/// Default config path searched when `--config` is not given.
-const DEFAULT_CONFIG_PATH: &str = "rencoder.toml";
 
 fn main() -> Result<()> {
     tracing_init::init();
@@ -41,9 +40,9 @@ fn main() -> Result<()> {
 /// write per-file records to the default `./data/encoding-*.parquet`.
 #[instrument(skip_all, fields(files = tracing::field::Empty))]
 fn encode_cmd(args: args::EncodeArgs) -> Result<()> {
-    let project = load_project_config(args.config.as_deref())?;
+    let app_config = load_app_config(args.config.as_deref())?;
 
-    let enc = project.encode.as_ref();
+    let enc = app_config.encode.as_ref();
 
     let target = if let Some(file) = &args.file {
         Target::File(file.clone())
@@ -79,7 +78,7 @@ fn encode_cmd(args: args::EncodeArgs) -> Result<()> {
 
     let enable_nv = enc.and_then(|e| e.nv).unwrap_or(false);
 
-    let config = Config::from_project(project.encode.as_ref());
+    let config = Config::from_project(app_config.encode.as_ref());
 
     let params = EncodeParams {
         format,
@@ -168,8 +167,8 @@ fn write_records(
 /// prints summary, optionally writes a detailed file.
 #[instrument(skip_all, fields(dir = ?args.dir, file = ?args.file, parallel = tracing::field::Empty))]
 fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
-    let project = load_project_config(args.config.as_deref())?;
-    let an = project.analyze.as_ref();
+    let app_config = load_app_config(args.config.as_deref())?;
+    let an = app_config.analyze.as_ref();
 
     let target =
         target_from_analyze_args(&args).with_context(|| "failed to determine target directory")?;
@@ -326,17 +325,31 @@ fn target_path(target: &Target) -> &Path {
     }
 }
 
-/// Load `ProjectConfig` from `--config`, falling back to
-/// `./rencoder.toml`. Missing file is not an error; the schema
-/// validation in `ProjectConfig::load` rejects malformed TOML.
-fn load_project_config(path: Option<&Path>) -> Result<ProjectConfig> {
-    let resolved = path.unwrap_or_else(|| Path::new(DEFAULT_CONFIG_PATH));
-    ProjectConfig::load(resolved)
+/// Load `AppConfig` from `--config` if given, otherwise resolve via
+/// `path::resolve_config()` (U18 step 5):
+///   1. `$RENENCODER_CONFIG` if set
+///   2. `<app_dir>/rencoder.toml` (binary's parent dir)
+///
+/// Missing file at the resolved path is NOT an error — `AppConfig::load`
+/// auto-creates a default config with mode bits 0o644 (Unix).
+/// Schema validation rejects malformed TOML.
+fn load_app_config(path: Option<&Path>) -> Result<AppConfig> {
+    let resolved = if let Some(p) = path {
+        p.to_path_buf()
+    } else {
+        rencoder_lib::config::path::resolve_config().ok_or_else(|| {
+            anyhow::anyhow!(
+                "could not determine config location: no --config, $RENENCODER_CONFIG \
+                 is unset, and binary directory is unavailable. Pass --config explicitly."
+            )
+        })?
+    };
+    AppConfig::load(&resolved)
         .with_context(|| format!("failed to load config from {}", resolved.display()))
 }
 
 // ---------------------------------------------------------------------------
-// ProjectConfig -> Config conversion lives in `rencoder_lib::config`
+// AppConfig -> Config conversion lives in `rencoder_lib::config`
 // (`Config::from_project`) so the inherent impl stays in the same crate
 // as `Config`.
 // ---------------------------------------------------------------------------
@@ -374,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn load_project_config_missing_file_auto_creates() {
+    fn load_app_config_missing_file_auto_creates() {
         // U18 step 4: missing file now auto-creates a default config
         // (atomic tmp+rename; mode bits 0o644 on Unix). The previous
         // behavior of "silent Self::default() on missing" was removed.
@@ -384,11 +397,11 @@ mod tests {
         let path = dir.join("rencoder.toml");
         assert!(!path.exists(), "precondition: file must not exist");
 
-        let cfg = load_project_config(Some(&path)).expect("auto-create load");
+        let cfg = load_app_config(Some(&path)).expect("auto-create load");
         assert!(path.exists(), "auto-create must write the file");
 
         // The auto-generated content has explicit values (bitrate=5000
-        // etc.), so cfg is NOT == ProjectConfig::default(). Just verify
+        // etc.), so cfg is NOT == AppConfig::default(). Just verify
         // the result is parseable.
         assert!(cfg.encode.is_some() || cfg.analyze.is_some());
 
@@ -397,7 +410,7 @@ mod tests {
     }
 
     #[test]
-    fn load_project_config_explicit_path_loads_existing() {
+    fn load_app_config_explicit_path_loads_existing() {
         // Verify that an explicit --config pointing at an existing file
         // is read as-is (no auto-create side effects).
         let dir =
@@ -406,7 +419,7 @@ mod tests {
         let path = dir.join("rencoder.toml");
         std::fs::write(&path, "[encode]\nformat = \"hevc\"\nmax_fps = 30\n").unwrap();
 
-        let cfg = load_project_config(Some(&path)).expect("load existing");
+        let cfg = load_app_config(Some(&path)).expect("load existing");
         let enc = cfg.encode.as_ref().expect("encode section");
         assert_eq!(enc.format, Some(FormatArg::Hevc));
         assert_eq!(enc.max_fps, Some(30));

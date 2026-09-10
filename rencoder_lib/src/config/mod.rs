@@ -131,8 +131,8 @@ fn parse_encoders(v: Option<&Value>) -> EncoderConfig {
     }
 }
 
-impl From<&project::EncodersConfig> for EncoderConfig {
-    fn from(e: &project::EncodersConfig) -> Self {
+impl From<&app::EncodersConfig> for EncoderConfig {
+    fn from(e: &app::EncodersConfig) -> Self {
         Self {
             av1: e.av1.clone(),
             x264: e.x264.clone(),
@@ -142,12 +142,12 @@ impl From<&project::EncodersConfig> for EncoderConfig {
     }
 }
 
-/// Build a runtime `Config` from a `ProjectConfig`'s `encode` section.
+/// Build a runtime `Config` from an `AppConfig`'s `encode` section.
 /// Missing fields fall back to `Config::default()`. The CLI uses this
 /// after loading `rencoder.toml` to feed `batch::transcode_batch` and
 /// `encoder::select::select_encoder`.
 impl Config {
-    pub fn from_project(encode: Option<&project::EncodeConfig>) -> Self {
+    pub fn from_project(encode: Option<&app::EncodeConfig>) -> Self {
         let Some(enc) = encode else {
             return Self::default();
         };
@@ -329,12 +329,12 @@ mod tests {
     }
 }
 
+pub mod app;
 pub mod fs_perms;
 pub mod path;
-pub mod project;
 
-// Re-exports for ergonomics: callers can write `rencoder_lib::config::ProjectConfig`
-// instead of `rencoder_lib::config::project::ProjectConfig`.
-pub use project::{
-    AnalyzeConfig, AnalyzeFormatArg, EncodeConfig, EncodersConfig, FormatArg, ProjectConfig,
+// Re-exports for ergonomics: callers can write `rencoder_lib::config::AppConfig`
+// instead of `rencoder_lib::config::app::AppConfig`.
+pub use app::{
+    AnalyzeConfig, AnalyzeFormatArg, AppConfig, EncodeConfig, EncodersConfig, FormatArg,
 };
