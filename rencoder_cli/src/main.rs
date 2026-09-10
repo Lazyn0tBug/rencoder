@@ -344,7 +344,7 @@ fn load_project_config(path: Option<&Path>) -> Result<ProjectConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rencoder_lib::config::{AnalyzeConfig, EncodeConfig, EncodersConfig};
+    use rencoder_lib::config::{AnalyzeConfig, EncodeConfig, EncodersConfig, FormatArg};
     use std::path::PathBuf;
 
     #[test]
@@ -374,17 +374,50 @@ mod tests {
     }
 
     #[test]
-    fn load_project_config_missing_file_returns_default() {
-        let cfg = load_project_config(Some(Path::new("/nonexistent/never.toml"))).unwrap();
-        assert_eq!(cfg, ProjectConfig::default());
+    fn load_project_config_missing_file_auto_creates() {
+        // U18 step 4: missing file now auto-creates a default config
+        // (atomic tmp+rename; mode bits 0o644 on Unix). The previous
+        // behavior of "silent Self::default() on missing" was removed.
+        // Use a temp dir so the parent exists and auto-create succeeds.
+        let dir = std::env::temp_dir().join(format!("rencoder_cli_missing_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rencoder.toml");
+        assert!(!path.exists(), "precondition: file must not exist");
+
+        let cfg = load_project_config(Some(&path)).expect("auto-create load");
+        assert!(path.exists(), "auto-create must write the file");
+
+        // The auto-generated content has explicit values (bitrate=5000
+        // etc.), so cfg is NOT == ProjectConfig::default(). Just verify
+        // the result is parseable.
+        assert!(cfg.encode.is_some() || cfg.analyze.is_some());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
-    fn load_project_config_default_path_when_none() {
-        // ./rencoder.toml almost certainly doesn't exist in a test run;
-        // the loader is supposed to swallow a missing file silently.
-        let cfg = load_project_config(None).unwrap();
-        assert_eq!(cfg, ProjectConfig::default());
+    fn load_project_config_explicit_path_loads_existing() {
+        // Verify that an explicit --config pointing at an existing file
+        // is read as-is (no auto-create side effects).
+        let dir =
+            std::env::temp_dir().join(format!("rencoder_cli_explicit_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rencoder.toml");
+        std::fs::write(&path, "[encode]\nformat = \"hevc\"\nmax_fps = 30\n").unwrap();
+
+        let cfg = load_project_config(Some(&path)).expect("load existing");
+        let enc = cfg.encode.as_ref().expect("encode section");
+        assert_eq!(enc.format, Some(FormatArg::Hevc));
+        assert_eq!(enc.max_fps, Some(30));
+
+        // File unchanged (auto-create would only fire on missing).
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("hevc"));
+        assert!(!after.contains("av1"), "auto-create must not overwrite");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]

@@ -167,7 +167,10 @@ impl ProjectConfig {
         if !path.exists() {
             let content = DEFAULT_CONFIG_TOML;
             write_atomic(path, content.as_bytes())?;
-            eprintln!(
+            // Surface auto-create via the project's log infrastructure
+            // (design doc §2.3: lib uses `log`, CLI bridges via
+            // `tracing-log`). User can silence via RUST_LOG.
+            log::info!(
                 "rencoder: created {} (no config found; edit to customize)",
                 path.display()
             );
@@ -258,6 +261,11 @@ pub enum ConfigError {
 /// is either fully-present or fully-absent (assuming `rename` is
 /// atomic on the platform, which std guarantees on Unix and on
 /// Windows via `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`).
+///
+/// On any error during the write sequence (File::create, write_all,
+/// sync_all, fs_perms::set_config_file_mode, rename), the tmp file is
+/// cleaned up so it doesn't leak. A successful `rename` atomically
+/// removes the tmp, so cleanup is only needed on the error path.
 fn write_atomic(path: &Path, content: &[u8]) -> Result<(), ConfigError> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -265,18 +273,20 @@ fn write_atomic(path: &Path, content: &[u8]) -> Result<(), ConfigError> {
         }
     }
     let tmp = tmp_path_for(path);
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(content)?;
-        f.sync_all()?;
-    }
-    fs_perms::set_config_file_mode(&tmp)?;
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        // Best-effort cleanup so we don't leak tmp files on rename failure.
+    let result: Result<(), ConfigError> = (|| {
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(content)?;
+            f.sync_all()?;
+        }
+        fs_perms::set_config_file_mode(&tmp)?;
+        std::fs::rename(&tmp, path).map_err(ConfigError::Io)?;
+        Ok(())
+    })();
+    if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
-        return Err(ConfigError::Io(e));
     }
-    Ok(())
+    result
 }
 
 /// Tmp path: `<target>.tmp` in the same directory. Falls back to a
