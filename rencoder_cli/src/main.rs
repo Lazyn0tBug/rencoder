@@ -109,7 +109,7 @@ fn encode_cmd(args: args::EncodeArgs) -> Result<()> {
 
     // Install signal handler; the per-batch loop registers/unregisters
     // the current output path so a SIGINT cleans up the partial file.
-    let _current_output = signal::install_handler();
+    let current_output = signal::install_handler();
 
     let records = transcode_batch(
         &params,
@@ -117,6 +117,7 @@ fn encode_cmd(args: args::EncodeArgs) -> Result<()> {
         &cache,
         &config,
         ProcessOutput::Inherit,
+        Some(&current_output),
         None,
     );
 

@@ -160,7 +160,15 @@ fn transcode_batch_end_to_end_produces_output_files() {
         max_fps: rencoder_lib::types::MaxFpsConfig::default(),
     };
 
-    let results = transcode_batch(&params, &files, &cache, &config, ProcessOutput::Null, None);
+    let results = transcode_batch(
+        &params,
+        &files,
+        &cache,
+        &config,
+        ProcessOutput::Null,
+        None,
+        None,
+    );
 
     assert_eq!(results.len(), 2);
     for record in &results {
@@ -219,7 +227,7 @@ fn transcode_batch_skips_when_output_exists() {
         max_fps: rencoder_lib::types::MaxFpsConfig::default(),
     };
 
-    let result = transcode_single(&task, &params, &cache, &config, ProcessOutput::Null)
+    let result = transcode_single(&task, &params, &cache, &config, ProcessOutput::Null, None)
         .expect("transcode_single should succeed");
     assert!(matches!(
         result.outcome,

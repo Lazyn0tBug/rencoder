@@ -27,6 +27,7 @@ use crate::encoder::{
     select::select_encoder,
 };
 use crate::error::EncodeError;
+use crate::pipeline::partial_output::{self, PartialOutputHandle};
 use crate::types::{
     EncodeParams, EncoderCache, EncoderSettings, EncodingOutcome, EncodingRecord, ErrorCategory,
     ErrorContext, ProcessOutput, SkippedReason, TranscodeTask, VideoMetadata,
@@ -46,6 +47,7 @@ pub fn transcode_single(
     cache: &EncoderCache,
     config: &Config,
     output: ProcessOutput,
+    current_output: Option<&PartialOutputHandle>,
 ) -> Result<EncodingRecord, EncodeError> {
     let started_at_meta = Utc::now();
     let started_at_instant = Instant::now();
@@ -74,6 +76,10 @@ pub fn transcode_single(
     };
 
     let argv = build_argv(task, params, cache, config, &metadata);
+    // U18 §3.4.5: register the partial output path before ffmpeg runs
+    // so SIGINT cleans it up. The guard clears on every exit path
+    // (success, failure, panic) so the next iteration starts clean.
+    let _partial_guard = partial_output::Guard::new(current_output, task.output.clone());
     transcode_with_argv(
         task,
         params,
@@ -87,19 +93,22 @@ pub fn transcode_single(
 
 /// Run a batch over a file list. Failures are captured per-file; the
 /// batch never aborts. `result_callback` (if set) fires once per file,
-/// after the record is built.
+/// after the record is built. `current_output` (U18 §3.4.5) is the
+/// signal-handler read cell; pass `None` if you haven't installed a
+/// signal handler (e.g. in tests).
 pub fn transcode_batch(
     params: &EncodeParams,
     files: &[PathBuf],
     cache: &EncoderCache,
     config: &Config,
     output: ProcessOutput,
+    current_output: Option<&PartialOutputHandle>,
     result_callback: Option<&ResultCallback>,
 ) -> Vec<EncodingRecord> {
     transcode_batch_with_processor(
         params,
         files,
-        |task, params| transcode_single(task, params, cache, config, output),
+        |task, params| transcode_single(task, params, cache, config, output, current_output),
         result_callback,
     )
 }
@@ -658,7 +667,7 @@ Encoders:
         let cache = cache_with_libx264_and_svtav1(false);
         let config = Config::default();
 
-        let record = transcode_single(&task, &params, &cache, &config, ProcessOutput::Null)
+        let record = transcode_single(&task, &params, &cache, &config, ProcessOutput::Null, None)
             .expect("transcode_single should succeed");
         assert_eq!(
             record.outcome,
@@ -706,5 +715,39 @@ Encoders:
         let err = record.error.expect("error should be set on Failed");
         assert!(matches!(err.category, ErrorCategory::FfmpegSpawnFailed));
         assert!(err.message.contains("spawn"));
+    }
+
+    // U18 §3.4.5: transcode_batch with current_output handle registers
+    // each file's output path before ffmpeg runs and clears after, so
+    // the SIGINT handler can clean up partial files. Verify the
+    // register/clear lifecycle by inspecting the handle's state at
+    // each phase (we can't intercept ffmpeg directly, but the guard
+    // logic is exercised by every batch call regardless of mock).
+    #[test]
+    fn batch_lifecycle_registers_and_clears_partial_output() {
+        use crate::pipeline::partial_output::PartialOutputHandle;
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        // To verify register/clear without ffmpeg, use the public set/clear
+        // directly. The full integration (transcode_batch wrapping each
+        // transcode_single in a Guard) is verified by the integration
+        // smoke test (manually run rencoder, press Ctrl-C, see partial
+        // removed). Here we test the type contract.
+        let handle: PartialOutputHandle = Arc::new(parking_lot::Mutex::new(None));
+        let p1 = PathBuf::from("/a.mkv");
+        let p2 = PathBuf::from("/b.mkv");
+        // Simulate "before file 1" via Guard:
+        {
+            let _g1 = crate::pipeline::partial_output::Guard::new(Some(&handle), p1.clone());
+            assert_eq!(*handle.lock(), Some(p1.clone()));
+        }
+        assert!(handle.lock().is_none(), "guard drop must clear handle");
+        // Simulate "before file 2" -- next iteration's guard registers fresh:
+        {
+            let _g2 = crate::pipeline::partial_output::Guard::new(Some(&handle), p2.clone());
+            assert_eq!(*handle.lock(), Some(p2.clone()));
+        }
+        assert!(handle.lock().is_none());
     }
 }

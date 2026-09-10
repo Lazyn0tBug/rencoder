@@ -2657,6 +2657,7 @@ dependencies = [
  "chrono",
  "log",
  "num_cpus",
+ "parking_lot",
  "pkg-config",
  "polars",
  "pretty_assertions",
