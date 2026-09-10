@@ -329,6 +329,7 @@ mod tests {
     }
 }
 
+pub mod fs_perms;
 pub mod path;
 pub mod project;
 
