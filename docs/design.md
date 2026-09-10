@@ -886,12 +886,19 @@ rencoder-cli-<triple>/
 
 **scripts/dist.sh 职责**：
 
-1. `cargo build --release --target <triple>`
-2. 创建 `dist/<app>-<triple>/`
-3. 拷贝 `target/<triple>/release/rencoder` + `LICENSE` + `README.md` +
-   `examples/rencoder.toml.example`（作为默认配置种子）→ `dist/<app>-<triple>/`
-4. 创建 `dist/<app>-<triple>/log/` 和 `dist/<app>-<triple>/data/`（占位目录）
-5. 打包成 `.tar.xz`（cargo-dist 完成最后一步）
+本项目把"打包"流程切成两层——`cargo-dist` 做 archive（archive format + checksum），
+shell script 做 U18 augmentation（塞 `rencoder.toml` + `log/` + `data/` 占位）。
+
+| 步骤 | 谁做 | 什么 |
+|------|------|------|
+| 1. 编译 binary | `cargo-dist` | `dist build --target <triple>` |
+| 2. 打包 archive | `cargo-dist` | `.tar.xz` (Unix) / `.zip` (Windows)；含 binary + LICENSE + README + sha256 |
+| 3. 抽 host tarball 到 `dist/` | `scripts/dist.sh` | `tar -xJf ... -C dist/` |
+| 4. Augment tarball（U18 单目录 layout） | `scripts/dist.sh` | extract → cp `rencoder.toml` + mkdir `log/` + mkdir `data/` → re-pack in place |
+
+`cargo-dist` 不做 step 4（augment）的原因是它不识别 U18 单目录应用模型——它只产出 binary + LICENSE + README。
+augment 必须 post-process，由 `scripts/dist.sh` 在 host 抽 tarball 后做，并 re-pack 写回原 tarball。
+这一步是 [§3.4.5](#345-app-level-config--single-directory-app-u18) "dist 镜像运行时布局" 的实现。
 
 **Auto-create 流程**（`AppConfig::load` 内部）：
 
@@ -915,6 +922,52 @@ AppConfig::load(path)
 | `RENENCODER_CONFIG` | 显式指定 config 文件路径 | `<app_dir>/rencoder.toml` |
 | `RENENCODER_LOG_DIR` | 日志目录 | `<app_dir>/log/` |
 | `RENENCODER_DATA_DIR` | 数据/工作记录目录 | `<app_dir>/data/` |
+
+---
+
+### 3.7 持续部署（GitHub Actions U18）
+
+release 流程由 `.github/workflows/release.yml` 编排，触发条件为 tag push
+匹配 `v[0-9]+.[0-9]+.[0-9]+*`（cargo SemVer style）。
+
+```
+tag push v0.x.y
+  ↓
+build (matrix: 3 targets)
+  ├─ aarch64-apple-darwin   -> rencoder_cli-aarch64-apple-darwin.tar.xz (cargo-dist) + U18 augmentation
+  ├─ x86_64-unknown-linux-gnu -> rencoder_cli-x86_64-unknown-linux-gnu.tar.xz (cargo-dist) + U18 augmentation
+  └─ x86_64-pc-windows-msvc  -> rencoder_cli-x86_64-pc-windows-msvc.zip  (cargo-dist; portable)
+  ↓
+macos-dmg (needs build; only on aarch64-apple-darwin success)
+  ├─ download aarch64-apple-darwin artifact
+  ├─ brew install create-dmg
+  ├─ ad-hoc codesign -s -<binary> (mountable on Apple Silicon)
+  └─ create-dmg → rencoder_cli-aarch64-apple-darwin.dmg
+  ↓
+release (needs build + macos-dmg)
+  └─ softprops/action-gh-release --generate-notes
+```
+
+**为什么不用 cargo-dist 生成 GitHub Actions workflow**：
+
+cargo-dist 0.32 的 `dist init --ci github` 会生成一个 600+ 行 Jinja2 模板的 release.yml，
+带 partials、prerelease logic、SBOM、attestations、cross-platform runner matrix 等大量
+默认 feature。本项目只产 3 targets + 1 个 DMG，**手写 224 行比承载 cargo-dist 的全部 feature set
+更可维护**。如果未来需要 homebrew / npm 发布，再考虑 cargo-dist 的 partials 系统。
+
+**cargo-dist 0.32 限制 + 应对**：
+
+cargo-dist 0.32 不支持 `dmg` installer 类型（只支持 msi/shell/powershell/npm/homebrew）。
+应对：单独的 `macos-dmg` job 用 `create-dmg`（homebrew formula，macos-latest runner 自带）
++ ad-hoc codesign（`--sign -`）让 DMG 在 Apple Silicon 上能挂载。
+正式签名 + notarization 需要 Developer ID + Apple ID secrets，那是独立的 story。
+
+**Windows 限制**：
+
+`scripts/dist.sh` 里的 augmentation 用 Unix-only `tar -xJf` 语法，Windows runner
+跑同样脚本会失败。`build` job 用 `if [ "$target" != ...windows... ]` 跳过 Windows 的 augmentation，
+所以 Windows zip 不含 `rencoder.toml` / `log/` / `data/`。U18 在 Windows 上的最终 layout
+需要 U19 加 PowerShell augmentation step（或用 git-bash 的 tar）。
 
 ---
 
