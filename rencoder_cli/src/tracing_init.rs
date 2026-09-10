@@ -43,10 +43,20 @@ pub fn init() -> anyhow::Result<()> {
 
     let file_sink =
         FileSink::new(&dir, 10 * 1024 * 1024, 7).context("failed to open log file sink")?;
+    // File layer is for post-mortem analysis: keep it scannable.
+    // - No ANSI escape codes (terminal is for colors; files would just
+    //   be noise + break text tools like grep / less -R).
+    // - No FmtSpan::CLOSE events (those are interactive-debug aids for
+    //   the terminal; in files they add lines per span close that hide
+    //   the actual log content).
+    // - Keep `target` (module path) so post-mortem analysis can grep
+    //   by module.
+    // - No thread ids (process is single-threaded; rare rayon threads
+    //   would just clutter).
     let file_layer = fmt::layer()
+        .with_ansi(false)
         .with_target(true)
         .with_thread_ids(false)
-        .with_span_events(fmt::format::FmtSpan::CLOSE)
         .with_writer(file_sink)
         .with_filter(EnvFilter::new("info"));
 
