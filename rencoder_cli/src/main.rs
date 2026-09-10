@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use tracing::{info, instrument, warn};
 
 fn main() -> Result<()> {
-    tracing_init::init();
+    tracing_init::init().context("initialize tracing")?;
     let cli = args::Cli::parse();
     match cli.command {
         args::Command::Encode(encode_args) => encode_cmd(encode_args),
@@ -125,7 +125,7 @@ fn encode_cmd(args: args::EncodeArgs) -> Result<()> {
     // | .jsonl | .csv.
     let output_path = match &args.output {
         Some(p) => p.clone(),
-        None => default_data_path(),
+        None => default_data_path()?,
     };
     write_records(&records, &output_path)?;
     print_encode_summary(&records);
@@ -137,15 +137,24 @@ fn encode_cmd(args: args::EncodeArgs) -> Result<()> {
 /// named by start time. Uses the canonical UTC timestamp formatter from
 /// `rencoder_lib::utils::time` so the format stays in sync with the
 /// library's docs. Honors `$RENENCODER_DATA_DIR` (U18 step 11).
-fn default_data_path() -> PathBuf {
+///
+/// Filesystem errors (directory creation / mode bits) propagate up via
+/// `Result` so the user sees a clean error instead of a panic. When
+/// `resolve_data_dir` returns `None` (app_dir undeterminable and no
+/// env override), falls back to CWD-relative `data/` so legacy hosts
+/// without a determinable binary dir still produce output (tracing_init
+/// has the same fallback for `log/`).
+fn default_data_path() -> anyhow::Result<PathBuf> {
+    use anyhow::Context;
+
     let dir =
         rencoder_lib::config::path::resolve_data_dir().unwrap_or_else(|| PathBuf::from("data"));
-    std::fs::create_dir_all(&dir).expect("create data dir");
-    rencoder_lib::config::fs_perms::set_app_dir_mode(&dir).expect("set data dir mode");
-    dir.join(format!(
+    std::fs::create_dir_all(&dir).context("create data dir")?;
+    rencoder_lib::config::fs_perms::set_app_dir_mode(&dir).context("set data dir mode bits")?;
+    Ok(dir.join(format!(
         "encoding-{}.parquet",
         rencoder_lib::utils::time::utc_timestamp_filename()
-    ))
+    )))
 }
 
 /// Write the records to the given path. Extension determines format.

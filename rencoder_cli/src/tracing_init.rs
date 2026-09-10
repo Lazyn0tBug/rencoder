@@ -20,8 +20,12 @@ use crate::file_sink::FileSink;
 /// Initialize the global tracing subscriber with stdout + file sinks.
 ///
 /// Idempotent: subsequent calls are no-ops (the registry init returns
-/// `Err` and we swallow it).
-pub fn init() {
+/// `Err` and we swallow it). Filesystem errors (log dir creation /
+/// mode-bit set) propagate via `Result` so the binary exits with a
+/// clean error message instead of panicking.
+pub fn init() -> anyhow::Result<()> {
+    use anyhow::Context;
+
     // Bridge log -> tracing so library events flow through our subscriber.
     let _ = tracing_log::LogTracer::init();
 
@@ -34,10 +38,11 @@ pub fn init() {
         .with_writer(std::io::stderr);
 
     let dir = log_dir();
-    std::fs::create_dir_all(&dir).expect("create log dir");
-    rencoder_lib::config::fs_perms::set_app_dir_mode(&dir).expect("set log dir mode");
+    std::fs::create_dir_all(&dir).context("create log dir")?;
+    rencoder_lib::config::fs_perms::set_app_dir_mode(&dir).context("set log dir mode bits")?;
 
-    let file_sink = FileSink::new(&dir, 10 * 1024 * 1024, 7).expect("failed to open log file sink");
+    let file_sink =
+        FileSink::new(&dir, 10 * 1024 * 1024, 7).context("failed to open log file sink")?;
     let file_layer = fmt::layer()
         .with_target(true)
         .with_thread_ids(false)
@@ -50,6 +55,7 @@ pub fn init() {
         .with(stdout_layer)
         .with(file_layer)
         .try_init();
+    Ok(())
 }
 
 /// Resolve the log directory via `path::resolve_log_dir()` (U18).
@@ -66,8 +72,8 @@ mod tests {
 
     #[test]
     fn init_is_idempotent() {
-        init();
-        init();
+        init().expect("first init");
+        init().expect("second init (idempotent)");
     }
 
     #[test]

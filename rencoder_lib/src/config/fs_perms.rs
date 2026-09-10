@@ -15,40 +15,36 @@
 use std::io;
 use std::path::Path;
 
-/// Apply mode bits appropriate for a config file the user is expected
-/// to edit: user-writable, world-readable.
+/// Apply Unix mode bits appropriate for a config file the user is
+/// expected to edit: user-writable, world-readable.
 ///
 /// - Unix: `0o644` (rw-r--r--).
 /// - Non-Unix: no-op, `Ok(())` (TBD future work when porting beyond macOS).
 pub fn set_config_file_mode<P: AsRef<Path>>(path: P) -> io::Result<()> {
-    let path = path.as_ref();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))?;
-    }
-    // Non-Unix placeholder: explicit `let _` makes the "path unused on
-    // this target" intent visible at the call site of `path.as_ref()`.
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
+    apply_mode(path, 0o644)
 }
 
-/// Apply mode bits appropriate for an app-managed directory the user
-/// is expected to drop new files into: user-writable + executable
+/// Apply Unix mode bits appropriate for an app-managed directory the
+/// user is expected to drop new files into: user-writable + executable
 /// (executable bit needed for directory traversal), world-readable +
 /// executable.
 ///
 /// - Unix: `0o755` (rwxr-xr-x).
 /// - Non-Unix: no-op, `Ok(())` (TBD future work when porting beyond macOS).
 pub fn set_app_dir_mode<P: AsRef<Path>>(path: P) -> io::Result<()> {
+    apply_mode(path, 0o755)
+}
+
+/// Internal helper that consolidates the cfg-at-definition pattern.
+/// `mode_bits` is the POSIX mode (only meaningful on Unix). Non-Unix
+/// is a no-op placeholder; the explicit `let _ = path` makes "unused
+/// on this target" a compile-time fact, not a runtime surprise.
+fn apply_mode<P: AsRef<Path>>(path: P, mode_bits: u32) -> io::Result<()> {
     let path = path.as_ref();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode_bits))?;
     }
     #[cfg(not(unix))]
     {
