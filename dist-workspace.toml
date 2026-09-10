@@ -5,9 +5,17 @@ members = ["cargo:."]
 [dist]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.32.0"
-# CI backends to support
+# CI backends to support. Empty: cargo-dist's CI generator is unused
+# because .github/workflows/release.yml is hand-written (cargo-dist
+# 0.32 doesn't support dmg installers, so we augment with a manual
+# macos-dmg job + create-dmg).
 ci = []
-# The installers to generate for each app
+# The installers to generate for each app (cargo-dist 0.32 supports
+# shell/powershell/npm/homebrew/msi; we use none and rely on default
+# archives -- .tar.xz for unix, .zip for windows).
 installers = []
-# Target platforms to build apps for (Rust target-triple syntax)
-targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# Target platforms to build apps for (Rust target-triple syntax).
+# Windows -> portable zip (cargo-dist default archive).
+# Unix -> tar.xz (cargo-dist default archive; scripts/dist.sh augments
+# with the U18 single-dir-app layout -- see step 12).
+targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
