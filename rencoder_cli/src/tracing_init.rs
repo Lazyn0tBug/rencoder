@@ -2,7 +2,8 @@
 //!
 //! Two output sinks:
 //! - stdout via `fmt` (RUST_LOG / default info)
-//! - rotating file under `./log/` (default 10 MB, 7 days)
+//! - rotating file under `<app_dir>/log/` (U18; `$RENENCODER_LOG_DIR` overrides)
+//!   default 10 MB, 7 days
 //!
 //! `tracing-log` bridges the library's `log` events into tracing.
 //!
@@ -32,8 +33,11 @@ pub fn init() {
         .with_span_events(fmt::format::FmtSpan::CLOSE)
         .with_writer(std::io::stderr);
 
-    let file_sink =
-        FileSink::new(log_dir(), 10 * 1024 * 1024, 7).expect("failed to open log file sink");
+    let dir = log_dir();
+    std::fs::create_dir_all(&dir).expect("create log dir");
+    rencoder_lib::config::fs_perms::set_app_dir_mode(&dir).expect("set log dir mode");
+
+    let file_sink = FileSink::new(&dir, 10 * 1024 * 1024, 7).expect("failed to open log file sink");
     let file_layer = fmt::layer()
         .with_target(true)
         .with_thread_ids(false)
@@ -48,10 +52,12 @@ pub fn init() {
         .try_init();
 }
 
+/// Resolve the log directory via `path::resolve_log_dir()` (U18).
+/// Honors `$RENENCODER_LOG_DIR`; falls back to `<app_dir>/log/`.
+/// If both env and app_dir are unavailable, falls back to CWD-relative
+/// `log/` — same as U17 behavior, so the test environment still works.
 fn log_dir() -> PathBuf {
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("log")
+    rencoder_lib::config::path::resolve_log_dir().unwrap_or_else(|| PathBuf::from("log"))
 }
 
 #[cfg(test)]
@@ -65,8 +71,15 @@ mod tests {
     }
 
     #[test]
-    fn log_dir_is_under_cwd() {
+    fn log_dir_ends_with_log() {
+        // U18: log_dir() resolves to <app_dir>/log when app_dir is known.
+        // Don't pin the absolute path (varies by test runner); just check
+        // the trailing path component.
         let dir = log_dir();
-        assert!(dir.ends_with("log"));
+        assert!(
+            dir.ends_with("log"),
+            "log dir must end with 'log', got {}",
+            dir.display()
+        );
     }
 }

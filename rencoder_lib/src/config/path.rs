@@ -1,13 +1,15 @@
-//! Path resolution for app-level config (U18).
+//! Path resolution for app-level state (U18).
 //!
 //! All persistent app state lives under `app_dir` — the directory containing
 //! the running binary. This module exposes:
 //!
 //! - [`app_dir`] — the binary's parent dir
-//! - [`resolve_config`] — config file path (env override > app_dir)
+//! - [`resolve_config`] — config file path (`$RENENCODER_CONFIG` > `app_dir`)
+//! - [`resolve_log_dir`] — log dir (`$RENENCODER_LOG_DIR` > `<app_dir>/log`)
+//! - [`resolve_data_dir`] — data dir (`$RENENCODER_DATA_DIR` > `<app_dir>/data`)
 //!
-//! See `docs/smart_code.md` §3.6 for the full env-override matrix
-//! (log / data dirs add their own resolvers in U18 step 11).
+//! See `docs/smart_code.md` §3.6 for the full env-override matrix and
+//! §3.4.5 for the resolution contract.
 //!
 //! Env var overrides take priority over the app_dir default. When `app_dir`
 //! can't be determined (e.g. binary deleted between launch and exec, or
@@ -51,6 +53,43 @@ pub fn resolve_config() -> Option<PathBuf> {
         }
     }
     app_dir().map(|d| d.join(CONFIG_FILE_NAME))
+}
+
+/// Resolves the log directory.
+///
+/// Priority:
+///
+/// 1. `$RENENCODER_LOG_DIR` if set and non-empty (explicit override for
+///    debugging / CI / read-only systems)
+/// 2. `<app_dir>/log`
+///
+/// Returns `None` only when the env var is unset *and* `app_dir()` is
+/// unavailable. Empty-string env var is treated as unset.
+pub fn resolve_log_dir() -> Option<PathBuf> {
+    if let Some(raw) = env::var_os("RENENCODER_LOG_DIR") {
+        if !raw.is_empty() {
+            return Some(PathBuf::from(raw));
+        }
+    }
+    app_dir().map(|d| d.join("log"))
+}
+
+/// Resolves the data directory (work records, Parquet outputs, etc.).
+///
+/// Priority:
+///
+/// 1. `$RENENCODER_DATA_DIR` if set and non-empty
+/// 2. `<app_dir>/data`
+///
+/// Returns `None` only when the env var is unset *and* `app_dir()` is
+/// unavailable. Empty-string env var is treated as unset.
+pub fn resolve_data_dir() -> Option<PathBuf> {
+    if let Some(raw) = env::var_os("RENENCODER_DATA_DIR") {
+        if !raw.is_empty() {
+            return Some(PathBuf::from(raw));
+        }
+    }
+    app_dir().map(|d| d.join("data"))
 }
 
 #[cfg(test)]
@@ -112,6 +151,38 @@ mod tests {
         with_env_var("RENENCODER_CONFIG", Some("/tmp/override.toml"), || {
             let resolved = resolve_config().expect("resolve_config must succeed");
             assert_eq!(resolved, PathBuf::from("/tmp/override.toml"));
+        });
+    }
+
+    #[test]
+    fn resolve_log_dir_defaults_to_app_dir_log() {
+        with_env_var("RENENCODER_LOG_DIR", None, || {
+            let resolved = resolve_log_dir().expect("resolve_log_dir must succeed");
+            assert_eq!(resolved, app_dir().unwrap().join("log"));
+        });
+    }
+
+    #[test]
+    fn resolve_log_dir_honors_env_override() {
+        with_env_var("RENENCODER_LOG_DIR", Some("/var/log/rencoder"), || {
+            let resolved = resolve_log_dir().expect("resolve_log_dir must succeed");
+            assert_eq!(resolved, PathBuf::from("/var/log/rencoder"));
+        });
+    }
+
+    #[test]
+    fn resolve_data_dir_defaults_to_app_dir_data() {
+        with_env_var("RENENCODER_DATA_DIR", None, || {
+            let resolved = resolve_data_dir().expect("resolve_data_dir must succeed");
+            assert_eq!(resolved, app_dir().unwrap().join("data"));
+        });
+    }
+
+    #[test]
+    fn resolve_data_dir_honors_env_override() {
+        with_env_var("RENENCODER_DATA_DIR", Some("/srv/rencoder/data"), || {
+            let resolved = resolve_data_dir().expect("resolve_data_dir must succeed");
+            assert_eq!(resolved, PathBuf::from("/srv/rencoder/data"));
         });
     }
 

@@ -37,7 +37,8 @@ fn main() -> Result<()> {
 
 /// `rencoder encode ...` -- full pipeline: load config, init encoder
 /// cache, install SIGINT handler, collect files, run the batch,
-/// write per-file records to the default `./data/encoding-*.parquet`.
+/// write per-file records to `<app_dir>/data/encoding-*.parquet`
+/// (U18; honors `$RENENCODER_DATA_DIR`).
 #[instrument(skip_all, fields(files = tracing::field::Empty))]
 fn encode_cmd(args: args::EncodeArgs) -> Result<()> {
     let app_config = load_app_config(args.config.as_deref())?;
@@ -119,8 +120,9 @@ fn encode_cmd(args: args::EncodeArgs) -> Result<()> {
         None,
     );
 
-    // Default output: timestamped Parquet in ./data/. Extension of -o
-    // picks the format: .parquet | .jsonl | .csv.
+    // Default output: timestamped Parquet in <app_dir>/data/ (U18; honors
+    // $RENENCODER_DATA_DIR). Extension of -o picks the format: .parquet
+    // | .jsonl | .csv.
     let output_path = match &args.output {
         Some(p) => p.clone(),
         None => default_data_path(),
@@ -131,12 +133,16 @@ fn encode_cmd(args: args::EncodeArgs) -> Result<()> {
     Ok(())
 }
 
-/// `data/encoding-<UTC-ISO8601>Z.parquet` -- one file per run, named by
-/// start time. Uses the canonical UTC timestamp formatter from
+/// `<app_dir>/data/encoding-<UTC-ISO8601>Z.parquet` -- one file per run,
+/// named by start time. Uses the canonical UTC timestamp formatter from
 /// `rencoder_lib::utils::time` so the format stays in sync with the
-/// library's docs.
+/// library's docs. Honors `$RENENCODER_DATA_DIR` (U18 step 11).
 fn default_data_path() -> PathBuf {
-    PathBuf::from("data").join(format!(
+    let dir =
+        rencoder_lib::config::path::resolve_data_dir().unwrap_or_else(|| PathBuf::from("data"));
+    std::fs::create_dir_all(&dir).expect("create data dir");
+    rencoder_lib::config::fs_perms::set_app_dir_mode(&dir).expect("set data dir mode");
+    dir.join(format!(
         "encoding-{}.parquet",
         rencoder_lib::utils::time::utc_timestamp_filename()
     ))
