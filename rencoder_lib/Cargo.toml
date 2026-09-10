@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Core library for Rencoder: smart video transcoding and analysis."
+# U18: internal lib for this app only. `cargo publish -p rencoder_lib`
+# would leak internal types (EncodeConfig, AppConfig schema) and lock
+# the schema -- once downstream users depend on these types, breaking
+# changes become user-facing. Mark non-publishable to enforce the
+# "single application" deployment model.
+publish = false
 
 [dependencies]
 walkdir = "2"
