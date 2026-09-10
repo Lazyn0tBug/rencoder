@@ -78,11 +78,15 @@ for tarball in dist/rencoder_cli-*.tar.xz; do
     : > "$app_dir/log/.gitkeep"
     : > "$app_dir/data/.gitkeep"
 
-    # Re-pack in place. Use --transform so the leading workdir/ is
-    # stripped and we preserve the cargo-dist `rencoder_cli-<triple>/`
-    # top-level layout.
+    # Re-pack in place. `tar -C` switches working dir for the
+    # duration of the operation but writes to the path we give it --
+    # so the output lands at the absolute path of $tarball.new even
+    # though $inner_name is read from $workdir. This avoids the bug
+    # where (cd $workdir && tar -cJf $tarball.new ...) tried to write
+    # to dist/$tarball.new relative to the tempdir (which doesn't
+    # exist there).
     inner_name=$(basename "$app_dir")
-    (cd "$workdir" && tar -cJf "$tarball.new" "$inner_name")
+    tar -C "$workdir" -cJf "$tarball.new" "$inner_name"
     mv "$tarball.new" "$tarball"
     rm -rf "$workdir"
     augmented=$((augmented + 1))
