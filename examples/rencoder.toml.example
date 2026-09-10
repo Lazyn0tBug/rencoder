@@ -1,0 +1,65 @@
+# Rencoder user config (TOML).
+#
+# Dev-only reference. This file mirrors `DEFAULT_CONFIG_TOML` in
+# `rencoder_lib/src/config/app.rs` -- the live config that gets written
+# to `<app_dir>/rencoder.toml` on first run via auto-create.
+#
+# When modifying either side, keep them in sync. (Future work: make
+# this the single source of truth via `include_str!` from app.rs.)
+
+# Auto-generated on first run because no config file was found at the
+# app-level location (binary dir; or $RENENCODER_CONFIG if set). Edit
+# values below to customize behavior; the file is reloaded on each
+# invocation.
+#
+# CLI flags (-i, -o, --config, passthrough args) override values here.
+# Unknown keys are rejected so typos surface immediately.
+
+[encode]
+# Target format. One of: x264 | hevc | vp9 | av1. Default: av1.
+format = "av1"
+
+# Bitrate in Kbps (used when crf = 0). Ignored in CRF mode.
+# Default: 5000.
+bitrate = 5000
+
+# CRF quality value (libsvtav1 scale, 0..=63). Aligns 1:1 with ffmpeg's
+# `-crf N`. Sentinel `0` switches to bitrate mode (uses `bitrate` field).
+# Default: 45 (libsvtav1 medium quality).
+crf = 45
+
+# Cap source FPS at canonical values (0, 24, 25, 30, 60). 0 disables.
+# Default: 0.
+max_fps = 0
+
+# Enable NVIDIA hardware acceleration via NVENC. Falls back silently
+# to software encoding when nvidia-smi is missing or no GPU is detected.
+# Default: false.
+nv = false
+
+# Extension filter for `encode -d DIR`. Empty list = all files.
+extensions = ["mp4", "mov", "mkv"]
+
+# Optional: directory where encoded outputs land. Not wired yet (output
+# paths are computed per-input); reserved for a future stage where
+# batch output lands in a single project directory.
+# output_dir = "encoded"
+
+[encode.encoders]
+# Per-format encoder overrides. Uncomment to use a different encoder
+# than the built-in default (libsvtav1, libx264, libx265, libvpx-vp9).
+# av1 = "libsvtav1"
+# x264 = "libx264"
+# hevc = "libx265"
+# vp9 = "libvpx-vp9"
+
+[analyze]
+# Output format. One of: csv | table | text | json. Default: csv.
+format = "csv"
+
+# Parallel analysis via rayon. Default: false.
+parallel = false
+
+# Optional: write the analyze output to this path instead of stdout.
+# The CLI `-o` flag overrides this per-run; `-` means stdout (default).
+# output = "fps_stats.txt"

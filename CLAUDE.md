@@ -33,7 +33,7 @@ Everything else (format, bitrate, max-fps, crf, nv, extensions, encoder
 overrides, analyze format, parallel) lives in `rencoder.toml` at the
 app-level location (binary dir by default; `$RENENCODER_CONFIG` overrides).
 See `rencoder_lib::config::app::AppConfig` for the schema and
-`examples/rencoder.toml` for a dev-only reference. Unknown TOML keys are
+`examples/rencoder.toml.example` for a dev-only reference. Unknown TOML keys are
 rejected so typos surface immediately.
 
 CRF is a `u32` (default 45, sentinel 0 = bitrate mode), not a bool — this

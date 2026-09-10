@@ -63,8 +63,12 @@ target list.
 ## Quickstart
 
 A copyable reference config ships at
-[`examples/rencoder.toml`](examples/rencoder.toml). Drop it at the
-project root as `rencoder.toml` and edit per your workflow.
+[`examples/rencoder.toml.example`](examples/rencoder.toml.example). For
+U18, this is a dev-only reference — `rencoder` auto-generates the live
+config at `<app_dir>/rencoder.toml` on first run, so most users don't
+need to copy anything. Drop the example at `<app_dir>/rencoder.toml`
+to override individual fields, or set `$RENENCODER_CONFIG` to point
+at any other path.
 
 ### Analyze a directory of videos
 

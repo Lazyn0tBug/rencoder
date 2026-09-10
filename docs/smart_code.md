@@ -784,7 +784,7 @@ ctrlc::set_handler(move || {
   有 inline 注释），atomic write（tmp + rename），stderr 日志提示
 - 路径存在但 parse / validate 失败 → 报错（**绝不覆盖**用户已有文件）
 
-**schema**：见 `rencoder_lib::config::app::AppConfig` 和 `examples/rencoder.toml`
+**schema**：见 `rencoder_lib::config::app::AppConfig` 和 `examples/rencoder.toml.example`
 （dev-only 参考，dist 用户无需手动拷贝）。schema 校验在 `AppConfig::load`；runtime
 `Config` 通过 `Config::from_project(&app_config.encode)` 派生。
 
@@ -889,7 +889,7 @@ rencoder-cli-<triple>/
 1. `cargo build --release --target <triple>`
 2. 创建 `dist/<app>-<triple>/`
 3. 拷贝 `target/<triple>/release/rencoder` + `LICENSE` + `README.md` +
-   `examples/rencoder.toml`（作为默认配置种子）→ `dist/<app>-<triple>/`
+   `examples/rencoder.toml.example`（作为默认配置种子）→ `dist/<app>-<triple>/`
 4. 创建 `dist/<app>-<triple>/log/` 和 `dist/<app>-<triple>/data/`（占位目录）
 5. 打包成 `.tar.xz`（cargo-dist 完成最后一步）
 

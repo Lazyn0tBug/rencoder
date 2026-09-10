@@ -535,7 +535,7 @@ Stripped from CLI (now in config): `-c`/`--format`, `-b`/`--bitrate`,
 - `rencoder_cli/src/main.rs` — loads `ProjectConfig`, merges into
   `EncodeParams` / analyze command; default config path
   `./rencoder.toml`
-- `examples/rencoder.toml` — reference config (every field documented)
+- `examples/rencoder.toml.example` — reference config (every field documented)
 
 ### Verify
 
@@ -610,7 +610,7 @@ marked `publish = false`.
   `<app_dir>/data/` (via `RENENCODER_DATA_DIR` override)
 - [ ] `rencoder_lib/src/encoder/command.rs` (or wherever
   `build_ffmpeg_command` lives) — crf semantics updated for new schema
-- [ ] `examples/rencoder.toml` — header updated: "dev-only reference;
+- [ ] `examples/rencoder.toml.example` — header updated: "dev-only reference;
   dist users don't need this"; crf value updated to `45`
 - [ ] `scripts/build-dist.sh` — new: cargo build + assemble dist tree +
   empty log/data placeholders + cargo-dist tarball
@@ -631,4 +631,4 @@ marked `publish = false`.
 - Manual: `RENENCODER_CONFIG=/tmp/c.toml <app_dir>/rencoder ...` uses
   override; `RENENCODER_LOG_DIR=/tmp/log <app_dir>/rencoder ...` writes
   logs to `/tmp/log`.
-- Existing examples/rencoder.toml parses with new u32 crf.
+- Existing examples/rencoder.toml.example parses with new u32 crf.
