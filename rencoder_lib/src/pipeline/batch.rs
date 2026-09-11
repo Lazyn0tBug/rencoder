@@ -69,6 +69,14 @@ pub fn transcode_single(
         .expect("transcode_single called with TranscodeTask.output = None");
 
     if output_path.exists() {
+        // Visible scaffold: the task scaffold in TaskManager::run emits
+        // generic start/end lines. Domain-level skips like this one need
+        // their own log so operators can tell "ran and wrote" from
+        // "did nothing because the output was already on disk".
+        log::info!(
+            "    task skipped: output already exists at {}",
+            output_path.display()
+        );
         return Ok(make_skipped_record(
             task,
             params,
@@ -206,6 +214,10 @@ fn transcode_with_argv(
         .unwrap_or(false);
 
     if should_skip_encoding(codec, params.format, need_reduce) {
+        // Source codec already matches target format and no fps reduction
+        // needed. Surface this so the operator can distinguish "skipped
+        // because nothing to do" from "ran and re-encoded".
+        log::info!("    task skipped: source codec matches target ({})", codec);
         return Ok(make_skipped_record(
             task,
             params,
