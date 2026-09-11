@@ -42,7 +42,7 @@ use crate::types::VideoFormat;
 /// config path doesn't exist on first run. This is a starter template
 /// (not the literal `Default::default()` output) — it includes inline
 /// documentation of every field plus recommended starting values
-/// (e.g., `bitrate = 5000`, `extensions = ["mp4", "mov", "mkv"]`).
+/// (e.g., `bitrate = 5000`, `extensions = ["mp4", "mov", "avi"]`).
 ///
 /// When schema fields change (e.g., U18 step 6's `crf` u32 redesign),
 /// this string is updated in lockstep with `EncodeConfig` /
