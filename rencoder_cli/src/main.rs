@@ -155,7 +155,7 @@ fn default_data_path() -> anyhow::Result<PathBuf> {
     rencoder_lib::config::fs_perms::set_app_dir_mode(&dir).context("set data dir mode bits")?;
     Ok(dir.join(format!(
         "encoding-{}.parquet",
-        rencoder_lib::utils::time::utc_timestamp_filename()
+        rencoder_lib::utils::time::utc_timestamp()
     )))
 }
 

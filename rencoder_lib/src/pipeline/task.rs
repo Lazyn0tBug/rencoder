@@ -39,8 +39,6 @@
 
 use std::path::{Path, PathBuf};
 
-use chrono::Utc;
-
 use crate::error::EncodeError;
 use crate::pipeline::partial_output::{self, PartialOutputHandle};
 use crate::types::TranscodeTask;
@@ -145,13 +143,11 @@ impl TaskManager {
             // events (system logs, ticket timelines). Filename tells
             // operators which file the in-flight row corresponds to
             // without parsing the batch label.
-            let ts_start = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
             log::info!(
-                "    task {}/{} {}, start at {}",
+                "    task {}/{} {} start",
                 ctx.index,
                 ctx.total,
-                ctx.source.display(),
-                ts_start
+                ctx.source.display()
             );
 
             // The Guard lives only across the processor call so the
@@ -164,13 +160,11 @@ impl TaskManager {
                 processor(task, &ctx)
             };
 
-            let ts_end = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
             log::info!(
-                "    task {}/{} {} end at {}",
+                "    task {}/{} {} end",
                 ctx.index,
                 ctx.total,
-                ctx.source.display(),
-                ts_end
+                ctx.source.display()
             );
 
             results.push(result.unwrap_or_else(|e| {

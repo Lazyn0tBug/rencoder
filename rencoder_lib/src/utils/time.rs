@@ -10,7 +10,7 @@ use chrono::Utc;
 /// ISO 8601 UTC timestamp formatted for filesystem use (colons
 /// replaced with `-` for macOS / Windows safety). Example:
 /// `2026-09-08T16-53-00Z`.
-pub fn utc_timestamp_filename() -> String {
+pub fn utc_timestamp() -> String {
     Utc::now().format("%Y-%m-%dT%H-%M-%SZ").to_string()
 }
 
@@ -20,7 +20,7 @@ mod tests {
 
     #[test]
     fn format_is_iso8601_with_z_suffix() {
-        let s = utc_timestamp_filename();
+        let s = utc_timestamp();
         // Length is 20 chars: YYYY-MM-DDTHH-MM-SSZ.
         assert_eq!(s.len(), 20);
         assert!(s.ends_with('Z'));
