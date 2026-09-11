@@ -325,6 +325,71 @@ mod tests {
     }
 
     #[test]
+    fn empty_write_is_noop() {
+        // A zero-length write still goes through File::write which
+        // returns 0. The current_size must NOT advance on empty writes
+        // (otherwise a flood of empty writes from a quiet service would
+        // push the file over the rotation threshold without any actual
+        // content). Confirm current_size stays at 0 and the file remains
+        // empty.
+        let dir = fixture_dir();
+        let sink = FileSink::new(&dir, 1024, 7).unwrap();
+        {
+            let mut w = sink.make_writer();
+            let n = w.write(b"").unwrap();
+            assert_eq!(n, 0);
+        }
+        let path = dir.join(list_log_files(&dir).into_iter().next().unwrap());
+        let content = fs::read(&path).unwrap();
+        assert!(content.is_empty(), "empty write must not produce bytes");
+    }
+
+    #[test]
+    fn rotate_at_exact_max_size_boundary() {
+        // max_size=10. Write exactly 10 bytes. After write, current_size
+        // becomes 10 which is >= max_size, so the next write goes to
+        // the next suffix. Verify by writing another 5 bytes and seeing
+        // both suffixes appear.
+        let dir = fixture_dir();
+        let sink = FileSink::new(&dir, 10, 7).unwrap();
+
+        // First write: 10 bytes -> fills file, rotation queued for next.
+        {
+            let mut w = sink.make_writer();
+            w.write_all(b"0123456789").unwrap();
+        }
+        // Second write: triggers rotation, goes to suffix 01.
+        {
+            let mut w = sink.make_writer();
+            w.write_all(b"abcde").unwrap();
+        }
+        let files = list_log_files(&dir);
+        assert_eq!(
+            files.len(),
+            2,
+            "expected rotation after boundary hit, got {files:?}"
+        );
+        assert!(files[0].ends_with(".00.log"));
+        assert!(files[1].ends_with(".01.log"));
+
+        let content_0 = fs::read_to_string(dir.join(&files[0])).unwrap();
+        let content_1 = fs::read_to_string(dir.join(&files[1])).unwrap();
+        assert_eq!(content_0, "0123456789");
+        assert_eq!(content_1, "abcde");
+    }
+
+    #[test]
+    fn mixed_ansi_and_plain_preserves_plain() {
+        // A buffer that interleaves ANSI codes with plain text should
+        // round-trip the plain parts cleanly. The previous strip_ansi
+        // test focused on sequences in isolation; this one is the
+        // realistic case from a tracing-subscriber emit.
+        let input = b"INFO \x1b[2mthread main\x1b[0m: starting\n\x1b[31mERROR\x1b[0m: nope\n";
+        let stripped = strip_ansi(input);
+        assert_eq!(&*stripped, b"INFO thread main: starting\nERROR: nope\n");
+    }
+
+    #[test]
     fn strip_ansi_removes_csi_sequences() {
         // Single SGR escape (italic + reset).
         let input = b"hello \x1b[3mworld\x1b[0m end";

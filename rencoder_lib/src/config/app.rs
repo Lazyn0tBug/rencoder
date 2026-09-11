@@ -499,4 +499,110 @@ mod tests {
         }
         std::fs::remove_file(&path).ok();
     }
+
+    // ---- validate() direct branch coverage ----
+
+    #[test]
+    fn validate_rejects_invalid_max_fps() {
+        // 15, 50, 100 are all valid int values but not canonical video
+        // frame rates; the encode pipeline assumes 24/25/30/60 only.
+        for bad in [15u32, 50, 100, 1] {
+            let cfg = AppConfig {
+                encode: Some(EncodeConfig {
+                    format: None,
+                    bitrate: None,
+                    crf: 45,
+                    max_fps: Some(bad),
+                    nv: None,
+                    extensions: None,
+                    output_dir: None,
+                    encoders: None,
+                }),
+                analyze: None,
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                matches!(err, ConfigError::InvalidValue { ref field, .. } if field == "encode.max_fps"),
+                "max_fps={bad} should be rejected, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_canonical_max_fps_values() {
+        // 0 (disabled) and the canonical video rates (24/25/30/60) all
+        // pass validation. The encode pipeline handles the 0 = disabled
+        // case (no -r injection).
+        for good in [0u32, 24, 25, 30, 60] {
+            let cfg = AppConfig {
+                encode: Some(EncodeConfig {
+                    format: None,
+                    bitrate: None,
+                    crf: 45,
+                    max_fps: Some(good),
+                    nv: None,
+                    extensions: None,
+                    output_dir: None,
+                    encoders: None,
+                }),
+                analyze: None,
+            };
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("max_fps={good} should validate, got {e:?}"));
+        }
+    }
+
+    #[test]
+    fn validate_rejects_bitrate_zero() {
+        // bitrate = 0 means "encode at zero kbps" which is degenerate;
+        // the user almost certainly meant to use crf mode instead.
+        let cfg = AppConfig {
+            encode: Some(EncodeConfig {
+                format: None,
+                bitrate: Some(0),
+                crf: 45,
+                max_fps: None,
+                nv: None,
+                extensions: None,
+                output_dir: None,
+                encoders: None,
+            }),
+            analyze: None,
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidValue { ref field, .. } if field == "encode.bitrate"),
+            "bitrate=0 should be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_bitrate_nonzero() {
+        let cfg = AppConfig {
+            encode: Some(EncodeConfig {
+                format: None,
+                bitrate: Some(5000),
+                crf: 45,
+                max_fps: None,
+                nv: None,
+                extensions: None,
+                output_dir: None,
+                encoders: None,
+            }),
+            analyze: None,
+        };
+        cfg.validate().expect("bitrate=5000 should validate");
+    }
+
+    #[test]
+    fn validate_ok_when_no_encode_section() {
+        // A config with only the [analyze] section (or no sections at
+        // all) should validate cleanly -- the encode validator only
+        // runs when encode.is_some().
+        let cfg = AppConfig {
+            encode: None,
+            analyze: Some(AnalyzeConfig::default()),
+        };
+        cfg.validate().expect("analyze-only config should validate");
+    }
 }
