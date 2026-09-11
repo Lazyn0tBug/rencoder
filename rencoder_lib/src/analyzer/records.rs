@@ -211,13 +211,6 @@ fn csv_escape_field(s: &str) -> String {
     }
 }
 
-/// Probe files and aggregate into `VideoStats`. Public entry point for
-/// the CLI's text summary path.
-pub fn analyze_fps(files: &[PathBuf]) -> Result<VideoStats, EncodeError> {
-    let records = analyze_records(files)?;
-    Ok(aggregate_records(&records))
-}
-
 /// Aggregate an already-built record list into `VideoStats` using
 /// Polars expressions: `group_by([fps, codec]).agg([count, sum(duration),
 /// sum(bytes)])` plus manual totals (parsed/failed counts and the
@@ -440,8 +433,10 @@ mod tests {
     }
 
     #[test]
-    fn analyze_fps_routes_through_records() {
-        // Smoke: analyze_fps == aggregate_records(analyze_records(...))
+    fn aggregate_records_composes_with_probe_seam() {
+        // U20: replaces the deleted `analyze_fps` smoke test. The
+        // composition `aggregate_records(analyze_records_with_probe(...))`
+        // is what callers build themselves now that the wrapper is gone.
         let files = vec![PathBuf::from("/x.mp4")];
         let probe = |_: &Path| -> Result<VideoMetadata, EncodeError> {
             Ok(VideoMetadata {

@@ -10,7 +10,6 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rencoder_lib::{
-    analyzer::records::analyze_fps,
     config::Config,
     data::extract::probe_video_metadata,
     pipeline::{
@@ -94,10 +93,10 @@ fn probe_real_video_returns_codec_and_fps() {
     assert!((fps - 30.0).abs() < 0.5, "expected ~30 fps, got {fps}");
 }
 
-// ---- analyze_fps ----
+// ---- analyze_records + aggregate_records (U20: analyze_fps deleted) ----
 
 #[test]
-fn analyze_fps_groups_mixed_fixtures() {
+fn aggregate_records_groups_mixed_fixtures() {
     if skip_if_no_ffmpeg() {
         return;
     }
@@ -107,7 +106,9 @@ fn analyze_fps_groups_mixed_fixtures() {
     make_video(&dir, "c.mp4", 60, 1);
 
     let files = vec![dir.join("a.mp4"), dir.join("b.mp4"), dir.join("c.mp4")];
-    let stats = analyze_fps(&files).expect("analyze should succeed");
+    let records =
+        rencoder_lib::analyzer::records::analyze_records_with_probe(&files, probe_video_metadata);
+    let stats = rencoder_lib::analyzer::records::aggregate_records(&records);
     assert_eq!(stats.total_files, 3);
     assert_eq!(stats.parsed_files, 3);
     assert_eq!(stats.failed_files, 0);
@@ -119,10 +120,12 @@ fn analyze_fps_groups_mixed_fixtures() {
 }
 
 #[test]
-fn analyze_fps_handles_probe_failure_for_missing_file() {
+fn aggregate_records_handles_probe_failure_for_missing_file() {
     let dir = fixture_dir("analyze_missing");
     let files = vec![dir.join("does_not_exist.mp4")];
-    let stats = analyze_fps(&files).expect("analyze should succeed");
+    let records =
+        rencoder_lib::analyzer::records::analyze_records_with_probe(&files, probe_video_metadata);
+    let stats = rencoder_lib::analyzer::records::aggregate_records(&records);
     assert_eq!(stats.total_files, 1);
     assert_eq!(stats.parsed_files, 0);
     assert_eq!(stats.failed_files, 1);
