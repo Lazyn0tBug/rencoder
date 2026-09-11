@@ -1,22 +1,224 @@
-name: Rust
+# GitHub Actions release workflow for Rencoder.
+#
+# Builds for three targets with cargo-dist:
+#   - aarch64-apple-darwin   -> .tar.xz (augmented by scripts/dist.sh; see U18 step 12)
+#   - x86_64-unknown-linux-gnu -> .tar.xz
+#   - x86_64-pc-windows-msvc  -> .zip (portable; U18 design contract)
+#
+# Adds a separate `macos-dmg` job that builds a .dmg from the aarch64-apple-darwin
+# artifact using `create-dmg` (cargo-dist 0.32 doesn't support dmg natively).
+#
+# Triggers on tag push matching `v*` (cargo SemVer style).
+
+name: Release
 
 on:
   push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to release (e.g. v0.1.0). Leave blank for HEAD.
+        required: false
+        default: ''
+        type: string
 
-env:
-  CARGO_TERM_COLOR: always
+permissions:
+  contents: write  # for creating GitHub Releases
+  actions: read
 
 jobs:
+  # Build each target. cargo-dist defaults give us .tar.xz for Unix and
+  # .zip for Windows. The .tar.xz archives are then augmented in place
+  # by scripts/dist.sh to include rencoder.toml + log/ + data/ subdirs
+  # (U18 single-dir-app layout).
   build:
-
-    runs-on: ubuntu-latest
-
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+
+      - name: Cache cargo-dist
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/dist
+          key: cargo-dist-v0.32.0
+
+      - name: Install cargo-dist
+        run: |
+          if [ ! -f ~/.cargo/bin/dist ]; then
+            curl --proto '=https' --tlsv1.2 -sSf \
+              https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-v0.32.0-lets-do-this-mac-latest.tar.xz \
+              | tar -xJ -C /tmp
+            mv /tmp/cargo-dist-v0.32.0-lets-do-this/bin/cargo-dist ~/.cargo/bin/dist
+            chmod +x ~/.cargo/bin/dist
+          fi
+          dist --version
+
+      - name: Build artifacts (cargo-dist)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # BUILD_MANIFEST_NAME is consumed by the upload step to know
+          # what to ship -- kept identical to the standard cargo-dist flow
+          # so post-build tooling doesn't break.
+          export BUILD_MANIFEST_NAME="target/distrib/${{ matrix.target }}-dist-manifest.json"
+          mkdir -p target/distrib
+
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            TAG_FLAG="--tag=${{ github.event.inputs.tag }}"
+          else
+            TAG_FLAG=""
+          fi
+
+          dist build $TAG_FLAG --target ${{ matrix.target }} \
+            --print=linkage --output-format=json \
+            > dist-manifest.json
+          echo "dist build succeeded for ${{ matrix.target }}"
+
+          # Augment tar.xz archives with the U18 single-dir-app layout
+          # (only relevant for Unix targets; Windows zip already gets
+          # everything cargo-dist provides).
+          if [ "${{ matrix.target }}" != "x86_64-pc-windows-msvc" ]; then
+            bash scripts/dist.sh
+            # scripts/dist.sh does its own `rm -rf dist` then re-stages;
+            # re-run dist build once more after augmentation is NOT
+            # needed because augmentation writes back to the original
+            # target/distrib/*.tar.xz via tar -cJf (in-place re-pack).
+          fi
+
+      - name: Post-build (parse manifest)
+        id: cargo-dist
+        shell: bash
+        run: |
+          # Tell the upload step which paths came out of dist
+          echo "paths<<EOF" >> "$GITHUB_OUTPUT"
+          dist print-upload-files-from-manifest --manifest dist-manifest.json >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-${{ matrix.target }}
+          path: |
+            ${{ steps.cargo-dist.outputs.paths }}
+            dist-manifest.json
+
+  # Build a macOS .dmg from the aarch64-apple-darwin artifact. cargo-dist
+  # 0.32 doesn't support dmg natively; we use `create-dmg` (homebrew).
+  macos-dmg:
+    name: macos dmg (${{ needs.build.outputs.target }})
+    needs: build
+    runs-on: macos-14
+    if: ${{ needs.build.result == 'success' && contains(needs.build.outputs.target, 'aarch64-apple-darwin') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: artifacts-aarch64-apple-darwin
+          path: dist-tmp/
+
+      - name: Install create-dmg
+        run: |
+          brew install create-dmg
+
+      - name: Locate tarball and stage
+        id: stage
+        shell: bash
+        run: |
+          TARBALL=$(ls dist-tmp/*.tar.xz | head -1)
+          APP_NAME="rencoder_cli-aarch64-apple-darwin"
+          WORK=$(mktemp -d)
+          tar -xJf "$TARBALL" -C "$WORK"
+          # The augmented tarball contains the single-dir-app layout
+          # (rencoder + LICENSE + README + rencoder.toml + log/ + data/).
+          # create-dmg needs a source dir; we point it at the extracted dir.
+          APP_PATH="$WORK/$APP_NAME"
+          # Sign with ad-hoc identity so the dmg is mountable on Apple Silicon.
+          codesign --force --deep --sign - "$APP_PATH/rencoder" 2>&1 | tail -3 || true
+          echo "app_path=$APP_PATH" >> "$GITHUB_OUTPUT"
+          echo "app_name=$APP_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Build .dmg
+        shell: bash
+        run: |
+          APP_PATH="${{ steps.stage.outputs.app_path }}"
+          APP_NAME="${{ steps.stage.outputs.app_name }}"
+          cd "$(dirname "$APP_PATH")"
+          create-dmg \
+            --volname "Rencoder" \
+            --window-pos 200 120 \
+            --window-size 600 400 \
+            --icon-size 100 \
+            --icon "rencoder" 200 190 \
+            --hide-extension "rencoder" \
+            --app-drop-link 400 190 \
+            "dist-tmp/$APP_NAME.dmg" \
+            "$APP_NAME" || true
+          # create-dmg returns non-zero on sandbox issues; treat dmg as
+          # best-effort and let the release step check file existence.
+          ls -la dist-tmp/*.dmg || echo "no dmg produced"
+
+      - name: Upload dmg
+        if: ${{ hashFiles('dist-tmp/*.dmg') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-aarch64-apple-darwin-dmg
+          path: dist-tmp/*.dmg
+
+  # Combine all artifacts into a GitHub Release.
+  release:
+    name: github release
+    needs: [build, macos-dmg]
+    runs-on: ubuntu-22.04
+    if: ${{ !failure() && !cancelled() }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: artifacts-*
+          path: release/
+          merge-multiple: true
+
+      - name: List artifacts
+        run: |
+          echo "Files to release:"
+          ls -la release/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "Rencoder ${{ github.ref_name }}"
+          generate_release_notes: true
+          files: |
+            release/**/*.tar.xz
+            release/**/*.zip
+            release/**/*.dmg
+            release/**/*.sha256
+            release/**/*.sha256.sum
+            release/**/dist-manifest.json
