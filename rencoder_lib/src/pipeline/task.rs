@@ -7,24 +7,24 @@
 //! list and need the same scaffolding:
 //!
 //! 1. Build a per-task context (index / total / source / output).
-//! 2. Emit a start log line.
+//! 2. Emit a minimal `task N/M start` log line.
 //! 3. Register the partial output with the signal-handler handle (when
 //!    the task has an output that a SIGINT should clean up).
 //! 4. Run the per-task processor closure.
-//! 5. Emit an `ok` or `failed` log line.
+//! 5. Emit a minimal `task N/M end` log line.
 //!
 //! Centralising this in [`TaskManager::run`] lets domain functions
 //! (`transcode_single`, `analyze_records_with_probe`) stay focused on
 //! their own work -- encode or probe -- without owning the lifecycle
 //! metadata.
 //!
-//! ## Domain log content
+//! ## Scaffold log content
 //!
-//! The scaffold log lines (`task N/M: <label> <src>` / `task N/M: ok Nms`)
-//! are deliberately generic. Encode-specific detail (output path, codec,
-//! crf) lives in domain code (or stays out of the log entirely); the
-//! scaffold tells the operator "which file is in flight" without
-//! duplicating per-task data.
+//! The scaffold log is intentionally minimal: just `task N/M` followed
+//! by `start` or `end`. No path, no duration, no status, no error.
+//! Per-task detail is recoverable from the per-run data record
+//! (parquet/csv in `<app_dir>/data/`); the scaffold tells the operator
+//! "this file is in flight", nothing more.
 //!
 //! ## Parallel analyze
 //!
@@ -37,8 +37,6 @@
 //! log on failure.
 //!
 //! U19 design: docs/design.md §3.4.6.
-
-use std::time::Instant;
 
 use crate::error::EncodeError;
 use crate::pipeline::partial_output::{self, PartialOutputHandle};
@@ -80,6 +78,13 @@ impl TaskManager {
     /// output) registering the partial-output Guard before each
     /// `processor` call. Returns one `R` per task.
     ///
+    /// Scaffold log is intentionally minimal: just `task N/M` at start
+    /// and end of each task, no path / duration / status. Per-task
+    /// detail (path, duration, codec, error) is recoverable from the
+    /// per-run data record (parquet/csv in `<app_dir>/data/`).
+    /// The scaffold tells the operator "this file is in flight",
+    /// nothing more.
+    ///
     /// The processor closure returns `Err` only for unrecoverable
     /// setup failures (the existing batch contract -- per-file probe
     /// or encode failures are encoded as `Ok(record)` with
@@ -87,9 +92,9 @@ impl TaskManager {
     /// task-level failure: a `failed` log line is emitted and the
     /// iteration continues with the next task.
     ///
-    /// `label` is the verb that appears in the start log
-    /// (`task N/M: <label> <src>`); examples: `"encoding"`, `"probing"`.
-    pub fn run<P, R>(&self, tasks: &[TranscodeTask], label: &str, mut processor: P) -> Vec<R>
+    /// `label` is currently unused by the scaffold (kept in the API
+    /// for callers that may want to re-introduce domain tags).
+    pub fn run<P, R>(&self, tasks: &[TranscodeTask], _label: &str, mut processor: P) -> Vec<R>
     where
         P: FnMut(&TranscodeTask, &TaskContext) -> Result<R, EncodeError>,
     {
@@ -102,8 +107,7 @@ impl TaskManager {
                 source: task.input.clone(),
                 output: task.output.clone(),
             };
-            log_start(&ctx, label);
-            let started = Instant::now();
+            log_task_marker(&ctx, "start");
 
             // The Guard lives only across the processor call so the
             // handle is cleared between tasks -- a SIGINT after the
@@ -115,10 +119,7 @@ impl TaskManager {
                 processor(task, &ctx)
             };
 
-            match &result {
-                Ok(_) => log_ok(&ctx, started),
-                Err(e) => log_failed(&ctx, started, e),
-            }
+            log_task_marker(&ctx, "end");
 
             results.push(result.unwrap_or_else(|e| {
                 // Processors should map per-file failures to Ok(record);
@@ -136,32 +137,12 @@ impl TaskManager {
     }
 }
 
-fn log_start(ctx: &TaskContext, label: &str) {
-    log::info!(
-        "task {}/{}: {} {}",
-        ctx.index,
-        ctx.total,
-        label,
-        ctx.source.display()
-    );
-}
-
-fn log_ok(ctx: &TaskContext, started: Instant) {
-    log::info!(
-        "task {}/{}: ok {}ms",
-        ctx.index,
-        ctx.total,
-        started.elapsed().as_millis()
-    );
-}
-
-fn log_failed(ctx: &TaskContext, started: Instant, err: &EncodeError) {
-    log::warn!(
-        "task {}/{}: failed {}ms: {err}",
-        ctx.index,
-        ctx.total,
-        started.elapsed().as_millis()
-    );
+fn log_task_marker(ctx: &TaskContext, phase: &str) {
+    // Minimal scaffold: `task N/M phase`. No path, no duration, no
+    // status. Two lines per task (start, end). The parquet/CSV
+    // record in `<app_dir>/data/` carries per-task detail; the log
+    // is for "is this file in flight?" presence.
+    log::info!("task {}/{} {}", ctx.index, ctx.total, phase);
 }
 
 #[cfg(test)]
