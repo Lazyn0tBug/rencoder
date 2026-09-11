@@ -27,7 +27,7 @@ use crate::encoder::{
     select::select_encoder,
 };
 use crate::error::EncodeError;
-use crate::pipeline::partial_output::{self, PartialOutputHandle};
+use crate::pipeline::partial_output::{self, PartialOutputHandle, TaskContext};
 use crate::types::{
     EncodeParams, EncoderCache, EncoderSettings, EncodingOutcome, EncodingRecord, ErrorCategory,
     ErrorContext, ProcessOutput, SkippedReason, TranscodeTask, VideoMetadata,
@@ -41,6 +41,11 @@ type ResultCallback = dyn Fn(&EncodingRecord);
 /// failures (e.g. corrupt/unreadable input) surface as `Err`. ffmpeg
 /// failures land in `EncodingRecord.outcome = Failed` with stderr
 /// captured for the `ErrorContext`.
+///
+/// `task_ctx` carries the per-task index/total/source/output for
+/// logging and signal-handler cleanup. The signal handler reads
+/// `task_ctx.output` on SIGINT to remove the partial file; the
+/// log lines use `task_ctx.index/total/source` for context.
 pub fn transcode_single(
     task: &TranscodeTask,
     params: &EncodeParams,
@@ -48,11 +53,15 @@ pub fn transcode_single(
     config: &Config,
     output: ProcessOutput,
     current_output: Option<&PartialOutputHandle>,
+    task_ctx: &TaskContext,
 ) -> Result<EncodingRecord, EncodeError> {
     let started_at_meta = Utc::now();
     let started_at_instant = Instant::now();
 
+    log_task_start(task_ctx, params);
+
     if task.output.exists() {
+        log_task_skipped(task_ctx);
         return Ok(make_skipped_record(
             task,
             params,
@@ -65,6 +74,7 @@ pub fn transcode_single(
     let metadata = match probe_video_metadata_auto(&task.input) {
         Ok(m) => m,
         Err(e) => {
+            log_task_probe_failed(task_ctx, &e);
             return Ok(make_failed_probe_record(
                 task,
                 params,
@@ -79,8 +89,8 @@ pub fn transcode_single(
     // U18 §3.4.5: register the partial output path before ffmpeg runs
     // so SIGINT cleans it up. The guard clears on every exit path
     // (success, failure, panic) so the next iteration starts clean.
-    let _partial_guard = partial_output::Guard::new(current_output, task.output.clone());
-    transcode_with_argv(
+    let _partial_guard = partial_output::Guard::new(current_output, task_ctx.clone());
+    let record = transcode_with_argv(
         task,
         params,
         &metadata,
@@ -88,7 +98,9 @@ pub fn transcode_single(
         started_at_meta,
         started_at_instant,
         output,
-    )
+    )?;
+    log_task_done(task_ctx, &record.outcome, started_at_instant);
+    Ok(record)
 }
 
 /// Run a batch over a file list. Failures are captured per-file; the
@@ -114,7 +126,9 @@ pub fn transcode_batch(
     transcode_batch_with_processor(
         params,
         files,
-        |task, params| transcode_single(task, params, cache, config, output, current_output),
+        |task, params, ctx| {
+            transcode_single(task, params, cache, config, output, current_output, ctx)
+        },
         result_callback,
     )
 }
@@ -129,16 +143,23 @@ fn transcode_batch_with_processor<F>(
     result_callback: Option<&ResultCallback>,
 ) -> Vec<EncodingRecord>
 where
-    F: FnMut(&TranscodeTask, &EncodeParams) -> Result<EncodingRecord, EncodeError>,
+    F: FnMut(&TranscodeTask, &EncodeParams, &TaskContext) -> Result<EncodingRecord, EncodeError>,
 {
     let mut records = Vec::with_capacity(files.len());
-    for input in files {
+    let total = files.len();
+    for (idx, input) in files.iter().enumerate() {
         let output_path = output_path_for(input, params.format);
         let task = TranscodeTask {
             input: input.clone(),
             output: output_path,
         };
-        let record = match processor(&task, params) {
+        let ctx = TaskContext {
+            index: idx + 1,
+            total,
+            source: task.input.clone(),
+            output: task.output.clone(),
+        };
+        let record = match processor(&task, params, &ctx) {
             Ok(r) => r,
             Err(e) => make_failed_probe_record(&task, params, Utc::now(), None, &e),
         };
@@ -160,9 +181,85 @@ pub(crate) fn transcode_batch_with_processor_for_test<F>(
     result_callback: Option<&ResultCallback>,
 ) -> Vec<EncodingRecord>
 where
-    F: FnMut(&TranscodeTask, &EncodeParams) -> Result<EncodingRecord, EncodeError>,
+    F: FnMut(&TranscodeTask, &EncodeParams, &TaskContext) -> Result<EncodingRecord, EncodeError>,
 {
     transcode_batch_with_processor(params, files, processor, result_callback)
+}
+
+/// Per-task lifecycle log helpers. Each task in a batch emits one
+/// `start`, one `end` (or skip / probe-fail variant), and on signal
+/// the signal handler emits an `interrupted` event after the partial
+/// file is removed. Together these give post-mortem log analysis a
+/// per-file timeline without grepping ffmpeg stderr.
+///
+/// Format choice: keep the message body self-contained ("task 3/58:
+/// ...") rather than relying on span fields, so the rolling log file
+/// is readable even when stripped of span context (the file layer
+/// uses Compact format, which truncates nested span depth).
+fn log_task_start(ctx: &TaskContext, params: &EncodeParams) {
+    // The encode command's `bitrate_or_crf` field is overloaded: it's
+    // the CRF value when `is_crf == true`, otherwise it's a bitrate
+    // (Kbps). Surface that in the log so the operator can tell at a
+    // glance whether this is a CRF run or a bitrate run.
+    let mode = if params.is_crf { "crf" } else { "bitrate" };
+    log::info!(
+        "task {}/{}: encoding {} -> {} ({}, {}={})",
+        ctx.index,
+        ctx.total,
+        ctx.source.display(),
+        ctx.output.display(),
+        format_target_label(params),
+        mode,
+        params.bitrate_or_crf,
+    );
+}
+
+fn log_task_skipped(ctx: &TaskContext) {
+    log::info!("task {}/{}: skipped (output exists)", ctx.index, ctx.total);
+}
+
+fn log_task_probe_failed(ctx: &TaskContext, err: &EncodeError) {
+    log::warn!(
+        "task {}/{}: probe failed for {}: {err}",
+        ctx.index,
+        ctx.total,
+        ctx.source.display()
+    );
+}
+
+fn log_task_done(ctx: &TaskContext, outcome: &EncodingOutcome, started: Instant) {
+    let elapsed_ms = started.elapsed().as_millis();
+    match outcome {
+        EncodingOutcome::Succeeded | EncodingOutcome::ReducedFps => {
+            log::info!(
+                "task {}/{}: ok {}ms -> {}",
+                ctx.index,
+                ctx.total,
+                elapsed_ms,
+                ctx.output.display()
+            );
+        }
+        EncodingOutcome::Failed => {
+            log::warn!(
+                "task {}/{}: failed {}ms (see record for detail)",
+                ctx.index,
+                ctx.total,
+                elapsed_ms
+            );
+        }
+        EncodingOutcome::Skipped(_) => {
+            // Already logged by `log_task_skipped` at the skip site.
+        }
+    }
+}
+
+fn format_target_label(params: &EncodeParams) -> &'static str {
+    match params.format {
+        crate::types::VideoFormat::Av1 => "av1",
+        crate::types::VideoFormat::X264 => "h264",
+        crate::types::VideoFormat::Hevc => "hevc",
+        crate::types::VideoFormat::Vp9 => "vp9",
+    }
 }
 
 /// Build the ffmpeg argv (used by `transcode_single`). Probes the source
@@ -605,7 +702,7 @@ Encoders:
         let records = super::transcode_batch_with_processor_for_test(
             &params,
             std::slice::from_ref(&task.input),
-            |_, _| Ok(test_succeeded_record(&task, &params)),
+            |_, _, _| Ok(test_succeeded_record(&task, &params)),
             None,
         );
         assert_eq!(records.len(), 1);
@@ -673,8 +770,21 @@ Encoders:
         let cache = cache_with_libx264_and_svtav1(false);
         let config = Config::default();
 
-        let record = transcode_single(&task, &params, &cache, &config, ProcessOutput::Null, None)
-            .expect("transcode_single should succeed");
+        let record = transcode_single(
+            &task,
+            &params,
+            &cache,
+            &config,
+            ProcessOutput::Null,
+            None,
+            &TaskContext {
+                index: 1,
+                total: 1,
+                source: task.input.clone(),
+                output: task.output.clone(),
+            },
+        )
+        .expect("transcode_single should succeed");
         assert_eq!(
             record.outcome,
             EncodingOutcome::Skipped(SkippedReason::OutputExists)
@@ -741,8 +851,18 @@ Encoders:
         // smoke test (manually run rencoder, press Ctrl-C, see partial
         // removed). Here we test the type contract.
         let handle: PartialOutputHandle = Arc::new(parking_lot::Mutex::new(None));
-        let p1 = PathBuf::from("/a.mkv");
-        let p2 = PathBuf::from("/b.mkv");
+        let p1 = TaskContext {
+            index: 1,
+            total: 2,
+            source: PathBuf::from("/a.mp4"),
+            output: PathBuf::from("/a.mkv"),
+        };
+        let p2 = TaskContext {
+            index: 2,
+            total: 2,
+            source: PathBuf::from("/b.mp4"),
+            output: PathBuf::from("/b.mkv"),
+        };
         // Simulate "before file 1" via Guard:
         {
             let _g1 = crate::pipeline::partial_output::Guard::new(Some(&handle), p1.clone());

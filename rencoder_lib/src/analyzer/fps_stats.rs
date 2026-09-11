@@ -41,11 +41,15 @@ where
     F: Fn(&Path) -> Result<crate::types::VideoMetadata, EncodeError>,
 {
     let mut records = Vec::with_capacity(files.len());
-    for path in files {
+    let total = files.len();
+    for (idx, path) in files.iter().enumerate() {
+        log_analyze_start(idx + 1, total, path);
+        let started = std::time::Instant::now();
         let file_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         match probe(path) {
             Ok(metadata) => {
                 let fps = metadata.best_fps().map(|f| f.round() as u32);
+                log_analyze_done(idx + 1, total, started, path, Some(&metadata));
                 records.push(AnalysisRecord {
                     path: path.clone(),
                     fps,
@@ -55,7 +59,7 @@ where
                 });
             }
             Err(e) => {
-                log::warn!("probe failed for {}: {e}", path.display());
+                log_analyze_failed(idx + 1, total, started, path, &e);
                 records.push(AnalysisRecord {
                     path: path.clone(),
                     fps: None,
@@ -69,6 +73,48 @@ where
     records
 }
 
+/// Per-task log helpers for the serial analyze path. Each file in a
+/// directory emits one `start`, one `done` (or `failed`). The
+/// parallel variant intentionally has no per-task lines because
+/// rayon's worker pool has no ordering guarantee -- emitting
+/// `task N/M` mid-flight would be misleading.
+fn log_analyze_start(index: usize, total: usize, path: &Path) {
+    log::info!("task {index}/{total}: probing {}", path.display());
+}
+
+fn log_analyze_done(
+    index: usize,
+    total: usize,
+    started: std::time::Instant,
+    path: &Path,
+    metadata: Option<&crate::types::VideoMetadata>,
+) {
+    let elapsed_ms = started.elapsed().as_millis();
+    let codec = metadata.and_then(|m| m.codec.as_deref()).unwrap_or("?");
+    let fps = metadata
+        .and_then(|m| m.best_fps())
+        .map(|f| format!("{f:.1}"))
+        .unwrap_or_else(|| "?".into());
+    log::info!(
+        "task {index}/{total}: ok {elapsed_ms}ms (codec={codec}, fps={fps}) {}",
+        path.display()
+    );
+}
+
+fn log_analyze_failed(
+    index: usize,
+    total: usize,
+    started: std::time::Instant,
+    path: &Path,
+    err: &EncodeError,
+) {
+    log::warn!(
+        "task {index}/{total}: probe failed {ms}ms: {err} ({p})",
+        ms = started.elapsed().as_millis(),
+        p = path.display(),
+    );
+}
+
 /// Parallel variant of `analyze_records` using `rayon`. Each file is
 /// probed concurrently; per-thread probe failures become a record with
 /// `None` metric fields (matching the serial contract). Output ordering
@@ -78,6 +124,11 @@ where
 /// Probe failures inside a worker thread can't be propagated as `Result`
 /// through `par_iter().collect()` without `try_reduce` gymnastics, so we
 /// log + downgrade to a None-metric row, matching the serial behavior.
+///
+/// **No per-task log lines here**: rayon's parallel iteration runs
+/// across worker threads with no guaranteed ordering, so emitting
+/// `task 3/8: ...` would be misleading. Per-task logging is the
+/// serial path's responsibility.
 #[cfg(feature = "parallel-analyze")]
 pub fn analyze_records_parallel(files: &[PathBuf]) -> Result<Vec<AnalysisRecord>, EncodeError> {
     use rayon::prelude::*;
