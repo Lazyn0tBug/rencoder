@@ -273,7 +273,7 @@ pub type TranscodeResult = EncodingOutcome;
 /// plus high-level totals for the CLI summary line and the failed-files
 /// list.
 #[derive(Debug)]
-pub struct FpsStats {
+pub struct VideoStats {
     /// One row per `(fps, codec)` bucket; columns: `fps, codec, files,
     /// duration_secs, bytes`. Failed probes (fps=None) are excluded;
     /// `failed_files` and `failed_paths` track them.
@@ -285,8 +285,8 @@ pub struct FpsStats {
     pub failed_paths: Vec<PathBuf>,
 }
 
-impl FpsStats {
-    /// Build an empty `FpsStats` with the given total-file count and an
+impl VideoStats {
+    /// Build an empty `VideoStats` with the given total-file count and an
     /// empty cross-tab table. Tests and early-return paths use this;
     /// production callers should prefer `aggregate_records` to populate
     /// the table.
@@ -524,7 +524,7 @@ mod tests {
         assert_eq!(ProcessOutput::default(), ProcessOutput::Inherit);
     }
 
-    // ---- FpsStats (Polars-backed) ----
+    // ---- VideoStats (Polars-backed) ----
 
     fn rec(
         fps: Option<u32>,
@@ -552,7 +552,7 @@ mod tests {
 
     #[test]
     fn fps_stats_new_initializes_total_with_empty_table() {
-        let s = FpsStats::new(100);
+        let s = VideoStats::new(100);
         assert_eq!(s.total_files, 100);
         assert_eq!(s.parsed_files, 0);
         assert_eq!(s.failed_files, 0);

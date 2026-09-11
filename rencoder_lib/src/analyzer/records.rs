@@ -1,5 +1,5 @@
 //! FPS analysis: probe each file, build per-file `AnalysisRecord`s,
-//! then aggregate into `FpsStats`.
+//! then aggregate into `VideoStats`.
 //!
 //! Per-file failures are recorded with `fps`/`codec`/`duration_secs = None`
 //! (only `path` and `file_bytes` set) so the resulting CSV has one row
@@ -17,7 +17,7 @@ use polars::prelude::*;
 
 use crate::data::extract::probe_video_metadata_auto;
 use crate::error::EncodeError;
-use crate::types::FpsStats;
+use crate::types::VideoStats;
 
 /// One row per input file. Failed probes yield a row with `path` and
 /// `file_bytes` set but metric fields `None`.
@@ -211,18 +211,18 @@ fn csv_escape_field(s: &str) -> String {
     }
 }
 
-/// Probe files and aggregate into `FpsStats`. Public entry point for
+/// Probe files and aggregate into `VideoStats`. Public entry point for
 /// the CLI's text summary path.
-pub fn analyze_fps(files: &[PathBuf]) -> Result<FpsStats, EncodeError> {
+pub fn analyze_fps(files: &[PathBuf]) -> Result<VideoStats, EncodeError> {
     let records = analyze_records(files)?;
     Ok(aggregate_records(&records))
 }
 
-/// Aggregate an already-built record list into `FpsStats` using
+/// Aggregate an already-built record list into `VideoStats` using
 /// Polars expressions: `group_by([fps, codec]).agg([count, sum(duration),
 /// sum(bytes)])` plus manual totals (parsed/failed counts and the
 /// failed-files list).
-pub fn aggregate_records(records: &[AnalysisRecord]) -> FpsStats {
+pub fn aggregate_records(records: &[AnalysisRecord]) -> VideoStats {
     // Single pass: parsed/failed counts, total duration, failed paths.
     let mut parsed = 0usize;
     let mut total_duration = 0f64;
@@ -244,7 +244,7 @@ pub fn aggregate_records(records: &[AnalysisRecord]) -> FpsStats {
     // (fps = None) are filtered out -- they're tracked in failed_files
     // and failed_paths instead.
     let table = if records.is_empty() {
-        FpsStats::new(0).table
+        VideoStats::new(0).table
     } else {
         records_to_dataframe(records)
             .expect("records_to_dataframe")
@@ -261,7 +261,7 @@ pub fn aggregate_records(records: &[AnalysisRecord]) -> FpsStats {
             .expect("polars aggregate")
     };
 
-    FpsStats {
+    VideoStats {
         table,
         total_files,
         parsed_files: parsed,
