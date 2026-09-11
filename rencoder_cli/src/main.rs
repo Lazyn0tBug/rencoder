@@ -212,7 +212,7 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
     tracing::Span::current().record("parallel", parallel);
 
     let records = if parallel {
-        rencoder_lib::analyzer::fps_stats::analyze_records_parallel(&files)
+        rencoder_lib::analyzer::records::analyze_records_parallel(&files)
             .with_context(|| "fps analysis failed")?
     } else {
         // U19 step 5: serial analyze routes through TaskManager so the
@@ -233,14 +233,14 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
         manager.run(&tasks, "analyze", target_path(&target), |task, _ctx| {
             let file_bytes = std::fs::metadata(&task.input).map(|m| m.len()).unwrap_or(0);
             match probe_video_metadata(&task.input) {
-                Ok(metadata) => Ok(rencoder_lib::analyzer::fps_stats::AnalysisRecord {
+                Ok(metadata) => Ok(rencoder_lib::analyzer::records::AnalysisRecord {
                     path: task.input.clone(),
                     fps: metadata.best_fps().map(|f| f.round() as u32),
                     codec: metadata.codec,
                     duration_secs: metadata.duration_secs,
                     file_bytes,
                 }),
-                Err(_) => Ok(rencoder_lib::analyzer::fps_stats::AnalysisRecord {
+                Err(_) => Ok(rencoder_lib::analyzer::records::AnalysisRecord {
                     path: task.input.clone(),
                     fps: None,
                     codec: None,
@@ -250,7 +250,7 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
             }
         })
     };
-    let stats = rencoder_lib::analyzer::fps_stats::aggregate_records(&records);
+    let stats = rencoder_lib::analyzer::records::aggregate_records(&records);
 
     // One-line summary to stderr regardless of output format.
     eprintln!(
@@ -284,10 +284,10 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
 
     match format {
         AnalyzeFormatArg::Csv => {
-            render(rencoder_lib::analyzer::fps_stats::records_to_csv(&records))?;
+            render(rencoder_lib::analyzer::records::records_to_csv(&records))?;
         }
         AnalyzeFormatArg::Table => {
-            let df = rencoder_lib::analyzer::fps_stats::records_to_dataframe(&records)
+            let df = rencoder_lib::analyzer::records::records_to_dataframe(&records)
                 .map_err(|e| anyhow::anyhow!("dataframe build: {e}"))?;
             render(format!("{df}"))?;
         }
@@ -303,7 +303,7 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
 }
 
 /// Render records as JSON Lines: one `AnalysisRecord` per line.
-fn records_to_jsonl(records: &[rencoder_lib::analyzer::fps_stats::AnalysisRecord]) -> String {
+fn records_to_jsonl(records: &[rencoder_lib::analyzer::records::AnalysisRecord]) -> String {
     let mut out = String::new();
     for r in records {
         let fps = r

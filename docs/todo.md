@@ -14,7 +14,7 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
 - [x] `EncodeError` with `#[non_exhaustive]` (7 variants per origin §5)
 - [x] All public types in `types.rs` (`VideoFormat`, `VideoMetadata`, `MaxFpsConfig`, `ProcessOutput`, `EncoderCache`, `EncodeParams`, `Target`, `TranscodeTask`, `TranscodeResult`, `FpsStats`, `AnalyzeParams`)
 - [x] `Config` struct + `Config::load` + `Config::max_fps_config()` (5 unit tests passing)
-- [x] Stub modules with phase comments: collect, ffmpeg/{probe,encoder,encoder_cache,command}, fps/{parse,limit}, analyzer/fps_stats, processor/batch
+- [x] Stub modules with phase comments: collect, ffmpeg/{probe,encoder,encoder_cache,command}, fps/{parse,limit}, analyzer/fps_stats (renamed to analyzer/records in U20), processor/batch
 - [x] `path_util::{normalize, output_path_for}` stubs
 - [x] Project CLAUDE.md (build/test, external tools, conventions, TODO)
 - [x] `.gitignore` (target, .DS_Store, *.swp, *~, .claude/settings.local.json)
@@ -111,13 +111,13 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
 
 - [x] `FpsStats::summary()` in `types.rs` — group counts plus totals line
 - [x] `FpsStats::detailed()` in `types.rs` — per-file listing grouped by fps
-- [x] `analyze_fps(files) -> Result<FpsStats, EncodeError>` in `analyzer/fps_stats.rs`
+- [x] `analyze_fps(files) -> Result<FpsStats, EncodeError>` in `analyzer/records.rs` (was `analyzer/fps_stats.rs` pre-U20)
   - Probe seam (`analyze_fps_with<F>(probe: F)`) so tests inject canned metadata
   - Per-file failures (probe Err OR no fps in metadata) increment `failed_files` with `warn!` log
   - fps rounded to nearest u32 (NTSC 23.976 -> 24, 29.97 -> 30, 59.94 -> 60)
 - [x] Tests added per step:
   - Step 1: 5 FpsStats::summary/detailed tests in `types.rs` (group counts, totals, empty, failures, path grouping)
-  - Step 2: 7 analyze_fps tests in `analyzer/fps_stats.rs` (empty input, group-by-fps, integer fps, probe failure, missing fps, mixed success+failure, boundary rounding)
+  - Step 2: 7 analyze_fps tests in `analyzer/records.rs` (empty input, group-by-fps, integer fps, probe failure, missing fps, mixed success+failure, boundary rounding)
 - **Verify**: `cargo test -p rencoder_lib --lib` 139/139 pass (was 127; +12 from U7)
 
 ## U7.5. Polars-based analyzer refactor — DONE
@@ -245,7 +245,7 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
 
 ## U12. Parallel analyze — DONE
 
-- [x] `analyze_records_parallel` in `analyzer/fps_stats.rs` behind `#[cfg(feature = "parallel-analyze")]`
+- [x] `analyze_records_parallel` in `analyzer/records.rs` (was `analyzer/fps_stats.rs` pre-U20) behind `#[cfg(feature = "parallel-analyze")]`
 - [x] `rayon::prelude::*`; per-record `par_iter().map().collect()` preserves input order
 - [x] Per-thread probe failures become None-metric rows (same contract as serial)
 - [x] Test seam `analyze_records_with_probe_parallel` for tests with `Fn + Sync + Send` bound

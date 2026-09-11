@@ -25,7 +25,7 @@ rayon = { version = "1", optional = true }
 polars = { version = "0.53", default-features = false, features = ["csv", "lazy", "fmt", "parquet", "json", "dtype-datetime", "temporal"] }
 
 [features]
-default = []
+default = ["c-probe", "parallel-analyze"]
 parallel-analyze = ["dep:rayon"]
 c-probe = ["dep:cc", "dep:pkg-config"]
 

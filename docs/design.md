@@ -267,7 +267,7 @@ df_to_csv  df_to_jsonl  df_to_parquet
 rencoder_lib/
 ├── lib.rs                       # 库入口，pub mod 声明
 ├── analyzer/
-│   └── fps_stats.rs             # FPS 聚合分析（保留：CLI analyze 子命令用）
+│   └── records.rs              # probe → AnalysisRecord + aggregate → FpsStats
 ├── collect.rs                   # 文件收集（按目录 / 单文件 / 扩展名过滤）
 ├── config/
 │   ├── mod.rs                   # runtime Config + Config::from_encode_config + 重导出
@@ -315,7 +315,8 @@ rencoder_lib/
 
 **为什么 `analyzer/` 还在，`fps/` 已删除**：
 
-- `analyzer/fps_stats.rs` 是历史遗留的「按 fps 分组」分析，CLI 的 `analyze` 子命令直接用。
+- `analyzer/records.rs` 是 U7 起的 fps 聚合分析的现状（U20 重命名；旧名 `fps_stats` 只
+  在历史 U7/U7.5 段落里出现）。CLI 的 `analyze` 子命令直接用。
   当真有 `--query "SELECT fps, COUNT(*) ..."` 这种 CLI 时再考虑迁移到 `data engine/`；目前
   Pass 1-2 没有这条路径。
 - `fps/` 已删除（option B）。`parse_fps_value` 移入 `data/extract.rs`（probe 时用 fps

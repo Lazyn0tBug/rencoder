@@ -530,8 +530,8 @@ mod tests {
         fps: Option<u32>,
         codec: &str,
         dur: Option<f64>,
-    ) -> crate::analyzer::fps_stats::AnalysisRecord {
-        crate::analyzer::fps_stats::AnalysisRecord {
+    ) -> crate::analyzer::records::AnalysisRecord {
+        crate::analyzer::records::AnalysisRecord {
             path: PathBuf::from("/x"),
             fps,
             codec: Some(codec.into()),
@@ -540,8 +540,8 @@ mod tests {
         }
     }
 
-    fn fail_rec() -> crate::analyzer::fps_stats::AnalysisRecord {
-        crate::analyzer::fps_stats::AnalysisRecord {
+    fn fail_rec() -> crate::analyzer::records::AnalysisRecord {
+        crate::analyzer::records::AnalysisRecord {
             path: PathBuf::from("/bad.mp4"),
             fps: None,
             codec: None,
@@ -568,7 +568,7 @@ mod tests {
             rec(Some(30), "vp9", Some(60.0)),
             rec(Some(60), "av1", Some(120.0)),
         ];
-        let stats = crate::analyzer::fps_stats::aggregate_records(&records);
+        let stats = crate::analyzer::records::aggregate_records(&records);
         assert_eq!(stats.parsed_files, 4);
         assert_eq!(stats.failed_files, 0);
         assert_eq!(stats.table.height(), 4); // 4 (fps, codec) combos
@@ -583,7 +583,7 @@ mod tests {
             rec(Some(30), "h264", Some(60.0)),
             fail_rec(),
         ];
-        let stats = crate::analyzer::fps_stats::aggregate_records(&records);
+        let stats = crate::analyzer::records::aggregate_records(&records);
         assert_eq!(stats.total_files, 3);
         assert_eq!(stats.parsed_files, 2);
         assert_eq!(stats.failed_files, 1);
@@ -593,7 +593,7 @@ mod tests {
 
     #[test]
     fn aggregate_records_empty_input() {
-        let stats = crate::analyzer::fps_stats::aggregate_records(&[]);
+        let stats = crate::analyzer::records::aggregate_records(&[]);
         assert_eq!(stats.total_files, 0);
         assert_eq!(stats.parsed_files, 0);
         assert_eq!(stats.failed_files, 0);
@@ -607,7 +607,7 @@ mod tests {
             rec(Some(30), "h264", Some(60.0)),
             rec(Some(60), "av1", Some(120.0)),
         ];
-        let stats = crate::analyzer::fps_stats::aggregate_records(&records);
+        let stats = crate::analyzer::records::aggregate_records(&records);
         let summary = stats.summary();
         assert!(summary.contains("Total: 2 files (2 parsed, 0 failed)"));
         assert!(summary.contains("0:03:00")); // 60 + 120 = 180 = 3:00
@@ -620,7 +620,7 @@ mod tests {
             rec(Some(30), "h264", Some(60.0)),
             rec(Some(60), "av1", Some(120.0)),
         ];
-        let stats = crate::analyzer::fps_stats::aggregate_records(&records);
+        let stats = crate::analyzer::records::aggregate_records(&records);
         let summary = stats.summary();
         // Polars' default Display shows column names.
         assert!(summary.contains("fps"));
@@ -635,7 +635,7 @@ mod tests {
     #[test]
     fn fps_stats_summary_lists_failed_files_at_end() {
         let records = vec![rec(Some(30), "h264", Some(60.0)), fail_rec()];
-        let stats = crate::analyzer::fps_stats::aggregate_records(&records);
+        let stats = crate::analyzer::records::aggregate_records(&records);
         let summary = stats.summary();
         assert!(summary.contains("Failed files:"));
         assert!(summary.contains("/bad.mp4"));
@@ -643,7 +643,7 @@ mod tests {
 
     #[test]
     fn fps_stats_summary_omits_total_line_for_empty_input() {
-        let stats = crate::analyzer::fps_stats::aggregate_records(&[]);
+        let stats = crate::analyzer::records::aggregate_records(&[]);
         let summary = stats.summary();
         assert!(!summary.contains("Total:"));
     }
@@ -651,7 +651,7 @@ mod tests {
     #[test]
     fn fps_stats_summary_omits_duration_when_zero() {
         let records = vec![rec(Some(30), "h264", None)];
-        let stats = crate::analyzer::fps_stats::aggregate_records(&records);
+        let stats = crate::analyzer::records::aggregate_records(&records);
         let summary = stats.summary();
         assert!(!summary.contains("0:00:00"));
         // No duration column data displayed in the summary line.

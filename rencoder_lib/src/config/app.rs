@@ -17,8 +17,8 @@
 //! format = "av1"
 //! crf = 45   # 0 = bitrate mode; default 45 (libsvtav1 medium)
 //! max_fps = 30
-//! nv = true
-//! extensions = ["mp4", "mov", "mkv"]
+//! nv = false
+//! extensions = ["mp4", "mov", "avi"]
 //! output_dir = "encoded"
 //!
 //! [encode.encoders]
@@ -74,7 +74,7 @@ crf = 45
 
 # Cap source FPS at canonical values (0, 24, 25, 30, 60). 0 disables.
 # Default: 0.
-max_fps = 0
+max_fps = 30
 
 # Enable NVIDIA hardware acceleration via NVENC. Falls back silently
 # to software encoding when nvidia-smi is missing or no GPU is detected.
@@ -82,7 +82,7 @@ max_fps = 0
 nv = false
 
 # Extension filter for `encode -d DIR`. Empty list = all files.
-extensions = ["mp4", "mov", "mkv"]
+extensions = ["mp4", "mov", "avi"]
 
 # Optional: directory where encoded outputs land. Not wired yet (output
 # paths are computed per-input); reserved for a future stage where
@@ -102,7 +102,7 @@ extensions = ["mp4", "mov", "mkv"]
 format = "csv"
 
 # Parallel analysis via rayon. Default: false.
-parallel = false
+parallel = true
 
 # Optional: write the analyze output to this path instead of stdout.
 # The CLI `-o` flag overrides this per-run; `-` means stdout (default).

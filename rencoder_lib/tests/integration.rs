@@ -10,7 +10,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rencoder_lib::{
-    analyzer::fps_stats::analyze_fps,
+    analyzer::records::analyze_fps,
     config::Config,
     data::extract::probe_video_metadata,
     pipeline::{
