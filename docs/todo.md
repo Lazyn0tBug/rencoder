@@ -190,7 +190,7 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
 
 - [x] `Cli` struct + `Command` enum (Encode/Analyze) in `args.rs`
 - [x] `EncodeArgs`: `-c/--format` (ValueEnum: x264/hevc/vp9/av1, default av1), `-b/--bitrate`, `-f/--file`, `-d/--dir`, `-e/--ext`, `-i/--interactive`, `--nv`, `--max-fps`, `--crf`, `--config`, `--` passthrough
-- [x] `AnalyzeArgs`: `-d/--dir`, `-f/--file`, `-e/--ext`, `-p/--parallel`, `-v/--verbose`, `-o/--output` (default fps_stats.txt)
+- [x] `AnalyzeArgs`: `-d/--dir`, `-f/--file`, `-e/--ext`, `-p/--parallel`, `-v/--verbose`, `-o/--output` (default analyze.csv)
 - [x] `signal::install_handler()` + `register_partial` / `clear_partial` / `remove_partial` helpers
   - `ctrlc::set_handler` removes the registered partial file and exits 1
   - `Arc<Mutex<Option<PathBuf>>>` (parking_lot, no poisoning — per R14)
@@ -209,7 +209,7 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked.
 
 - [x] `analyze_cmd(args)` in `main.rs`: Target resolution -> collect_files -> analyze_fps -> print summary
 - [x] `target_from_analyze_args(args)` helper: --file > --dir > current_dir (testable)
-- [x] Verbose mode writes `stats.detailed()` to `args.output` (default `fps_stats.txt`)
+- [x] Verbose mode writes `stats.detailed()` to `args.output` (default `analyze.csv`)
 - [x] `--parallel` warns (U12 not implemented yet) and falls back to serial
 - [x] Tests:
   - `target_from_file_flag_wins`: --file beats --dir
@@ -508,7 +508,7 @@ vp9 = "libvpx-vp9"
 format = "csv"             # csv | table | text | json
 parallel = false
 extensions = []
-output = "fps_stats.txt"   # CLI -o wins per-run
+output = "analyze.csv"   # CLI -o wins per-run
 ```
 
 ### CLI surface (U17)

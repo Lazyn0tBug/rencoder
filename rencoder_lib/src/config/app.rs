@@ -27,7 +27,7 @@
 //! [analyze]
 //! format = "table"
 //! parallel = true
-//! output = "fps_stats.txt"
+//! output = "analyze.csv"
 //! ```
 
 use std::io::Write;
@@ -106,7 +106,7 @@ parallel = true
 
 # Optional: write the analyze output to this path instead of stdout.
 # The CLI `-o` flag overrides this per-run; `-` means stdout (default).
-# output = "fps_stats.txt"
+# output = "analyze.csv"
 "#;
 
 /// Top-level user-facing config. Both sections are optional; missing

@@ -156,7 +156,7 @@ parallel = false
 
 # Optional: write the analyze output to this path instead of stdout.
 # The CLI `-o` flag overrides this per-run; `-` means stdout (default).
-# output = "fps_stats.txt"
+# output = "analyze.csv"
 ```
 
 ### 2.4 CRF semantics
@@ -253,7 +253,7 @@ rencoder analyze -d ./my_videos/
 # Total: 8 files (8 parsed, 0 failed)
 
 # Save detailed CSV
-rencoder analyze -d ./my_videos/ -o fps_stats.csv
+rencoder analyze -d ./my_videos/ -o analyze.csv
 
 # Analyze a single file
 rencoder analyze -f single_movie.mp4

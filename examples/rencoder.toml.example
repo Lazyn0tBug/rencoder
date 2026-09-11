@@ -62,4 +62,4 @@ parallel = false
 
 # Optional: write the analyze output to this path instead of stdout.
 # The CLI `-o` flag overrides this per-run; `-` means stdout (default).
-# output = "fps_stats.txt"
+# output = "analyze.csv"
