@@ -45,17 +45,44 @@ pub fn install_handler() -> CurrentOutput {
         // iteration consumes one signal. The body always calls
         // `std::process::exit(1)` on signal so the loop runs once per
         // process -- clippy::never_loop is a false positive here.
+        //
+        // We log via `tracing::warn!` (not `eprintln!`) so the event
+        // flows through the global subscriber and lands in both stderr
+        // AND the rolling log file -- which is the only way an operator
+        // who isn't tailing the terminal sees the cleanup happened.
         #[allow(clippy::never_loop)]
-        for _sig in signals.forever() {
-            if let Some(path) = signal_output.lock().take() {
-                match std::fs::remove_file(&path) {
-                    Ok(()) => eprintln!("interrupted: removed partial output {}", path.display()),
-                    Err(e) => eprintln!(
-                        "warning: failed to remove partial output {}: {e}",
-                        path.display()
+        for sig in signals.forever() {
+            let sig_name = match sig {
+                SIGINT => "SIGINT",
+                SIGTERM => "SIGTERM",
+                SIGHUP => "SIGHUP",
+                _ => "unknown",
+            };
+            tracing::warn!("received {sig_name}, interrupting encode");
+
+            if let Some(ctx) = signal_output.lock().take() {
+                match std::fs::remove_file(&ctx.output) {
+                    Ok(()) => tracing::warn!(
+                        "task {}/{} interrupted ({}): removed partial output {}",
+                        ctx.index,
+                        ctx.total,
+                        ctx.source.display(),
+                        ctx.output.display()
+                    ),
+                    Err(e) => tracing::warn!(
+                        "task {}/{} interrupted ({}): failed to remove partial output {}: {e}",
+                        ctx.index,
+                        ctx.total,
+                        ctx.source.display(),
+                        ctx.output.display()
                     ),
                 }
             }
+            // `process::exit(1)` skips destructors but the tracing
+            // subscriber's `fmt::Layer` writes synchronously per event
+            // via our FileSink (no internal buffer), and the kernel
+            // flushes its page cache during process teardown -- so the
+            // log line lands on disk before we exit.
             std::process::exit(1);
         }
     });
