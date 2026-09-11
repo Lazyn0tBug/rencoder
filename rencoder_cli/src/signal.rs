@@ -61,21 +61,33 @@ pub fn install_handler() -> CurrentOutput {
             tracing::warn!("received {sig_name}, interrupting encode");
 
             if let Some(ctx) = signal_output.lock().take() {
-                match std::fs::remove_file(&ctx.output) {
-                    Ok(()) => tracing::warn!(
-                        "task {}/{} interrupted ({}): removed partial output {}",
+                // TaskContext.output is Option: None for read-only
+                // tasks (analyze), where there's nothing to clean up.
+                // Some for encode -- the file we may have half-written.
+                if let Some(output) = ctx.output.as_ref() {
+                    match std::fs::remove_file(output) {
+                        Ok(()) => tracing::warn!(
+                            "task {}/{} interrupted ({}): removed partial output {}",
+                            ctx.index,
+                            ctx.total,
+                            ctx.source.display(),
+                            output.display()
+                        ),
+                        Err(e) => tracing::warn!(
+                            "task {}/{} interrupted ({}): failed to remove partial output {}: {e}",
+                            ctx.index,
+                            ctx.total,
+                            ctx.source.display(),
+                            output.display()
+                        ),
+                    }
+                } else {
+                    tracing::warn!(
+                        "task {}/{} interrupted ({}): no partial output to remove",
                         ctx.index,
                         ctx.total,
-                        ctx.source.display(),
-                        ctx.output.display()
-                    ),
-                    Err(e) => tracing::warn!(
-                        "task {}/{} interrupted ({}): failed to remove partial output {}: {e}",
-                        ctx.index,
-                        ctx.total,
-                        ctx.source.display(),
-                        ctx.output.display()
-                    ),
+                        ctx.source.display()
+                    );
                 }
             }
             // `process::exit(1)` skips destructors but the tracing

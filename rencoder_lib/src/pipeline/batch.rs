@@ -60,7 +60,16 @@ pub fn transcode_single(
 
     log_task_start(task_ctx, params);
 
-    if task.output.exists() {
+    // transcode_single is only invoked from `transcode_batch`, which
+    // always builds `TranscodeTask { output: Some(...) }`. Treat
+    // `None` as a programming error rather than a soft "skip" --
+    // there's no input-defined output path to compare against.
+    let output_path = task
+        .output
+        .as_ref()
+        .expect("transcode_single called with TranscodeTask.output = None");
+
+    if output_path.exists() {
         log_task_skipped(task_ctx);
         return Ok(make_skipped_record(
             task,
@@ -151,7 +160,7 @@ where
         let output_path = output_path_for(input, params.format);
         let task = TranscodeTask {
             input: input.clone(),
-            output: output_path,
+            output: Some(output_path),
         };
         let ctx = TaskContext {
             index: idx + 1,
@@ -207,7 +216,10 @@ fn log_task_start(ctx: &TaskContext, params: &EncodeParams) {
         ctx.index,
         ctx.total,
         ctx.source.display(),
-        ctx.output.display(),
+        ctx.output
+            .as_ref()
+            .expect("encode TranscodeTask always has Some output")
+            .display(),
         format_target_label(params),
         mode,
         params.bitrate_or_crf,
@@ -236,7 +248,10 @@ fn log_task_done(ctx: &TaskContext, outcome: &EncodingOutcome, started: Instant)
                 ctx.index,
                 ctx.total,
                 elapsed_ms,
-                ctx.output.display()
+                ctx.output
+                    .as_ref()
+                    .expect("encode TranscodeTask always has Some output")
+                    .display()
             );
         }
         EncodingOutcome::Failed => {
@@ -331,9 +346,11 @@ fn transcode_with_argv(
     match run_result {
         Ok(()) => {
             // Success: fill result-side fields.
-            let output_size_bytes = std::fs::metadata(&task.output)
-                .map(|m| m.len())
-                .unwrap_or(0);
+            let output_path = task
+                .output
+                .as_ref()
+                .expect("encode TranscodeTask always has Some output");
+            let output_size_bytes = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
             let source_size_bytes = std::fs::metadata(&task.input).map(|m| m.len()).unwrap_or(0);
             let compression_ratio = if source_size_bytes > 0 {
                 Some(output_size_bytes as f64 / source_size_bytes as f64)
@@ -366,7 +383,13 @@ fn transcode_with_argv(
                 ffmpeg_argv: argv,
                 ffmpeg_stderr_tail: String::new(),
 
-                output_path: Some(task.output.to_string_lossy().into_owned()),
+                output_path: Some(
+                    task.output
+                        .as_ref()
+                        .expect("encode TranscodeTask always has Some output")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
                 output_size_bytes: Some(output_size_bytes),
                 output_duration_secs: metadata.duration_secs, // same as source (no trimming)
                 output_codec: encoder_selected,
@@ -689,7 +712,7 @@ Encoders:
 
         let task = TranscodeTask {
             input: input.clone(),
-            output: output.clone(),
+            output: Some(output.clone()),
         };
         let params = params_x264_crf();
         let _cache = cache_with_libx264_and_svtav1(false);
@@ -743,7 +766,13 @@ Encoders:
             ffmpeg_argv: Vec::new(),
             ffmpeg_stderr_tail: String::new(),
 
-            output_path: Some(task.output.to_string_lossy().into_owned()),
+            output_path: Some(
+                task.output
+                    .as_ref()
+                    .expect("encode TranscodeTask always has Some output")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
             output_size_bytes: Some(512),
             output_duration_secs: Some(60.0),
             output_codec: Some("libx264".into()),
@@ -764,7 +793,7 @@ Encoders:
 
         let task = TranscodeTask {
             input: dir.join("input.mp4"),
-            output,
+            output: Some(output),
         };
         let params = params_x264_crf();
         let cache = cache_with_libx264_and_svtav1(false);
@@ -805,7 +834,10 @@ Encoders:
         let output = dir.join("out.mkv");
         std::fs::write(&input, b"x").unwrap();
 
-        let task = TranscodeTask { input, output };
+        let task = TranscodeTask {
+            input,
+            output: Some(output),
+        };
         let params = params_x264_crf();
         let _cache = cache_with_libx264_and_svtav1(false);
         let _config = Config::default();
@@ -855,13 +887,13 @@ Encoders:
             index: 1,
             total: 2,
             source: PathBuf::from("/a.mp4"),
-            output: PathBuf::from("/a.mkv"),
+            output: Some(PathBuf::from("/a.mkv")),
         };
         let p2 = TaskContext {
             index: 2,
             total: 2,
             source: PathBuf::from("/b.mp4"),
-            output: PathBuf::from("/b.mkv"),
+            output: Some(PathBuf::from("/b.mkv")),
         };
         // Simulate "before file 1" via Guard:
         {

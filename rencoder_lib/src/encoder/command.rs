@@ -106,7 +106,15 @@ pub fn build_ffmpeg_command(
     argv.extend(params.extra_args.iter().cloned());
 
     // Output path always last.
-    argv.push(task.output.to_string_lossy().into_owned());
+    argv.push(
+        task.output
+            .as_ref()
+            .expect(
+                "encoder::command::build_ffmpeg_command called with TranscodeTask.output = None",
+            )
+            .to_string_lossy()
+            .into_owned(),
+    );
 
     argv
 }
@@ -120,7 +128,7 @@ mod tests {
     fn task(input: &str, output: &str) -> TranscodeTask {
         TranscodeTask {
             input: PathBuf::from(input),
-            output: PathBuf::from(output),
+            output: Some(PathBuf::from(output)),
         }
     }
 

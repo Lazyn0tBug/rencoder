@@ -210,7 +210,7 @@ fn transcode_batch_skips_when_output_exists() {
 
     let task = TranscodeTask {
         input: input.clone(),
-        output: output.clone(),
+        output: Some(output.clone()),
     };
     let cache = EncoderCache {
         encoders_output: String::new(),

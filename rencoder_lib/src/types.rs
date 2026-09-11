@@ -163,7 +163,10 @@ impl Default for Target {
 #[derive(Clone, Debug)]
 pub struct TranscodeTask {
     pub input: PathBuf,
-    pub output: PathBuf,
+    /// Output path the task writes to. `Some` for encode (ffmpeg
+    /// output), `None` for analyze (read-only). The signal handler
+    /// removes the file at this path on SIGINT when `Some`.
+    pub output: Option<PathBuf>,
 }
 
 // ===== Work-analysis record (encode pipeline output) =====

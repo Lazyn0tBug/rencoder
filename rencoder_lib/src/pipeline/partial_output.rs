@@ -72,7 +72,7 @@ mod tests {
             index: 1,
             total: 3,
             source: PathBuf::from(name),
-            output: PathBuf::from(output),
+            output: Some(PathBuf::from(output)),
         }
     }
 
@@ -83,7 +83,7 @@ mod tests {
         assert_eq!(set(&h, ctx("/in/a.mp4", "/out/a.mkv")), None);
         assert_eq!(
             h.lock().as_ref().map(|c| c.output.clone()),
-            Some(PathBuf::from("/out/a.mkv"))
+            Some(Some(PathBuf::from("/out/a.mkv")))
         );
         clear(&h);
         assert!(h.lock().is_none());
@@ -110,7 +110,7 @@ mod tests {
             let _g = Guard::new(Some(&h), ctx("/in/x.mp4", "/out/x.mkv"));
             assert_eq!(
                 h.lock().as_ref().map(|c| c.output.clone()),
-                Some(PathBuf::from("/out/x.mkv"))
+                Some(Some(PathBuf::from("/out/x.mkv")))
             );
         }
         // Guard dropped at end of scope

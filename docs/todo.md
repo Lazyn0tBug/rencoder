@@ -700,3 +700,100 @@ Fix scope:
   override; `RENENCODER_LOG_DIR=/tmp/log <app_dir>/rencoder ...` writes
   logs to `/tmp/log`.
 - Existing examples/rencoder.toml.example parses with new u32 crf.
+
+---
+
+## U19. TaskManager — extract pipeline orchestration (branch: u19-task-manager)
+
+PENDING CONFIRMATION. design §3.4.6 has the full proposal; this section
+is the per-step task list for execution.
+
+### Context
+
+After U18.1, `transcode_batch_with_processor` mixes three concerns:
+
+1. Task management (index, total, scaffold logs, signal-handler Guard)
+2. Probe + skip + argv build (`transcode_single`)
+3. ffmpeg execution (`transcode_with_argv`)
+
+The encode pipeline should "just encode"; analyze should "just probe".
+Task management is generic — both pipelines share the same scaffolding.
+
+### Goal
+
+- New module `rencoder_lib::pipeline::task` with `TaskContext` and
+  `TaskManager`.
+- `transcode_single(task, params, cache, config, output)` — drops
+  `current_output` and `task_ctx` params. Pure encode.
+- `analyze_records_with_probe` drops per-task log calls. Pure probe.
+- `TranscodeTask.output: PathBuf` → `Option<PathBuf>` so a single
+  TaskManager handles both write-tasks (encode) and read-tasks (analyze).
+- `transcode_batch` becomes a thin wrapper around `TaskManager::run`.
+- `analyze_cmd` (CLI) calls `TaskManager::run` for serial analyze;
+  parallel analyze still bypasses TaskManager.
+
+### Step-by-step
+
+- [ ] Step 1: New module `rencoder_lib/src/pipeline/task.rs`
+  - `TaskContext { index, total, source, output: Option<PathBuf> }`
+  - `TaskManager::new(handle: Option<PartialOutputHandle>) -> Self`
+  - `TaskManager::run<P, R>(tasks, label, processor) -> Vec<R>`
+  - Scaffold logs: `task N/M: <label> <src>` / `task N/M: ok <ms>ms` /
+    `task N/M: failed <ms>ms: <err>`
+  - Conditional `partial_output::Guard` only when `ctx.output.is_some()`
+  - `cargo test` green at this point (TaskManager is unused, just exists)
+- [ ] Step 2: `TranscodeTask.output: PathBuf` → `Option<PathBuf>`
+  - Update all call sites in `batch.rs`, `partial_output.rs`, tests
+  - `transcode_batch` builds `Some(output_path_for(...))` per task
+- [ ] Step 3: `transcode_single` simplification
+  - Drop `current_output: Option<&PartialOutputHandle>` param
+  - Drop `task_ctx: &TaskContext` param
+  - Drop `log_task_start` / `log_task_done` / `log_task_skipped` /
+    `log_task_probe_failed` helpers
+  - Drop `partial_output::Guard::new(...)` inside `transcode_single`
+  - `cargo test` green; tests for `transcode_single` update signature
+- [ ] Step 4: `transcode_batch` → thin wrapper
+  - Build `Vec<TranscodeTask>` with `Some(output_path_for(...))`
+  - Construct `TaskManager::new(current_output.cloned())`
+  - Call `TaskManager::run(&tasks, "encoding", |task, _ctx| transcode_single(...))`
+  - `cargo test` green; integration test passes
+- [ ] Step 5: `analyze_records_with_probe` simplification
+  - Drop `log_analyze_start` / `log_analyze_done` / `log_analyze_failed`
+  - `analyze_cmd` in CLI constructs `TaskManager::new(None)` and calls
+    `run` with label = "probing"
+  - Only serial analyze path uses TaskManager; parallel variant keeps
+    its own log line ("probe failed for X: ...") — already sufficient
+    for failure post-mortem
+- [ ] Step 6: Update integration tests
+  - `transcode_batch_end_to_end_produces_output_files`: same signature
+    unchanged (TaskManager is internal to `transcode_batch`)
+  - `transcode_batch_skips_when_output_exists`: same — `transcode_single`
+    signature change handled by `transcode_batch` adapter
+- [ ] Step 7: Update unit tests
+  - `batch_wraps_each_file_in_a_guard` becomes `batch_uses_task_manager`
+    (test TaskManager integration indirectly via batch)
+  - New unit test for `TaskManager::run` with mock processor (no ffmpeg)
+- [ ] Step 8: Final validation
+  - `cargo test --workspace` green (target: 244+ tests, no regressions)
+  - `cargo clippy --all-targets --workspace -- -D warnings` clean
+  - `cargo fmt --check` clean
+  - End-to-end: encode 3 files, verify log has 1 batch-start + 6
+    per-task events (3 starts + 3 done) — log format unchanged from
+    U18.1 commit 2a28a45
+  - End-to-end: analyze 5 files (4 failed probes + 1 ok), verify log
+    has scaffold start/done/failed for each
+  - End-to-end: SIGINT mid-encode, verify "task N/M interrupted" still
+    appears with TaskContext fields intact
+
+### Verify
+
+- `cargo test --workspace` green
+- `cargo clippy --all-targets --workspace -- -D warnings` clean
+- `cargo fmt --check` clean
+- Log file format unchanged from U18.1 (per-task events carry same info)
+- `transcode_single` is pure: no `log::info!` / `partial_output::Guard`
+  inside its body
+- `analyze_records_with_probe` is pure: no `log::info!` / `log::warn!`
+  inside its body
+- New `TaskManager::run` unit tests cover: success, failure aggregation,
+  Guard construction timing, no-handle (read-only) path

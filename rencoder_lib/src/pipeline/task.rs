@@ -46,10 +46,6 @@ use crate::types::TranscodeTask;
 
 /// Task metadata passed alongside the per-task closure. Mirrors what
 /// the signal-handler reads from [`PartialOutputHandle`].
-///
-/// U19 step 2 will change `output` to `Option<PathBuf>` so the same
-/// type carries read-only tasks (analyze, no partial file to clean
-/// up). Until then, `output` is required.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskContext {
     /// 1-based index in the batch (`3` of `task 3/58`).
@@ -58,8 +54,10 @@ pub struct TaskContext {
     pub total: usize,
     /// Source (input) file path -- what the operator cares about.
     pub source: std::path::PathBuf,
-    /// Output file path -- what the signal handler removes (if Some).
-    pub output: std::path::PathBuf,
+    /// Output file path -- what the signal handler removes on SIGINT.
+    /// `None` for read-only tasks (analyze); the signal handler sees
+    /// `None` and skips the removal.
+    pub output: Option<std::path::PathBuf>,
 }
 
 /// Owns the [`PartialOutputHandle`] for the lifetime of a batch run.
@@ -175,7 +173,7 @@ mod tests {
         (0..n)
             .map(|i| TranscodeTask {
                 input: PathBuf::from(format!("/in/{i}.mp4")),
-                output: PathBuf::from(format!("/out/{i}.mkv")),
+                output: Some(PathBuf::from(format!("/out/{i}.mkv"))),
             })
             .collect()
     }
@@ -203,7 +201,7 @@ mod tests {
         assert_eq!(seen[0].index, 1);
         assert_eq!(seen[0].total, 2);
         assert_eq!(seen[0].source, PathBuf::from("/in/0.mp4"));
-        assert_eq!(seen[0].output, PathBuf::from("/out/0.mkv"));
+        assert_eq!(seen[0].output, Some(PathBuf::from("/out/0.mkv")));
         assert_eq!(seen[1].index, 2);
         assert_eq!(seen[1].source, PathBuf::from("/in/1.mp4"));
     }
