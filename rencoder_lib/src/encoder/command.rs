@@ -47,7 +47,7 @@ fn codec_matches_format(codec: &str, format: VideoFormat) -> bool {
 /// ```text
 /// ffmpeg -y -i <input>
 ///   -c:v <encoder> [-preset ...] [-crf ... | -b:v ...]
-///   -c:a copy
+///   -c:a libopus -b:a 32k
 ///   [-r <MAX_FPS>]              # only when src_fps is Some AND need_reduce
 ///   [... extra_args]
 ///   <output>
@@ -88,10 +88,12 @@ pub fn build_ffmpeg_command(
         argv.push(format!("{}k", params.bitrate_or_crf));
     }
 
-    // Audio: passthrough copy as the safe default; users override via
+    // Audio: passthrough encode as libopus; users override via
     // `params.extra_args` if they need a specific audio codec.
     argv.push("-c:a".to_string());
-    argv.push("copy".to_string());
+    argv.push("libopus".to_string());
+    argv.push("-b:a".to_string());
+    argv.push("32k".to_string());
 
     // Frame-rate cap (R4 + R21): only injected when we have a real source
     // fps AND the cap applies to it.
