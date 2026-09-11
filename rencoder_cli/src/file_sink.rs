@@ -10,6 +10,7 @@
 //! produces a `FileSinkHandle` that holds `&Mutex<Inner>`, so writes
 //! serialize on the mutex without needing `&mut FileSink`.
 
+use std::borrow::Cow;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -74,15 +75,51 @@ impl Write for FileSinkHandle<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let mut inner = self.inner.lock().unwrap();
         inner.rotate_for_date()?;
-        let n = inner.writer.write(buf)?;
+        // Strip ANSI escape sequences before writing. `tracing_subscriber::fmt`'s
+        // default `Format::Full` (and `Format::Compact`) uses `Pretty` for
+        // span-field display, which emits ANSI codes for syntax highlighting
+        // regardless of `with_ansi(false)` on the layer (verified by reading
+        // bytes from a real run). Stripping at the writer boundary keeps the
+        // on-disk format clean without fighting the formatter internals.
+        let stripped = strip_ansi(buf);
+        let n = inner.writer.write(&stripped)?;
         inner.current_size += n as u64;
         inner.rotate_for_size()?;
-        Ok(n)
+        // Return the original buffer length so the caller sees no
+        // short-write even though we wrote fewer bytes.
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
         self.inner.lock().unwrap().writer.flush()
     }
+}
+
+/// Strip ANSI CSI sequences (`ESC [ ... letter`) from `buf`. Other escape
+/// forms (`ESC c`, etc.) are left intact — they're vanishingly rare in
+/// tracing output and stripping them risks corrupting real content.
+fn strip_ansi(buf: &[u8]) -> Cow<'_, [u8]> {
+    // Fast path: most events from a `with_ansi(false)` layer have no
+    // escape bytes at all. Avoid the allocation in that case.
+    if !buf.contains(&0x1b) {
+        return Cow::Borrowed(buf);
+    }
+    let mut out = Vec::with_capacity(buf.len());
+    let mut i = 0;
+    while i < buf.len() {
+        if buf[i] == 0x1b && i + 1 < buf.len() && buf[i + 1] == b'[' {
+            // Skip until the terminator (a byte in 0x40..=0x7E).
+            i += 2;
+            while i < buf.len() && !(0x40..=0x7E).contains(&buf[i]) {
+                i += 1;
+            }
+            i += 1; // consume the terminator
+        } else {
+            out.push(buf[i]);
+            i += 1;
+        }
+    }
+    Cow::Owned(out)
 }
 
 impl<'a> MakeWriter<'a> for FileSink {
@@ -285,5 +322,46 @@ mod tests {
         let content = fs::read_to_string(&path).unwrap();
         assert!(content.contains("first"));
         assert!(content.contains("second"));
+    }
+
+    #[test]
+    fn strip_ansi_removes_csi_sequences() {
+        // Single SGR escape (italic + reset).
+        let input = b"hello \x1b[3mworld\x1b[0m end";
+        assert_eq!(&*strip_ansi(input), b"hello world end");
+
+        // Nested escapes (multiple attrs).
+        let input = b"\x1b[3mdir\x1b[0m\x1b[2m=\x1b[0mSome(...)";
+        assert_eq!(&*strip_ansi(input), b"dir=Some(...)");
+
+        // No escapes — fast path returns the original slice.
+        let input = b"plain text";
+        match strip_ansi(input) {
+            Cow::Borrowed(b) => assert_eq!(b, input),
+            Cow::Owned(_) => panic!("expected borrowed for no-escape input"),
+        }
+
+        // Escape sequence that runs to end of buffer.
+        let input = b"prefix \x1b[3m";
+        assert_eq!(&*strip_ansi(input), b"prefix ");
+    }
+
+    #[test]
+    fn writes_to_file_have_no_ansi_bytes() {
+        let dir = fixture_dir();
+        let sink = FileSink::new(&dir, 1024, 7).unwrap();
+        {
+            let mut w = sink.make_writer();
+            w.write_all(b"clean text \x1b[3mstyled\x1b[0m end\n")
+                .unwrap();
+        }
+
+        let path = dir.join(list_log_files(&dir).into_iter().next().unwrap());
+        let bytes = fs::read(&path).unwrap();
+        assert!(
+            !bytes.contains(&0x1b),
+            "file should not contain ESC bytes, got {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
     }
 }

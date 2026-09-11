@@ -44,16 +44,18 @@ pub fn init() -> anyhow::Result<()> {
     let file_sink =
         FileSink::new(&dir, 10 * 1024 * 1024, 7).context("failed to open log file sink")?;
     // File layer is for post-mortem analysis: keep it scannable.
-    // - No ANSI escape codes (terminal is for colors; files would just
-    //   be noise + break text tools like grep / less -R).
-    // - No FmtSpan::CLOSE events (those are interactive-debug aids for
-    //   the terminal; in files they add lines per span close that hide
-    //   the actual log content).
+    // - `.compact()` produces Format::Compact, which renders span
+    //   fields inline without the Pretty field formatter's ANSI
+    //   styling. (`with_ansi(false)` alone is not enough — the
+    //   default `Format::Full` uses `Pretty` for span-field display,
+    //   which emits escape codes regardless of the layer-level
+    //   ANSI flag. Confirmed via `xxd` on a sample run.)
     // - Keep `target` (module path) so post-mortem analysis can grep
     //   by module.
     // - No thread ids (process is single-threaded; rare rayon threads
     //   would just clutter).
     let file_layer = fmt::layer()
+        .compact()
         .with_ansi(false)
         .with_target(true)
         .with_thread_ids(false)

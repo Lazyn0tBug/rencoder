@@ -188,7 +188,7 @@ fn write_records(
 
 /// `rencoder analyze ...` -- probes each file, groups by rounded fps,
 /// prints summary, optionally writes a detailed file.
-#[instrument(skip_all, fields(dir = ?args.dir, file = ?args.file, parallel = tracing::field::Empty))]
+#[instrument(skip_all, fields(dir = ?args.dir, file = ?args.file))]
 fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
     let app_config = load_app_config(args.config.as_deref())?;
     let an = app_config.analyze.as_ref();
