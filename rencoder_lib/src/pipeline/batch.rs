@@ -27,7 +27,7 @@ use crate::encoder::{
     select::select_encoder,
 };
 use crate::error::EncodeError;
-use crate::pipeline::partial_output::{self, PartialOutputHandle, TaskContext};
+use crate::pipeline::partial_output::PartialOutputHandle;
 use crate::types::{
     EncodeParams, EncoderCache, EncoderSettings, EncodingOutcome, EncodingRecord, ErrorCategory,
     ErrorContext, ProcessOutput, SkippedReason, TranscodeTask, VideoMetadata,
@@ -37,28 +37,26 @@ use crate::utils::fs::output_path_for;
 /// Per-file callback fired after the record is built.
 type ResultCallback = dyn Fn(&EncodingRecord);
 
-/// Transcode a single file. Returns the work-analysis record; probe
-/// failures (e.g. corrupt/unreadable input) surface as `Err`. ffmpeg
-/// failures land in `EncodingRecord.outcome = Failed` with stderr
-/// captured for the `ErrorContext`.
+/// Transcode a single file. Pure encode: probe + skip + argv + ffmpeg.
+/// Returns the work-analysis record; probe failures (e.g. corrupt/
+/// unreadable input) surface as `Ok(record)` with `Outcome::Failed`.
+/// ffmpeg failures land in `EncodingRecord.outcome = Failed` with
+/// stderr captured for the `ErrorContext`.
 ///
-/// `task_ctx` carries the per-task index/total/source/output for
-/// logging and signal-handler cleanup. The signal handler reads
-/// `task_ctx.output` on SIGINT to remove the partial file; the
-/// log lines use `task_ctx.index/total/source` for context.
+/// **U19**: no `current_output` or `task_ctx` params. Lifecycle
+/// logging and signal-handler Guard construction live in
+/// [`crate::pipeline::task::TaskManager::run`]; `transcode_single`
+/// focuses on encode. Callers (CLI / tests) wrap the call via
+/// `TaskManager` when they need scaffold logs and Guard registration.
 pub fn transcode_single(
     task: &TranscodeTask,
     params: &EncodeParams,
     cache: &EncoderCache,
     config: &Config,
     output: ProcessOutput,
-    current_output: Option<&PartialOutputHandle>,
-    task_ctx: &TaskContext,
 ) -> Result<EncodingRecord, EncodeError> {
     let started_at_meta = Utc::now();
     let started_at_instant = Instant::now();
-
-    log_task_start(task_ctx, params);
 
     // transcode_single is only invoked from `transcode_batch`, which
     // always builds `TranscodeTask { output: Some(...) }`. Treat
@@ -70,7 +68,6 @@ pub fn transcode_single(
         .expect("transcode_single called with TranscodeTask.output = None");
 
     if output_path.exists() {
-        log_task_skipped(task_ctx);
         return Ok(make_skipped_record(
             task,
             params,
@@ -83,7 +80,6 @@ pub fn transcode_single(
     let metadata = match probe_video_metadata_auto(&task.input) {
         Ok(m) => m,
         Err(e) => {
-            log_task_probe_failed(task_ctx, &e);
             return Ok(make_failed_probe_record(
                 task,
                 params,
@@ -95,11 +91,7 @@ pub fn transcode_single(
     };
 
     let argv = build_argv(task, params, cache, config, &metadata);
-    // U18 §3.4.5: register the partial output path before ffmpeg runs
-    // so SIGINT cleans it up. The guard clears on every exit path
-    // (success, failure, panic) so the next iteration starts clean.
-    let _partial_guard = partial_output::Guard::new(current_output, task_ctx.clone());
-    let record = transcode_with_argv(
+    transcode_with_argv(
         task,
         params,
         &metadata,
@@ -107,9 +99,7 @@ pub fn transcode_single(
         started_at_meta,
         started_at_instant,
         output,
-    )?;
-    log_task_done(task_ctx, &record.outcome, started_at_instant);
-    Ok(record)
+    )
 }
 
 /// Run a batch over a file list. Failures are captured per-file; the
@@ -132,12 +122,16 @@ pub fn transcode_batch(
     current_output: Option<&PartialOutputHandle>,
     result_callback: Option<&ResultCallback>,
 ) -> Vec<EncodingRecord> {
+    // Note: `current_output` is kept in the public signature for
+    // backward compatibility with the CLI, but U19 routes the actual
+    // partial-output registration through `TaskManager::run` once step
+    // 4 lands. This wrapper still drives the iteration directly; the
+    // handle is wired back in step 4.
+    let _ = current_output;
     transcode_batch_with_processor(
         params,
         files,
-        |task, params, ctx| {
-            transcode_single(task, params, cache, config, output, current_output, ctx)
-        },
+        |task, params| transcode_single(task, params, cache, config, output),
         result_callback,
     )
 }
@@ -152,23 +146,16 @@ fn transcode_batch_with_processor<F>(
     result_callback: Option<&ResultCallback>,
 ) -> Vec<EncodingRecord>
 where
-    F: FnMut(&TranscodeTask, &EncodeParams, &TaskContext) -> Result<EncodingRecord, EncodeError>,
+    F: FnMut(&TranscodeTask, &EncodeParams) -> Result<EncodingRecord, EncodeError>,
 {
     let mut records = Vec::with_capacity(files.len());
-    let total = files.len();
-    for (idx, input) in files.iter().enumerate() {
+    for input in files {
         let output_path = output_path_for(input, params.format);
         let task = TranscodeTask {
             input: input.clone(),
             output: Some(output_path),
         };
-        let ctx = TaskContext {
-            index: idx + 1,
-            total,
-            source: task.input.clone(),
-            output: task.output.clone(),
-        };
-        let record = match processor(&task, params, &ctx) {
+        let record = match processor(&task, params) {
             Ok(r) => r,
             Err(e) => make_failed_probe_record(&task, params, Utc::now(), None, &e),
         };
@@ -190,91 +177,9 @@ pub(crate) fn transcode_batch_with_processor_for_test<F>(
     result_callback: Option<&ResultCallback>,
 ) -> Vec<EncodingRecord>
 where
-    F: FnMut(&TranscodeTask, &EncodeParams, &TaskContext) -> Result<EncodingRecord, EncodeError>,
+    F: FnMut(&TranscodeTask, &EncodeParams) -> Result<EncodingRecord, EncodeError>,
 {
     transcode_batch_with_processor(params, files, processor, result_callback)
-}
-
-/// Per-task lifecycle log helpers. Each task in a batch emits one
-/// `start`, one `end` (or skip / probe-fail variant), and on signal
-/// the signal handler emits an `interrupted` event after the partial
-/// file is removed. Together these give post-mortem log analysis a
-/// per-file timeline without grepping ffmpeg stderr.
-///
-/// Format choice: keep the message body self-contained ("task 3/58:
-/// ...") rather than relying on span fields, so the rolling log file
-/// is readable even when stripped of span context (the file layer
-/// uses Compact format, which truncates nested span depth).
-fn log_task_start(ctx: &TaskContext, params: &EncodeParams) {
-    // The encode command's `bitrate_or_crf` field is overloaded: it's
-    // the CRF value when `is_crf == true`, otherwise it's a bitrate
-    // (Kbps). Surface that in the log so the operator can tell at a
-    // glance whether this is a CRF run or a bitrate run.
-    let mode = if params.is_crf { "crf" } else { "bitrate" };
-    log::info!(
-        "task {}/{}: encoding {} -> {} ({}, {}={})",
-        ctx.index,
-        ctx.total,
-        ctx.source.display(),
-        ctx.output
-            .as_ref()
-            .expect("encode TranscodeTask always has Some output")
-            .display(),
-        format_target_label(params),
-        mode,
-        params.bitrate_or_crf,
-    );
-}
-
-fn log_task_skipped(ctx: &TaskContext) {
-    log::info!("task {}/{}: skipped (output exists)", ctx.index, ctx.total);
-}
-
-fn log_task_probe_failed(ctx: &TaskContext, err: &EncodeError) {
-    log::warn!(
-        "task {}/{}: probe failed for {}: {err}",
-        ctx.index,
-        ctx.total,
-        ctx.source.display()
-    );
-}
-
-fn log_task_done(ctx: &TaskContext, outcome: &EncodingOutcome, started: Instant) {
-    let elapsed_ms = started.elapsed().as_millis();
-    match outcome {
-        EncodingOutcome::Succeeded | EncodingOutcome::ReducedFps => {
-            log::info!(
-                "task {}/{}: ok {}ms -> {}",
-                ctx.index,
-                ctx.total,
-                elapsed_ms,
-                ctx.output
-                    .as_ref()
-                    .expect("encode TranscodeTask always has Some output")
-                    .display()
-            );
-        }
-        EncodingOutcome::Failed => {
-            log::warn!(
-                "task {}/{}: failed {}ms (see record for detail)",
-                ctx.index,
-                ctx.total,
-                elapsed_ms
-            );
-        }
-        EncodingOutcome::Skipped(_) => {
-            // Already logged by `log_task_skipped` at the skip site.
-        }
-    }
-}
-
-fn format_target_label(params: &EncodeParams) -> &'static str {
-    match params.format {
-        crate::types::VideoFormat::Av1 => "av1",
-        crate::types::VideoFormat::X264 => "h264",
-        crate::types::VideoFormat::Hevc => "hevc",
-        crate::types::VideoFormat::Vp9 => "vp9",
-    }
 }
 
 /// Build the ffmpeg argv (used by `transcode_single`). Probes the source
@@ -725,7 +630,7 @@ Encoders:
         let records = super::transcode_batch_with_processor_for_test(
             &params,
             std::slice::from_ref(&task.input),
-            |_, _, _| Ok(test_succeeded_record(&task, &params)),
+            |_, _| Ok(test_succeeded_record(&task, &params)),
             None,
         );
         assert_eq!(records.len(), 1);
@@ -799,21 +704,8 @@ Encoders:
         let cache = cache_with_libx264_and_svtav1(false);
         let config = Config::default();
 
-        let record = transcode_single(
-            &task,
-            &params,
-            &cache,
-            &config,
-            ProcessOutput::Null,
-            None,
-            &TaskContext {
-                index: 1,
-                total: 1,
-                source: task.input.clone(),
-                output: task.output.clone(),
-            },
-        )
-        .expect("transcode_single should succeed");
+        let record = transcode_single(&task, &params, &cache, &config, ProcessOutput::Null)
+            .expect("transcode_single should succeed");
         assert_eq!(
             record.outcome,
             EncodingOutcome::Skipped(SkippedReason::OutputExists)
@@ -865,136 +757,11 @@ Encoders:
         assert!(err.message.contains("spawn"));
     }
 
-    // U18 §3.4.5: transcode_batch with current_output handle registers
-    // each file's output path before ffmpeg runs and clears after, so
-    // the SIGINT handler can clean up partial files. Verify the
-    // register/clear lifecycle by inspecting the handle's state at
-    // each phase (we can't intercept ffmpeg directly, but the guard
-    // logic is exercised by every batch call regardless of mock).
-    #[test]
-    fn batch_lifecycle_registers_and_clears_partial_output() {
-        use crate::pipeline::partial_output::PartialOutputHandle;
-        use std::path::PathBuf;
-        use std::sync::Arc;
-
-        // To verify register/clear without ffmpeg, use the public set/clear
-        // directly. The full integration (transcode_batch wrapping each
-        // transcode_single in a Guard) is verified by the integration
-        // smoke test (manually run rencoder, press Ctrl-C, see partial
-        // removed). Here we test the type contract.
-        let handle: PartialOutputHandle = Arc::new(parking_lot::Mutex::new(None));
-        let p1 = TaskContext {
-            index: 1,
-            total: 2,
-            source: PathBuf::from("/a.mp4"),
-            output: Some(PathBuf::from("/a.mkv")),
-        };
-        let p2 = TaskContext {
-            index: 2,
-            total: 2,
-            source: PathBuf::from("/b.mp4"),
-            output: Some(PathBuf::from("/b.mkv")),
-        };
-        // Simulate "before file 1" via Guard:
-        {
-            let _g1 = crate::pipeline::partial_output::Guard::new(Some(&handle), p1.clone());
-            assert_eq!(*handle.lock(), Some(p1.clone()));
-        }
-        assert!(handle.lock().is_none(), "guard drop must clear handle");
-        // Simulate "before file 2" -- next iteration's guard registers fresh:
-        {
-            let _g2 = crate::pipeline::partial_output::Guard::new(Some(&handle), p2.clone());
-            assert_eq!(*handle.lock(), Some(p2.clone()));
-        }
-        assert!(handle.lock().is_none());
-    }
-
-    // U18.1.1 Finding 2: integration test verifying that
-    // `transcode_batch` actually wires the Guard per iteration. The
-    // type-contract test above proves the Guard works in isolation; this
-    // test proves the batch loop constructs + drops one Guard per file
-    // (the previous test only exercised set/clear directly).
-    //
-    // Strategy: use `transcode_batch_with_processor_for_test` with a
-    // closure that captures whether `current_output.lock()` was `Some`
-    // while it was running, and `None` before/after. Pre-create output
-    // paths so `transcode_single` hits the "skip" early-return (which
-    // still constructs the Guard around the ffmpeg call) — but the skip
-    // path means the Guard drops without spawning ffmpeg.
-    #[test]
-    fn batch_wraps_each_file_in_a_guard() {
-        use crate::pipeline::partial_output::PartialOutputHandle;
-        use std::sync::Arc;
-
-        let dir = std::env::temp_dir().join("rencoder_batch_guard_integration");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let input1 = dir.join("a.webm");
-        let input2 = dir.join("b.webm");
-        std::fs::write(&input1, b"").unwrap();
-        std::fs::write(&input2, b"").unwrap();
-
-        // Pre-create output paths so transcode_single skips (output
-        // exists branch). The Guard is still constructed + dropped
-        // around the (no-op) ffmpeg call, so handle.lock() observes
-        // Some then None per iteration.
-        let out1 = crate::utils::fs::output_path_for(&input1, VideoFormat::Av1);
-        let out2 = crate::utils::fs::output_path_for(&input2, VideoFormat::Av1);
-        std::fs::write(&out1, b"").unwrap();
-        std::fs::write(&out2, b"").unwrap();
-
-        let handle: PartialOutputHandle = Arc::new(parking_lot::Mutex::new(None));
-
-        // The processor closure runs inside the Guard scope. We can't
-        // access `current_output` from inside the closure directly
-        // (it's a `&PartialOutputHandle` parameter to transcode_batch),
-        // but the lib's `transcode_batch` passes it through. Capture
-        // observed state by reading `handle.lock()` at fixed points via
-        // a side channel: we use the actual processor fn (the test
-        // seam `transcode_batch_with_processor` doesn't expose
-        // `current_output` to the closure, so we verify the lib-level
-        // contract a different way: check that pre-batch, mid-batch,
-        // and post-batch, the handle's state matches expected.
-        //
-        // Since `transcode_batch_with_processor` is the test-only seam
-        // (no current_output support), and `transcode_batch` is the
-        // production version (with current_output support), the
-        // following covers the *production* path by capturing state
-        // *before* and *after* the batch.
-        assert!(handle.lock().is_none(), "handle must start empty");
-
-        let params = params_av1_crf();
-        let cache = cache_with_libx264_and_svtav1(false);
-        let config = Config::default();
-        let files = vec![input1.clone(), input2.clone()];
-
-        let records = transcode_batch(
-            &params,
-            &files,
-            &cache,
-            &config,
-            ProcessOutput::Null,
-            Some(&handle),
-            None,
-        );
-
-        // After the batch, the handle must be empty (last iteration's
-        // Guard dropped on transcode_single return).
-        assert!(
-            handle.lock().is_none(),
-            "handle must be cleared after batch (last Guard dropped); got {:?}",
-            handle.lock()
-        );
-        assert_eq!(records.len(), 2);
-        for r in &records {
-            assert!(matches!(
-                r.outcome,
-                EncodingOutcome::Succeeded
-                    | EncodingOutcome::ReducedFps
-                    | EncodingOutcome::Skipped { .. }
-            ));
-        }
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+    // U18 §3.4.5 (transcode_batch with Guard around each file) and
+    // U18.1.1 Finding 2 (verify wiring through the production
+    // transcode_batch) tests were removed in U19 step 3. They
+    // exercised `transcode_single` constructing a partial-output
+    // Guard per task -- the new contract routes that wiring through
+    // `TaskManager::run` (U19 step 4). The replacement TaskManager
+    // unit tests land in U19 step 7.
 }

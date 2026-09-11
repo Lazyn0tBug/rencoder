@@ -227,21 +227,8 @@ fn transcode_batch_skips_when_output_exists() {
         max_fps: rencoder_lib::types::MaxFpsConfig::default(),
     };
 
-    let result = transcode_single(
-        &task,
-        &params,
-        &cache,
-        &config,
-        ProcessOutput::Null,
-        None,
-        &rencoder_lib::pipeline::partial_output::TaskContext {
-            index: 1,
-            total: 1,
-            source: task.input.clone(),
-            output: task.output.clone(),
-        },
-    )
-    .expect("transcode_single should succeed");
+    let result = transcode_single(&task, &params, &cache, &config, ProcessOutput::Null)
+        .expect("transcode_single should succeed");
     assert!(matches!(
         result.outcome,
         rencoder_lib::types::EncodingOutcome::Skipped(
