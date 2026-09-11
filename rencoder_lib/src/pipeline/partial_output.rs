@@ -7,33 +7,15 @@
 //! `signal` module. The CLI's `signal::CurrentOutput` is just a
 //! type-alias to this.
 //!
-//! ## Task context
-//!
-//! The cell stores a full [`TaskContext`] (not just `PathBuf`) so the
-//! signal handler can log "task 3/58 (input.mp4) interrupted" with
-//! the index, total, and source path. The output path is what gets
-//! removed; the source path is what the operator cares about for
-//! post-mortem analysis.
+//! U19: the [`TaskContext`] type moved to [`crate::pipeline::task`]
+//! (it is the per-task orchestration record; this module just stores
+//! it). Re-exported here for backward-compatible imports.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-/// Task metadata stored alongside the output path so the signal
-/// handler can log a context-rich interruption message. Constructed
-/// by the batch loop and registered via `Guard::new`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TaskContext {
-    /// 1-based index in the batch (`3` of `task 3/58`).
-    pub index: usize,
-    /// Total files in the batch (`58` of `task 3/58`).
-    pub total: usize,
-    /// Source (input) file path — what the operator cares about.
-    pub source: PathBuf,
-    /// Output file path — what the signal handler removes.
-    pub output: PathBuf,
-}
+pub use crate::pipeline::task::TaskContext;
 
 /// Per-process handle for the in-flight ffmpeg task.
 /// `None` means "no partial output is registered right now".
@@ -83,6 +65,7 @@ impl Drop for Guard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn ctx(name: &str, output: &str) -> TaskContext {
         TaskContext {
@@ -153,25 +136,5 @@ mod tests {
         }
         assert!(early_return(&h).is_err());
         assert!(h.lock().is_none(), "guard must clear on early return");
-    }
-
-    #[test]
-    fn task_context_carries_index_and_total() {
-        let h: PartialOutputHandle = Arc::new(Mutex::new(None));
-        set(
-            &h,
-            TaskContext {
-                index: 7,
-                total: 58,
-                source: PathBuf::from("/in/movie.mp4"),
-                output: PathBuf::from("/out/movie.mkv"),
-            },
-        );
-        let got = h.lock();
-        let c = got.as_ref().unwrap();
-        assert_eq!(c.index, 7);
-        assert_eq!(c.total, 58);
-        assert_eq!(c.source, PathBuf::from("/in/movie.mp4"));
-        assert_eq!(c.output, PathBuf::from("/out/movie.mkv"));
     }
 }
