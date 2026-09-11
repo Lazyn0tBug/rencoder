@@ -6,37 +6,38 @@
 //! `transcode_batch` and `analyze_records_with_probe` both walk a file
 //! list and need the same scaffolding:
 //!
-//! 1. Build a per-task context (index / total / source / output).
-//! 2. Emit a minimal `task N/M start` log line.
-//! 3. Register the partial output with the signal-handler handle (when
-//!    the task has an output that a SIGINT should clean up).
-//! 4. Run the per-task processor closure.
-//! 5. Emit a minimal `task N/M end` log line.
+//! 1. Build a per-task context (index / total / source / output /
+//!    batch label / batch path).
+//! 2. Emit a batch-level `start at <path>, N files` line.
+//! 3. For each task: emit a task-level `start` line, register the
+//!    partial output Guard, run the processor, emit a task-level
+//!    `end` line.
+//! 4. Emit a batch-level `end at <path>, N files successed` line.
 //!
-//! Centralising this in [`TaskManager::run`] lets domain functions
-//! (`transcode_single`, `analyze_records_with_probe`) stay focused on
-//! their own work -- encode or probe -- without owning the lifecycle
-//! metadata.
+//! Each level logs only the knowledge it owns (design rule): the
+//! batch knows total + completed count + the path; each task knows
+//! its index + total + the lifecycle event. No level leaks detail
+//! from the other into the scaffold.
 //!
-//! ## Scaffold log content
+//! On SIGINT, the signal handler reads the current TaskContext (with
+//! the batch label + path) and emits:
+//!   - a task-level `interrupt` line
+//!   - a batch-level `interrupt at <path>, M files successed` line
 //!
-//! The scaffold log is intentionally minimal: just `task N/M` followed
-//! by `start` or `end`. No path, no duration, no status, no error.
-//! Per-task detail is recoverable from the per-run data record
-//! (parquet/csv in `<app_dir>/data/`); the scaffold tells the operator
-//! "this file is in flight", nothing more.
+//! where M = tasks completed before interrupt (ctx.index - 1).
 //!
 //! ## Parallel analyze
 //!
 //! `analyze_records_parallel` (rayon-backed) intentionally does **not**
 //! use `TaskManager`. rayon's worker pool has no ordering guarantee, so
 //! emitting `task N/M` from worker threads would mislead post-mortem
-//! analysis (two workers could log `task 3/8` simultaneously). The
-//! serial `analyze_records_with_probe` path uses TaskManager; the
-//! parallel path keeps its existing single-line `probe failed for X`
-//! log on failure.
+//! analysis. The serial `analyze_records_with_probe` path uses
+//! TaskManager; the parallel path keeps its single-line
+//! `probe failed for X` log on failure.
 //!
 //! U19 design: docs/design.md §3.4.6.
+
+use std::path::{Path, PathBuf};
 
 use crate::error::EncodeError;
 use crate::pipeline::partial_output::{self, PartialOutputHandle};
@@ -50,12 +51,19 @@ pub struct TaskContext {
     pub index: usize,
     /// Total files in the batch (`58` of `task 3/58`).
     pub total: usize,
+    /// Batch label (verb describing the batch, e.g. `"encoding"`,
+    /// `"analyze"`). Carried into the scaffold log and into the
+    /// signal handler so interrupt summaries use the same label.
+    pub batch_label: String,
+    /// Batch target path -- the directory or file the batch is
+    /// processing. Appears in batch-level scaffold lines.
+    pub batch_path: PathBuf,
     /// Source (input) file path -- what the operator cares about.
-    pub source: std::path::PathBuf,
+    pub source: PathBuf,
     /// Output file path -- what the signal handler removes on SIGINT.
     /// `None` for read-only tasks (analyze); the signal handler sees
     /// `None` and skips the removal.
-    pub output: Option<std::path::PathBuf>,
+    pub output: Option<PathBuf>,
 }
 
 /// Owns the [`PartialOutputHandle`] for the lifetime of a batch run.
@@ -78,36 +86,59 @@ impl TaskManager {
     /// output) registering the partial-output Guard before each
     /// `processor` call. Returns one `R` per task.
     ///
-    /// Scaffold log is intentionally minimal: just `task N/M` at start
-    /// and end of each task, no path / duration / status. Per-task
-    /// detail (path, duration, codec, error) is recoverable from the
-    /// per-run data record (parquet/csv in `<app_dir>/data/`).
-    /// The scaffold tells the operator "this file is in flight",
-    /// nothing more.
+    /// Log shape (batch contains N tasks):
+    /// ```text
+    /// {label} start at {batch_path}, {N} files
+    ///     task 1/{N} start
+    ///     task 1/{N} end
+    ///     task 2/{N} start
+    ///     task 2/{N} end
+    ///     ...
+    /// {label}, end at {batch_path}, {N} files successed
+    /// ```
     ///
-    /// The processor closure returns `Err` only for unrecoverable
-    /// setup failures (the existing batch contract -- per-file probe
-    /// or encode failures are encoded as `Ok(record)` with
-    /// `Outcome::Failed`). `Err` from the closure is treated as a
-    /// task-level failure: a `failed` log line is emitted and the
-    /// iteration continues with the next task.
+    /// On SIGINT (handled in `signal.rs`):
+    /// ```text
+    /// {label} start at {batch_path}, {N} files
+    ///     task 1/{N} start
+    ///     task 1/{N} end
+    ///     task 2/{N} start
+    ///     task 2/{N} interrupt
+    /// {label} interrupt at {batch_path}, {M} files successed
+    /// ```
+    /// where M = ctx.index - 1 (tasks completed before the interrupt).
     ///
-    /// `label` is currently unused by the scaffold (kept in the API
-    /// for callers that may want to re-introduce domain tags).
-    pub fn run<P, R>(&self, tasks: &[TranscodeTask], _label: &str, mut processor: P) -> Vec<R>
+    /// Each level logs only what it knows (design rule): the batch
+    /// doesn't name per-task detail; the task doesn't name batch
+    /// summary.
+    pub fn run<P, R>(
+        &self,
+        tasks: &[TranscodeTask],
+        label: &str,
+        batch_path: &Path,
+        mut processor: P,
+    ) -> Vec<R>
     where
         P: FnMut(&TranscodeTask, &TaskContext) -> Result<R, EncodeError>,
     {
         let total = tasks.len();
+        log::info!(
+            "{} start at {}, {} files",
+            label,
+            batch_path.display(),
+            total
+        );
         let mut results = Vec::with_capacity(total);
         for (idx, task) in tasks.iter().enumerate() {
             let ctx = TaskContext {
                 index: idx + 1,
                 total,
+                batch_label: label.to_string(),
+                batch_path: batch_path.to_path_buf(),
                 source: task.input.clone(),
                 output: task.output.clone(),
             };
-            log_task_marker(&ctx, "start");
+            log::info!("    task {}/{} start", ctx.index, ctx.total);
 
             // The Guard lives only across the processor call so the
             // handle is cleared between tasks -- a SIGINT after the
@@ -119,7 +150,7 @@ impl TaskManager {
                 processor(task, &ctx)
             };
 
-            log_task_marker(&ctx, "end");
+            log::info!("    task {}/{} end", ctx.index, ctx.total);
 
             results.push(result.unwrap_or_else(|e| {
                 // Processors should map per-file failures to Ok(record);
@@ -133,16 +164,14 @@ impl TaskManager {
                 );
             }));
         }
+        log::info!(
+            "{}, end at {}, {} files successed",
+            label,
+            batch_path.display(),
+            total
+        );
         results
     }
-}
-
-fn log_task_marker(ctx: &TaskContext, phase: &str) {
-    // Minimal scaffold: `task N/M phase`. No path, no duration, no
-    // status. Two lines per task (start, end). The parquet/CSV
-    // record in `<app_dir>/data/` carries per-task detail; the log
-    // is for "is this file in flight?" presence.
-    log::info!("task {}/{} {}", ctx.index, ctx.total, phase);
 }
 
 #[cfg(test)]
@@ -163,7 +192,7 @@ mod tests {
     fn run_returns_one_result_per_task() {
         let mgr = TaskManager::new(None);
         let tasks = make_tasks(3);
-        let results = mgr.run(&tasks, "encoding", |_task, _ctx| {
+        let results = mgr.run(&tasks, "encoding", Path::new("/in"), |_task, _ctx| {
             Ok::<usize, EncodeError>(42)
         });
         assert_eq!(results.len(), 3);
@@ -174,13 +203,15 @@ mod tests {
         let mgr = TaskManager::new(None);
         let tasks = make_tasks(2);
         let mut seen: Vec<TaskContext> = Vec::new();
-        mgr.run(&tasks, "probing", |_task, ctx| {
+        mgr.run(&tasks, "probing", Path::new("/in"), |_task, ctx| {
             seen.push(ctx.clone());
             Ok::<(), EncodeError>(())
         });
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0].index, 1);
         assert_eq!(seen[0].total, 2);
+        assert_eq!(seen[0].batch_label, "probing");
+        assert_eq!(seen[0].batch_path, PathBuf::from("/in"));
         assert_eq!(seen[0].source, PathBuf::from("/in/0.mp4"));
         assert_eq!(seen[0].output, Some(PathBuf::from("/out/0.mkv")));
         assert_eq!(seen[1].index, 2);
@@ -193,7 +224,9 @@ mod tests {
         let mgr = TaskManager::new(None);
         let tasks = make_tasks(1);
         // Should not panic; Guard is a no-op when handle is None.
-        let results = mgr.run(&tasks, "probing", |_, _| Ok::<(), EncodeError>(()));
+        let results = mgr.run(&tasks, "probing", Path::new("/in"), |_, _| {
+            Ok::<(), EncodeError>(())
+        });
         assert_eq!(results.len(), 1);
     }
 
@@ -206,7 +239,7 @@ mod tests {
         let mgr = TaskManager::new(None);
         let tasks = make_tasks(3);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            mgr.run(&tasks, "encoding", |task, _ctx| {
+            mgr.run(&tasks, "encoding", Path::new("/in"), |task, _ctx| {
                 if task.input.to_string_lossy().ends_with("1.mp4") {
                     Err(EncodeError::Ffmpeg("boom".into()))
                 } else {

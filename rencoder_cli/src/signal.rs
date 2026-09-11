@@ -50,6 +50,12 @@ pub fn install_handler() -> CurrentOutput {
         // flows through the global subscriber and lands in both stderr
         // AND the rolling log file -- which is the only way an operator
         // who isn't tailing the terminal sees the cleanup happened.
+        //
+        // U19 step 10: the signal handler emits the task-level and
+        // batch-level scaffold lines for the interrupt case:
+        //     task N/M interrupt
+        //     {batch_label} interrupt at {batch_path}, M files successed
+        // where M = ctx.index - 1 (tasks completed before this one).
         #[allow(clippy::never_loop)]
         for sig in signals.forever() {
             let sig_name = match sig {
@@ -58,38 +64,50 @@ pub fn install_handler() -> CurrentOutput {
                 SIGHUP => "SIGHUP",
                 _ => "unknown",
             };
-            tracing::warn!("received {sig_name}, interrupting encode");
 
             if let Some(ctx) = signal_output.lock().take() {
-                // TaskContext.output is Option: None for read-only
-                // tasks (analyze), where there's nothing to clean up.
-                // Some for encode -- the file we may have half-written.
-                if let Some(output) = ctx.output.as_ref() {
-                    match std::fs::remove_file(output) {
-                        Ok(()) => tracing::warn!(
-                            "task {}/{} interrupted ({}): removed partial output {}",
-                            ctx.index,
-                            ctx.total,
-                            ctx.source.display(),
-                            output.display()
-                        ),
-                        Err(e) => tracing::warn!(
-                            "task {}/{} interrupted ({}): failed to remove partial output {}: {e}",
-                            ctx.index,
-                            ctx.total,
-                            ctx.source.display(),
-                            output.display()
-                        ),
-                    }
-                } else {
-                    tracing::warn!(
-                        "task {}/{} interrupted ({}): no partial output to remove",
-                        ctx.index,
-                        ctx.total,
-                        ctx.source.display()
-                    );
+                // Task-level scaffold: which file was in flight when
+                // the signal arrived.
+                tracing::warn!("    task {}/{} interrupt", ctx.index, ctx.total);
+
+                // Remove the partial output if there is one. analyze
+                // tasks have output = None; nothing to clean up.
+                // We log a separate warn on failure but keep the
+                // batch-level summary line identical so post-mortem
+                // tooling can pattern-match it.
+                let removed = match ctx.output.as_ref() {
+                    Some(output) => match std::fs::remove_file(output) {
+                        Ok(()) => Ok(output.clone()),
+                        Err(e) => Err(format!("failed to remove {}: {e}", output.display())),
+                    },
+                    None => Ok(std::path::PathBuf::new()),
+                };
+                if let Err(e) = &removed {
+                    tracing::warn!("{}", e);
                 }
+
+                // Batch-level scaffold: summary of the interrupted
+                // batch. M = tasks completed before interrupt.
+                let completed = ctx.index.saturating_sub(1);
+                tracing::warn!(
+                    "{} interrupt at {}, {} files successed",
+                    ctx.batch_label,
+                    ctx.batch_path.display(),
+                    completed
+                );
+
+                // Quiet the unused-variable warning from `sig_name`:
+                // we keep the variable in scope for the future case
+                // where the handler wants to log the signal name in
+                // the task-level line.
+                let _ = sig_name;
+            } else {
+                // Signal arrived outside any batch (e.g. before any
+                // task started). Still log the signal name for the
+                // operator.
+                tracing::warn!("received {sig_name} (no active batch)");
             }
+
             // `process::exit(1)` skips destructors but the tracing
             // subscriber's `fmt::Layer` writes synchronously per event
             // via our FileSink (no internal buffer), and the kernel

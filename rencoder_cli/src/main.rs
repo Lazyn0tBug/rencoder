@@ -216,7 +216,7 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
             .with_context(|| "fps analysis failed")?
     } else {
         // U19 step 5: serial analyze routes through TaskManager so the
-        // scaffold logs (`task N/M: probing / ok / failed`) are
+        // scaffold logs (batch start/end + per-task start/end) are
         // emitted by the manager rather than baked into the probe
         // function. analyze_records_with_probe stays pure: input ->
         // records, no log calls. The parallel variant keeps its own
@@ -230,7 +230,7 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
             })
             .collect();
         let manager = rencoder_lib::pipeline::task::TaskManager::new(None);
-        manager.run(&tasks, "probing", |task, _ctx| {
+        manager.run(&tasks, "analyze", target_path(&target), |task, _ctx| {
             let file_bytes = std::fs::metadata(&task.input).map(|m| m.len()).unwrap_or(0);
             match probe_video_metadata(&task.input) {
                 Ok(metadata) => Ok(rencoder_lib::analyzer::fps_stats::AnalysisRecord {

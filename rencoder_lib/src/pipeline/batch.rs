@@ -135,10 +135,15 @@ pub fn transcode_batch(
         })
         .collect();
 
+    // The batch label + path form the batch-level scaffold header
+    // (U19 step 10). The path is the user's target (file or dir),
+    // surfaced from EncodeParams.target.
+    let batch_path = batch_target_path(&params.target);
     let manager = TaskManager::new(current_output.cloned());
-    let records: Vec<EncodingRecord> = manager.run(&tasks, "encoding", |task, _ctx| {
-        transcode_single(task, params, cache, config, output)
-    });
+    let records: Vec<EncodingRecord> =
+        manager.run(&tasks, "encoding", &batch_path, |task, _ctx| {
+            transcode_single(task, params, cache, config, output)
+        });
 
     if let Some(cb) = result_callback {
         for record in &records {
@@ -146,6 +151,15 @@ pub fn transcode_batch(
         }
     }
     records
+}
+
+/// Extract the target path (file or directory) from `EncodeParams.target`
+/// for the batch-level scaffold log.
+fn batch_target_path(target: &crate::types::Target) -> PathBuf {
+    use crate::types::Target;
+    match target {
+        Target::File(p) | Target::Dir(p) => p.clone(),
+    }
 }
 
 /// Build the ffmpeg argv (used by `transcode_single`). Probes the source
@@ -601,9 +615,10 @@ Encoders:
             output: task.output.clone(),
         }];
         let manager = super::TaskManager::new(None);
-        let records: Vec<EncodingRecord> = manager.run(&tasks, "encoding", |_task, _ctx| {
-            Ok(test_succeeded_record(&task, &params))
-        });
+        let records: Vec<EncodingRecord> =
+            manager.run(&tasks, "encoding", Path::new("/test"), |_task, _ctx| {
+                Ok(test_succeeded_record(&task, &params))
+            });
         assert_eq!(records.len(), 1);
         let record = &records[0];
         assert_eq!(record.outcome, EncodingOutcome::Succeeded);

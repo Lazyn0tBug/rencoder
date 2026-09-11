@@ -71,6 +71,8 @@ mod tests {
         TaskContext {
             index: 1,
             total: 3,
+            batch_label: "encoding".into(),
+            batch_path: PathBuf::from("/in"),
             source: PathBuf::from(name),
             output: Some(PathBuf::from(output)),
         }
