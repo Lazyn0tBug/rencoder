@@ -20,6 +20,7 @@ use clap::Parser;
 use rencoder_lib::{
     collect::collect_files,
     config::{AnalyzeFormatArg, AppConfig, Config},
+    data::extract::probe_video_metadata,
     pipeline::{batch::transcode_batch, cache::init_encoder_cache},
     types::{EncodeParams, EncodingOutcome, ProcessOutput, SkippedReason, Target, VideoFormat},
 };
@@ -214,8 +215,40 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
         rencoder_lib::analyzer::fps_stats::analyze_records_parallel(&files)
             .with_context(|| "fps analysis failed")?
     } else {
-        rencoder_lib::analyzer::fps_stats::analyze_records(&files)
-            .with_context(|| "fps analysis failed")?
+        // U19 step 5: serial analyze routes through TaskManager so the
+        // scaffold logs (`task N/M: probing / ok / failed`) are
+        // emitted by the manager rather than baked into the probe
+        // function. analyze_records_with_probe stays pure: input ->
+        // records, no log calls. The parallel variant keeps its own
+        // log path because rayon's worker pool has no ordering
+        // guarantee.
+        let tasks: Vec<rencoder_lib::types::TranscodeTask> = files
+            .iter()
+            .map(|input| rencoder_lib::types::TranscodeTask {
+                input: input.clone(),
+                output: None,
+            })
+            .collect();
+        let manager = rencoder_lib::pipeline::task::TaskManager::new(None);
+        manager.run(&tasks, "probing", |task, _ctx| {
+            let file_bytes = std::fs::metadata(&task.input).map(|m| m.len()).unwrap_or(0);
+            match probe_video_metadata(&task.input) {
+                Ok(metadata) => Ok(rencoder_lib::analyzer::fps_stats::AnalysisRecord {
+                    path: task.input.clone(),
+                    fps: metadata.best_fps().map(|f| f.round() as u32),
+                    codec: metadata.codec,
+                    duration_secs: metadata.duration_secs,
+                    file_bytes,
+                }),
+                Err(_) => Ok(rencoder_lib::analyzer::fps_stats::AnalysisRecord {
+                    path: task.input.clone(),
+                    fps: None,
+                    codec: None,
+                    duration_secs: None,
+                    file_bytes,
+                }),
+            }
+        })
     };
     let stats = rencoder_lib::analyzer::fps_stats::aggregate_records(&records);
 

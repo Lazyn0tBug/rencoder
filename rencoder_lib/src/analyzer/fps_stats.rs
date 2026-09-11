@@ -31,25 +31,28 @@ pub struct AnalysisRecord {
 }
 
 /// Probe every file and emit one `AnalysisRecord` per input.
+///
+/// **U19**: this function is now a pure probe -- no scaffold logs.
+/// Lifecycle logs (`task N/M: probing / ok / failed`) live in
+/// [`crate::pipeline::task::TaskManager::run`]; the CLI's
+/// `analyze_cmd` calls `TaskManager::new(None).run(...)` to drive the
+/// serial probe loop with scaffold logs.
 pub fn analyze_records(files: &[PathBuf]) -> Result<Vec<AnalysisRecord>, EncodeError> {
     Ok(analyze_records_with_probe(files, probe_video_metadata_auto))
 }
 
 /// Test seam: same as `analyze_records` but with an injectable probe.
+/// Pure probe (U19) -- emits no logs of its own.
 pub fn analyze_records_with_probe<F>(files: &[PathBuf], probe: F) -> Vec<AnalysisRecord>
 where
     F: Fn(&Path) -> Result<crate::types::VideoMetadata, EncodeError>,
 {
     let mut records = Vec::with_capacity(files.len());
-    let total = files.len();
-    for (idx, path) in files.iter().enumerate() {
-        log_analyze_start(idx + 1, total, path);
-        let started = std::time::Instant::now();
+    for path in files {
         let file_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         match probe(path) {
             Ok(metadata) => {
                 let fps = metadata.best_fps().map(|f| f.round() as u32);
-                log_analyze_done(idx + 1, total, started, path, Some(&metadata));
                 records.push(AnalysisRecord {
                     path: path.clone(),
                     fps,
@@ -58,8 +61,7 @@ where
                     file_bytes,
                 });
             }
-            Err(e) => {
-                log_analyze_failed(idx + 1, total, started, path, &e);
+            Err(_) => {
                 records.push(AnalysisRecord {
                     path: path.clone(),
                     fps: None,
@@ -71,48 +73,6 @@ where
         }
     }
     records
-}
-
-/// Per-task log helpers for the serial analyze path. Each file in a
-/// directory emits one `start`, one `done` (or `failed`). The
-/// parallel variant intentionally has no per-task lines because
-/// rayon's worker pool has no ordering guarantee -- emitting
-/// `task N/M` mid-flight would be misleading.
-fn log_analyze_start(index: usize, total: usize, path: &Path) {
-    log::info!("task {index}/{total}: probing {}", path.display());
-}
-
-fn log_analyze_done(
-    index: usize,
-    total: usize,
-    started: std::time::Instant,
-    path: &Path,
-    metadata: Option<&crate::types::VideoMetadata>,
-) {
-    let elapsed_ms = started.elapsed().as_millis();
-    let codec = metadata.and_then(|m| m.codec.as_deref()).unwrap_or("?");
-    let fps = metadata
-        .and_then(|m| m.best_fps())
-        .map(|f| format!("{f:.1}"))
-        .unwrap_or_else(|| "?".into());
-    log::info!(
-        "task {index}/{total}: ok {elapsed_ms}ms (codec={codec}, fps={fps}) {}",
-        path.display()
-    );
-}
-
-fn log_analyze_failed(
-    index: usize,
-    total: usize,
-    started: std::time::Instant,
-    path: &Path,
-    err: &EncodeError,
-) {
-    log::warn!(
-        "task {index}/{total}: probe failed {ms}ms: {err} ({p})",
-        ms = started.elapsed().as_millis(),
-        p = path.display(),
-    );
 }
 
 /// Parallel variant of `analyze_records` using `rayon`. Each file is
