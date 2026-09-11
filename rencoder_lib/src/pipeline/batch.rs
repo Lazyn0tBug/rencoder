@@ -28,6 +28,7 @@ use crate::encoder::{
 };
 use crate::error::EncodeError;
 use crate::pipeline::partial_output::PartialOutputHandle;
+use crate::pipeline::task::TaskManager;
 use crate::types::{
     EncodeParams, EncoderCache, EncoderSettings, EncodingOutcome, EncodingRecord, ErrorCategory,
     ErrorContext, ProcessOutput, SkippedReason, TranscodeTask, VideoMetadata,
@@ -122,64 +123,29 @@ pub fn transcode_batch(
     current_output: Option<&PartialOutputHandle>,
     result_callback: Option<&ResultCallback>,
 ) -> Vec<EncodingRecord> {
-    // Note: `current_output` is kept in the public signature for
-    // backward compatibility with the CLI, but U19 routes the actual
-    // partial-output registration through `TaskManager::run` once step
-    // 4 lands. This wrapper still drives the iteration directly; the
-    // handle is wired back in step 4.
-    let _ = current_output;
-    transcode_batch_with_processor(
-        params,
-        files,
-        |task, params| transcode_single(task, params, cache, config, output),
-        result_callback,
-    )
-}
-
-/// Core batch loop with an injectable per-file processor. Used by
-/// `transcode_batch` in production; tests inject a mock processor that
-/// returns canned records without spawning `ffmpeg`/`ffprobe`.
-fn transcode_batch_with_processor<F>(
-    params: &EncodeParams,
-    files: &[PathBuf],
-    mut processor: F,
-    result_callback: Option<&ResultCallback>,
-) -> Vec<EncodingRecord>
-where
-    F: FnMut(&TranscodeTask, &EncodeParams) -> Result<EncodingRecord, EncodeError>,
-{
-    let mut records = Vec::with_capacity(files.len());
-    for input in files {
-        let output_path = output_path_for(input, params.format);
-        let task = TranscodeTask {
+    // U19 step 4: route the batch through `TaskManager::run`. The
+    // manager owns the iteration, scaffold logs, and signal-handler
+    // Guard wiring. The `current_output` handle is cloned into the
+    // manager so per-task Guards register the in-flight output path.
+    let tasks: Vec<TranscodeTask> = files
+        .iter()
+        .map(|input| TranscodeTask {
             input: input.clone(),
-            output: Some(output_path),
-        };
-        let record = match processor(&task, params) {
-            Ok(r) => r,
-            Err(e) => make_failed_probe_record(&task, params, Utc::now(), None, &e),
-        };
-        if let Some(cb) = result_callback {
-            cb(&record);
+            output: Some(output_path_for(input, params.format)),
+        })
+        .collect();
+
+    let manager = TaskManager::new(current_output.cloned());
+    let records: Vec<EncodingRecord> = manager.run(&tasks, "encoding", |task, _ctx| {
+        transcode_single(task, params, cache, config, output)
+    });
+
+    if let Some(cb) = result_callback {
+        for record in &records {
+            cb(record);
         }
-        records.push(record);
     }
     records
-}
-
-/// Test-only public re-export of `transcode_batch_with_processor` so unit
-/// tests in this module can inject canned processors.
-#[cfg(test)]
-pub(crate) fn transcode_batch_with_processor_for_test<F>(
-    params: &EncodeParams,
-    files: &[PathBuf],
-    processor: F,
-    result_callback: Option<&ResultCallback>,
-) -> Vec<EncodingRecord>
-where
-    F: FnMut(&TranscodeTask, &EncodeParams) -> Result<EncodingRecord, EncodeError>,
-{
-    transcode_batch_with_processor(params, files, processor, result_callback)
 }
 
 /// Build the ffmpeg argv (used by `transcode_single`). Probes the source
@@ -623,16 +589,21 @@ Encoders:
         let _cache = cache_with_libx264_and_svtav1(false);
         let _config = Config::default();
 
-        // We can't actually run ffmpeg on a fake webm file -- so use the
-        // processor seam (`transcode_batch_with_processor`) with a
-        // canned success path that mimics what a real successful
-        // transcode_with_argv would produce.
-        let records = super::transcode_batch_with_processor_for_test(
-            &params,
-            std::slice::from_ref(&task.input),
-            |_, _| Ok(test_succeeded_record(&task, &params)),
-            None,
-        );
+        // We can't actually run ffmpeg on a fake webm file -- so use
+        // TaskManager directly with a canned success closure that
+        // mimics what a real successful transcode_with_argv would
+        // produce. TaskManager is the new processor seam (U19 step 1
+        // + step 4); the old `transcode_batch_with_processor_for_test`
+        // shim was removed when `transcode_batch` started routing
+        // through TaskManager.
+        let tasks = vec![TranscodeTask {
+            input: task.input.clone(),
+            output: task.output.clone(),
+        }];
+        let manager = super::TaskManager::new(None);
+        let records: Vec<EncodingRecord> = manager.run(&tasks, "encoding", |_task, _ctx| {
+            Ok(test_succeeded_record(&task, &params))
+        });
         assert_eq!(records.len(), 1);
         let record = &records[0];
         assert_eq!(record.outcome, EncodingOutcome::Succeeded);
