@@ -673,24 +673,61 @@ CLI 输出双轨：
 
 #### C FFI 桥接层（可选特性 `c-probe`）
 
+高性能元数据探测：直接调 libavformat，跳过 `ffprobe` 进程 spawn。**默认开启**（在
+`Cargo.toml` 的 `default = ["c-probe", "parallel-analyze"]` 里），无 libavformat 的环境
+可手动关掉（见下文）。
+
+**Rust 端 API**：
+
 ```rust
-/// 高性能元数据探测（直接调用 libavformat）
-///
-/// # 线程安全
-/// 本函数无状态、可重入。每次调用创建独立的 AVFormatContext，
-/// 不依赖任何全局/静态变量。可安全地在 rayon 中并发调用。
 #[cfg(feature = "c-probe")]
 pub fn probe_video_metadata_fast(input: &Path) -> Result<VideoMetadata, EncodeError>;
 
-/// 自动选择探测方式，统一返回 Result
-pub fn probe_video_metadata_auto(input: &Path) -> Result<VideoMetadata, EncodeError> {
-    #[cfg(feature = "c-probe")]
-    { return probe_video_metadata_fast(input); }
-
-    #[cfg(not(feature = "c-probe"))]
-    { return probe_video_metadata(input); }
-}
+/// 自动选择探测方式，统一返回 Result。c-probe 启用时优先 FFI，失败 fallback 到 ffprobe CLI。
+pub fn probe_video_metadata_auto(input: &Path) -> Result<VideoMetadata, EncodeError>;
 ```
+
+**线程安全**：FFI 桥 stateless，每次调用自己 `avformat_open_input` / `avformat_close_input`，
+不依赖任何全局/静态变量。rayon 中并发调用安全。
+
+**编译配置**（`rencoder_lib/Cargo.toml`）：
+
+```toml
+[features]
+default = ["c-probe", "parallel-analyze"]    # 默认开启 c-probe
+c-probe = ["dep:cc", "dep:pkg-config"]        # 需要 cc + pkg-config build-deps
+```
+
+**依赖（host 系统）**：
+
+| 平台 | 安装方式 |
+|---|---|
+| macOS | `brew install pkg-config ffmpeg`（ffmpeg 提供 libavformat 的 .pc 文件） |
+| Debian/Ubuntu | `sudo apt-get install pkg-config libavformat-dev` |
+| Fedora/RHEL | `sudo dnf install pkg-config ffmpeg-devel` |
+
+构建时 `build.rs` 调 `pkg-config --cflags --libs libavformat` 取头文件 + 库路径，
+用 `cc` 编译 `src/ffi/video_probe.c` 成静态库 `librencoder_probe.a` 链进
+`rencoder_lib`。
+
+**关闭 c-probe 的场景**：
+
+```bash
+# host 没有 libavformat（pure-CLI fallback only）
+cargo build --no-default-features --features parallel-analyze
+# 探测走 spawn ffprobe，每次多 30-100ms 进程启动开销（per file）
+```
+
+**Runtime 检查**：
+
+- c-probe 失败时自动 fallback 到 ffprobe CLI，warn 一行后继续：
+
+  ```
+  WARN c-probe failed for /path/in.mp4, falling back to ffprobe CLI: <reason>
+  ```
+
+- pkg-config 找不到 libavformat 时 `build.rs` 直接 panic，提示"pkg-config libavformat
+  failed: <stderr>"。修复：装 ffmpeg-dev / libavformat-dev 包。
 
 ---
 
@@ -777,40 +814,51 @@ beforeunload / IPC 机制），会单独写。
    - `partial_output::clear(handle)` → 清空（成功时避免下一次 SIGINT 误删好文件；失败时
      下一次 register 会覆盖当前 path）
 4. **SIGINT/SIGTERM/SIGHUP**（用户中断）：
-   - listener `take()` 当前 `TaskContext` → `fs::remove_file(ctx.output)` → `tracing::warn!`
-     写"task N/M interrupted" → `exit(1)`
+   - listener `take()` 当前 `TaskContext` → emit task-level scaffold `    task N/M interrupt`
+   - `fs::remove_file(ctx.output)`（analyze path 无 output，跳过）
+   - emit batch-level scaffold `{label} interrupt at {path}, M files successed` (M = ctx.index - 1)
+   - `exit(1)`
 
-**Shared type**（在 lib，CLI 只用 type alias）：
+**U19 scaffold log**（batch + task 两层，每层只 log 自己 level 的 knowledge）：
+
+| Level | 正常结束 | 中断 |
+|---|---|---|
+| Batch | `{label}, end at {path}, {N} files successed` | `{label} interrupt at {path}, {M} files successed` |
+| Task | `    task N/M end` | `    task N/M interrupt` |
+| Batch open | `{label} start at {path}, {N} files` | (same) |
+
+每层只 log 自己的 knowledge：batch 知道 path / total / completed count；task 知道 index / phase。
+跨层 leak 会让 post-mortem 工具 regex 复杂化，所以严格分层。
+
+完整示例（encode 5 个文件，跑到第 3 个时 SIGINT）：
+```
+encoding start at /data/in, 5 files
+    task 1/5 start
+    task 1/5 end
+    task 2/5 start
+    task 2/5 end
+    task 3/5 start
+    task 3/5 interrupt              <- signal handler
+encoding interrupt at /data/in, 2 files successed   <- signal handler
+```
+
+**Shared type**（U19：TaskContext 搬到 `pipeline::task`，`partial_output` re-export 保持 import path 兼容）：
 
 ```rust
-// rencoder_lib/src/pipeline/partial_output.rs
-use std::path::PathBuf;
-use std::sync::Arc;
-use parking_lot::Mutex;
-
-/// Task metadata stored alongside the output path so the signal
-/// handler can log a context-rich interruption message.
+// rencoder_lib/src/pipeline/task.rs
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskContext {
-    /// 1-based index in the batch (`3` of `task 3/58`).
-    pub index: usize,
-    /// Total files in the batch (`58` of `task 3/58`).
+    pub index: usize,            // 1-based; signal handler 用 index - 1 算 completed
     pub total: usize,
-    /// Source (input) file path -- what the operator cares about.
-    pub source: PathBuf,
-    /// Output file path -- what the signal handler removes.
-    pub output: PathBuf,
+    pub batch_label: String,     // "encoding" / "analyze" -- 给 batch-level scaffold 用
+    pub batch_path: PathBuf,     // batch target -- 给 batch-level scaffold 用
+    pub source: PathBuf,         // 当前文件路径（保留给未来扩展；scaffold 不显示）
+    pub output: Option<PathBuf>, // None for analyze（read-only）
 }
 
-/// Per-process handle for the in-flight ffmpeg task.
-/// `None` means "no partial output is registered right now".
 pub type PartialOutputHandle = Arc<Mutex<Option<TaskContext>>>;
-
-/// RAII guard: registers `ctx` on construction, clears on drop.
 pub struct Guard<'a> { handle: Option<&'a PartialOutputHandle> }
-impl<'a> Guard<'a> {
-    pub fn new(handle: Option<&'a PartialOutputHandle>, ctx: TaskContext) -> Self;
-}
+impl<'a> Guard<'a> { pub fn new(handle: ..., ctx: TaskContext) -> Self; }
 ```
 
 **Why the type lives in lib, not CLI**：lib 的 `transcode_batch` 需要接受 `current_output`
@@ -820,52 +868,20 @@ rencoder_lib::pipeline::partial_output::PartialOutputHandle;`。
 
 **Handler 安装**（CLI `signal.rs`）：
 
-```rust
-use rencoder_lib::pipeline::partial_output::{PartialOutputHandle, TaskContext};
-use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
-use signal_hook::iterator::Signals;
+逻辑骨架：listener 线程在 `Signals::forever()` 上阻塞，每次信号到达：
 
-pub type CurrentOutput = PartialOutputHandle;
+1. `signal_output.lock().take()` 拿到当前 `TaskContext`（如果没在 batch 中就跳过 cleanup）
+2. emit task-level scaffold `    task N/M interrupt`
+3. `fs::remove_file(ctx.output)`（analyze path 的 output = None，跳过）
+4. emit batch-level scaffold `{label} interrupt at {path}, M files successed` (M = ctx.index - 1)
+5. `process::exit(1)`
 
-pub fn install_handler() -> CurrentOutput {
-    let current: CurrentOutput = Arc::new(Mutex::new(None));
-    let signal_output = current.clone();
-    let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP])
-        .expect("failed to register signal handlers");
+完整代码见 `rencoder_cli/src/signal.rs`（70 行左右）。
 
-    std::thread::spawn(move || {
-        #[allow(clippy::never_loop)]
-        for sig in signals.forever() {
-            let sig_name = match sig {
-                SIGINT => "SIGINT", SIGTERM => "SIGTERM", SIGHUP => "SIGHUP", _ => "unknown",
-            };
-            tracing::warn!("received {sig_name}, interrupting encode");
-
-            if let Some(ctx) = signal_output.lock().take() {
-                match std::fs::remove_file(&ctx.output) {
-                    Ok(()) => tracing::warn!(
-                        "task {}/{} interrupted ({}): removed partial output {}",
-                        ctx.index, ctx.total, ctx.source.display(), ctx.output.display()
-                    ),
-                    Err(e) => tracing::warn!(
-                        "task {}/{} interrupted ({}): failed to remove partial output {}: {e}",
-                        ctx.index, ctx.total, ctx.source.display(), ctx.output.display()
-                    ),
-                }
-            }
-            std::process::exit(1);
-        }
-    });
-
-    current
-}
-```
-
-**Log via tracing, not eprintln**（U18.1 修复）：信号事件用 `tracing::warn!` 而非
-`eprintln!`，这样事件经过 global subscriber 同时落到 stderr 和滚动 log file。eprintln
-只到 stderr，operator 不挂 terminal tail 就看不到 cleanup 发生了。`process::exit(1)`
-跳析构函数但 `fmt::Layer` 同步写 FileSink（无内部 buffer），kernel 在进程 teardown 时
-刷 page cache -- 日志行在 exit 之前已经落盘。
+**Log via tracing, not eprintln**（U18.1）：信号事件用 `tracing::warn!` 而非 `eprintln!`，
+事件经 global subscriber 同时落到 stderr 和滚动 log file。`process::exit(1)` 跳析构但
+`fmt::Layer` 同步写 FileSink（无内部 buffer），kernel 在进程 teardown 时刷 page cache --
+日志行在 exit 之前已经落盘。
 
 **Batch integration**（lib `pipeline/batch.rs`，per-task scaffolding 见 §3.4.6
 TaskManager 提取）：
@@ -950,153 +966,75 @@ x264 max=51）。这跟 ffmpeg 的 `-crf N` 1:1 对齐，避免 U17 那种"bool 
 
 ---
 
-#### TaskManager — pipeline 任务编排（U19，**计划中**）
+#### TaskManager — pipeline 任务编排（U19，已实现）
 
-**意图**：把 batch 循环里的"任务管理"关注点（index/total 编号、生命周期 log、signal-handler
-Guard 注册、结果聚合）从 encode / analyze 的领域逻辑里抽出来，让 `transcode_single` 和
-`analyze_records_with_probe` 只关心自己的领域工作（探测 + 转码，或探测 + 解析），不再
-混合"我在 batch 里是第几个 / 我要在 log 里写什么 / 我要把自己注册给 signal handler"。
+**意图**：把 batch 循环里的"任务管理"关注点（index/total 编号、batch/task 两层 lifecycle log、
+signal-handler Guard 注册、结果聚合）从 encode / analyze 的领域逻辑里抽出来，让
+`transcode_single` 和 `analyze_records_with_probe` 只关心自己的领域工作（探测 + 转码，或
+探测 + 解析），不再混合"我在 batch 里是第几个 / 我要在 log 里写什么 / 我要把自己注册给
+signal handler"。
 
 **SRP 三层切分**：
 
-| 关注点 | 现在的实现（U18.1）| U19 后的归属 |
+| 关注点 | U18.1 散落位置 | U19 归属 |
 |---|---|---|
-| 任务编号、生命周期 log、Guard 注册、结果聚合 | `transcode_batch_with_processor` 散在循环里 | `pipeline::task::TaskManager::run` |
-| 探测、跳过判断、argv 构造、ffmpeg 执行 | `transcode_single` | `transcode_single`（保持不变） |
+| 任务编号、lifecycle log、Guard 注册、结果聚合 | `transcode_batch_with_processor` 内联 | `pipeline::task::TaskManager::run` |
+| 探测、跳过判断、argv 构造、ffmpeg 执行 | `transcode_single` | `transcode_single`（不变） |
 | signal 处理（listener thread + cleanup） | `cli::signal::install_handler` | 不变 |
+| analyze 的 probe | `analyze_records_with_probe` | 不变（drop log helpers） |
 
-**新模块 `rencoder_lib/src/pipeline/task.rs`**：
+**模块 `rencoder_lib/src/pipeline/task.rs`**（U19 新增）：
 
-```rust
-pub struct TaskContext {
-    pub index: usize,
-    pub total: usize,
-    pub source: PathBuf,
-    /// None for read-only tasks (analyze). Some for write tasks (encode) --
-    /// the signal handler removes this on SIGINT.
-    pub output: Option<PathBuf>,
-}
+- `TaskContext`（带 `batch_label` + `batch_path`）：signal handler 用 `batch_label`/`batch_path`
+  拼 batch-level scaffold line；用 `ctx.index - 1` 算 completed count，不需要跨线程共享 counter
+- `TaskManager::run(tasks, label, batch_path, processor)`：emit batch open + per-task start/end
+  + batch close（或中断时由 signal handler emit batch-level interrupt line）
 
-pub struct TaskManager {
-    handle: Option<PartialOutputHandle>,
-}
+**`TranscodeTask.output` 改为 `Option<PathBuf>`**：None for analyze（read-only），Some
+for encode。signal handler 看到 None 就跳过 `fs::remove_file`。
 
-impl TaskManager {
-    /// Iterate tasks with: scaffold logs (start/ok/failed), signal-handler
-    /// Guard construction (only when ctx.output is Some), result aggregation.
-    pub fn run<P, R>(
-        &self,
-        tasks: &[TranscodeTask],
-        label: &str,                    // "encoding" / "probing"
-        processor: P,
-    ) -> Vec<R>
-    where
-        P: FnMut(&TranscodeTask, &TaskContext) -> Result<R, EncodeError>;
-}
+**`transcode_single` 简化**（U19 step 3）：去掉 `current_output: Option<&PartialOutputHandle>`
+和 `task_ctx: &TaskContext` 两个参数以及 4 个 `log_task_*` helper。变成纯 encode：
+`task + params + cache + config → record`。
+
+**`analyze_records_with_probe` 简化**（U19 step 5）：去掉 3 个 `log_analyze_*` helper。
+变成纯 probe。rayon 并行版本（`analyze_records_parallel`）继续走自己的 log 路径，因为
+worker 池无顺序保证。
+
+**调用链**（encode）：
+
+```
+main::encode_cmd
+  → transcode_batch               # thin wrapper（U19 step 4）
+      → TaskManager::run(tasks, "encoding", target_path, |task, ctx| transcode_single(task, params, ...))
 ```
 
-**Scaffold logs**（`TaskManager::run` 自动发，domain 不写）：
+**调用链**（analyze, serial）：
 
-| Phase | Level | Message |
-|---|---|---|
-| Start | INFO | `task N/M: <label> <src>` |
-| Ok | INFO | `task N/M: ok <ms>ms` |
-| Failed | WARN | `task N/M: failed <ms>ms: <err>` |
-
-**`TranscodeTask` 结构调整**：
-
-```rust
-// Before (U18.1):
-pub struct TranscodeTask {
-    pub input: PathBuf,
-    pub output: PathBuf,    // always Some implicitly
-}
-
-// After (U19):
-pub struct TranscodeTask {
-    pub input: PathBuf,
-    pub output: Option<PathBuf>,  // None for analyze, Some for encode
-}
+```
+main::analyze_cmd
+  → TaskManager::run(tasks, "analyze", target_path, |task, ctx| probe_one(task))
+  → aggregate_records
 ```
 
-`transcode_batch` 构建 tasks 时填 `Some(output_path_for(input, format))`；`analyze_records`
-的入口（`main.rs::analyze_cmd` 那一层）填 `None`。`TaskManager::run` 仅在 `output.is_some()`
-时构造 `partial_output::Guard`，analyze 路径根本不碰 partial_output 注册（read-only）。
+**Log 格式**（span-style，batch + task 两层各 log 自己 level 的 knowledge）：
 
-**`transcode_single` 简化（drop 两个参数）**：
-
-```rust
-// Before:
-pub fn transcode_single(
-    task: &TranscodeTask,
-    params: &EncodeParams,
-    cache: &EncoderCache,
-    config: &Config,
-    output: ProcessOutput,
-    current_output: Option<&PartialOutputHandle>,   // ← U19 删除
-    task_ctx: &TaskContext,                          // ← U19 删除
-) -> Result<EncodingRecord, EncodeError>;
-
-// After:
-pub fn transcode_single(
-    task: &TranscodeTask,
-    params: &EncodeParams,
-    cache: &EncoderCache,
-    config: &Config,
-    output: ProcessOutput,
-) -> Result<EncodingRecord, EncodeError>;
+```
+{label} start at {batch_path}, {N} files
+    task 1/{N} start
+    task 1/{N} end
+    ...
+{label}, end at {batch_path}, {N} files successed
 ```
 
-`transcode_single` 内不再有 `log_task_start` / `log_task_done` / `log_task_skipped` /
-`log_task_probe_failed` 调用，也不再 `partial_output::Guard::new(...，task_ctx)`。它变
-成纯 encode：`task + params + cache + config → record`。同样地，`analyze_records_with_probe`
-变成纯 probe：去掉 `log_analyze_start` / `log_analyze_done` / `log_analyze_failed`。
-
-**`analyze_records_with_probe` 不再 per-task log**：per-task log 移到 `TaskManager::run`
-的 scaffold 里。rayon 并行版本（`analyze_records_parallel`）继续**不**走 TaskManager
-（worker 池无顺序保证，`task N/M` 编号会误导），改由 `analyze_cmd` 在 parallel=false 时
-才走 TaskManager。
-
-**新调用链**（`main.rs::encode_cmd` 仍然调用 `transcode_batch`，但 `transcode_batch` 现在是
-thin wrapper）：
-
-```rust
-pub fn transcode_batch(
-    params: &EncodeParams,
-    files: &[PathBuf],
-    cache: &EncoderCache,
-    config: &Config,
-    output: ProcessOutput,
-    current_output: Option<&PartialOutputHandle>,
-    result_callback: Option<&ResultCallback>,
-) -> Vec<EncodingRecord> {
-    let tasks: Vec<TranscodeTask> = files.iter().map(|input| TranscodeTask {
-        input: input.clone(),
-        output: Some(output_path_for(input, params.format)),
-    }).collect();
-    let mgr = TaskManager::new(current_output.cloned());
-    mgr.run(&tasks, "encoding", |task, _ctx| {
-        transcode_single(task, params, cache, config, output)
-    })
-}
-```
+每层只 log 自己的 knowledge：batch 知道 path / total / completed count；task 知道
+index / phase。signal handler emit 中断的 batch-level summary 时用 `ctx.index - 1` 算
+completed，不需要跨线程共享 counter。完整示例见 §3.4.5。
 
 **Test 收益**：
-- `TaskManager::run` 可独立 unit-test：mock processor closure，断言 scaffold log 行 +
-  Guard 注册/清理时序 + 错误聚合。
-- `transcode_single` 不再依赖 `PartialOutputHandle` / `TaskContext`，可单独用 `transcode_with_argv`
-  的 mock processor 测试。
-- `analyze_records_with_probe` 去除 scaffold 后回归"输入 → 输出"的纯函数测试。
-
-**迁移步骤**（每步独立可测）：
-1. 新建 `pipeline/task.rs`：`TaskContext`（含 `output: Option<PathBuf>`）+ `TaskManager::run`。
-2. `TranscodeTask.output: PathBuf` → `Option<PathBuf>`；更新所有 call site。
-3. `transcode_single` 删 `current_output` 和 `task_ctx` 参数；删除 `log_task_*` 函数。
-4. `transcode_batch` 改为调用 `TaskManager::run`。
-5. `analyze_records_with_probe` 删除 `log_analyze_*`；`analyze_cmd` 改为调用 `TaskManager::run`
-   （仅 serial 路径）。
-6. 更新 `integration.rs` 与 unit tests。
-7. 跑 `cargo test` + `cargo clippy` + 一次端到端 encode/analyze 验证 log 行格式不变。
+- `TaskManager::run` 可独立 unit-test（mock processor closure）
+- `transcode_single` / `analyze_records_with_probe` 回归"输入 → 输出"的纯函数测试
+- 信号 handler 不影响 `transcode_single` 测试（无 mock signal handler）
 
 ---
 
