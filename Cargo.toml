@@ -7,7 +7,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
-version = "0.1.0"
+version = "0.6.0"
 license = "MIT"
 
 # The profile that 'dist' will build with

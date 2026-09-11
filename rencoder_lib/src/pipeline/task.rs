@@ -39,6 +39,8 @@
 
 use std::path::{Path, PathBuf};
 
+use chrono::Utc;
+
 use crate::error::EncodeError;
 use crate::pipeline::partial_output::{self, PartialOutputHandle};
 use crate::types::TranscodeTask;
@@ -138,7 +140,19 @@ impl TaskManager {
                 source: task.input.clone(),
                 output: task.output.clone(),
             };
-            log::info!("    task {}/{} start", ctx.index, ctx.total);
+            // Task-level scaffold: filename + timestamp. The timestamp
+            // lets post-mortem tools correlate with external wall-clock
+            // events (system logs, ticket timelines). Filename tells
+            // operators which file the in-flight row corresponds to
+            // without parsing the batch label.
+            let ts_start = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+            log::info!(
+                "    task {}/{} {}, start at {}",
+                ctx.index,
+                ctx.total,
+                ctx.source.display(),
+                ts_start
+            );
 
             // The Guard lives only across the processor call so the
             // handle is cleared between tasks -- a SIGINT after the
@@ -150,7 +164,14 @@ impl TaskManager {
                 processor(task, &ctx)
             };
 
-            log::info!("    task {}/{} end", ctx.index, ctx.total);
+            let ts_end = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+            log::info!(
+                "    task {}/{} {} end at {}",
+                ctx.index,
+                ctx.total,
+                ctx.source.display(),
+                ts_end
+            );
 
             results.push(result.unwrap_or_else(|e| {
                 // Processors should map per-file failures to Ok(record);
