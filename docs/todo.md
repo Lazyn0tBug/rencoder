@@ -797,3 +797,66 @@ Task management is generic — both pipelines share the same scaffolding.
   inside its body
 - New `TaskManager::run` unit tests cover: success, failure aggregation,
   Guard construction timing, no-handle (read-only) path
+
+---
+
+## U20. Rename FpsStats → VideoStats + delete analyze_fps (branch: u19-task-manager)
+
+PENDING CONFIRMATION. Design decision + analysis at §3.4.6 U20 note.
+
+### Context
+
+After U20 step 1 (rename `fps_stats` module → `records`) we discovered the
+aggregate type still named `FpsStats` is misnamed. The struct holds a
+Polars `group_by([fps, codec]).agg([count, sum(duration), sum(bytes)])`
+cross-tab plus totals — it is not "FPS stats", it is a directory-wide
+video-analysis aggregate. Name change is the only correction.
+
+There was also a convenience wrapper `analyze_fps(files)` that just calls
+`aggregate_records(analyze_records(files))`. CLI does not use it (CLI
+runs probe + format dispatch via TaskManager in main.rs). Only callers
+were 2 integration tests. Genuinely dead.
+
+### Goal
+
+- Rename `FpsStats` → `VideoStats` for naming accuracy. Keep the struct,
+  `aggregate_records`, `summary()`, `format_duration` — they're library
+  concerns, not CLI.
+- Delete `analyze_fps` (truly dead) + the 2 integration tests for it.
+- Keep the 8 unit tests in `types.rs` that test `FpsStats` (now retarget
+  to `VideoStats` mechanically).
+
+### Why we don't delete FpsStats outright
+
+`FpsStats::summary()` is the only path that renders the Polars cross-tab
+aggregated view (`fps × codec × files × duration × bytes`) — and the
+CLI's `format = "text"` calls it. Deleting the struct breaks the
+aggregated view unless we build the aggregation inline in main.rs, which
+violates layering (main is a thin call layer; aggregation belongs in
+lib). Keep the lib type; rename for accuracy.
+
+### Step-by-step
+
+- [ ] Step 1: design.md update — note U20 rename + analyze_fps deletion
+  in §3.4.6 U20 comment; update module tree + API sketch (FpsStats →
+  VideoStats). Commit docs.
+- [ ] Step 2: todo.md update — this entry.
+- [ ] Step 3: Rename `FpsStats` → `VideoStats` across `types.rs`,
+  `records.rs`, `integration.rs`, `rencoder_cli/src/main.rs`. Update
+  unit tests in `types.rs` (mechanical `s/FpsStats/VideoStats/g`).
+- [ ] Step 4: Delete `analyze_fps` from `records.rs`. Delete the 2
+  integration tests (`analyze_fps_groups_mixed_fixtures`,
+  `analyze_fps_handles_probe_failure_for_missing_file`). Replace with
+  tests for the renamed aggregate path if coverage needs filling.
+- [ ] Step 5: Validate -- `cargo clippy --all-targets --workspace -- -D warnings`
+  clean, `cargo test --workspace` green (247+), `cargo fmt --check` clean,
+  end-to-end `rencoder analyze -o analyze.csv` produces csv with fps column.
+
+### Verify
+
+- `cargo test --workspace` green
+- `cargo clippy --all-targets --workspace -- -D warnings` clean
+- `cargo fmt --check` clean
+- CLI `format = "text"` still renders the aggregated Polars table
+  (`fps`, `codec`, `files`, `duration_secs`, `bytes` columns)
+- No `FpsStats` references remain in code (only in historical docs)

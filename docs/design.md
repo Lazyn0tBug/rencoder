@@ -267,7 +267,7 @@ df_to_csv  df_to_jsonl  df_to_parquet
 rencoder_lib/
 ├── lib.rs                       # 库入口，pub mod 声明
 ├── analyzer/
-│   └── records.rs              # probe → AnalysisRecord + aggregate → FpsStats
+│   └── records.rs              # probe → AnalysisRecord + aggregate → VideoStats
 ├── collect.rs                   # 文件收集（按目录 / 单文件 / 扩展名过滤）
 ├── config/
 │   ├── mod.rs                   # runtime Config + Config::from_encode_config + 重导出
@@ -315,10 +315,19 @@ rencoder_lib/
 
 **为什么 `analyzer/` 还在，`fps/` 已删除**：
 
-- `analyzer/records.rs` 是 U7 起的 fps 聚合分析的现状（U20 重命名；旧名 `fps_stats` 只
-  在历史 U7/U7.5 段落里出现）。CLI 的 `analyze` 子命令直接用。
+- `analyzer/records.rs` 是 U7 起的视频聚合分析的现状。U20 把模块从 `fps_stats` 重命名为
+  `records`（旧名出现在历史 U7/U7.5 段落里），把 `FpsStats` 重命名为 `VideoStats`（见下）。
+  CLI 的 `analyze` 子命令直接用。
   当真有 `--query "SELECT fps, COUNT(*) ..."` 这种 CLI 时再考虑迁移到 `data engine/`；目前
   Pass 1-2 没有这条路径。
+- U20 重命名决策记录：`FpsStats` 原本是 U7 起的 fps 分组聚合类型，U7.5 加 Polars 表之后字段
+  扩展到 fps + codec + duration + bytes + 计数 + failed_paths，名字已经不准确（不只是 fps）。
+  重命名为 `VideoStats`，反映它实际代表的是"一个目录的 video 分析聚合结果"。`analyze_fps`
+  在 U20 同次清理中删除：它只是 `aggregate_records(analyze_records(files))` 的便利包装，
+  CLI 不调用（CLI 走 TaskManager 后自己组装），只有 2 个 integration test 在用，删了之后
+  那 2 个 test 一起删。**不删 `aggregate_records`** -- 它是真正的聚合逻辑，CLI Text 格式
+  仍依赖 `VideoStats::summary()` 渲染 Polars 交叉表（fps × codec × files × duration × bytes）。
+  把聚合逻辑塞进 `main.rs` 是分层错误（main 是 thin call layer，聚合属于 lib）。
 - `fps/` 已删除（option B）。`parse_fps_value` 移入 `data/extract.rs`（probe 时用 fps
   字符串解析，逻辑上属于「数据采集」层）；`fps/limit` 是空壳，整个 `fps::limit` 概念已不存在
   （`MaxFpsConfig::need_reduce` 直接放在 `types.rs`）。
@@ -475,14 +484,14 @@ pub enum TranscodeResult {
 
 // ===== 帧率统计结果（视频分析模块） =====
 #[derive(Clone, Debug, Default)]
-pub struct FpsStats {
+pub struct VideoStats {
     pub groups: std::collections::BTreeMap<u32, Vec<PathBuf>>,
     pub total_files: usize,
     pub parsed_files: usize,
     pub failed_files: usize,
 }
 
-impl FpsStats {
+impl VideoStats {
     pub fn new(total_files: usize) -> Self {
         Self { total_files, ..Default::default() }
     }
@@ -653,9 +662,9 @@ pub struct AnalysisRecord {
 /// produce a row (with `fps`/`codec`/`duration_secs` = None).
 pub fn analyze_records(files: &[PathBuf]) -> Result<Vec<AnalysisRecord>, EncodeError>;
 
-/// Aggregate records into `FpsStats`. Internally backed by a Polars
-/// DataFrame; the public `FpsStats` is the rendered view.
-pub fn analyze_fps(files: &[PathBuf]) -> Result<FpsStats, EncodeError>;
+/// Aggregate records into `VideoStats`. Internally backed by a Polars
+/// DataFrame; the public `VideoStats` is the rendered view.
+pub fn aggregate_records(records: &[AnalysisRecord]) -> VideoStats;
 
 /// Render records as CSV (header + rows, with proper quoting).
 pub fn records_to_csv(records: &[AnalysisRecord]) -> String;
