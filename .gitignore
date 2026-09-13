@@ -11,3 +11,4 @@ rencoder_cli/data/
 /dist/
 
 .context/
+Cargo.lock
