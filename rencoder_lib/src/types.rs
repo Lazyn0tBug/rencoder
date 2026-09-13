@@ -218,7 +218,14 @@ pub enum ErrorCategory {
 
 /// Context captured when an encode fails. Used for monitoring and
 /// failure-mode analysis.
+///
+/// `#[non_exhaustive]` (added U21): symmetric with `ErrorCategory` and
+/// `Command`/`Event` (see `docs/design.md` §3.8.3 item 33 / §8 item 36).
+/// External crates (e.g. `rencoder_ui`) cannot construct this directly
+/// but can still read fields on the value carried by
+/// `EncodingRecord.error`.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct ErrorContext {
     pub category: ErrorCategory,
     pub message: String,

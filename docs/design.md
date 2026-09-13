@@ -535,7 +535,11 @@ pub enum ErrorCategory {
     IoError,
 }
 
+/// `#[non_exhaustive]`（U21）：外部 crate（如 `rencoder_ui`）不能直接构造本类型，
+/// 但仍可读 `EncodingRecord.error` 携带的字段值。与 `Command` / `Event` /
+/// `ErrorCategory` 对齐（见 §3.8.3 item 33 / §8 item 36）。
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct ErrorContext {
     pub category: ErrorCategory,
     pub message: String,
@@ -1473,6 +1477,7 @@ UI 启动时调一次，拿到 `(cmd_tx, evt_rx)`，然后再不管 lib 内部�
 | `pipeline/cancel.rs`（新） | `CancelToken` | `Arc<AtomicBool>` + `cancel()` / `is_cancelled()` |
 | `pipeline/batch.rs` | `run_ffmpeg_with_progress(argv, cancel, on_progress)` | `cmd.spawn()` 替代 `cmd.output()`，支持 cancel + progress 回调；CLI 路径的同步 ffmpeg 编排保留不动 |
 | `data/store.rs` | `read_records(path) -> Vec<EncodingRecord>` | 单 Parquet 文件回读；多文件 glob + limit/after 过滤在 controller |
+| `config/path.rs` | `resolve_data_dir() -> PathBuf` | controller 在响应 `Command::LoadHistory` 时调此拿到数据目录(`$RENENCODER_DATA_DIR` > `<app_dir>/data`);**不**走 `Command::LoadHistory` 的 payload,UI 不需要知道路径 |
 | `job.rs`（新） | `start_controller() -> ControllerHandle` | 编排：后台线程 + mpsc + 现有 `transcode_batch` + 新 `run_ffmpeg_with_progress` |
 | `job.rs`（新） | `pub enum Command` / `pub enum Event` | 消息协议（见 §3.8.3） |
 
@@ -1482,14 +1487,43 @@ UI 启动时调一次，拿到 `(cmd_tx, evt_rx)`，然后再不管 lib 内部�
 
 #### 3.8.7 UI 端模式："everything is msg"
 
-Dioxus 端用 reducer 模式（Elm 架构）：
+Dioxus 端用 reducer 模式（Elm 架构）。UI 端的状态类型：
 
 ```rust
+/// 顶层 UI state。整个 app 一个,所有视图组件读它。
 struct AppState {
+    /// 当前活跃批的元信息;`None` = 没有批在跑
     batch: Option<BatchInfo>,
+    /// per-file 进度,key 是 file_index(§3.8.3 `Progress.file_index`)
     progress: HashMap<usize, ProgressInfo>,
+    /// stderr log ring buffer(§3.8.6:上限 1000 行)
     log: VecDeque<LogLine>,
+    /// 历史记录(由 `Command::LoadHistory` 填充)
     history: Vec<EncodingRecord>,
+}
+
+/// 当前批的元信息;由 `Event::BatchStarted` 写入、`Event::BatchCompleted`/`BatchCancelled` 关闭
+struct BatchInfo {
+    id: u64,
+    total_files: usize,
+    /// `cancelled: true` 后 reducer 忽略后续的 `Event::Progress` / `FileCompleted`
+    /// 直到收到 `BatchCancelled` 或新 `BatchStarted`
+    cancelled: bool,
+}
+
+/// 单文件进度;由 `Event::Progress` 更新
+struct ProgressInfo {
+    frame: u64,
+    fps: f64,
+    speed: f64,
+    time_secs: f64,
+    eta_secs: Option<f64>,
+}
+
+/// 单行 stderr;由 `Event::LogLine` 推送
+struct LogLine {
+    file_index: usize,
+    line: String,
 }
 
 enum Msg {
@@ -1683,6 +1717,9 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 34 | `ErrorCategory` 在 §3.8.3 内联列出 7 个 variant（§3.2 类型定义同步） | ✅ |
 | 35 | §3.8 GUI 范围 Unix-only（matches §1.3）；wry/Dioxus 非 Unix 支持 deferred | ✅ |
 | 36 | `ErrorCategory` 加 `#[non_exhaustive]`（U21，对齐 `Command` / `Event`）；`Event::Error` 故意只带 `(category, message)` 不带 stderr_tail | ✅ |
+| 37 | `ErrorContext` 加 `#[non_exhaustive]`（U21，对齐 `ErrorCategory`）；外部 crate 不可构造,字段读取仍可 | ✅ |
+| 38 | §3.8.7 定义 `BatchInfo` / `ProgressInfo` / `LogLine` 三个 UI state struct,让 reducer 可独立 unit-test | ✅ |
+| 39 | `Command::LoadHistory` 不带 path 字段；controller 用 `config::path::resolve_data_dir()` 自解析（honors `$RENENCODER_DATA_DIR`） | ✅ |
 
 ---
 
