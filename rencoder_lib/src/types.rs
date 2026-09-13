@@ -200,7 +200,12 @@ pub enum EncodingOutcome {
 
 /// Failure categorization for the monitoring dimension (independent of
 /// the source/process/result dimensions, which are about a single encode).
+///
+/// `#[non_exhaustive]` (added U21): symmetric with `Command`/`Event` (see
+/// `docs/design.md` §3.8.3 item 33) — future variants do not break
+/// exhaustive `match` on `Event::Error { category, .. }`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ErrorCategory {
     ProbeFailed,
     EncoderSelectionFailed,

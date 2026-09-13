@@ -520,7 +520,11 @@ pub enum SkippedReason {
 
 /// Fatal / per-file 失败分类（§3.8 `Event::Error` 和 `EncodingRecord.error` 都引用）。
 /// 完整定义在 `types.rs`，此处列出以让 §3.2 自完备。
+///
+/// `#[non_exhaustive]`（U21）：与 `Command` / `Event` 对齐（见 §3.8.3 item 33）。
+/// 新增 variant 不破坏 `Event::Error { category, .. }` 的 exhaustive match。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ErrorCategory {
     ProbeFailed,
     EncoderSelectionFailed,
@@ -1397,6 +1401,14 @@ pub enum Event {
     HistoryLoaded { records: Vec<EncodingRecord> },
 
     // Error topic（仅 fatal；per-file 失败走 EncodingRecord.error）
+    /// 仅 fatal 错误；payload 故意精简为 `(category, message)`。
+    ///
+    /// **不**携带 `ErrorContext.ffmpeg_stderr_tail`——大多数 fatal 类别
+    /// (`ProbeFailed` / `EncoderSelectionFailed` / `FfmpegSpawnFailed` /
+    /// `ConfigError` / `IoError`) ffmpeg 根本没跑,stderr 为空;
+    /// `FfmpegNonzeroExit` 才有 stderr,但 GUI 如需展示,可在收到
+    /// `BatchCompleted` 后从对应 `EncodingRecord.error` 读 `stderr_tail`
+    /// (`EncodingRecord.error` 路径才有完整 `ErrorContext` 三字段)。
     Error { category: ErrorCategory, message: String },
 }
 
@@ -1670,6 +1682,7 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 33 | `pub enum Command` 和 `pub enum Event` 加 `#[non_exhaustive]`，新增 variant 不破坏 exhaustive match | ✅ |
 | 34 | `ErrorCategory` 在 §3.8.3 内联列出 7 个 variant（§3.2 类型定义同步） | ✅ |
 | 35 | §3.8 GUI 范围 Unix-only（matches §1.3）；wry/Dioxus 非 Unix 支持 deferred | ✅ |
+| 36 | `ErrorCategory` 加 `#[non_exhaustive]`（U21，对齐 `Command` / `Event`）；`Event::Error` 故意只带 `(category, message)` 不带 stderr_tail | ✅ |
 
 ---
 
