@@ -182,10 +182,21 @@ pub struct EncoderSettings {
 }
 
 /// Reason a file was skipped (no work performed).
+///
+/// `#[non_exhaustive]` (added U21): future variants don't break exhaustive
+/// match. `PartialOutput` is reserved for the case where partial-output
+/// detection succeeds but removal fails (rare); the happy path is
+/// "detect → remove → reencode" which produces a real encode record,
+/// not a Skipped one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SkippedReason {
     SameCodec,
     OutputExists,
+    /// Output exists and is detected as partial (truncated/corrupt),
+    /// but removal failed (e.g. permission denied). Encode cannot
+    /// proceed because the output is in the way.
+    PartialOutput,
 }
 
 /// Outcome of a single encode. `Succeeded` and `ReducedFps` produced

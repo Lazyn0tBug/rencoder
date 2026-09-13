@@ -513,10 +513,17 @@ pub enum EncodingOutcome {
     Failed,
 }
 
+/// `#[non_exhaustive]`（U21）：未来 variant 不破坏现有 exhaustive match。
+/// `PartialOutput` 用于 partial-output 检测成功但删除失败(罕见)的场景;
+/// happy path 是"detect → remove → reencode"——产生正常 encode record,不是 Skipped。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SkippedReason {
     SameCodec,
     OutputExists,
+    /// Output 存在且检测为 partial(截断 / 损坏),但删除失败
+    /// (如权限拒绝)。encode 无法继续(output 在那挡着)。
+    PartialOutput,
 }
 
 /// Fatal / per-file 失败分类（§3.8 `Event::Error` 和 `EncodingRecord.error` 都引用）。
@@ -727,9 +734,13 @@ pub fn should_skip_encoding(codec: &str, format: VideoFormat) -> bool;
 #### 单文件转码
 
 ```rust
-/// 内部流程（对齐 encode.zsh 的 encode_single_file）：
-///   1. 检查输出是否已存在
-///   2. probe_video_metadata（一次 ffprobe）
+/// 内部流程（对齐 encode.zsh 的 encode_single_file + partial output 重转）：
+///   1. probe_video_metadata（一次 ffprobe,源）→ 拿 duration
+///   2. 输出存在?→ probe output duration 比较:
+///       a. output + 1s < source → partial → remove + 继续到 7
+///       b. output probe 失败 / 无 duration → 视作 partial → remove + 继续
+///       c. 其他 → `Skipped(OutputExists)` 提前返回
+///       d. remove 失败 → `Skipped(PartialOutput)` 提前返回
 ///   3. MaxFpsConfig::need_reduce（谓词）
 ///   4. should_skip_encoding（编码匹配 + 帧率判断）
 ///   5. select_encoder（缓存）
@@ -742,6 +753,20 @@ pub fn transcode_single(
     output: ProcessOutput,
 ) -> Result<TranscodeResult, EncodeError>;
 ```
+
+**Partial output 检测**（U21 引入,§3.4.5 "注意"段的对应实现）：
+
+- **目的**:SIGTERM/SIGHUP 现在不再清半成品（见 §3.4.5）。下次启动时如果
+  output 存在且是 partial,自动删 + 重转,不让用户踩坑（以为"已完成"实际是损坏）。
+- **检测方法**:`probe_video_metadata_auto` 跑 output,对比 source duration。
+- **阈值**:output duration < source duration - 1.0 秒 → partial。
+  1 秒容忍 codec delay + 容器 metadata 误差。
+- **保守 fallback**:output probe 失败 / 无 duration → 视作 partial。
+  这是合理的:video 输出一定有 duration;没有 = 文件损坏。
+- **删除失败 fallback**:`fs::remove_file` 失败（如权限拒绝）→
+  `Skipped(PartialOutput)`,encode 不继续（output 在那挡着）。
+- **代价**:每个 skipped file 多一次 ffprobe 调用（~10ms）。
+  1000-file 二次跑额外 ~10s,可接受。
 
 #### 批量转码
 
@@ -1720,6 +1745,7 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 37 | `ErrorContext` 加 `#[non_exhaustive]`（U21，对齐 `ErrorCategory`）；外部 crate 不可构造,字段读取仍可 | ✅ |
 | 38 | §3.8.7 定义 `BatchInfo` / `ProgressInfo` / `LogLine` 三个 UI state struct,让 reducer 可独立 unit-test | ✅ |
 | 39 | `Command::LoadHistory` 不带 path 字段；controller 用 `config::path::resolve_data_dir()` 自解析（honors `$RENENCODER_DATA_DIR`） | ✅ |
+| 40 | Partial-output 检测(U21)：output duration < source - 1s → partial → 删 + 重转；probe 失败视作 partial；删除失败 → `Skipped(PartialOutput)` | ✅ |
 
 ---
 
