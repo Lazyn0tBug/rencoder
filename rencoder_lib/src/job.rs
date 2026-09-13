@@ -28,7 +28,8 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 
-use crate::config::Config;
+use crate::config::app::AppConfig;
+use crate::config::{path::resolve_config, Config};
 use crate::pipeline::batch::{run_ffmpeg_with_progress, transcode_single, FfmpegProgress};
 use crate::pipeline::cache::init_encoder_cache;
 use crate::pipeline::cancel::CancelToken;
@@ -308,9 +309,42 @@ fn run_actor(
     cmd_rx: Receiver<Command>,
     evt_tx: Sender<Event>,
 ) {
-    // Init once for the controller's lifetime. v1: no NV, default
-    // config. Future: pull from AppConfig + honor `[encode].nv`.
-    let cache: EncoderCache = match init_encoder_cache(false) {
+    // Init once for the controller's lifetime. Both load paths can
+    // fail; on either failure we emit Event::Error and exit the
+    // actor thread (UI sees the error then no more events).
+
+    // Resolve + load AppConfig (creates default file if missing —
+    // matches CLI behavior; see AppConfig::load).
+    let config_path = match resolve_config() {
+        Some(p) => p,
+        None => {
+            let _ = evt_tx.send(Event::Error {
+                category: ErrorCategory::ConfigError,
+                message: "could not determine config path (no $RENENCODER_CONFIG, \
+                          binary dir unavailable)"
+                    .into(),
+            });
+            return;
+        }
+    };
+    let app_config = match AppConfig::load(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = evt_tx.send(Event::Error {
+                category: ErrorCategory::ConfigError,
+                message: format!("failed to load {}: {e}", config_path.display()),
+            });
+            return;
+        }
+    };
+    let config = Config::from_encode_config(app_config.encode.as_ref());
+
+    let enable_nv = app_config
+        .encode
+        .as_ref()
+        .and_then(|e| e.nv)
+        .unwrap_or(false);
+    let cache: EncoderCache = match init_encoder_cache(enable_nv) {
         Ok(c) => c,
         Err(e) => {
             let _ = evt_tx.send(Event::Error {
@@ -320,7 +354,7 @@ fn run_actor(
             return;
         }
     };
-    let config = Config::default();
+    drop(app_config); // explicit: not used after this point
 
     let mut next_batch_id: BatchId = 0;
     // Set when a batch is running; gates StartBatch to one at a time.
