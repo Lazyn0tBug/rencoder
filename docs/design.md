@@ -56,7 +56,7 @@ Rencoder 是一个独立的第三方应用，不是发布到 crates.io 的通用
   `app_dir`。所有持久化状态（config / log / data）从 `app_dir` 派生。CWD 只承载
   用户输入的视频文件，与应用状态无关。
 - **Source 仍是 workspace**：`rencoder_lib` 完成核心工作（业务逻辑、配置加载、
-  ffmpeg 命令构造），`rencoder_cli`（及未来的 `rencoder_gui` / `rencoder_tauri`）
+  ffmpeg 命令构造），`rencoder_cli`（及未来的 `rencoder_ui`，见 §3.8）
   是 thin wrapper。
 - **Lib 内部约束**：`rencoder_lib` 加 `publish = false`，明确"不要 `cargo publish`"。
 
@@ -258,7 +258,7 @@ df_to_csv  df_to_jsonl  df_to_parquet
 - `data/store.rs` 拥有 Polars DataFrame writers（`records_to_dataframe`、`records_to_csv/jsonl/parquet`、`dataframe_to_*`）
 - `data/record.rs` 拥有 `EncodingRecord` 组装 helpers（`make_skipped_record`、`make_failed_probe_record`、`encoder_settings_from_params`）
 - `encoder/{command,select}.rs` 拥有 `build_ffmpeg_command` + `select_encoder`
-- `pipeline/{batch,cache}.rs` 拥有 `transcode_batch` + `init_encoder_cache`
+- `pipeline/{batch,cancel,cache}.rs` 拥有 `transcode_batch` + `CancelToken` + `init_encoder_cache`
 - `utils/{fs,time}.rs` 拥有 `output_path_for` + `utc_timestamp_filename`
 - `config/mod.rs` 拥有 runtime `Config`（JSON 加载 → `from_value` 转换；U17+ 由 `from_encode_config` 从 `AppConfig` 派生）
 - `config/app.rs` 拥有 user-facing `AppConfig`（U18 重命名自 `project.rs`；TOML 加载在 U17 新增）
@@ -282,10 +282,12 @@ rencoder_lib/
 │   ├── command.rs               # build_ffmpeg_command（参数映射，含 -r 输出选项位置）
 │   └── select.rs                # select_encoder（cache + Config → 编码器名）
 ├── error.rs                     # EncodeError（thiserror）
+├── job.rs                       # GUI actor 入口（§3.8）：Command/Event + start_controller()
 ├── pipeline/
 │   ├── mod.rs
 │   ├── batch.rs                 # 编排：collect_files → transcode_batch（按文件循环，写记录+日志）
-│   └── cache.rs                 # init_encoder_cache（ffmpeg -encoders + nvidia-smi）
+│   ├── cache.rs                 # init_encoder_cache（ffmpeg -encoders + nvidia-smi）
+│   └── cancel.rs                # CancelToken（§3.8；Arc<AtomicBool> + cancel()/is_cancelled()）
 ├── types.rs                     # 跨模块共享类型（VideoFormat、EncodingRecord、MaxFpsConfig 等）
 └── utils/
     ├── mod.rs
@@ -362,6 +364,23 @@ rencoder_cli/
 ├── tracing_init.rs       # tracing-subscriber 初始化 + 双 sink
 └── file_sink.rs          # 自定义 MakeWriter：日/大小双轴滚动
 ```
+
+#### GUI 前端（`rencoder_ui`，U21 计划）
+
+```
+rencoder_ui/
+├── main.rs               # Dioxus desktop 入口
+├── app.rs                # 顶层 AppState + reducer + App 组件
+├── view/                 # 组件（按 view-model 分文件）
+│   ├── mod.rs
+│   ├── start_view.rs     # 选择目录 / 配置 / 开始
+│   ├── progress_view.rs  # 当前文件、ETA、批进度
+│   ├── log_view.rs       # VecDeque<LogLine> 渲染
+│   └── history_view.rs   # 历史记录列表
+└── msg.rs                # Msg 枚举 + reduce() 函数
+```
+
+详见 §3.8。
 
 ---
 
@@ -939,8 +958,8 @@ log "task N/M (source) interrupted" 而不是光秃秃的 path。同步把 `epri
 与部署——binary、config、log、data 全部在 `<app_dir>` 下，不依赖 CWD 或系统路径。
 
 **架构契约**：
-- **Source 仍是 workspace**（`rencoder_lib` + `rencoder_cli`；未来 `rencoder_gui` /
-  `rencoder_tauri`）。`rencoder_lib` 加 `publish = false`——明确"内部 lib，不要
+- **Source 仍是 workspace**（`rencoder_lib` + `rencoder_cli` + `rencoder_ui`，§3.8）。
+  `rencoder_lib` 加 `publish = false`——明确"内部 lib，不要
   `cargo publish`"。
 - **lib 完成核心工作**：业务逻辑、配置加载、FFmpeg 命令构造全部在 `rencoder_lib`；
   `rencoder_cli`（及未来的 GUI / Tauri）是 thin wrapper，只负责 args 解析 + 编排。
@@ -1224,7 +1243,174 @@ cargo-dist 0.32 不支持 `dmg` installer 类型（只支持 msi/shell/powershel
 
 ---
 
-## 4. 依赖关系
+### 3.8 GUI 前端（rencoder_ui，U21 计划）
+
+#### 3.8.1 框架与形态
+
+- **Dioxus desktop (0.6)**：纯 Rust、wry webview 后端，与 Tauri 同层但避免 IPC JSON 序列化税（每条 `Progress` 事件不跨 IPC 边界）。
+- **单 batch per process**：编码是 CPU 密集，多任务无益于效率。沿用 §3.4 的 `current_output` cell 单例约束——UI 一次只能有一个活跃批。**不**设计 `JobRegistry` / 多 job 抽象。
+- **位置**：作为第三个 crate 加入 workspace（`rencoder_ui`），依赖 `rencoder_lib`（`publish = false`，零外部发布）。**不**复用 `rencoder_cli::signal`（webview 自带 beforeunload / IPC 机制）。
+
+#### 3.8.2 Actor 模型：UI 与 lib 是两个 actor
+
+```
+UI actor (Dioxus)  ──Command──►  lib actor (BatchController bg thread)
+                 ◄───Event────
+```
+
+- 两个 actor 完全独立，**只**通过消息通信。无共享变量、无回调、无跨边界函数调用。
+- ffmpeg 子进程、`PartialOutputHandle`、`Child` handle、SIGINT 全部封装在 lib actor 内部。
+- 这把 lib 内部的复杂性收敛到一处，UI 端只看到消息流。
+
+#### 3.8.3 消息协议
+
+**Command（UI → lib）**
+
+```rust
+pub enum Command {
+    StartBatch { params: EncodeParams, files: Vec<PathBuf> },
+    Cancel,
+    LoadHistory,
+}
+```
+
+**Event（lib → UI）**
+
+按 topic 隐式分类（通过 enum variant，无需独立 `topic` 字段）：
+
+```rust
+pub enum Event {
+    // Lifecycle topic（低频，批级 / 文件级）
+    BatchStarted { id: u64, total_files: usize },
+    FileStarted { index: usize, total: usize, source: PathBuf },
+    FileCompleted { index: usize, record: EncodingRecord },
+    BatchCompleted { records: Vec<EncodingRecord> },
+    BatchCancelled { completed: usize, total: usize },
+
+    // Progress topic（高频，~2/sec/文件）
+    Progress {
+        file_index: usize,
+        frame: u64, fps: f64, speed: f64,
+        time_secs: f64, eta_secs: Option<f64>,
+    },
+
+    // Log topic（中频，~10/sec）
+    LogLine { file_index: usize, line: String },
+
+    // State topic
+    HistoryLoaded { records: Vec<EncodingRecord> },
+
+    // Error topic（仅 fatal；per-file 失败走 EncodingRecord.error）
+    Error { category: ErrorCategory, message: String },
+}
+```
+
+Topic 设计意图：dispatch 由 UI 端 reducer 用 `match` 完成，路由成本零；不需要单独的 `topic: Topic` 字段或多 channel。
+
+#### 3.8.4 Controller
+
+```rust
+pub struct ControllerHandle {
+    cmd_tx: UnboundedSender<Command>,
+    evt_rx: UnboundedReceiver<Event>,
+}
+
+pub fn start_controller() -> ControllerHandle;
+```
+
+UI 启动时调一次，拿到 `(cmd_tx, evt_rx)`，然后再不管 lib 内部。
+
+- `cmd_tx`：可克隆供多个 UI 组件使用（开始按钮、取消按钮、历史按钮）。
+- `evt_rx`：由顶层 `use_coroutine` 独占消费；不广播、不多订阅者——保证单消费者的因果序。
+- Channel 策略：`UnboundedSender`（单 batch 下每秒最多 ~50 个事件，UI 永远消费得过来；如未来有背压风险再换 `bounded + DropOldest`）。
+
+#### 3.8.5 状态与持久化的双轨
+
+| 通道 | 形式 | 生命周期 |
+|------|------|----------|
+| 实时 | mpsc 事件流 | 临时，重启即丢 |
+| 持久 | `<app_dir>/data/encoding-*.parquet` | 永久 |
+
+- 批结束：lib 写 Parquet + 发 `Event::BatchCompleted`。
+- UI 启动：发 `Command::LoadHistory` → lib 读 Parquet → 发 `Event::HistoryLoaded` 填充历史视图。
+- 这是 event sourcing 的两面：state 是 event log 的 fold，event log 是 append-only 真相源。
+
+#### 3.8.6 lib 内部实现要点
+
+**不修改**（CLI 路径零回归）：
+
+- `transcode_batch` 签名
+- `EncodingRecord` / `EncodingOutcome` / `ErrorContext`
+- `TaskManager` / `PartialOutputHandle` / signal handler（CLI 端）
+- `EncodeError`（保持 `thiserror` 原样，不加 `Serialize`）
+- `ProcessOutput` 枚举
+- `AppConfig` 加载/校验
+
+**新增**：
+
+| 位置 | 类型 / 函数 | 职责 |
+|------|-------------|------|
+| `pipeline/cancel.rs`（新） | `CancelToken` | `Arc<AtomicBool>` + `cancel()` / `is_cancelled()` |
+| `pipeline/batch.rs` | `run_ffmpeg_with_progress(argv, cancel, on_progress)` | `cmd.spawn()` 替代 `cmd.output()`，支持 cancel + progress 回调；CLI 路径的 `run_ffmpeg_with_stderr` 保留不动 |
+| `data/store.rs` | `read_records(path)` | Parquet 回读，对应 `Command::LoadHistory` |
+| `job.rs`（新） | `start_controller() -> ControllerHandle` | 编排：后台线程 + mpsc + 现有 `transcode_batch` + 新 `run_ffmpeg_with_progress` |
+| `job.rs`（新） | `pub enum Command` / `pub enum Event` | 消息协议（见 §3.8.3） |
+
+**CancelToken 共享**：UI `Command::Cancel` 与 SIGINT handler（lib 内部安装，可选）共享同一个 `Arc<AtomicBool>`，等价语义——UI 按钮和 Ctrl-C 都把同一个 token 置位。
+
+**log 过滤/节流**：lib 透传所有 ffmpeg stderr 行（不解析、不丢弃），上限/截断由 UI reducer 在 state 层做（`VecDeque` 限 1000 行）。
+
+#### 3.8.7 UI 端模式："everything is msg"
+
+Dioxus 端用 reducer 模式（Elm 架构）：
+
+```rust
+struct AppState {
+    batch: Option<BatchInfo>,
+    progress: HashMap<usize, ProgressInfo>,
+    log: VecDeque<LogLine>,
+    history: Vec<EncodingRecord>,
+}
+
+enum Msg {
+    UserClickedStart,
+    UserClickedCancel,
+    UserOpenedHistory,
+    Lib(Event),
+}
+
+fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &UnboundedSender<Command>) {
+    match msg {
+        Msg::UserClickedStart => drop(cmd_tx.send(Command::StartBatch { /* ... */ })),
+        Msg::UserClickedCancel => drop(cmd_tx.send(Command::Cancel)),
+        Msg::UserOpenedHistory => drop(cmd_tx.send(Command::LoadHistory)),
+        Msg::Lib(Event::Progress(p)) => { state.progress.insert(p.file_index, p); }
+        Msg::Lib(Event::LogLine(l)) => {
+            state.log.push_back(l);
+            while state.log.len() > 1000 { state.log.pop_front(); }
+        }
+        Msg::Lib(Event::HistoryLoaded { records }) => { state.history = records; }
+        // ...
+    }
+}
+```
+
+- 所有用户输入转成 `Msg` → reducer 决定是否反发 `Command`。
+- 所有 lib 事件包成 `Msg::Lib(Event)` → reducer 更新 `state`。
+- 组件只读 `state`，不直接调 lib。
+- 测试：构造 `Vec<Msg>` 灌进 reducer 断言 `state`——不需 Dioxus runtime。
+
+#### 3.8.8 与 §3.4 CLI 前端的关系
+
+CLI 和 GUI 共享同一份 `rencoder.toml`（§1.2）和同一份 lib 实现：
+
+- **CLI 路径不变**：直接调 `transcode_batch`，写 Parquet，写终端日志。
+- **GUI 路径**：发 `Command` → 收 `Event` → reducer → 渲染。
+- 两条路径都触发 Parquet 写入；GUI 加载历史 = 读 Parquet（同一文件路径）。
+
+---
+
+
 
 #### 核心库
 
@@ -1333,7 +1519,7 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 14 | 集成测试与文档 |
 | 15 | （可选）`parallel-analyze`：`rayon` 并行分析 |
 | 16 | （可选）`c-probe`：C FFI 桥接层 |
-| 17 | （可选）GUI：`ProcessOutput::Piped` + 控制台区域 |
+| 17 | （可选）GUI 前端（`rencoder_ui`）：Dioxus desktop（0.6），actor 模型（§3.8），`Command` / `Event` 双通道；lib 新增 `start_controller` + `CancelToken` + `run_ffmpeg_with_progress` + Parquet 回读 |
 
 ---
 
@@ -1362,6 +1548,15 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 19 | CLI 提供 `encode` 和 `analyze` 两个子命令 | ✅ |
 | 20 | `nvidia-smi` 未安装/spawn 失败视为"无 GPU"降级，不作为 `EncodeError` 传播 | ✅ |
 | 21 | `build_ffmpeg_command` 在 `src_fps = None` 时忽略 `MaxFpsConfig`，不注入 `-r` | ✅ |
+| 22 | GUI 框架：Dioxus desktop (0.6)，纯 Rust + wry 后端，避免 IPC 序列化税 | ✅ |
+| 23 | 单 batch per process：UI 不支持多任务，`current_output` 单例约束保持 | ✅ |
+| 24 | UI 与 lib 通过 `Command`（in）+ `Event`（out）消息通信，actor 模型，互不直接调用 | ✅ |
+| 25 | lib 不为 UI 新增 `Serialize` 派生（保持 `thiserror` 原样，actor 间传 Rust 类型无需序列化） | ✅ |
+| 26 | `Event::Error` 仅 fatal；per-file 失败走 `EncodingRecord.error` 字段 | ✅ |
+| 27 | 双轨 state：mpsc 实时事件 + Parquet 持久化；`Command::LoadHistory` 触发回读 | ✅ |
+| 28 | Channel 策略：`UnboundedSender`（单 batch 下背压风险极低） | ✅ |
+| 29 | lib 内部 `CancelToken`（`Arc<AtomicBool>`）由 UI `Command::Cancel` 与 SIGINT handler 共享 | ✅ |
+| 30 | Log 行在 lib 透传；UI reducer 层设上限（`VecDeque` 1000 行） | ✅ |
 
 ---
 
