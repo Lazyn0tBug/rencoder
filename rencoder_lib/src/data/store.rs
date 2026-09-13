@@ -20,9 +20,7 @@ use polars::prelude::*;
 use std::path::Path;
 
 use crate::error::EncodeError;
-use crate::types::{
-    EncodingOutcome, EncodingRecord, ErrorCategory, ErrorContext, SkippedReason,
-};
+use crate::types::{EncodingOutcome, EncodingRecord, ErrorCategory, ErrorContext, SkippedReason};
 
 /// Build a `Series` of `DateTime<Utc>` values, casting the underlying
 /// `i64` (milliseconds since epoch) into Polars' `Datetime` type so
@@ -210,9 +208,9 @@ pub fn records_to_parquet(records: &[EncodingRecord]) -> PolarsResult<Vec<u8>> {
 pub fn read_records(path: &Path) -> Result<Vec<EncodingRecord>, EncodeError> {
     use polars::prelude::ParquetReader;
     let file = std::fs::File::open(path)?; // io::Error → EncodeError::Io via #[from]
-    let df = ParquetReader::new(file).finish().map_err(|e| {
-        EncodeError::Probe(format!("parquet read {}: {e}", path.display()))
-    })?;
+    let df = ParquetReader::new(file)
+        .finish()
+        .map_err(|e| EncodeError::Probe(format!("parquet read {}: {e}", path.display())))?;
     columns_to_records(&df).map_err(|e| EncodeError::Probe(format!("parquet decode: {e}")))
 }
 
@@ -298,7 +296,10 @@ fn columns_to_records(df: &DataFrame) -> PolarsResult<Vec<EncodingRecord>> {
     let mut records = Vec::with_capacity(h);
     for i in 0..h {
         let outcome = parse_outcome(outcome_str[i].as_deref().unwrap_or(""));
-        let error = match (error_category_str[i].as_deref(), error_message[i].as_deref()) {
+        let error = match (
+            error_category_str[i].as_deref(),
+            error_message[i].as_deref(),
+        ) {
             (Some(cat), Some(msg)) => Some(ErrorContext {
                 category: parse_error_category(cat),
                 message: msg.to_string(),
@@ -318,7 +319,7 @@ fn columns_to_records(df: &DataFrame) -> PolarsResult<Vec<EncodingRecord>> {
             source_duration_secs: source_duration_secs[i],
             source_bit_rate_bps: source_bit_rate_bps[i],
 
-            started_at: started_at[i].unwrap_or_else(|| Utc::now()),
+            started_at: started_at[i].unwrap_or_else(Utc::now),
             ended_at: ended_at[i],
             encoding_duration_secs: encoding_duration_secs[i],
             encoder_selected: encoder_selected[i].clone(),
@@ -505,7 +506,10 @@ mod tests {
         assert_eq!(a.source_fps, b.source_fps);
         assert_eq!(a.encoder_selected, b.encoder_selected);
         assert_eq!(a.encoder_settings.is_crf, b.encoder_settings.is_crf);
-        assert_eq!(a.encoder_settings.crf_or_bitrate, b.encoder_settings.crf_or_bitrate);
+        assert_eq!(
+            a.encoder_settings.crf_or_bitrate,
+            b.encoder_settings.crf_or_bitrate
+        );
         assert_eq!(a.output_path, b.output_path);
         assert_eq!(a.output_size_bytes, b.output_size_bytes);
         assert_eq!(a.outcome, b.outcome);
@@ -523,7 +527,11 @@ mod tests {
         let mut rec = sample_record();
         rec.outcome = EncodingOutcome::Skipped(SkippedReason::PartialOutput);
         let df = records_to_dataframe(&[rec]).expect("df");
-        let outcome_col = df.column("outcome").expect("outcome col").str().expect("str");
+        let outcome_col = df
+            .column("outcome")
+            .expect("outcome col")
+            .str()
+            .expect("str");
         let first = outcome_col.get(0).expect("first");
         assert_eq!(first, "Skipped(PartialOutput)");
     }

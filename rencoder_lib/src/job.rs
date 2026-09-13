@@ -30,12 +30,10 @@ use chrono::{DateTime, Utc};
 
 use crate::config::app::AppConfig;
 use crate::config::{path::resolve_config, Config};
-use crate::pipeline::batch::{run_ffmpeg_with_progress, transcode_single, FfmpegProgress};
+use crate::pipeline::batch::{transcode_single_with_progress, FfmpegProgress};
 use crate::pipeline::cache::init_encoder_cache;
 use crate::pipeline::cancel::CancelToken;
-use crate::types::{
-    EncodeParams, EncodingRecord, EncoderCache, ErrorCategory, ProcessOutput, TranscodeTask,
-};
+use crate::types::{EncodeParams, EncoderCache, EncodingRecord, ErrorCategory, TranscodeTask};
 use crate::utils::fs::output_path_for;
 
 /// Identifier for one batch run. Monotonically increasing per
@@ -87,15 +85,20 @@ pub enum Command {
 /// Messages from the lib actor to the UI. Variants are grouped by
 /// topic in the doc but encoded as enum variants (no separate
 /// `topic` field) so dispatch is just `match` (§3.8.3).
+///
+/// `large_enum_variant` is accepted: `BatchCompleted` /
+/// `HistoryLoaded` carry `Vec<EncodingRecord>` (~230 B per
+/// variant) while other variants are <100 B. Events are emitted
+/// one-at-a-time through a single mpsc receiver — no in-flight
+/// accumulation, so the memory cost is bounded by one variant's
+/// worst-case size at a time.
+#[allow(clippy::large_enum_variant)]
 #[non_exhaustive]
 pub enum Event {
     // ---- Lifecycle topic (low frequency) ----
     /// A batch has started. `id` is unique within the controller's
     /// lifetime. `total_files` is the count after collection.
-    BatchStarted {
-        id: BatchId,
-        total_files: usize,
-    },
+    BatchStarted { id: BatchId, total_files: usize },
     /// A single file is about to be encoded. `source` is the input
     /// path; the output path is computed by the lib and surfaced via
     /// `FileCompleted`.
@@ -139,10 +142,7 @@ pub enum Event {
     /// Single stderr line from ffmpeg. The lib passes lines through
     /// unfiltered (§3.8.6 log filtering); the UI reducer caps the
     /// ring buffer at 1000 entries (§8 item 30).
-    LogLine {
-        file_index: usize,
-        line: String,
-    },
+    LogLine { file_index: usize, line: String },
 
     // ---- State topic ----
     /// Result of a `Command::LoadHistory`. `records` is the filtered
@@ -226,7 +226,10 @@ mod tests {
             total: 5,
             source: PathBuf::from("/a.mp4"),
         };
-        let _ = Event::FileCompleted { index: 0, record: rec };
+        let _ = Event::FileCompleted {
+            index: 0,
+            record: rec,
+        };
         let _ = Event::BatchCompleted {
             records: vec![sample_record()],
         };
@@ -305,10 +308,7 @@ pub fn start_controller() -> ControllerHandle {
     ControllerHandle { cmd_tx, evt_rx }
 }
 
-fn run_actor(
-    cmd_rx: Receiver<Command>,
-    evt_tx: Sender<Event>,
-) {
+fn run_actor(cmd_rx: Receiver<Command>, evt_tx: Sender<Event>) {
     // Init once for the controller's lifetime. Both load paths can
     // fail; on either failure we emit Event::Error and exit the
     // actor thread (UI sees the error then no more events).
@@ -404,23 +404,42 @@ fn run_actor(
                         output: Some(output_path),
                     };
 
-                    // v1: use CLI-style transcode_single (no per-frame
-                    // progress events). Per-frame events land when
-                    // transcode_single is extended to accept
-                    // CancelToken + on_progress.
-                    match transcode_single(&task, &params, &cache, &config, ProcessOutput::Null) {
+                    // Per-file progress → wrapped into Event::Progress.
+                    // The closure must be FnMut (not FnOnce) since
+                    // transcode_single_with_progress calls it many
+                    // times across the run.
+                    let progress_evt_tx = &evt_tx;
+                    let progress_file_index = index;
+                    let mut on_progress = |p: FfmpegProgress| {
+                        let _ = progress_evt_tx.send(Event::Progress {
+                            file_index: progress_file_index,
+                            frame: p.frame,
+                            fps: p.fps,
+                            speed: p.speed,
+                            time_secs: p.time_secs,
+                            eta_secs: p.eta_secs,
+                        });
+                    };
+
+                    match transcode_single_with_progress(
+                        &task,
+                        &params,
+                        &cache,
+                        &config,
+                        &cancel_token,
+                        &mut on_progress,
+                    ) {
                         Ok(record) => {
                             records.push(record.clone());
                             let _ = evt_tx.send(Event::FileCompleted { index, record });
                         }
                         Err(e) => {
-                            // transcode_single normally returns Ok(Failed record)
-                            // for per-file failures; this branch is for
-                            // unexpected setup-level errors. Emit and
-                            // continue.
+                            // Setup-level error; per-file failures are
+                            // mapped to Ok(Failed record) inside
+                            // transcode_single_with_progress.
                             let _ = evt_tx.send(Event::Error {
                                 category: ErrorCategory::ConfigError,
-                                message: format!("transcode_single error: {e}"),
+                                message: format!("transcode_single_with_progress error: {e}"),
                             });
                         }
                     }
@@ -457,10 +476,7 @@ fn run_actor(
 /// Read history records from `<app_dir>/data/encoding-*.parquet`,
 /// apply `limit` + `after`, return newest-first. Resolves the data
 /// dir via `config::path::resolve_data_dir()` (§8 item 39).
-fn load_history(
-    limit: Option<usize>,
-    after: Option<DateTime<Utc>>,
-) -> Vec<EncodingRecord> {
+fn load_history(limit: Option<usize>, after: Option<DateTime<Utc>>) -> Vec<EncodingRecord> {
     use crate::config::path::resolve_data_dir;
     use crate::data::store::read_records;
 

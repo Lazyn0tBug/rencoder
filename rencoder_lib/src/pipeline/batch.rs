@@ -60,13 +60,111 @@ pub fn transcode_single(
     let started_at_meta = Utc::now();
     let started_at_instant = Instant::now();
 
-    // transcode_single is only invoked from `transcode_batch`, which
-    // always builds `TranscodeTask { output: Some(...) }`. Treat
-    // `None` as a programming error rather than a soft "skip" --
-    // there's no input-defined output path to compare against.
+    // CLI path. Shared prepare logic + sync ffmpeg execution.
+    let prepare = encode_prepare(
+        task,
+        params,
+        cache,
+        config,
+        started_at_meta,
+        started_at_instant,
+    );
+    match prepare {
+        EncodePrepareResult::Skipped(r) | EncodePrepareResult::FailedProbe(r) => Ok(r),
+        EncodePrepareResult::Ready {
+            metadata,
+            argv,
+            output_path,
+        } => transcode_with_argv(
+            task,
+            params,
+            &metadata,
+            argv,
+            &output_path,
+            started_at_meta,
+            started_at_instant,
+            output,
+        ),
+    }
+}
+
+/// Sibling to [`transcode_single`] for the GUI / actor path (U21).
+/// Same probe + partial detection + skip + argv logic (shared via
+/// [`encode_prepare`]), but uses [`run_ffmpeg_with_progress`] for
+/// cancellable, event-driven ffmpeg execution. `cancel` is polled
+/// between progress reads; `on_progress` is invoked once per
+/// `progress=continue` / `progress=end` block from ffmpeg.
+pub fn transcode_single_with_progress(
+    task: &TranscodeTask,
+    params: &EncodeParams,
+    cache: &EncoderCache,
+    config: &Config,
+    cancel: &CancelToken,
+    on_progress: &mut dyn FnMut(FfmpegProgress),
+) -> Result<EncodingRecord, EncodeError> {
+    let started_at_meta = Utc::now();
+    let started_at_instant = Instant::now();
+
+    let prepare = encode_prepare(
+        task,
+        params,
+        cache,
+        config,
+        started_at_meta,
+        started_at_instant,
+    );
+    match prepare {
+        EncodePrepareResult::Skipped(r) | EncodePrepareResult::FailedProbe(r) => Ok(r),
+        EncodePrepareResult::Ready {
+            metadata,
+            argv,
+            output_path,
+        } => transcode_with_progress(
+            task,
+            params,
+            &metadata,
+            argv,
+            &output_path,
+            started_at_meta,
+            started_at_instant,
+            cancel,
+            on_progress,
+        ),
+    }
+}
+
+/// Outcome of the common prepare step (probe + partial detection +
+/// skip decision + argv build). Either ready to invoke ffmpeg, or a
+/// terminal record (skipped / failed-probe) the caller returns as-is.
+enum EncodePrepareResult {
+    Ready {
+        metadata: VideoMetadata,
+        argv: Vec<String>,
+        output_path: PathBuf,
+    },
+    Skipped(EncodingRecord),
+    FailedProbe(EncodingRecord),
+}
+
+/// Shared by [`transcode_single`] (CLI) and [`transcode_single_with_progress`]
+/// (GUI). Performs the probe + partial-output-detection + skip-decision +
+/// argv-build steps so both paths agree on what work to do; only the
+/// actual ffmpeg invocation differs.
+fn encode_prepare(
+    task: &TranscodeTask,
+    params: &EncodeParams,
+    cache: &EncoderCache,
+    config: &Config,
+    started_at_meta: chrono::DateTime<chrono::Utc>,
+    _started_at_instant: Instant,
+) -> EncodePrepareResult {
+    // transcode_single(_with_progress) is only invoked via task graphs
+    // that build `TranscodeTask { output: Some(...) }`. Treat `None`
+    // as a programming error rather than a soft "skip" -- there's no
+    // input-defined output path to compare against.
     let output_path = task
         .output
-        .as_ref()
+        .clone()
         .expect("transcode_single called with TranscodeTask.output = None");
 
     // Probe input FIRST so we have ground truth (source duration) for
@@ -76,7 +174,7 @@ pub fn transcode_single(
     let metadata = match probe_video_metadata_auto(&task.input) {
         Ok(m) => m,
         Err(e) => {
-            return Ok(make_failed_probe_record(
+            return EncodePrepareResult::FailedProbe(make_failed_probe_record(
                 task,
                 params,
                 started_at_meta,
@@ -87,25 +185,18 @@ pub fn transcode_single(
     };
 
     if output_path.exists() {
-        // Probe the candidate output. Probe failure or missing duration
-        // is treated as partial (video output always has a duration;
-        // absence = corrupt or truncated file).
-        let output_meta = probe_video_metadata_auto(output_path).ok();
+        let output_meta = probe_video_metadata_auto(&output_path).ok();
         let is_partial = match (
             metadata.duration_secs,
             output_meta.as_ref().and_then(|m| m.duration_secs),
         ) {
-            // Output more than 1s shorter than source → partial.
             (Some(src), Some(out)) => out + 1.0 < src,
-            // No output duration / probe failed → partial.
             (Some(_), None) => true,
-            // No source duration → no ground truth; treat as real
-            // (skip) to avoid false positives on weird inputs.
             (None, _) => false,
         };
 
         if is_partial {
-            match std::fs::remove_file(output_path) {
+            match std::fs::remove_file(&output_path) {
                 Ok(()) => {
                     log::warn!(
                         "    partial output detected at {} (output {:.2}s vs source {:.2}s); removed, re-encoding",
@@ -113,7 +204,7 @@ pub fn transcode_single(
                         output_meta.as_ref().and_then(|m| m.duration_secs).unwrap_or(0.0),
                         metadata.duration_secs.unwrap_or(0.0),
                     );
-                    // Fall through to the normal encode path below.
+                    // Fall through.
                 }
                 Err(e) => {
                     log::warn!(
@@ -121,7 +212,7 @@ pub fn transcode_single(
                         output_path.display(),
                         e,
                     );
-                    return Ok(make_skipped_record(
+                    return EncodePrepareResult::Skipped(make_skipped_record(
                         task,
                         params,
                         started_at_meta,
@@ -131,15 +222,11 @@ pub fn transcode_single(
                 }
             }
         } else {
-            // Visible scaffold: the task scaffold in TaskManager::run emits
-            // generic start/end lines. Domain-level skips like this one need
-            // their own log so operators can tell "ran and wrote" from
-            // "did nothing because the output was already on disk".
             log::info!(
                 "    task skipped: output already exists at {}",
                 output_path.display()
             );
-            return Ok(make_skipped_record(
+            return EncodePrepareResult::Skipped(make_skipped_record(
                 task,
                 params,
                 started_at_meta,
@@ -150,15 +237,210 @@ pub fn transcode_single(
     }
 
     let argv = build_argv(task, params, cache, config, &metadata);
-    transcode_with_argv(
+    EncodePrepareResult::Ready {
+        metadata,
+        argv,
+        output_path,
+    }
+}
+
+/// Inner helper for [`transcode_single`] (CLI path). Invokes ffmpeg
+/// with stderr-capture and blocks until exit.
+#[allow(clippy::too_many_arguments)]
+fn transcode_with_argv(
+    task: &TranscodeTask,
+    params: &EncodeParams,
+    metadata: &VideoMetadata,
+    argv: Vec<String>,
+    output_path: &Path,
+    started_at_meta: chrono::DateTime<chrono::Utc>,
+    started_at_instant: Instant,
+    output: ProcessOutput,
+) -> Result<EncodingRecord, EncodeError> {
+    // (kept structurally identical to the original transcode_with_argv
+    // but now reads output_path from the explicit parameter instead
+    // of recomputing it from task.output.)
+    let _ = output_path; // currently unused inside; reserved for symmetry with progress variant
+    let src_fps = metadata.best_fps();
+    let codec = metadata.codec.as_deref().unwrap_or("");
+    let need_reduce = src_fps
+        .map(|s| params.max_fps.enabled() && params.max_fps.need_reduce(s))
+        .unwrap_or(false);
+
+    if should_skip_encoding(codec, params.format, need_reduce) {
+        log::info!("    task skipped: source codec matches target ({})", codec);
+        return Ok(make_skipped_record(
+            task,
+            params,
+            started_at_meta,
+            Some(started_at_instant.elapsed().as_secs_f64()),
+            SkippedReason::SameCodec,
+        ));
+    }
+
+    let run_result = run_ffmpeg_with_stderr(&argv, output);
+    build_encode_record(
         task,
         params,
-        &metadata,
+        metadata,
         argv,
+        output_path,
         started_at_meta,
         started_at_instant,
-        output,
+        run_result,
     )
+}
+
+/// Inner helper for [`transcode_single_with_progress`] (GUI path).
+/// Invokes ffmpeg via [`run_ffmpeg_with_progress`] which:
+/// - Uses `cmd.spawn()` (not `cmd.output()`) — we hold a `Child`
+///   handle and can kill it mid-stream.
+/// - Polls `cancel.is_cancelled()` between progress reads; on detection
+///   kills the child and returns `Err((Cancelled, ...))`.
+/// - Streams progress snapshots to `on_progress` (one per ffmpeg
+///   progress block, ~2/sec per active file).
+#[allow(clippy::too_many_arguments)]
+fn transcode_with_progress(
+    task: &TranscodeTask,
+    params: &EncodeParams,
+    metadata: &VideoMetadata,
+    argv: Vec<String>,
+    output_path: &Path,
+    started_at_meta: chrono::DateTime<chrono::Utc>,
+    started_at_instant: Instant,
+    cancel: &CancelToken,
+    on_progress: &mut dyn FnMut(FfmpegProgress),
+) -> Result<EncodingRecord, EncodeError> {
+    let src_fps = metadata.best_fps();
+    let codec = metadata.codec.as_deref().unwrap_or("");
+    let need_reduce = src_fps
+        .map(|s| params.max_fps.enabled() && params.max_fps.need_reduce(s))
+        .unwrap_or(false);
+
+    if should_skip_encoding(codec, params.format, need_reduce) {
+        log::info!("    task skipped: source codec matches target ({})", codec);
+        return Ok(make_skipped_record(
+            task,
+            params,
+            started_at_meta,
+            Some(started_at_instant.elapsed().as_secs_f64()),
+            SkippedReason::SameCodec,
+        ));
+    }
+
+    let run_result = run_ffmpeg_with_progress(&argv, cancel, metadata.duration_secs, on_progress);
+    build_encode_record(
+        task,
+        params,
+        metadata,
+        argv,
+        output_path,
+        started_at_meta,
+        started_at_instant,
+        run_result,
+    )
+}
+
+/// Build the final EncodingRecord from ffmpeg's exit result. Shared
+/// between CLI and GUI paths — both produce the same record shape;
+/// the difference is upstream (sync vs cancellable ffmpeg run).
+#[allow(clippy::too_many_arguments)]
+fn build_encode_record(
+    task: &TranscodeTask,
+    params: &EncodeParams,
+    metadata: &VideoMetadata,
+    argv: Vec<String>,
+    output_path: &Path,
+    started_at_meta: chrono::DateTime<chrono::Utc>,
+    started_at_instant: Instant,
+    run_result: Result<(), (ErrorCategory, String, String)>,
+) -> Result<EncodingRecord, EncodeError> {
+    let ended_at_meta = Utc::now();
+    let encoding_duration = started_at_instant.elapsed().as_secs_f64();
+    let encoder_selected = extract_encoder_from_argv(&argv);
+    let src_fps = metadata.best_fps();
+    let need_reduce = src_fps
+        .map(|s| params.max_fps.enabled() && params.max_fps.need_reduce(s))
+        .unwrap_or(false);
+
+    match run_result {
+        Ok(()) => {
+            let output_size_bytes = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+            let source_size_bytes = std::fs::metadata(&task.input).map(|m| m.len()).unwrap_or(0);
+            let compression_ratio = if source_size_bytes > 0 {
+                Some(output_size_bytes as f64 / source_size_bytes as f64)
+            } else {
+                None
+            };
+
+            let outcome = if need_reduce {
+                EncodingOutcome::ReducedFps
+            } else {
+                EncodingOutcome::Succeeded
+            };
+
+            Ok(EncodingRecord {
+                source_path: task.input.to_string_lossy().into_owned(),
+                source_size_bytes,
+                source_codec: metadata.codec.clone(),
+                source_container: metadata.container.clone(),
+                source_width: metadata.width,
+                source_height: metadata.height,
+                source_fps: src_fps,
+                source_duration_secs: metadata.duration_secs,
+                source_bit_rate_bps: metadata.bit_rate,
+
+                started_at: started_at_meta,
+                ended_at: Some(ended_at_meta),
+                encoding_duration_secs: Some(encoding_duration),
+                encoder_selected: encoder_selected.clone(),
+                encoder_settings: encoder_settings_from_params(params),
+                ffmpeg_argv: argv,
+                ffmpeg_stderr_tail: String::new(),
+
+                output_path: Some(output_path.to_string_lossy().into_owned()),
+                output_size_bytes: Some(output_size_bytes),
+                output_duration_secs: metadata.duration_secs,
+                output_codec: encoder_selected,
+                compression_ratio,
+
+                outcome,
+                error: None,
+            })
+        }
+        Err((category, message, stderr_tail)) => Ok(EncodingRecord {
+            source_path: task.input.to_string_lossy().into_owned(),
+            source_size_bytes: std::fs::metadata(&task.input).map(|m| m.len()).unwrap_or(0),
+            source_codec: metadata.codec.clone(),
+            source_container: metadata.container.clone(),
+            source_width: metadata.width,
+            source_height: metadata.height,
+            source_fps: src_fps,
+            source_duration_secs: metadata.duration_secs,
+            source_bit_rate_bps: metadata.bit_rate,
+
+            started_at: started_at_meta,
+            ended_at: Some(ended_at_meta),
+            encoding_duration_secs: Some(encoding_duration),
+            encoder_selected,
+            encoder_settings: encoder_settings_from_params(params),
+            ffmpeg_argv: argv,
+            ffmpeg_stderr_tail: stderr_tail.clone(),
+
+            output_path: None,
+            output_size_bytes: None,
+            output_duration_secs: None,
+            output_codec: None,
+            compression_ratio: None,
+
+            outcome: EncodingOutcome::Failed,
+            error: Some(ErrorContext {
+                category,
+                message,
+                ffmpeg_stderr_tail: stderr_tail,
+            }),
+        }),
+    }
 }
 
 /// Run a batch over a file list. Failures are captured per-file; the
@@ -244,141 +526,6 @@ fn build_argv(
     let encoder = select_encoder(params.format, cache, config)
         .expect("select_encoder in build_argv should have been filtered");
     build_ffmpeg_command(task, params, &encoder, src_fps)
-}
-
-/// Core orchestration: probe is done, argv is built; run ffmpeg and
-/// build the EncodingRecord.
-fn transcode_with_argv(
-    task: &TranscodeTask,
-    params: &EncodeParams,
-    metadata: &VideoMetadata,
-    argv: Vec<String>,
-    started_at_meta: chrono::DateTime<chrono::Utc>,
-    started_at_instant: Instant,
-    output: ProcessOutput,
-) -> Result<EncodingRecord, EncodeError> {
-    let src_fps = metadata.best_fps();
-    let codec = metadata.codec.as_deref().unwrap_or("");
-    let need_reduce = src_fps
-        .map(|s| params.max_fps.enabled() && params.max_fps.need_reduce(s))
-        .unwrap_or(false);
-
-    if should_skip_encoding(codec, params.format, need_reduce) {
-        // Source codec already matches target format and no fps reduction
-        // needed. Surface this so the operator can distinguish "skipped
-        // because nothing to do" from "ran and re-encoded".
-        log::info!("    task skipped: source codec matches target ({})", codec);
-        return Ok(make_skipped_record(
-            task,
-            params,
-            started_at_meta,
-            Some(started_at_instant.elapsed().as_secs_f64()),
-            SkippedReason::SameCodec,
-        ));
-    }
-
-    // Run ffmpeg (capture stderr if ProcessOutput::Piped so we can
-    // attach it to the ErrorContext on failure).
-    let run_result = run_ffmpeg_with_stderr(&argv, output);
-
-    let ended_at_meta = Utc::now();
-    let encoding_duration = started_at_instant.elapsed().as_secs_f64();
-
-    // Determine encoder selected from the argv (the second non-flag arg
-    // after -c:v). Simplest: extract from argv between "-c:v" and the
-    // next flag. For now, leave as None if extraction is awkward; the
-    // record carries enough other context for debugging.
-    let encoder_selected = extract_encoder_from_argv(&argv);
-
-    match run_result {
-        Ok(()) => {
-            // Success: fill result-side fields.
-            let output_path = task
-                .output
-                .as_ref()
-                .expect("encode TranscodeTask always has Some output");
-            let output_size_bytes = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
-            let source_size_bytes = std::fs::metadata(&task.input).map(|m| m.len()).unwrap_or(0);
-            let compression_ratio = if source_size_bytes > 0 {
-                Some(output_size_bytes as f64 / source_size_bytes as f64)
-            } else {
-                None
-            };
-
-            let outcome = if need_reduce {
-                EncodingOutcome::ReducedFps
-            } else {
-                EncodingOutcome::Succeeded
-            };
-
-            Ok(EncodingRecord {
-                source_path: task.input.to_string_lossy().into_owned(),
-                source_size_bytes,
-                source_codec: metadata.codec.clone(),
-                source_container: metadata.container.clone(),
-                source_width: metadata.width,
-                source_height: metadata.height,
-                source_fps: src_fps,
-                source_duration_secs: metadata.duration_secs,
-                source_bit_rate_bps: metadata.bit_rate,
-
-                started_at: started_at_meta,
-                ended_at: Some(ended_at_meta),
-                encoding_duration_secs: Some(encoding_duration),
-                encoder_selected: encoder_selected.clone(),
-                encoder_settings: encoder_settings_from_params(params),
-                ffmpeg_argv: argv,
-                ffmpeg_stderr_tail: String::new(),
-
-                output_path: Some(
-                    task.output
-                        .as_ref()
-                        .expect("encode TranscodeTask always has Some output")
-                        .to_string_lossy()
-                        .into_owned(),
-                ),
-                output_size_bytes: Some(output_size_bytes),
-                output_duration_secs: metadata.duration_secs, // same as source (no trimming)
-                output_codec: encoder_selected,
-                compression_ratio,
-
-                outcome,
-                error: None,
-            })
-        }
-        Err((category, message, stderr_tail)) => Ok(EncodingRecord {
-            source_path: task.input.to_string_lossy().into_owned(),
-            source_size_bytes: std::fs::metadata(&task.input).map(|m| m.len()).unwrap_or(0),
-            source_codec: metadata.codec.clone(),
-            source_container: metadata.container.clone(),
-            source_width: metadata.width,
-            source_height: metadata.height,
-            source_fps: src_fps,
-            source_duration_secs: metadata.duration_secs,
-            source_bit_rate_bps: metadata.bit_rate,
-
-            started_at: started_at_meta,
-            ended_at: Some(ended_at_meta),
-            encoding_duration_secs: Some(encoding_duration),
-            encoder_selected,
-            encoder_settings: encoder_settings_from_params(params),
-            ffmpeg_argv: argv,
-            ffmpeg_stderr_tail: stderr_tail.clone(),
-
-            output_path: None,
-            output_size_bytes: None,
-            output_duration_secs: None,
-            output_codec: None,
-            compression_ratio: None,
-
-            outcome: EncodingOutcome::Failed,
-            error: Some(ErrorContext {
-                category,
-                message,
-                ffmpeg_stderr_tail: stderr_tail,
-            }),
-        }),
-    }
 }
 
 /// Build the skipped-record skeleton (used for OutputExists and
@@ -990,6 +1137,7 @@ Encoders:
             &params,
             &VideoMetadata::default(),
             argv,
+            task.output.as_ref().unwrap().as_path(),
             Utc::now(),
             Instant::now(),
             ProcessOutput::Null,
