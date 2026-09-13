@@ -926,6 +926,30 @@ NVIDIA 加速: 未启用
 =============================================
 ```
 
+#### Encode summary 输出（U21 partial-output 修正）
+
+CLI 在 `rencoder encode` 批结束后打印 6 行 summary 到 stdout：
+
+```
+Summary:
+  Total:      N
+  Success:    X
+  Reduced:    Y    (FPS-reduced)
+  Skipped:    Z    (SameCodec | OutputExists)
+  PartialSkip: P   (PartialOutput —— partial detected 但删除失败)
+  Failed:     F
+```
+
+**为什么 PartialSkip 是独立分类（不是 Skipped 也不是 Failed）**：
+
+- 不是正常 skip:用户没看到完整文件,partial 留在磁盘上挡着后续 encode
+- 不是 failed:ffmpeg 没启动,没有尝试 encode
+- 独立分类让用户在 summary 里看到这个异常状态;典型场景是权限拒绝或文件被占用
+- §8 item 40 锁定决策
+
+**实现位置**:`rencoder_cli/src/main.rs::print_encode_summary` 显式 match 每个
+`SkippedReason` 变体,新 variant 加进 `PartialSkip` 计数(不进 `Skipped` 桶)。
+
 #### 信号处理（U18 + U18.1）
 
 **意图**：用户按 Ctrl-C 中断转码时，handler 读取当前正在写入的 output path，删除半成品
@@ -1746,6 +1770,7 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 38 | §3.8.7 定义 `BatchInfo` / `ProgressInfo` / `LogLine` 三个 UI state struct,让 reducer 可独立 unit-test | ✅ |
 | 39 | `Command::LoadHistory` 不带 path 字段；controller 用 `config::path::resolve_data_dir()` 自解析（honors `$RENENCODER_DATA_DIR`） | ✅ |
 | 40 | Partial-output 检测(U21)：output duration < source - 1s → partial → 删 + 重转；probe 失败视作 partial；删除失败 → `Skipped(PartialOutput)` | ✅ |
+| 41 | CLI encode summary 增加 `PartialSkip` 独立分类(`PartialOutput` 不计入 `Skipped` 也不计入 `Failed`) | ✅ |
 
 ---
 
