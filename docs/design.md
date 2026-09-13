@@ -1528,6 +1528,14 @@ UI 启动时调一次，拿到 `(cmd_tx, evt_rx)`，然后再不管 lib 内部�
 | `data/store.rs` | `read_records(path) -> Vec<EncodingRecord>` | 单 Parquet 文件回读；多文件 glob + limit/after 过滤在 controller |
 | `config/path.rs` | `resolve_data_dir() -> PathBuf` | controller 在响应 `Command::LoadHistory` 时调此拿到数据目录(`$RENENCODER_DATA_DIR` > `<app_dir>/data`);**不**走 `Command::LoadHistory` 的 payload,UI 不需要知道路径 |
 | `job.rs`（新） | `start_controller() -> ControllerHandle` | 编排：后台线程 + mpsc + 现有 `transcode_batch`（**复用 CLI 路径的纯函数，不 fork**）+ 新 `run_ffmpeg_with_progress`；job.rs 是 thin glue，把现有 pieces 装成 actor |
+
+**Controller 启动时加载 AppConfig**（U21 增量）：
+- `config::path::resolve_config()` 拿路径（`$RENENCODER_CONFIG` > `<app_dir>/rencoder.toml`）
+- `AppConfig::load(&path)` 读 TOML（缺失时自动创建默认文件，与 CLI 一致）
+- `Config::from_encode_config(app_config.encode.as_ref())` 派生 runtime Config
+- `init_encoder_cache(app_config.encode.as_ref().and_then(|e| e.nv).unwrap_or(false))`
+- 失败 → `Event::Error(ConfigError)` 后线程退出
+- 这把 controller 与 CLI 拉到同一配置源——GUI 不再绕开 `rencoder.toml` |
 | `job.rs`（新） | `pub enum Command` / `pub enum Event` | 消息协议（见 §3.8.3） |
 
 **CancelToken 共享**：UI `Command::Cancel` 与 SIGINT handler（lib 内部安装，可选）共享同一个 `Arc<AtomicBool>`，等价语义——UI 按钮和 Ctrl-C 都把同一个 token 置位。
