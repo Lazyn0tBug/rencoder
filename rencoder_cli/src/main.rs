@@ -346,6 +346,20 @@ fn print_encode_summary(results: &[rencoder_lib::types::EncodingRecord]) {
             )
         })
         .count();
+    // PartialOutput skips are NOT counted as `Skipped` (they leave a
+    // partial file behind, not a clean skip) and NOT counted as
+    // `Failed` (ffmpeg was never invoked). Surfaced separately so the
+    // user notices this rare actionable state (typically permission
+    // denied or file in use). See design.md §3.4 + §8 item 41.
+    let partial_skip = results
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.outcome,
+                EncodingOutcome::Skipped(SkippedReason::PartialOutput)
+            )
+        })
+        .count();
     let failed = results
         .iter()
         .filter(|r| matches!(r.outcome, EncodingOutcome::Failed))
@@ -353,10 +367,11 @@ fn print_encode_summary(results: &[rencoder_lib::types::EncodingRecord]) {
 
     println!();
     println!("Summary:");
-    println!("  Total:   {total}");
-    println!("  Success: {success}");
-    println!("  Reduced: {reduced}");
-    println!("  Skipped: {skipped}");
+    println!("  Total:       {total}");
+    println!("  Success:     {success}");
+    println!("  Reduced:     {reduced}");
+    println!("  Skipped:     {skipped}");
+    println!("  PartialSkip: {partial_skip}");
     println!("  Failed:  {failed}");
 }
 
