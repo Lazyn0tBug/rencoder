@@ -259,19 +259,25 @@ fn columns_to_records(df: &DataFrame) -> PolarsResult<Vec<EncodingRecord>> {
     let source_duration_secs = f64_col("source_duration_secs")?;
     let source_bit_rate_bps = u64_col("source_bit_rate_bps")?;
 
-    // started_at is a Datetime column; convert ms → DateTime<Utc>.
+    // started_at is a Datetime column; we stored microseconds
+    // (timestamp_micros) so we read with from_timestamp_micros.
+    // Using from_timestamp_millis here would interpret the value as
+    // ms and produce years like ~55,840 (a 1000x mismatch — the
+    // original read_records_round_trip test didn't check started_at
+    // so this went undetected until the mock_load_history filter
+    // tests surfaced it).
     let started_at_casted = df.column("started_at")?.cast(&DataType::Int64)?;
-    let started_at_ms = started_at_casted.i64()?;
-    let started_at: Vec<Option<DateTime<Utc>>> = started_at_ms
+    let started_at_us = started_at_casted.i64()?;
+    let started_at: Vec<Option<DateTime<Utc>>> = started_at_us
         .into_iter()
-        .map(|o| o.and_then(DateTime::<Utc>::from_timestamp_millis))
+        .map(|o| o.and_then(DateTime::<Utc>::from_timestamp_micros))
         .collect();
     // ended_at has the same schema.
     let ended_at_casted = df.column("ended_at")?.cast(&DataType::Int64)?;
-    let ended_at_ms = ended_at_casted.i64()?;
-    let ended_at: Vec<Option<DateTime<Utc>>> = ended_at_ms
+    let ended_at_us = ended_at_casted.i64()?;
+    let ended_at: Vec<Option<DateTime<Utc>>> = ended_at_us
         .into_iter()
-        .map(|o| o.and_then(DateTime::<Utc>::from_timestamp_millis))
+        .map(|o| o.and_then(DateTime::<Utc>::from_timestamp_micros))
         .collect();
 
     let encoding_duration_secs = f64_col("encoding_duration_secs")?;
