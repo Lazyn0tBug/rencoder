@@ -501,6 +501,88 @@ pub enum TranscodeResult {
     Failed(EncodeError),
 }
 
+/// Canonical name for `TranscodeResult`（U18 重命名以表达"outcome 包含跳过"）。
+/// 在 §3.8 / 新代码中优先使用 `EncodingOutcome`；`TranscodeResult` 保留作
+/// backwards-compat alias。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncodingOutcome {
+    Succeeded,
+    ReducedFps,
+    Skipped(SkippedReason),
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkippedReason {
+    SameCodec,
+    OutputExists,
+}
+
+/// Fatal / per-file 失败分类（§3.8 `Event::Error` 和 `EncodingRecord.error` 都引用）。
+/// 完整定义在 `types.rs`，此处列出以让 §3.2 自完备。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorCategory {
+    ProbeFailed,
+    EncoderSelectionFailed,
+    FfmpegSpawnFailed,
+    FfmpegNonzeroExit,
+    ConfigError,
+    Cancelled,
+    IoError,
+}
+
+#[derive(Clone, Debug)]
+pub struct ErrorContext {
+    pub category: ErrorCategory,
+    pub message: String,
+    pub ffmpeg_stderr_tail: String,
+}
+
+/// 单文件转码的工作记录（4 维度：source / process / result / status）。
+/// 通过 `transcode_batch` 产出，写入 `<app_dir>/data/encoding-*.parquet`（CLI 路径）
+/// 或经 `Event::FileCompleted` 推送（GUI 路径，§3.8）。
+#[derive(Clone, Debug)]
+pub struct EncodingRecord {
+    // 1. Source
+    pub source_path: String,
+    pub source_size_bytes: u64,
+    pub source_codec: Option<String>,
+    pub source_container: Option<String>,
+    pub source_width: Option<u32>,
+    pub source_height: Option<u32>,
+    pub source_fps: Option<f64>,
+    pub source_duration_secs: Option<f64>,
+    pub source_bit_rate_bps: Option<u64>,
+
+    // 2. Process
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub ended_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub encoding_duration_secs: Option<f64>,
+    pub encoder_selected: Option<String>,
+    pub encoder_settings: EncoderSettings,
+    pub ffmpeg_argv: Vec<String>,
+    pub ffmpeg_stderr_tail: String,
+
+    // 3. Result
+    pub output_path: Option<String>,
+    pub output_size_bytes: Option<u64>,
+    pub output_duration_secs: Option<f64>,
+    pub output_codec: Option<String>,
+    pub compression_ratio: Option<f64>,
+
+    // 4. Status
+    pub outcome: EncodingOutcome,
+    pub error: Option<ErrorContext>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct EncoderSettings {
+    pub is_crf: bool,
+    pub crf_or_bitrate: u32,
+    pub preset: Option<String>,
+    pub max_fps_target: Option<f32>,
+}
+
 // ===== 帧率统计结果（视频分析模块） =====
 #[derive(Clone, Debug, Default)]
 pub struct VideoStats {
@@ -1250,6 +1332,7 @@ cargo-dist 0.32 不支持 `dmg` installer 类型（只支持 msi/shell/powershel
 - **Dioxus desktop (0.6)**：纯 Rust、wry webview 后端，与 Tauri 同层但避免 IPC JSON 序列化税（每条 `Progress` 事件不跨 IPC 边界）。
 - **单 batch per process**：编码是 CPU 密集，多任务无益于效率。沿用 §3.4 的 `current_output` cell 单例约束——UI 一次只能有一个活跃批。**不**设计 `JobRegistry` / 多 job 抽象。
 - **位置**：作为第三个 crate 加入 workspace（`rencoder_ui`），依赖 `rencoder_lib`（`publish = false`，零外部发布）。**不**复用 `rencoder_cli::signal`（webview 自带 beforeunload / IPC 机制）。
+- **平台范围**：遵循 §1.3，当前实现 Unix-only（macOS 已验证；Linux 跟 macOS 共享 `#[cfg(unix)]` 分支，覆盖到时一并验证）。wry/Dioxus 的非 Unix 平台支持属于 future work——本节设计不阻止,但当前不投入测试。
 
 #### 3.8.2 Actor 模型：UI 与 lib 是两个 actor
 
@@ -1364,18 +1447,19 @@ UI 启动时调一次，拿到 `(cmd_tx, evt_rx)`，然后再不管 lib 内部�
 **不修改**（CLI 路径零回归）：
 
 - `transcode_batch` 签名
-- `EncodingRecord` / `EncodingOutcome` / `ErrorContext`
+- `EncodingRecord` / `EncodingOutcome` / `ErrorContext`（见 §3.2）
 - `TaskManager` / `PartialOutputHandle` / signal handler（CLI 端）
 - `EncodeError`（保持 `thiserror` 原样，不加 `Serialize`）
-- `ProcessOutput` 枚举
+- `ProcessOutput` 枚举（见 §3.2）
 - `AppConfig` 加载/校验
+- CLI 路径的 ffmpeg 编排（含 stderr 收集 + partial output 清理）——保留 `cmd.output()` 同步路径，仅在 lib 内部为 GUI 加 spawn-based sibling
 
 **新增**：
 
 | 位置 | 类型 / 函数 | 职责 |
 |------|-------------|------|
 | `pipeline/cancel.rs`（新） | `CancelToken` | `Arc<AtomicBool>` + `cancel()` / `is_cancelled()` |
-| `pipeline/batch.rs` | `run_ffmpeg_with_progress(argv, cancel, on_progress)` | `cmd.spawn()` 替代 `cmd.output()`，支持 cancel + progress 回调；CLI 路径的 `run_ffmpeg_with_stderr` 保留不动 |
+| `pipeline/batch.rs` | `run_ffmpeg_with_progress(argv, cancel, on_progress)` | `cmd.spawn()` 替代 `cmd.output()`，支持 cancel + progress 回调；CLI 路径的同步 ffmpeg 编排保留不动 |
 | `data/store.rs` | `read_records(path) -> Vec<EncodingRecord>` | 单 Parquet 文件回读；多文件 glob + limit/after 过滤在 controller |
 | `job.rs`（新） | `start_controller() -> ControllerHandle` | 编排：后台线程 + mpsc + 现有 `transcode_batch` + 新 `run_ffmpeg_with_progress` |
 | `job.rs`（新） | `pub enum Command` / `pub enum Event` | 消息协议（见 §3.8.3） |
@@ -1585,6 +1669,7 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 32 | `Command::LoadHistory { limit: Option<usize>, after: Option<DateTime<Utc>> }` 含 payload，避免后续加字段成 breaking change | ✅ |
 | 33 | `pub enum Command` 和 `pub enum Event` 加 `#[non_exhaustive]`，新增 variant 不破坏 exhaustive match | ✅ |
 | 34 | `ErrorCategory` 在 §3.8.3 内联列出 7 个 variant（§3.2 类型定义同步） | ✅ |
+| 35 | §3.8 GUI 范围 Unix-only（matches §1.3）；wry/Dioxus 非 Unix 支持 deferred | ✅ |
 
 ---
 
