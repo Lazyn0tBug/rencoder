@@ -1267,10 +1267,19 @@ UI actor (Dioxus)  ──Command──►  lib actor (BatchController bg thread)
 **Command（UI → lib）**
 
 ```rust
+#[non_exhaustive]
 pub enum Command {
     StartBatch { params: EncodeParams, files: Vec<PathBuf> },
+    /// 中止当前批（包括正在处理的单文件）：等效于 SIGINT 但由 UI 触发。
+    /// 单文件跳过不暴露——用户要么让当前文件跑完，要么按 Cancel 中整批。
     Cancel,
-    LoadHistory,
+    /// 从 `<app_dir>/data/encoding-*.parquet` 回读历史。
+    /// - `limit`：返回最多 N 条最新记录；`None` 表示全部
+    /// - `after`：仅返回 `started_at >= after` 的记录；`None` 表示不限时间
+    LoadHistory {
+        limit: Option<usize>,
+        after: Option<chrono::DateTime<chrono::Utc>>,
+    },
 }
 ```
 
@@ -1279,12 +1288,16 @@ pub enum Command {
 按 topic 隐式分类（通过 enum variant，无需独立 `topic` 字段）：
 
 ```rust
+#[non_exhaustive]
 pub enum Event {
     // Lifecycle topic（低频，批级 / 文件级）
     BatchStarted { id: u64, total_files: usize },
     FileStarted { index: usize, total: usize, source: PathBuf },
     FileCompleted { index: usize, record: EncodingRecord },
     BatchCompleted { records: Vec<EncodingRecord> },
+    /// 由 `Command::Cancel` 或 SIGINT 触发：`completed` 是取消前已完成的文件数。
+    /// partial 输出由 `PartialOutputHandle` 在 SIGINT 路径清理；Cancel 路径
+    /// 沿用同一清理逻辑。
     BatchCancelled { completed: usize, total: usize },
 
     // Progress topic（高频，~2/sec/文件）
@@ -1303,7 +1316,18 @@ pub enum Event {
     // Error topic（仅 fatal；per-file 失败走 EncodingRecord.error）
     Error { category: ErrorCategory, message: String },
 }
-```
+
+/// Fatal-only 错误的分类（per-file 失败不通过这里，走 `EncodingRecord.error`）。
+/// 在 §3.2 的运行时类型之外再列出是为了 §3.8 自完备——`types.rs` 是真源。
+pub enum ErrorCategory {
+    ProbeFailed,             // 探测阶段就失败的批（无法启动）
+    EncoderSelectionFailed,  // 编码器不可用且无 fallback
+    FfmpegSpawnFailed,       // ffmpeg 子进程无法 spawn（如 binary 不存在）
+    FfmpegNonzeroExit,       // ffmpeg 子进程异常退出且不可恢复
+    ConfigError,             // 配置解析/校验失败
+    Cancelled,               // 批被取消（Cancelled 错误 vs `Event::BatchCancelled` 生命周期事件）
+    IoError,                 // 磁盘 / 权限 / path 错误无法继续
+}
 
 Topic 设计意图：dispatch 由 UI 端 reducer 用 `match` 完成，路由成本零；不需要单独的 `topic: Topic` 字段或多 channel。
 
@@ -1352,7 +1376,7 @@ UI 启动时调一次，拿到 `(cmd_tx, evt_rx)`，然后再不管 lib 内部�
 |------|-------------|------|
 | `pipeline/cancel.rs`（新） | `CancelToken` | `Arc<AtomicBool>` + `cancel()` / `is_cancelled()` |
 | `pipeline/batch.rs` | `run_ffmpeg_with_progress(argv, cancel, on_progress)` | `cmd.spawn()` 替代 `cmd.output()`，支持 cancel + progress 回调；CLI 路径的 `run_ffmpeg_with_stderr` 保留不动 |
-| `data/store.rs` | `read_records(path)` | Parquet 回读，对应 `Command::LoadHistory` |
+| `data/store.rs` | `read_records(path) -> Vec<EncodingRecord>` | 单 Parquet 文件回读；多文件 glob + limit/after 过滤在 controller |
 | `job.rs`（新） | `start_controller() -> ControllerHandle` | 编排：后台线程 + mpsc + 现有 `transcode_batch` + 新 `run_ffmpeg_with_progress` |
 | `job.rs`（新） | `pub enum Command` / `pub enum Event` | 消息协议（见 §3.8.3） |
 
@@ -1383,7 +1407,7 @@ fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &UnboundedSender<Command>) {
     match msg {
         Msg::UserClickedStart => drop(cmd_tx.send(Command::StartBatch { /* ... */ })),
         Msg::UserClickedCancel => drop(cmd_tx.send(Command::Cancel)),
-        Msg::UserOpenedHistory => drop(cmd_tx.send(Command::LoadHistory)),
+        Msg::UserOpenedHistory => drop(cmd_tx.send(Command::LoadHistory { limit: Some(100), after: None })),
         Msg::Lib(Event::Progress(p)) => { state.progress.insert(p.file_index, p); }
         Msg::Lib(Event::LogLine(l)) => {
             state.log.push_back(l);
@@ -1557,6 +1581,10 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 28 | Channel 策略：`UnboundedSender`（单 batch 下背压风险极低） | ✅ |
 | 29 | lib 内部 `CancelToken`（`Arc<AtomicBool>`）由 UI `Command::Cancel` 与 SIGINT handler 共享 | ✅ |
 | 30 | Log 行在 lib 透传；UI reducer 层设上限（`VecDeque` 1000 行） | ✅ |
+| 31 | `Command::Cancel` 中止整批（包括当前文件），与 SIGINT 等价；不暴露"仅跳过当前文件" | ✅ |
+| 32 | `Command::LoadHistory { limit: Option<usize>, after: Option<DateTime<Utc>> }` 含 payload，避免后续加字段成 breaking change | ✅ |
+| 33 | `pub enum Command` 和 `pub enum Event` 加 `#[non_exhaustive]`，新增 variant 不破坏 exhaustive match | ✅ |
+| 34 | `ErrorCategory` 在 §3.8.3 内联列出 7 个 variant（§3.2 类型定义同步） | ✅ |
 
 ---
 
