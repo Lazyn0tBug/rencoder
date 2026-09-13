@@ -684,6 +684,21 @@ Fix scope:
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` clean
 - [ ] `cargo fmt --check` clean
 
+### U18.1.1 REVERTED (2026-09-13)
+
+U18.1.1's signal-hook migration was rolled back in commits `ed23d85` (docs)
+and `0933feb` (cli/signal.rs). `ctrlc = "3.4"` is restored. Rationale:
+preserve Windows console event extension. Tradeoff (SIGTERM/SIGHUP no
+longer clean up partial files) documented in `docs/design.md` §3.4.5.
+
+Status of U18.1.1 checkboxes:
+- The two `[x]` items above (docs §3.4.5 wording, this entry) — the
+  wording is now reverted to ctrlc/SIGINT-only. Treat as superseded.
+- The remaining `[ ]` items — never landed; moot after revert.
+
+The MED and LOW findings (#2, #3) are independent of the signal-handler
+choice and remain valid future work; tracking continues separately.
+
 ### Verify
 
 - `cargo test --workspace` green (existing tests + new auto-create coverage)
