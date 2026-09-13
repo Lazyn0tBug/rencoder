@@ -346,7 +346,10 @@ mod tests {
     }
 
     #[test]
-    fn audio_defaults_to_copy() {
+    fn audio_defaults_to_opus_32k() {
+        // Audio defaults to libopus @ 32k (transcode, not copy).
+        // Users override via params.extra_args if they need a
+        // different codec.
         let argv = build_ffmpeg_command(
             &task("/in.mp4", "/out.mkv"),
             &params_disabled(),
@@ -354,7 +357,9 @@ mod tests {
             None,
         );
         let ca_pos = argv.iter().position(|s| s == "-c:a").expect("-c:a present");
-        assert_eq!(argv[ca_pos + 1], "copy");
+        assert_eq!(argv[ca_pos + 1], "libopus");
+        let ba_pos = argv.iter().position(|s| s == "-b:a").expect("-b:a present");
+        assert_eq!(argv[ba_pos + 1], "32k");
     }
 
     #[test]
