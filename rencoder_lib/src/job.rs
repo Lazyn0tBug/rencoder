@@ -35,8 +35,14 @@ use crate::error::EncodeError;
 use crate::pipeline::batch::{transcode_single_with_progress, FfmpegProgress};
 use crate::pipeline::cache::init_encoder_cache;
 use crate::pipeline::cancel::CancelToken;
-use crate::types::{EncodeParams, EncoderCache, EncodingRecord, ErrorCategory, TranscodeTask};
+use crate::types::{EncodeParams, EncoderCache, ErrorCategory, TranscodeTask};
 use crate::utils::fs::output_path_for;
+
+// Re-export for UI consumers — `Event::FileCompleted` and
+// `Event::BatchCompleted` carry `EncodingRecord`, so consumers
+// (rencoder_ui) need to name the type. Also used internally by
+// the actor thread (mock_tests build EncodingRecord values).
+pub use crate::types::EncodingRecord;
 
 /// Identifier for one batch run. Monotonically increasing per
 /// process; assigned by `start_controller` on `BatchStarted`. U21

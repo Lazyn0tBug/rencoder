@@ -1,0 +1,18 @@
+[package]
+name = "rencoder_ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Dioxus desktop GUI for Rencoder (U21)."
+publish = false
+
+[dependencies]
+rencoder_lib = { path = "../rencoder_lib" }
+dioxus = { version = "0.6", features = ["desktop"] }
+dioxus-hooks = "0.6"
+crossbeam-channel = "0.5"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[[bin]]
+name = "rencoder-ui"
+path = "src/main.rs"
