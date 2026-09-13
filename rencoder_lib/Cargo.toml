@@ -23,6 +23,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 parking_lot = "0.12"
 rayon = { version = "1", optional = true }
 polars = { version = "0.53", default-features = false, features = ["csv", "lazy", "fmt", "parquet", "json", "dtype-datetime", "temporal"] }
+crossbeam-channel = "0.5"
 
 [features]
 default = ["c-probe", "parallel-analyze"]
