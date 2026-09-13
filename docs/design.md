@@ -1595,7 +1595,7 @@ c-probe = ["cc", "pkg-config"]
 rencoder_lib = { path = "../rencoder_lib", features = ["parallel-analyze"] }
 clap = { version = "4", features = ["derive"] }
 dialoguer = "0.11"
-ctrlc = "3"
+ctrlc = "3.4"
 parking_lot = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

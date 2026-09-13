@@ -1,4 +1,4 @@
-//! Signal handling: clean up partial output on SIGINT/SIGTERM/SIGHUP.
+//! Signal handling: clean up partial output on SIGINT.
 //!
 //! The handler is global (one per process). `main.rs` calls
 //! `install_handler()` once at process start, then passes the returned
@@ -7,13 +7,13 @@
 //! ffmpeg runs and clears after, so a signal mid-encode removes the
 //! half-written file.
 //!
-//! `signal-hook::iterator::Signals` runs a single background thread
-//! listening for `SIGINT` (Ctrl-C), `SIGTERM` (`kill <pid>` default,
-//! container orchestrators), and `SIGHUP` (SSH session disconnect) —
-//! matching encode.zsh's `trap _cleanup INT TERM HUP` exactly. We
-//! chose `signal-hook` over `ctrlc` because the latter only handles
-//! SIGINT; for SIGTERM/SIGHUP we'd need a second crate or `libc::signal`
-//! C-style handler (which can't access the Arc<Mutex>).
+//! `ctrlc::set_handler` installs a SIGINT handler that crosses to
+//! Windows console events internally — that's the only signal we
+//! cover. `encode.zsh`'s `trap _cleanup INT TERM HUP` covers more,
+//! but `ctrlc` can't reach SIGTERM/SIGHUP without an additional
+//! crate or `libc::signal` (C-style handler can't access the
+//! `Arc<Mutex>`). See §3.4.5 of `docs/design.md` for the tradeoff
+//! rationale (Windows extension preserved over TERM/HUP coverage).
 //!
 //! The `CurrentOutput` type is re-exported from
 //! `rencoder_lib::pipeline::partial_output` so the lib's `transcode_batch`
@@ -22,28 +22,22 @@
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
-use signal_hook::iterator::Signals;
 
 /// Re-export of the lib type for callers that don't want to depend on
 /// `rencoder_lib::pipeline::partial_output` directly.
 pub type CurrentOutput = rencoder_lib::pipeline::partial_output::PartialOutputHandle;
 
-/// Install signal handlers (SIGINT + SIGTERM + SIGHUP) that remove the
-/// registered partial output and exit with status 1. Spawns one
-/// background thread to listen on the signals; the returned
-/// `CurrentOutput` is the cell main.rs passes to `transcode_batch`.
+/// Install a SIGINT handler that removes the registered partial
+/// output and exits with status 1. The returned `CurrentOutput` is
+/// the cell main.rs passes to `transcode_batch`.
 pub fn install_handler() -> CurrentOutput {
     let current: CurrentOutput = Arc::new(Mutex::new(None));
     let signal_output = current.clone();
 
-    let mut signals =
-        Signals::new([SIGINT, SIGTERM, SIGHUP]).expect("failed to register signal handlers");
-
-    std::thread::spawn(move || {
-        // `signals.forever()` blocks until a signal arrives; each
-        // iteration consumes one signal. The body always calls
-        // `std::process::exit(1)` on signal so the loop runs once per
+    ctrlc::set_handler(move || {
+        // `ctrlc::set_handler` invokes this closure on SIGINT (cross-
+        // platform: Unix signal + Windows console event). We always
+        // call `std::process::exit(1)` so the handler runs once per
         // process -- clippy::never_loop is a false positive here.
         //
         // We log via `tracing::warn!` (not `eprintln!`) so the event
@@ -56,66 +50,51 @@ pub fn install_handler() -> CurrentOutput {
         //     task N/M interrupt
         //     {batch_label} interrupt at {batch_path}, M files successed
         // where M = ctx.index - 1 (tasks completed before this one).
-        #[allow(clippy::never_loop)]
-        for sig in signals.forever() {
-            let sig_name = match sig {
-                SIGINT => "SIGINT",
-                SIGTERM => "SIGTERM",
-                SIGHUP => "SIGHUP",
-                _ => "unknown",
+
+        if let Some(ctx) = signal_output.lock().take() {
+            // Task-level scaffold: which file was in flight when
+            // the signal arrived.
+            tracing::warn!("    task {}/{} interrupt", ctx.index, ctx.total);
+
+            // Remove the partial output if there is one. analyze
+            // tasks have output = None; nothing to clean up.
+            // We log a separate warn on failure but keep the
+            // batch-level summary line identical so post-mortem
+            // tooling can pattern-match it.
+            let removed = match ctx.output.as_ref() {
+                Some(output) => match std::fs::remove_file(output) {
+                    Ok(()) => Ok(output.clone()),
+                    Err(e) => Err(format!("failed to remove {}: {e}", output.display())),
+                },
+                None => Ok(std::path::PathBuf::new()),
             };
-
-            if let Some(ctx) = signal_output.lock().take() {
-                // Task-level scaffold: which file was in flight when
-                // the signal arrived.
-                tracing::warn!("    task {}/{} interrupt", ctx.index, ctx.total);
-
-                // Remove the partial output if there is one. analyze
-                // tasks have output = None; nothing to clean up.
-                // We log a separate warn on failure but keep the
-                // batch-level summary line identical so post-mortem
-                // tooling can pattern-match it.
-                let removed = match ctx.output.as_ref() {
-                    Some(output) => match std::fs::remove_file(output) {
-                        Ok(()) => Ok(output.clone()),
-                        Err(e) => Err(format!("failed to remove {}: {e}", output.display())),
-                    },
-                    None => Ok(std::path::PathBuf::new()),
-                };
-                if let Err(e) = &removed {
-                    tracing::warn!("{}", e);
-                }
-
-                // Batch-level scaffold: summary of the interrupted
-                // batch. M = tasks completed before interrupt.
-                let completed = ctx.index.saturating_sub(1);
-                tracing::warn!(
-                    "{} interrupt at {}, {} files successed",
-                    ctx.batch_label,
-                    ctx.batch_path.display(),
-                    completed
-                );
-
-                // Quiet the unused-variable warning from `sig_name`:
-                // we keep the variable in scope for the future case
-                // where the handler wants to log the signal name in
-                // the task-level line.
-                let _ = sig_name;
-            } else {
-                // Signal arrived outside any batch (e.g. before any
-                // task started). Still log the signal name for the
-                // operator.
-                tracing::warn!("received {sig_name} (no active batch)");
+            if let Err(e) = &removed {
+                tracing::warn!("{}", e);
             }
 
-            // `process::exit(1)` skips destructors but the tracing
-            // subscriber's `fmt::Layer` writes synchronously per event
-            // via our FileSink (no internal buffer), and the kernel
-            // flushes its page cache during process teardown -- so the
-            // log line lands on disk before we exit.
-            std::process::exit(1);
+            // Batch-level scaffold: summary of the interrupted
+            // batch. M = tasks completed before interrupt.
+            let completed = ctx.index.saturating_sub(1);
+            tracing::warn!(
+                "{} interrupt at {}, {} files successed",
+                ctx.batch_label,
+                ctx.batch_path.display(),
+                completed
+            );
+        } else {
+            // Signal arrived outside any batch (e.g. before any
+            // task started). Still log for the operator.
+            tracing::warn!("received SIGINT (no active batch)");
         }
-    });
+
+        // `process::exit(1)` skips destructors but the tracing
+        // subscriber's `fmt::Layer` writes synchronously per event
+        // via our FileSink (no internal buffer), and the kernel
+        // flushes its page cache during process teardown -- so the
+        // log line lands on disk before we exit.
+        std::process::exit(1);
+    })
+    .expect("failed to register ctrlc handler");
 
     current
 }
