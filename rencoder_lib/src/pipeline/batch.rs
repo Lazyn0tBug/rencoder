@@ -27,6 +27,7 @@ use crate::encoder::{
     select::select_encoder,
 };
 use crate::error::EncodeError;
+use crate::pipeline::cancel::CancelToken;
 use crate::pipeline::partial_output::PartialOutputHandle;
 use crate::pipeline::task::TaskManager;
 use crate::types::{
@@ -536,6 +537,203 @@ fn stderr_tail(stderr: &str, n: usize) -> String {
         .rev()
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Structured progress snapshot from ffmpeg's `-progress pipe:1`
+/// output (U21, §3.8.3 `Event::Progress`). Built incrementally as we
+/// parse key=value lines, then emitted once per `progress=continue`
+/// / `progress=end` block.
+#[derive(Clone, Debug, Default)]
+pub struct FfmpegProgress {
+    pub frame: u64,
+    pub fps: f64,
+    /// Encoding speed multiplier as a ratio (e.g. `1.5` for 1.5x).
+    /// `0.0` when ffmpeg reports `N/A` or hasn't started yet.
+    pub speed: f64,
+    pub time_secs: f64,
+    /// `(total - time) / speed`. `None` when speed is too low to be
+    /// meaningful (< 0.001) or when caller didn't provide total
+    /// duration.
+    pub eta_secs: Option<f64>,
+}
+
+/// Spawn ffmpeg with the given argv (built by `build_ffmpeg_command`),
+/// stream progress to `on_progress`, and return when the process
+/// exits or is cancelled. This is the U21 sibling to
+/// `run_ffmpeg_with_stderr` — the latter stays as the CLI path
+/// (terminal-attached, blocking). This one is for the GUI path
+/// (event-driven, cancellable).
+///
+/// Differences from `run_ffmpeg_with_stderr`:
+/// - Uses `cmd.spawn()` instead of `cmd.output()`, so we can read
+///   progress while the child runs and kill it mid-stream.
+/// - Appends `-progress pipe:1` to argv so ffmpeg writes structured
+///   key=value lines to stdout instead of overwriting stderr.
+/// - Polls `cancel.is_cancelled()` between progress reads; on detection
+///   kills the child and returns `Err(Cancelled, _, _)`.
+/// - Stderr still captured in a background thread for the
+///   `ErrorContext.ffmpeg_stderr_tail` payload on failure.
+///
+/// Returns the same `Result<(), (ErrorCategory, String, String)>`
+/// shape as `run_ffmpeg_with_stderr` so the controller can wrap
+/// both uniformly.
+pub fn run_ffmpeg_with_progress(
+    argv: &[String],
+    cancel: &CancelToken,
+    total_duration_secs: Option<f64>,
+    on_progress: &mut dyn FnMut(FfmpegProgress),
+) -> Result<(), (ErrorCategory, String, String)> {
+    if argv.is_empty() {
+        return Err((
+            ErrorCategory::ConfigError,
+            "empty ffmpeg argv".into(),
+            String::new(),
+        ));
+    }
+
+    let program = &argv[0];
+    let mut args: Vec<String> = argv[1..].to_vec();
+    // Append `-progress pipe:1`. ffmpeg writes structured progress
+    // to stdout and suppresses the regular status updates when this
+    // flag is set. CLI path doesn't use this — it gets raw status
+    // lines from stderr.
+    args.push("-progress".into());
+    args.push("pipe:1".into());
+
+    let mut cmd = Command::new(program);
+    cmd.args(&args);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return Err((
+                ErrorCategory::FfmpegSpawnFailed,
+                format!("spawn {program}: {e}"),
+                String::new(),
+            ));
+        }
+    };
+
+    let stdout = child
+        .stdout
+        .take()
+        .expect("child stdout was configured with Stdio::piped()");
+    let stderr = child
+        .stderr
+        .take()
+        .expect("child stderr was configured with Stdio::piped()");
+
+    // Stderr reader thread: collects tail for ErrorContext.ffmpeg_stderr_tail
+    // on failure. We don't surface stderr live in this path (CLI path
+    // inherits stderr to the terminal instead).
+    let stderr_thread = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = String::new();
+        let _ = std::io::BufReader::new(stderr).read_to_string(&mut buf);
+        stderr_tail(&buf, 20)
+    });
+
+    // Stdout reader: ffmpeg writes key=value lines, with blocks
+    // separated by `progress=continue` / `progress=end`.
+    use std::io::BufRead;
+    let stdout_reader = std::io::BufReader::new(stdout);
+    let mut current = FfmpegProgress::default();
+    let mut last_speed = 1.0_f64; // for ETA calc when speed=0 mid-block
+
+    for line in stdout_reader.lines() {
+        // Cancel poll: cheap, runs once per progress line (~2/sec).
+        if cancel.is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stderr_thread.join();
+            return Err((
+                ErrorCategory::Cancelled,
+                format!("{program} cancelled by user"),
+                String::new(),
+            ));
+        }
+
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+
+        if line.is_empty() {
+            continue;
+        }
+
+        if let Some((key, value)) = line.split_once('=') {
+            match key {
+                "frame" => current.frame = value.parse().unwrap_or(0),
+                "fps" => current.fps = value.parse().unwrap_or(0.0),
+                "speed" => {
+                    // ffmpeg writes "1.5x" or "N/A" — strip the suffix.
+                    let cleaned = value.trim_end_matches('x').trim();
+                    let parsed: f64 = cleaned.parse().unwrap_or(0.0);
+                    current.speed = parsed;
+                    if parsed > 0.0 {
+                        last_speed = parsed;
+                    }
+                }
+                "out_time_us" => {
+                    // microseconds → seconds. This is the canonical
+                    // key in current ffmpeg; out_time_ms is also
+                    // supported for older builds.
+                    let us: u64 = value.parse().unwrap_or(0);
+                    current.time_secs = us as f64 / 1_000_000.0;
+                }
+                "out_time_ms" => {
+                    let ms: u64 = value.parse().unwrap_or(0);
+                    current.time_secs = ms as f64 / 1_000.0;
+                }
+                "progress" => {
+                    // Emit one snapshot per block; reset for the next.
+                    current.eta_secs = if last_speed >= 0.001 {
+                        total_duration_secs
+                            .map(|total| (total - current.time_secs).max(0.0) / last_speed)
+                    } else {
+                        None
+                    };
+                    on_progress(current.clone());
+                    if value == "end" {
+                        break;
+                    }
+                    current = FfmpegProgress::default();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Stdout reader drops here automatically (it's not Copy); the
+    // child can no longer block on a full pipe since ffmpeg only
+    // writes progress blocks (~50 lines per file).
+
+    let status = match child.wait() {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = stderr_thread.join();
+            return Err((
+                ErrorCategory::FfmpegSpawnFailed,
+                format!("wait {program}: {e}"),
+                String::new(),
+            ));
+        }
+    };
+
+    let stderr_tail_str = stderr_thread.join().unwrap_or_default();
+
+    if !status.success() {
+        return Err((
+            ErrorCategory::FfmpegNonzeroExit,
+            format!("{program} exited {status}"),
+            stderr_tail_str,
+        ));
+    }
+
+    Ok(())
 }
 
 /// Extract the encoder name from a build_ffmpeg_command argv. The argv
