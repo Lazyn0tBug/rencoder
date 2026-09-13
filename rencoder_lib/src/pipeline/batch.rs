@@ -68,24 +68,10 @@ pub fn transcode_single(
         .as_ref()
         .expect("transcode_single called with TranscodeTask.output = None");
 
-    if output_path.exists() {
-        // Visible scaffold: the task scaffold in TaskManager::run emits
-        // generic start/end lines. Domain-level skips like this one need
-        // their own log so operators can tell "ran and wrote" from
-        // "did nothing because the output was already on disk".
-        log::info!(
-            "    task skipped: output already exists at {}",
-            output_path.display()
-        );
-        return Ok(make_skipped_record(
-            task,
-            params,
-            started_at_meta,
-            None,
-            SkippedReason::OutputExists,
-        ));
-    }
-
+    // Probe input FIRST so we have ground truth (source duration) for
+    // partial-output detection (§3.3.6 + §8 item 40). SIGTERM/SIGHUP
+    // can no longer clean up partial files (see §3.4.5 "注意"), so
+    // re-runs must detect + auto-remove + reencode them.
     let metadata = match probe_video_metadata_auto(&task.input) {
         Ok(m) => m,
         Err(e) => {
@@ -98,6 +84,69 @@ pub fn transcode_single(
             ));
         }
     };
+
+    if output_path.exists() {
+        // Probe the candidate output. Probe failure or missing duration
+        // is treated as partial (video output always has a duration;
+        // absence = corrupt or truncated file).
+        let output_meta = probe_video_metadata_auto(output_path).ok();
+        let is_partial = match (
+            metadata.duration_secs,
+            output_meta.as_ref().and_then(|m| m.duration_secs),
+        ) {
+            // Output more than 1s shorter than source → partial.
+            (Some(src), Some(out)) => out + 1.0 < src,
+            // No output duration / probe failed → partial.
+            (Some(_), None) => true,
+            // No source duration → no ground truth; treat as real
+            // (skip) to avoid false positives on weird inputs.
+            (None, _) => false,
+        };
+
+        if is_partial {
+            match std::fs::remove_file(output_path) {
+                Ok(()) => {
+                    log::warn!(
+                        "    partial output detected at {} (output {:.2}s vs source {:.2}s); removed, re-encoding",
+                        output_path.display(),
+                        output_meta.as_ref().and_then(|m| m.duration_secs).unwrap_or(0.0),
+                        metadata.duration_secs.unwrap_or(0.0),
+                    );
+                    // Fall through to the normal encode path below.
+                }
+                Err(e) => {
+                    log::warn!(
+                        "    partial output detected at {} but removal failed: {}; skipping",
+                        output_path.display(),
+                        e,
+                    );
+                    return Ok(make_skipped_record(
+                        task,
+                        params,
+                        started_at_meta,
+                        None,
+                        SkippedReason::PartialOutput,
+                    ));
+                }
+            }
+        } else {
+            // Visible scaffold: the task scaffold in TaskManager::run emits
+            // generic start/end lines. Domain-level skips like this one need
+            // their own log so operators can tell "ran and wrote" from
+            // "did nothing because the output was already on disk".
+            log::info!(
+                "    task skipped: output already exists at {}",
+                output_path.display()
+            );
+            return Ok(make_skipped_record(
+                task,
+                params,
+                started_at_meta,
+                None,
+                SkippedReason::OutputExists,
+            ));
+        }
+    }
 
     let argv = build_argv(task, params, cache, config, &metadata);
     transcode_with_argv(
