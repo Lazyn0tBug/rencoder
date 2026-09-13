@@ -5,7 +5,7 @@ Rust rewrite of `encode.zsh` and `video_fps_stats.zsh`: smart video transcoding 
 ## Workspace
 
 - `rencoder_lib` -- core library (`thiserror`, `walkdir`, `rayon`, `toml`); `publish = false` (U18, internal lib not on crates.io)
-- `rencoder_cli` -- CLI frontend (`clap`, `dialoguer`, `ctrlc`, `parking_lot`)
+- `rencoder_cli` -- CLI frontend (`clap`, `dialoguer`, `signal-hook`, `parking_lot`)
 
 Design source of truth: `docs/design.md`. Update the doc first when behavior changes.
 

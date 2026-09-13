@@ -82,17 +82,17 @@ Rencoder 是一个独立的第三方应用，不是发布到 crates.io 的通用
 |------|----------------------|---------|------|
 | config 文件 mode bits | `0o644` | no-op（TBD future work） | `rencoder_lib::config::fs_perms::set_config_file_mode` |
 | log / data 目录 mode bits | `0o755` | no-op（TBD future work） | `rencoder_lib::config::fs_perms::set_app_dir_mode` |
-| SIGINT → 清理半成品文件（§3.4.5） | 跨平台（`ctrlc` crate 抽象） | 跨平台（同） | `rencoder_cli::signal` + `rencoder_lib::pipeline::partial_output` |
+| SIGINT/SIGTERM/SIGHUP → 清理半成品文件（§3.4.5） | 跨平台（`signal-hook` crate 抽象） | 跨平台（同） | `rencoder_cli::signal` + `rencoder_lib::pipeline::partial_output` |
 
 **信号处理为什么不需要 `#[cfg]`**：本节列出的 fs_perms 调用的是 Unix-only Rust stdlib
 API（`PermissionsExt::from_mode`），所以需要 `#[cfg(unix)]` 切到 no-op 分支。信号处理不同：
-`ctrlc::set_handler` 在内部统一处理 Unix signal 和 Windows console event；`Arc<Mutex<PathBuf>>`、
+`signal-hook` 在内部统一处理 Unix signal 和 Windows console event；`Arc<Mutex<PathBuf>>`、
 `std::fs::remove_file`、`std::process::exit`、`eprintln!` 都是 stdlib 跨平台 API。源码里
 **没有任何 platform-specific 调用**——不需要 `#[cfg]`。
 
 **为什么不预先加防御性 `#[cfg]`**：加 `#[cfg(unix)]` + `#[cfg(not(unix))]` 重复 no-op 模式是
-cargo-cult —— 真正的 platform divergence 在 `ctrlc` 内部已经被它处理。如果未来加 GUI/Tauri
-build，**不复用** `rencoder_cli::signal`（webview 有自己的 beforeunload / IPC 机制），
+cargo-cult —— 真正的 platform divergence 在 `signal-hook` 内部已经被它处理。GUI build
+（§3.8）**不复用** `rencoder_cli::signal`（webview 有自己的 beforeunload / IPC 机制），
 会单独写。**所以这个 module 的 cross-platform story 是 "lib 内置 + CLI-only 作用域 + 不复用"，不是
 "加 `#[cfg]` 防御"**。
 
@@ -122,7 +122,7 @@ fs_perms::set_config_file_mode(&tmp)?;
 | FFmpeg 输出 | `ProcessOutput::Inherit` 透传（默认） | 与脚本一致；未来 GUI 用 `Piped` |
 | 文件遍历 | `walkdir` | 纯 Rust，不依赖外部工具；不跟随符号链接 |
 | 线程模型 | 转码：单线程串行；分析：可选并行（`rayon`） | 转码与脚本一致 |
-| 信号处理 | `ctrlc` + `parking_lot::Mutex` | 无中毒语义 |
+| 信号处理 | `signal-hook` + `parking_lot::Mutex` | 无中毒语义（U18.1.1） |
 | 命令行解析 | `clap`（derive） | 仅 CLI 前端 |
 | 交互模式 | `dialoguer` | 仅 CLI 前端 |
 | 错误处理 | `anyhow`（CLI）+ `thiserror`（核心库） | 分层清晰 |
@@ -360,7 +360,7 @@ rencoder_cli/
 ├── main.rs
 ├── args.rs               # clap 参数（含 --nv）
 ├── interact.rs           # dialoguer 交互
-├── signal.rs             # ctrlc + parking_lot::Mutex
+├── signal.rs             # signal-hook + parking_lot::Mutex（U18.1.1）
 ├── tracing_init.rs       # tracing-subscriber 初始化 + 双 sink
 └── file_sink.rs          # 自定义 MakeWriter：日/大小双轴滚动
 ```
@@ -441,7 +441,8 @@ pub enum ProcessOutput {
     /// 透传到父进程（默认，与脚本一致）
     #[default]
     Inherit,
-    /// 通过管道捕获（GUI 使用）
+    /// 通过管道捕获。CLI 当前不用;§3.8 GUI 路径绕开了这个枚举,
+    /// 用 `cmd.spawn()` + reader 线程直接消费 stderr。
     Piped,
     /// 丢弃
     Null,
@@ -1478,7 +1479,7 @@ UI 启动时调一次，拿到 `(cmd_tx, evt_rx)`，然后再不管 lib 内部�
 | `pipeline/batch.rs` | `run_ffmpeg_with_progress(argv, cancel, on_progress)` | `cmd.spawn()` 替代 `cmd.output()`，支持 cancel + progress 回调；CLI 路径的同步 ffmpeg 编排保留不动 |
 | `data/store.rs` | `read_records(path) -> Vec<EncodingRecord>` | 单 Parquet 文件回读；多文件 glob + limit/after 过滤在 controller |
 | `config/path.rs` | `resolve_data_dir() -> PathBuf` | controller 在响应 `Command::LoadHistory` 时调此拿到数据目录(`$RENENCODER_DATA_DIR` > `<app_dir>/data`);**不**走 `Command::LoadHistory` 的 payload,UI 不需要知道路径 |
-| `job.rs`（新） | `start_controller() -> ControllerHandle` | 编排：后台线程 + mpsc + 现有 `transcode_batch` + 新 `run_ffmpeg_with_progress` |
+| `job.rs`（新） | `start_controller() -> ControllerHandle` | 编排：后台线程 + mpsc + 现有 `transcode_batch`（**复用 CLI 路径的纯函数，不 fork**）+ 新 `run_ffmpeg_with_progress`；job.rs 是 thin glue，把现有 pieces 装成 actor |
 | `job.rs`（新） | `pub enum Command` / `pub enum Event` | 消息协议（见 §3.8.3） |
 
 **CancelToken 共享**：UI `Command::Cancel` 与 SIGINT handler（lib 内部安装，可选）共享同一个 `Arc<AtomicBool>`，等价语义——UI 按钮和 Ctrl-C 都把同一个 token 置位。
@@ -1595,7 +1596,7 @@ c-probe = ["cc", "pkg-config"]
 rencoder_lib = { path = "../rencoder_lib", features = ["parallel-analyze"] }
 clap = { version = "4", features = ["derive"] }
 dialoguer = "0.11"
-ctrlc = "3"
+signal-hook = "0.3"
 parking_lot = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -1673,7 +1674,7 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 14 | 集成测试与文档 |
 | 15 | （可选）`parallel-analyze`：`rayon` 并行分析 |
 | 16 | （可选）`c-probe`：C FFI 桥接层 |
-| 17 | （可选）GUI 前端（`rencoder_ui`）：Dioxus desktop（0.6），actor 模型（§3.8），`Command` / `Event` 双通道；lib 新增 `start_controller` + `CancelToken` + `run_ffmpeg_with_progress` + Parquet 回读 |
+| 17 | GUI 前端（`rencoder_ui`，U21）：Dioxus desktop（0.6），actor 模型（§3.8），`Command` / `Event` 双通道；lib 新增 `start_controller` + `CancelToken` + `run_ffmpeg_with_progress` + Parquet 回读 |
 
 ---
 

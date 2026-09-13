@@ -366,9 +366,7 @@ Schema evolution: edit `records_to_dataframe` once.
 writer adds ~5-10 MB); `cargo clippy --workspace --all-targets` clean.
 
 
-- [ ] Framework decision (Tauri / egui / Slint) — separate decision, separate crate
-- [ ] New crate `rencoder_gui` consuming `rencoder_lib`
-- [ ] Use `ProcessOutput::Piped` for live progress UI
+- [ ] **GUI work — superseded by design.md §3.8**. Framework: Dioxus desktop 0.6; crate: `rencoder_ui`; protocol: actor model with `Command`/`Event` mpsc. See `docs/design.md` §3.8 and §8 items 22–39 for the committed design.
 - **Verify**: out of scope for this plan
 
 ---
