@@ -41,8 +41,8 @@ Traced from `docs/smart_code.md` §8 (21 confirmation items). All confirmed by t
 | R10 | `collect_files` uses `walkdir`, does not follow symlinks, does not depend on `fd`. |
 | R11 | Parallel analysis uses `rayon`; no `xargs`. |
 | R12 | NVIDIA detection is `--nv` AND `nvidia-smi -L` reporting a GPU. No `ffmpeg -encoders` inference. |
-| R13 | `ProcessOutput::Inherit` is default; `Piped` variant exists but is unused by the GUI path — §3.8 GUI uses `cmd.spawn()` + reader thread instead (avoids IPC serialization tax). |
-| R14 | Signal handling uses `signal-hook` plus `parking_lot::Mutex` (U18.1.1 replaced `ctrlc` for SIGINT/SIGTERM/SIGHUP coverage). |
+| R13 | `ProcessOutput::Inherit` is default; `Piped` for the future GUI (kept; §3.8 GUI currently bypasses via `cmd.spawn()`). |
+| R14 | Signal handling uses `ctrlc` plus `parking_lot::Mutex` (cross-platform incl. Windows console events). |
 | R15 | `EncodeError` is `#[non_exhaustive]`. |
 | R16 | `FpsStats::new(total_files)` initializes the total count. |
 | R17 | The `c-probe` FFI bridge is stateless, re-entrant, and `rayon`-safe. |
@@ -76,7 +76,7 @@ KTDs traceable to `docs/smart_code.md` §2.
         clap args  --->  dialoguer (interactive)
                 \          |
                  \         v
-                  +-> signal.rs (signal-hook + parking_lot::Mutex; U18.1.1)
+                  +-> signal.rs (ctrlc + parking_lot::Mutex)
                               |
                               v
                     rencoder_lib  (Phase 1-7)
@@ -98,7 +98,7 @@ KTDs traceable to `docs/smart_code.md` §2.
 1. CLI parses clap args into `EncodeParams` + a `--config` path.
 2. `Config::load(path)` parses JSON; `cfg.max_fps_config()` produces the runtime `MaxFpsConfig`.
 3. `init_encoder_cache(enable_nv)` runs `ffmpeg -encoders` once and (if `--nv`) `nvidia-smi -L`.
-4. `signal_hook` registers the partial-file cleanup using a `parking_lot::Mutex<Option<PathBuf>>`.
+4. `ctrlc::set_handler` registers the partial-file cleanup using a `parking_lot::Mutex<Option<PathBuf>>`.
 5. `collect_files(target, extensions)` walks `walkdir`, filters by extension, returns `Vec<PathBuf>`.
 6. `transcode_batch` iterates: for each file, `transcode_single` runs:
    1. Check output existence (skip if so, except when force-reduce applies).
@@ -254,7 +254,7 @@ The `-r` block is the single most error-prone position; the unit test in U5 must
 
 ### U8. CLI core: args + signal + logging
 
-- **Goal**: `clap`-derived args for `encode` and `analyze` subcommands; `signal-hook`c` handler that cleans up partial output; `env_logger` initialization.
+- **Goal**: `clap`-derived args for `encode` and `analyze` subcommands; `ctrlc`c` handler that cleans up partial output; `env_logger` initialization.
 - **Requirements**: R13, R14, R19.
 - **Dependencies**: U1.
 - **Files**:

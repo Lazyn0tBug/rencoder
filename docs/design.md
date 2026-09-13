@@ -82,17 +82,17 @@ Rencoder 是一个独立的第三方应用，不是发布到 crates.io 的通用
 |------|----------------------|---------|------|
 | config 文件 mode bits | `0o644` | no-op（TBD future work） | `rencoder_lib::config::fs_perms::set_config_file_mode` |
 | log / data 目录 mode bits | `0o755` | no-op（TBD future work） | `rencoder_lib::config::fs_perms::set_app_dir_mode` |
-| SIGINT/SIGTERM/SIGHUP → 清理半成品文件（§3.4.5） | 跨平台（`signal-hook` crate 抽象） | 跨平台（同） | `rencoder_cli::signal` + `rencoder_lib::pipeline::partial_output` |
+| SIGINT → 清理半成品文件（§3.4.5） | 跨平台（`ctrlc` crate 抽象） | 跨平台（同） | `rencoder_cli::signal` + `rencoder_lib::pipeline::partial_output` |
 
 **信号处理为什么不需要 `#[cfg]`**：本节列出的 fs_perms 调用的是 Unix-only Rust stdlib
 API（`PermissionsExt::from_mode`），所以需要 `#[cfg(unix)]` 切到 no-op 分支。信号处理不同：
-`signal-hook` 在内部统一处理 Unix signal 和 Windows console event；`Arc<Mutex<PathBuf>>`、
+`ctrlc::set_handler` 在内部统一处理 Unix signal 和 Windows console event；`Arc<Mutex<PathBuf>>`、
 `std::fs::remove_file`、`std::process::exit`、`eprintln!` 都是 stdlib 跨平台 API。源码里
 **没有任何 platform-specific 调用**——不需要 `#[cfg]`。
 
 **为什么不预先加防御性 `#[cfg]`**：加 `#[cfg(unix)]` + `#[cfg(not(unix))]` 重复 no-op 模式是
-cargo-cult —— 真正的 platform divergence 在 `signal-hook` 内部已经被它处理。GUI build
-（§3.8）**不复用** `rencoder_cli::signal`（webview 有自己的 beforeunload / IPC 机制），
+cargo-cult —— 真正的 platform divergence 在 `ctrlc` 内部已经被它处理。如果未来加 GUI/Tauri
+build，**不复用** `rencoder_cli::signal`（webview 有自己的 beforeunload / IPC 机制），
 会单独写。**所以这个 module 的 cross-platform story 是 "lib 内置 + CLI-only 作用域 + 不复用"，不是
 "加 `#[cfg]` 防御"**。
 
@@ -122,7 +122,7 @@ fs_perms::set_config_file_mode(&tmp)?;
 | FFmpeg 输出 | `ProcessOutput::Inherit` 透传（默认） | 与脚本一致；未来 GUI 用 `Piped` |
 | 文件遍历 | `walkdir` | 纯 Rust，不依赖外部工具；不跟随符号链接 |
 | 线程模型 | 转码：单线程串行；分析：可选并行（`rayon`） | 转码与脚本一致 |
-| 信号处理 | `signal-hook` + `parking_lot::Mutex` | 无中毒语义（U18.1.1） |
+| 信号处理 | `ctrlc` + `parking_lot::Mutex` | 无中毒语义 |
 | 命令行解析 | `clap`（derive） | 仅 CLI 前端 |
 | 交互模式 | `dialoguer` | 仅 CLI 前端 |
 | 错误处理 | `anyhow`（CLI）+ `thiserror`（核心库） | 分层清晰 |
@@ -360,7 +360,7 @@ rencoder_cli/
 ├── main.rs
 ├── args.rs               # clap 参数（含 --nv）
 ├── interact.rs           # dialoguer 交互
-├── signal.rs             # signal-hook + parking_lot::Mutex（U18.1.1）
+├── signal.rs             # ctrlc + parking_lot::Mutex
 ├── tracing_init.rs       # tracing-subscriber 初始化 + 双 sink
 └── file_sink.rs          # 自定义 MakeWriter：日/大小双轴滚动
 ```
@@ -901,27 +901,26 @@ NVIDIA 加速: 未启用
 =============================================
 ```
 
-#### 信号处理（U18 + U18.1 + U18.1.1）
+#### 信号处理（U18 + U18.1）
 
 **意图**：用户按 Ctrl-C 中断转码时，handler 读取当前正在写入的 output path，删除半成品
-文件，避免留下损坏的 `.mkv`/`.mp4`。这跟 `encode.zsh` 里的 `trap _cleanup INT TERM HUP`
-是同一类行为（zsh script line 142）。`signal-hook` crate 让一个 iterator thread 同时监听
-SIGINT / SIGTERM / SIGHUP 三个信号，跟 zsh 的 `trap _cleanup INT TERM HUP` 完全对齐。
+文件，避免留下损坏的 `.mkv`/`.mp4`。`ctrlc` crate 跨平台处理 SIGINT（Unix signal + Windows
+console event）。这跟 `encode.zsh` 里的 `trap _cleanup INT` 行为对应。
 
 **信号覆盖**：
 - `SIGINT`（Ctrl-C / 中断键）
-- `SIGTERM`（`kill <pid>` 默认 / 进程管理器 / 容器 orchestrator）
-- `SIGHUP`（SSH 断开 / 终端关闭）
 
-三者触发同一段 cleanup 逻辑（读 `current_output` → `fs::remove_file` → `exit(1)`）。**单次
-process 只有一个 listener thread**（在 `install_handler()` 里 spawn 一次），跟 `Arc<Mutex>` 共享
-state。
+**注意**：`encode.zsh` 还 trap 了 TERM/HUP；`ctrlc` 只覆盖 SIGINT。TERM/HUP 路径下当前
+直接 kill 进程、不清半成品文件——这是 `ctrlc` 选择的已知 tradeoff（保留 Windows 跨平台
+支持；U18.1.1 的 `signal-hook` 路径曾覆盖这三个信号，2026-09 revert 回 `ctrlc` 以保留
+Windows extension）。如需回到 TERM/HUP cleanup，需要 `libc::signal` 的 C-style handler
+（不能访问 `Arc<Mutex>`，与当前 `TaskContext` 设计不兼容）——future work。
 
-**Cross-platform story**：源码无 platform-specific 调用 —— `signal-hook` 内部统一处理
+**Cross-platform story**：源码无 platform-specific 调用 —— `ctrlc` 内部统一处理
 Unix signal / Windows console event，`Arc<Mutex<TaskContext>>` + `std::fs::remove_file` +
 `std::process::exit` + `tracing::warn!` 都是 stdlib 跨平台 API。所以本节代码**不需要 `#[cfg]` 分支**，
 跟 §1.3 表里 `fs_perms`（有 `#[cfg(unix)]`）不同。详细原因见 §1.3 末尾的"为什么信号处理不需要
-`#[cfg]`"小节。未来 Tauri/GUI build **不复用** `rencoder_cli::signal`（webview 有自己的
+`#[cfg]`"小节。GUI build（§3.8）**不复用** `rencoder_cli::signal`（webview 有自己的
 beforeunload / IPC 机制），会单独写。
 
 **完整 lifecycle**（U18 wiring fix + U18.1 TaskContext 增强）：
@@ -983,7 +982,7 @@ impl<'a> Guard<'a> { pub fn new(handle: ..., ctx: TaskContext) -> Self; }
 
 **Why the type lives in lib, not CLI**：lib 的 `transcode_batch` 需要接受 `current_output`
 参数（不能依赖 CLI 的 signal module，否则 lib 反向依赖 CLI）。CLI 的 `signal.rs` 只
-保留 `install_handler()` + `signal-hook` 依赖，type 重新声明为 `pub type CurrentOutput =
+保留 `install_handler()` + `ctrlc` 依赖，type 重新声明为 `pub type CurrentOutput =
 rencoder_lib::pipeline::partial_output::PartialOutputHandle;`。
 
 **Handler 安装**（CLI `signal.rs`）：
@@ -1596,7 +1595,7 @@ c-probe = ["cc", "pkg-config"]
 rencoder_lib = { path = "../rencoder_lib", features = ["parallel-analyze"] }
 clap = { version = "4", features = ["derive"] }
 dialoguer = "0.11"
-signal-hook = "0.3"
+ctrlc = "3"
 parking_lot = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

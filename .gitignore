@@ -9,3 +9,5 @@ rencoder_cli/data/
 # Build outputs. cargo-dist produces tarballs under target/distrib/;
 # the wrapper script stages them into dist/.
 /dist/
+
+.context/
