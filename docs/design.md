@@ -1605,7 +1605,9 @@ where
 
 #### 3.8.7 UI 端模式："everything is msg"
 
-Dioxus 端用 reducer 模式（Elm 架构）。UI 端的状态类型：
+Dioxus 端用 reducer 模式（Elm 架构）。所有用户输入转成 `Msg::User*`,所有 lib 反馈包成 `Msg::Lib(Event)`,统一走 reducer。
+
+**UI-side state types**（`rencoder_ui/src/msg.rs`）:
 
 ```rust
 /// 顶层 UI state。整个 app 一个,所有视图组件读它。
@@ -1618,15 +1620,24 @@ struct AppState {
     log: VecDeque<LogLine>,
     /// 历史记录(由 `Command::LoadHistory` 填充)
     history: Vec<EncodingRecord>,
+    /// UI 侧选中的输入目录(由 DirPicker 设置,Start 按钮读取)
+    input_dir: Option<PathBuf>,
+    /// 最近一次 fatal 错误(由 `Event::Error` 设置;UI 在 header 顶部展示)
+    last_error: Option<String>,
 }
 
-/// 当前批的元信息;由 `Event::BatchStarted` 写入、`Event::BatchCompleted`/`BatchCancelled` 关闭
+/// 当前批的元信息;由 `Event::BatchStarted` 写入、`Event::BatchCompleted`/`BatchCancelled` 关闭。
 struct BatchInfo {
     id: u64,
     total_files: usize,
+    /// 已完成的 records（每个 `FileCompleted` push 进来;`BatchCompleted` 用 lib 给的
+    /// records 覆盖以保证权威性）
+    records: Vec<EncodingRecord>,
     /// `cancelled: true` 后 reducer 忽略后续的 `Event::Progress` / `FileCompleted`
     /// 直到收到 `BatchCancelled` 或新 `BatchStarted`
     cancelled: bool,
+    /// batch 生命周期结束(`BatchCompleted` 或 `BatchCancelled` 触发后)
+    finished: bool,
 }
 
 /// 单文件进度;由 `Event::Progress` 更新
@@ -1638,18 +1649,25 @@ struct ProgressInfo {
     eta_secs: Option<f64>,
 }
 
-/// 单行 stderr;由 `Event::LogLine` 推送
+/// 单行 stderr;由 `Event::LogLine` 推送。
 struct LogLine {
     file_index: usize,
     line: String,
+    /// 接收时间(chrono::DateTime<Utc>);UI 按此排序展示
+    at: DateTime<Utc>,
 }
 
 enum Msg {
+    UserSelectedDir(PathBuf),
     UserClickedStart,
     UserClickedCancel,
-    UserOpenedHistory,
+    UserClickedLoadHistory,
     Lib(Event),
 }
+
+/// 唯一的状态变更入口。所有视图只读 state;所有写都走这里。
+fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>) {
+    match msg {
 
 fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &UnboundedSender<Command>) {
     match msg {
