@@ -1389,7 +1389,7 @@ cargo-dist 0.32 不支持 `dmg` installer 类型（只支持 msi/shell/powershel
 | Tier | 内容 | 状态 |
 |------|------|------|
 | **U21 (v1)** | actor 模型 + Command/Event 协议 + 三按钮 UI (Start / Cancel) + batch + progress 极简显示 + AppConfig 加载 + actor thread 错误处理 | bootstrap 完成（rencoder_ui crate） |
-| **v1.1** | DirPicker + EncodeParams 从 AppConfig + 扩展名过滤 + 三个 Panel (Progress/Log/History) + History 回读 | §3.8.7 limitations 表 |
+| **v1.1** | DirPicker + EncodeParams 从 AppConfig + 扩展名过滤 + 三个 Panel (Progress/Log/History) + History 回读 + Preview/Dry Run (`Command::DryRun`) | §3.8.7 limitations 表 |
 | **v1.2** | Native 文件对话框 + preset/max_fps passthrough | future work |
 | **Future** | 多批 + 非 Unix 平台 | deferred |
 
@@ -1585,8 +1585,11 @@ UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `int
 | `pipeline/batch.rs` | `transcode_single_with_progress` | GUI 路径的 per-file 入口(共享 `encode_prepare`,ffmpeg 调用换成 spawn 路径) |
 | `pipeline/batch.rs` | `build_encode_record` | CLI / GUI 共享的 record 构造(成功 / 失败两种 outcome) |
 | `pipeline/batch.rs` | `FfmpegProgress` struct | `Event::Progress` 的源数据 |
+| `pipeline/batch.rs` | `dry_run_batch(params, cache, config, files)` | Dry-run 路径(V1.1):跑 `encode_prepare` per file 但**不调 ffmpeg**,返回 planned `EncodingRecord`(Ready → Succeeded,Skipped/FailedProbe → as-is)。`encode.nv` 故意忽略——dry-run 不知道也不关心 GPU 是否启用 |
 | `job.rs` | `process_one_file` | controller StartBatch 循环里的 per-file 逻辑;接受泛型 `encode_fn` 闭包,让测试注入 mock encoder |
 | `job.rs` | `encode_error_category(&EncodeError) -> ErrorCategory` | 编码错误 → UI 展示分类的映射 |
+| `job.rs` | `Command::DryRun { params, files }` | Dry-run 入口(V1.1):跟 StartBatch 同样的 busy-gate,但 emit `Event::DryRunFinished` 而不是 `BatchCompleted` |
+| `job.rs` | `Event::DryRunFinished { records }` | Dry-run 结果:planned outcomes,**没有**实际 ffmpeg 输出 |
 | `data/store.rs` | `read_records(path)` | 单 Parquet 文件回读(v1 不使用,v1.1 启用) |
 
 **`process_one_file` testability surface**(§8 item 43)——这是 §3.8 唯一保留的函数签名,因为它**解释了为何要抽出这个 helper**(测试性):
@@ -1677,6 +1680,8 @@ CLI 路径(`rencoder_cli`,对照):
 #### 3.8.7 UI 端模式："everything is msg"
 
 Dioxus 端用 reducer 模式（Elm 架构）。所有用户输入转成 `Msg::User*`,所有 lib 反馈包成 `Msg::Lib(Event)`,统一走 reducer。
+
+**Dioxus-controlled inputs**:表单 input 字段(如 `DirPicker` 的目录路径、未来的 config editor)使用 `use_signal<String>` 而**不是** `value: "..."` 属性。`value=` 属性只在首次 render 时设置,不响应后续 state 变化;`use_signal` + 双向同步才能让 state → UI → state 流正确(M3 review finding)。
 
 **UI-side state types**（`rencoder_ui/src/msg.rs`）:
 
@@ -1790,6 +1795,7 @@ fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>) {
 | `EncodeParams` 来源 | **硬编码** `EncodeParams::default()`(AV1/CRF 45) | v1.1 从 `AppConfig::load().encode` 派生 |
 | 文件扩展名过滤 | **无**——Start 读目录下所有文件 | v1.1 用 `encode.extensions` glob |
 | `EncoderSettings.preset` / `max_fps_target` | **未传给 ffmpeg** | v1.1 build_ffmpeg_command 接 `EncodeParams` |
+| Preview / Dry Run | **未实现**——user 无法预览编码结果 | v1.1 加 `Command::DryRun` + `Event::DryRunFinished` |
 | Native 文件选择对话框 | **无**——v1 用 `<input type="text">` | v1.2 调研 `rfd` 或 Dioxus 内建 |
 
 这些限制不影响协议契约（Command/Event 已端到端测试通过 mock_tests），只是 UI 渲染层不完整。
@@ -1970,6 +1976,7 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 47 | `rencoder_lib::job::EncodingRecord` 重新导出——UI 需要命名 `Event::FileCompleted` / `BatchCompleted` 携带的 record 类型 | ✅ |
 | 48 | `rencoder_ui` crate bootstrap(Dioxus desktop 0.6)：reducer + 9 个 unit test;App 组件 wire ControllerHandle via `use_coroutine` + `use_signal`;v1 三按钮 (Start/Cancel)+ 极简状态显示;Load History 按钮存在但 v1 不显示历史(v1.1 启用 HistoryPanel) | ✅ |
 | 49 | Actor 退出显式信号：`Event::ActorExited { reason: ExitReason }` 作为最后一个 event 在 lib drop `evt_tx` 前发出；UI reducer 设 `controller_alive = false` + `last_exit = Some(reason)`。Lifecycle 对称：start = 构造,exit = 显式消息,中间交互 = Command/Event | ✅ |
+| 50 | Preview / Dry Run (Tier 2 #6):`Command::DryRun { params, files }` 跑 `encode_prepare` 但**不调 ffmpeg**,emit `Event::DryRunFinished { records }`;`dry_run_batch` lib helper 复用 probe + partial + skip 逻辑。UI `Preview` 按钮 → reducer arm → DryRunPanel 渲染 planned outcomes。`encode.nv` 故意忽略——dry-run 不知道也不关心 GPU 是否启用 | ✅ |
 
 ---
 
