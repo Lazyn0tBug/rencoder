@@ -1701,6 +1701,14 @@ struct AppState {
     input_dir: Option<PathBuf>,
     /// 最近一次 fatal 错误(由 `Event::Error` 设置;UI 在 header 顶部展示)
     last_error: Option<String>,
+    /// Whether the lib actor thread is still alive. Set false on
+    /// `Event::ActorExited`; the coroutine exits naturally after
+    /// that since the sender side has dropped. UI can offer
+    /// "Restart Controller" if `controller_alive == false`.
+    controller_alive: bool,
+    /// Reason the actor thread exited. `Some` after `ActorExited`;
+    /// `None` while alive or before any exit has happened.
+    last_exit: Option<ExitReason>,
 }
 
 /// 当前批的元信息;由 `Event::BatchStarted` 写入、`Event::BatchCompleted`/`BatchCancelled` 关闭。
@@ -1759,6 +1767,13 @@ fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &UnboundedSender<Command>) {
             while state.log.len() > 1000 { state.log.pop_front(); }
         }
         Msg::Lib(Event::HistoryLoaded { records }) => { state.history = records; }
+        Msg::Lib(Event::ActorExited { reason }) => {
+            // Last event before the channel closes. The coroutine
+            // will exit naturally on the next recv(); UI keeps the
+            // last_exit reason visible until a restart.
+            state.controller_alive = false;
+            state.last_exit = Some(reason);
+        }
         // ...
     }
 }
@@ -1959,6 +1974,7 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 46 | `load_history(data_dir, limit, after)` 显式接受 data_dir 参数(不读 env var)——让 mock 测试 parallel-safe,env vars 是 process-global 会 race（v1.1 启用） | ✅ |
 | 47 | `rencoder_lib::job::EncodingRecord` 重新导出——UI 需要命名 `Event::FileCompleted` / `BatchCompleted` 携带的 record 类型 | ✅ |
 | 48 | `rencoder_ui` crate bootstrap(Dioxus desktop 0.6)：reducer + 9 个 unit test;App 组件 wire ControllerHandle via `use_coroutine` + `use_signal`;v1 三按钮 (Start/Cancel)+ 极简状态显示;Load History 按钮存在但 v1 不显示历史(v1.1 启用 HistoryPanel) | ✅ |
+| 49 | Actor 退出显式信号：`Event::ActorExited { reason: ExitReason }` 作为最后一个 event 在 lib drop `evt_tx` 前发出；UI reducer 设 `controller_alive = false` + `last_exit = Some(reason)`。Lifecycle 对称：start = 构造,exit = 显式消息,中间交互 = Command/Event | ✅ |
 
 ---
 
