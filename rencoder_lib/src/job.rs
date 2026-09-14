@@ -645,9 +645,6 @@ fn load_history(
 /// `StartBatch` loop once `transcode_single` accepts a progress
 /// callback. Currently unused — kept `pub(crate)` so future
 /// plumbing can call it without re-exporting.
-#[allow(dead_code)]
-pub(crate) fn _progress_unused(_p: FfmpegProgress) {}
-
 #[cfg(test)]
 mod controller_tests {
     use super::*;
