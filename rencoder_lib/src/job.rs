@@ -286,6 +286,23 @@ enum ProcessError {
 /// - `Event::Progress { ... }` per FfmpegProgress callback (during)
 /// - `Event::FileCompleted { index, record }` (on Ok return)
 ///
+/// Map an `EncodeError` (from the encode closure) to the appropriate
+/// `ErrorCategory` for `Event::Error`. Per design §3.8.6 mapping table:
+///   Io → IoError, Ffmpeg → FfmpegSpawnFailed, Probe → ProbeFailed,
+///   InvalidParam / FpsParse → ConfigError,
+///   EncoderNotFound → EncoderSelectionFailed, UserCancel → Cancelled.
+pub(crate) fn encode_error_category(e: &EncodeError) -> ErrorCategory {
+    match e {
+        EncodeError::Io(_) => ErrorCategory::IoError,
+        EncodeError::Ffmpeg(_) => ErrorCategory::FfmpegSpawnFailed,
+        EncodeError::Probe(_) => ErrorCategory::ProbeFailed,
+        EncodeError::InvalidParam(_) => ErrorCategory::ConfigError,
+        EncodeError::EncoderNotFound(_) => ErrorCategory::EncoderSelectionFailed,
+        EncodeError::FpsParse(_) => ErrorCategory::ConfigError,
+        EncodeError::UserCancel => ErrorCategory::Cancelled,
+    }
+}
+
 /// Returns `Err(ProcessError::Encode)` if the encode closure errors
 /// (caller emits `Event::Error`). Returns
 /// `Err(ProcessError::EventSend)` if `emit` has been disconnected
@@ -534,7 +551,7 @@ fn run_actor(cmd_rx: Receiver<Command>, evt_tx: Sender<Event>) {
                         }
                         Err(ProcessError::Encode(e)) => {
                             let _ = evt_tx.send(Event::Error {
-                                category: ErrorCategory::ConfigError,
+                                category: encode_error_category(&e),
                                 message: format!("encode error: {e}"),
                             });
                         }
@@ -766,11 +783,11 @@ mod mock_tests {
                                 Ok(record) => records.push(record),
                                 Err(super::ProcessError::Encode(e)) => {
                                     // Mirror production: surface setup-
-                                    // level errors as Event::Error.
-                                    // (process_one_file already sent
-                                    // FileStarted for this index.)
+                                    // level errors as Event::Error, using
+                                    // the same EncodeError→ErrorCategory
+                                    // mapping as production.
                                     let _ = evt_tx.send(Event::Error {
-                                        category: ErrorCategory::ConfigError,
+                                        category: super::encode_error_category(&e),
                                         message: format!("encode error: {e}"),
                                     });
                                 }
@@ -1252,18 +1269,43 @@ mod mock_tests {
         drop(cmd_tx);
 
         let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
-        // Expect: BatchStarted, Error(ConfigError), BatchCompleted(empty)
-        // (the loop bails on first encode error in our mock actor —
-        // process_one_file surfaces Err which the actor maps to
-        // Event::Error + continues to BatchCompleted with no records).
+        // Expect: BatchStarted, Error(FfmpegSpawnFailed per mapping
+        // table), BatchCompleted(empty).
         let error_events: Vec<_> = events
             .iter()
             .filter(|e| matches!(e, Event::Error { .. }))
             .collect();
         assert_eq!(error_events.len(), 1);
+        match error_events[0] {
+            Event::Error { category, .. } => {
+                assert!(matches!(category, ErrorCategory::FfmpegSpawnFailed));
+            }
+            _ => unreachable!(),
+        }
         assert!(matches!(
             events.last().unwrap(),
             Event::BatchCompleted { records } if records.is_empty()
         ));
+    }
+
+    #[test]
+    fn encode_error_category_mapping() {
+        // Direct test of the mapping helper. Per design §3.8.6.
+        let cases = [
+            (EncodeError::Io(std::io::Error::other("x")), ErrorCategory::IoError),
+            (EncodeError::Ffmpeg("x".into()), ErrorCategory::FfmpegSpawnFailed),
+            (EncodeError::Probe("x".into()), ErrorCategory::ProbeFailed),
+            (EncodeError::InvalidParam("x".into()), ErrorCategory::ConfigError),
+            (EncodeError::EncoderNotFound("x".into()), ErrorCategory::EncoderSelectionFailed),
+            (EncodeError::FpsParse("x".into()), ErrorCategory::ConfigError),
+            (EncodeError::UserCancel, ErrorCategory::Cancelled),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(
+                encode_error_category(&err),
+                expected,
+                "mapping wrong for {err:?}",
+            );
+        }
     }
 }
