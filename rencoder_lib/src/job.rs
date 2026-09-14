@@ -65,6 +65,18 @@ pub enum Command {
         params: EncodeParams,
         files: Vec<PathBuf>,
     },
+    /// Dry-run: simulate a batch without invoking ffmpeg. Runs the
+    /// same `encode_prepare` (probe + partial-output detection +
+    /// skip detection + argv build) for each file, then emits
+    /// `Event::DryRunFinished` with the planned records (Succeeded
+    /// outcomes — actually `SkippedSameCodec` / `SkippedOutputExists` /
+    /// `FailedProbe` / `Skipped(SameCodec)` etc., but NO ffmpeg
+    /// ran). Lets the UI show the user what WOULD happen before
+    /// commit (Tier 2, §3.8.7 v1 limitations item 1).
+    DryRun {
+        params: EncodeParams,
+        files: Vec<PathBuf>,
+    },
     /// Abort the current batch (including any in-flight single file).
     /// Equivalent to SIGINT but triggered by the UI button. The
     /// `CancelToken` shared with the SIGINT handler means both paths
@@ -125,6 +137,11 @@ pub enum Event {
     /// All files in the batch finished. The records vec mirrors
     /// what `transcode_batch` would have written to Parquet.
     BatchCompleted { records: Vec<EncodingRecord> },
+    /// Dry-run finished — `records` contains the planned outcomes
+    /// (SameCodec skipped / OutputExists skipped / FailedProbe /
+    /// Succeeded / ReducedFps) WITHOUT invoking ffmpeg. UI uses
+    /// this to show the user what WOULD happen before commit.
+    DryRunFinished { records: Vec<EncodingRecord> },
     /// The batch was cancelled (by `Command::Cancel` or SIGINT).
     /// `completed` is how many files finished before the cancel
     /// landed. Per §3.8.3 item 31: no partial-output cleanup is
@@ -652,6 +669,25 @@ fn run_actor(
                 }
             }
 
+            Command::DryRun { params, files } => {
+                // Dry-run: same per-file probe + partial + skip as
+                // StartBatch, but no ffmpeg invocation. busy-gate
+                // applies so a real batch can't sneak in during dry-run.
+                if busy.swap(true, Ordering::SeqCst) {
+                    let _ = evt_tx.send(Event::Error {
+                        category: ErrorCategory::ConfigError,
+                        message: "another batch is already running".into(),
+                    });
+                    continue;
+                }
+
+                let records = crate::pipeline::batch::dry_run_batch(
+                    &params, &cache, &config, files.iter(),
+                );
+                busy.store(false, Ordering::SeqCst);
+                let _ = evt_tx.send(Event::DryRunFinished { records });
+            }
+
             Command::Cancel => {
                 // Marks the per-batch token; checked between files in
                 // the StartBatch loop above. Per-ffmpeg-process
@@ -782,6 +818,7 @@ mod mock_tests {
     /// `mock_fn` is called once per file and returns the EncodingRecord
     /// for that file. `data_dir` is the path passed to `load_history`
     /// (not via env var — parallel-safe).
+    #[allow(clippy::needless_pass_by_value)]
     fn run_actor_inline<F>(
         mock_fn: F,
         data_dir: Option<PathBuf>,
@@ -813,6 +850,10 @@ mod mock_tests {
         std::thread::spawn(move || {
             let mut next_batch_id: BatchId = 0;
             let mut encode_fn = mock_fn;
+            let _cache = EncoderCache {
+                encoders_output: String::new(),
+                has_nvidia: false,
+            };
             let mut cancel_token = cancel_token;
             while let Ok(cmd) = cmd_rx.recv() {
                 match cmd {
@@ -886,8 +927,24 @@ mod mock_tests {
                         cancel_token.cancel();
                     }
                     Command::LoadHistory { limit, after } => {
+                        // Mock actor: use the test-supplied data_dir
+                        // (parallel-safe — env vars would race).
                         let records = load_history(data_dir.clone(), limit, after);
                         let _ = evt_tx.send(Event::HistoryLoaded { records });
+                    }
+                    Command::DryRun { params, files } => {
+                        // Mock actor: dry-run is purely prepare-step;
+                        // the mock encode_fn must NOT be invoked
+                        // (this is enforced by the test that uses a
+                        // panicking mock). Build records via lib's
+                        // dry_run_batch.
+                        let records = crate::pipeline::batch::dry_run_batch(
+                            &params,
+                            &_cache,
+                            &Config::default(),
+                            files.iter(),
+                        );
+                        let _ = evt_tx.send(Event::DryRunFinished { records });
                     }
                 }
             }

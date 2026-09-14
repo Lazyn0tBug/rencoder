@@ -520,6 +520,63 @@ pub fn transcode_batch(
     records
 }
 
+/// Dry-run a batch: same per-file `encode_prepare` (probe + partial
+/// detection + skip decision) as `transcode_batch`, but **no ffmpeg
+/// invocation**. Returns planned `EncodingRecord`s so the caller can
+/// surface them in the UI without committing any work.
+///
+/// Each record's outcome reflects what `transcode_batch` *would* do
+/// at the prepare step:
+/// - `Ready` → `outcome = Succeeded` (encode would run)
+/// - `Skipped(SameCodec | OutputExists | PartialOutput)` → record
+///   as-is
+/// - `FailedProbe` → record as-is
+///
+/// `encode.nv` (GPU enable) is ignored — it's only consulted when
+/// actually running ffmpeg, which dry-run skips.
+pub fn dry_run_batch<'a, I>(
+    params: &EncodeParams,
+    _cache: &EncoderCache,
+    config: &Config,
+    files: I,
+) -> Vec<EncodingRecord>
+where
+    I: IntoIterator<Item = &'a PathBuf>,
+{
+    use crate::types::{EncodingOutcome, SkippedReason};
+
+    let mut records = Vec::new();
+    for file in files {
+        let output_path = output_path_for(file, params.format);
+        let task = TranscodeTask {
+            input: file.clone(),
+            output: Some(output_path),
+        };
+        let prepare = encode_prepare(&task, params, _cache, config, Utc::now(), Instant::now());
+        match prepare {
+            EncodePrepareResult::Ready { .. } => {
+                // Plan: encode would actually run. Mark as
+                // Succeeded (planned). Use OutputExists as the
+                // placeholder skipped-reason — we override outcome
+                // to Succeeded below.
+                let mut r = make_skipped_record(
+                    &task,
+                    params,
+                    Utc::now(),
+                    None,
+                    SkippedReason::OutputExists,
+                );
+                r.outcome = EncodingOutcome::Succeeded;
+                records.push(r);
+            }
+            EncodePrepareResult::Skipped(r) | EncodePrepareResult::FailedProbe(r) => {
+                records.push(r);
+            }
+        }
+    }
+    records
+}
+
 /// Extract the target path (file or directory) from `EncodeParams.target`
 /// for the batch-level scaffold log.
 fn batch_target_path(target: &crate::types::Target) -> PathBuf {
