@@ -1690,6 +1690,21 @@ fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &UnboundedSender<Command>) {
 - 组件只读 `state`，不直接调 lib。
 - 测试：构造 `Vec<Msg>` 灌进 reducer 断言 `state`——不需 Dioxus runtime。
 
+**v1 已知 limitations**(rencoder_ui 当前 bootstrap 状态):
+
+| 项 | 状态 | 后续 |
+|----|------|------|
+| `DirPicker` 组件 | **未实现**——`input_dir` 字段在 AppState 但没有 UI 输入 | v1.1 加 `<input>` 元素 + `UserSelectedDir` Msg |
+| `ProgressPanel` 表格 | **未实现**——只显示 batch 状态字符串,没 per-file 进度表 | v1.1 加 `ProgressInfo` 表 |
+| `LogPanel` 滚动 + 时间戳 | **未实现**——只显示空/log 长度,没行内容 | v1.1 加 `LogLine` 滚动列表 |
+| `HistoryPanel` 表格 | **未实现**——只显示 history 长度,没 records 内容 | v1.1 加 records 表 |
+| `EncodeParams` 来源 | **硬编码** `EncodeParams::default()`(AV1/CRF 45) | v1.1 从 `AppConfig::load().encode` 派生 |
+| 文件扩展名过滤 | **无**——Start 读目录下所有文件 | v1.1 用 `encode.extensions` glob |
+| `EncoderSettings.preset` / `max_fps_target` | **未传给 ffmpeg** | v1.1 build_ffmpeg_command 接 `EncodeParams` |
+| Native 文件选择对话框 | **无**——v1 用 `<input type="text">` | v1.2 调研 `rfd` 或 Dioxus 内建 |
+
+这些限制不影响协议契约（Command/Event 已端到端测试通过 mock_tests），只是 UI 渲染层不完整。
+
 #### 3.8.8 与 §3.4 CLI 前端的关系
 
 CLI 和 GUI 共享同一份 `rencoder.toml`（§1.2）和同一份 lib 实现：
