@@ -73,6 +73,7 @@ pub fn App() -> Element {
             ProgressPanel { state: state }
             LogPanel { state: state }
             p { class: "history", "History: {history_count} records" }
+            HistoryPanel { state: state }
             div { class: "controls",
                 button {
                     onclick: move |_| {
@@ -131,6 +132,39 @@ fn ProgressPanel(state: Signal<AppState>) -> Element {
                         td { "{info.speed:.2}x" }
                         td { "{info.time_secs:.1}" }
                         td { if let Some(e) = info.eta_secs { "{e:.0}" } else { "—" } }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// History records table (v1.1). Reads `state.history` (loaded
+/// via `Command::LoadHistory`). Shows source path, outcome,
+/// output path, encoding duration, output size.
+#[component]
+fn HistoryPanel(state: Signal<AppState>) -> Element {
+    let history = state.read().history.clone();
+    if history.is_empty() {
+        return rsx! { p { class: "muted", "(no history loaded)" } };
+    }
+    rsx! {
+        table { class: "history-table",
+            thead { tr {
+                th { "Source" }
+                th { "Outcome" }
+                th { "Output" }
+                th { "Duration (s)" }
+                th { "Size (B)" }
+            } }
+            tbody {
+                for r in history.iter() {
+                    tr {
+                        td { "{r.source_path}" }
+                        td { "{r.outcome:?}" }
+                        td { if let Some(p) = &r.output_path { "{p}" } else { "—" } }
+                        td { if let Some(d) = r.encoding_duration_secs { "{d:.1}" } else { "—" } }
+                        td { if let Some(s) = r.output_size_bytes { "{s}" } else { "—" } }
                     }
                 }
             }
