@@ -1565,51 +1565,31 @@ UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `int
 
 #### 3.8.6 lib 内部实现要点
 
+本节描述 **设计意图**(WHAT/WHY),不重复实现细节(签名、struct 字段、work-flow 步骤 都在代码注释里)。
+
 **不修改**（CLI 路径零回归）：
 
-- `transcode_batch` 签名
-- `EncodingRecord` / `EncodingOutcome` / `ErrorContext`（见 §3.2）
-- `TaskManager` / `PartialOutputHandle` / signal handler（CLI 端）
-- `EncodeError`（保持 `thiserror` 原样，不加 `Serialize`）
-- `ProcessOutput` 枚举（见 §3.2）
+- `transcode_batch` 签名;`EncodingRecord` / `EncodingOutcome` / `ErrorContext`(见 §3.2)
+- `TaskManager` / `PartialOutputHandle` / signal handler(CLI 端)
+- `EncodeError`(保持 `thiserror` 原样,不加 `Serialize`);`ProcessOutput` 枚举(见 §3.2)
 - `AppConfig` 加载/校验
-- CLI 路径的 ffmpeg 编排（含 stderr 收集 + partial output 清理）——保留 `cmd.output()` 同步路径，仅在 lib 内部为 GUI 加 spawn-based sibling
+- CLI 路径的 ffmpeg 编排(含 stderr 收集 + partial output 清理)——保留 `cmd.output()` 同步路径
 
-**新增**：
+**新增**(U21):
 
-| 位置 | 类型 / 函数 | 职责 |
-|------|-------------|------|
-| `pipeline/cancel.rs`（新） | `CancelToken` | `Arc<AtomicBool>` + `cancel()` / `is_cancelled()` |
-| `pipeline/batch.rs` | `run_ffmpeg_with_progress(argv, cancel, total_duration_secs, on_progress)` | `cmd.spawn()` 替代 `cmd.output()`，支持 cancel + progress 回调；CLI 路径的同步 ffmpeg 编排保留不动。`total_duration_secs` 用于 ETA 计算（`None` → eta_secs=None） |
-| `pipeline/batch.rs` | `transcode_single_with_progress(...)` | GUI 路径：复用 CLI 的 probe + partial detection + skip + argv 逻辑(共享 `encode_prepare` helper)，把 ffmpeg 调用换成 `run_ffmpeg_with_progress`；CancelToken 真正能 kill 子进程 |
-| `job.rs`（新） | `process_one_file(...)` | 从 controller StartBatch 循环里抽出的 per-file 逻辑；接受泛型 `encode_fn` 闭包，让测试注入 mock encoder（不需 ffmpeg 即可验证消息协议契约） |
-| `data/store.rs` | `read_records(path) -> Result<Vec<EncodingRecord>, EncodeError>` | 单 Parquet 文件回读（v1 不使用——见 §3.8.7 limitations）;v1.1 才接 `Command::LoadHistory` |
+| 位置 | 抽象 | 职责 |
+|------|------|------|
+| `pipeline/cancel.rs` | `CancelToken` | `Arc<AtomicBool>` + cancel 标志(`run_ffmpeg_with_progress` 轮询) |
+| `pipeline/batch.rs` | `run_ffmpeg_with_progress` | GUI 路径的 cancellable ffmpeg 调用——`cmd.spawn()` + reader thread + progress 回调 |
+| `pipeline/batch.rs` | `encode_prepare` | CLI / GUI 共享的 probe + partial detect + skip + argv build 逻辑 |
+| `pipeline/batch.rs` | `transcode_single_with_progress` | GUI 路径的 per-file 入口(共享 `encode_prepare`,ffmpeg 调用换成 spawn 路径) |
+| `pipeline/batch.rs` | `build_encode_record` | CLI / GUI 共享的 record 构造(成功 / 失败两种 outcome) |
+| `pipeline/batch.rs` | `FfmpegProgress` struct | `Event::Progress` 的源数据 |
+| `job.rs` | `process_one_file` | controller StartBatch 循环里的 per-file 逻辑;接受泛型 `encode_fn` 闭包,让测试注入 mock encoder |
+| `job.rs` | `encode_error_category(&EncodeError) -> ErrorCategory` | 编码错误 → UI 展示分类的映射 |
+| `data/store.rs` | `read_records(path)` | 单 Parquet 文件回读(v1 不使用,v1.1 启用) |
 
-**`FfmpegProgress` struct**（U21 §3.8.3 `Event::Progress` 的源数据,`run_ffmpeg_with_progress` 每 ~0.5s emit 一次）:
-
-```rust
-pub struct FfmpegProgress {
-    pub frame: u64,          // 已编码帧数
-    pub fps: f64,            // 当前编码 FPS
-    pub speed: f64,          // 编码速度倍率（1.0 = 实时;0=N/A）
-    pub time_secs: f64,       // 已编码时长（来自 ffmpeg 的 `out_time_us`）
-    pub eta_secs: Option<f64>,// (total - time) / speed;speed<0.001 或 total=None 时为 None
-}
-```
-
-ETA 计算:`speed >= 0.001` 才返回 Some——低于该阈值视为"N/A"或刚启动,UI 显示"—"而不是几分钟的不稳定数字。`last_speed` 单独追踪,确保 `speed=0` 的 mid-block 不会让 ETA 在该 block 内变 None。
-
-**`run_ffmpeg_with_progress` 工作流**:
-
-1. `cmd.spawn()`(非 `cmd.output()`)拿 `Child` 句柄,可 kill
-2. 后台线程读 stderr 累积尾部 20 行(失败时塞 `ErrorContext.ffmpeg_stderr_tail`)
-3. 主线程读 stdout,逐行解析 `key=value`(`-progress pipe:1` 模式 ffmpeg 输出格式)
-4. 关键 keys:`frame` / `fps` / `speed` / `out_time_us` / `out_time_ms` / `progress`(continue | end)
-5. 每次解析到 `progress=continue` 或 `progress=end`:emit 一个 `FfmpegProgress`,end 时退出
-6. 每次 `progress` 之间轮询 `cancel.is_cancelled()` —— 是则 kill child + 返回 `Err(Cancelled, ...)`
-7. 全部事件 emit 完 + child 自然退出 → 等 `child.wait()`,非零退出码 → `Err(FfmpegNonzeroExit, ..., stderr_tail)`
-
-**`process_one_file` testability surface**(§8 item 43):
+**`process_one_file` testability surface**(§8 item 43)——这是 §3.8 唯一保留的函数签名,因为它**解释了为何要抽出这个 helper**(测试性):
 
 ```rust
 fn process_one_file<F>(
@@ -1627,7 +1607,7 @@ where
         -> Result<EncodingRecord, EncodeError>;
 ```
 
-内部 emit 三件事:`FileStarted` (前) / `Progress` × N (中) / `FileCompleted` (后)。返回 `Err(ProcessError::Encode(e))` 让 caller 发 `Event::Error`;`Err(ProcessError::EventSend)` 表示 UI dropped receiver,应 abort batch。
+其他签名(`run_ffmpeg_with_progress`、`FfmpegProgress` 字段、`EncodeError→ErrorCategory` 映射表) 在代码注释里。**`FfmpegProgress` struct + `run_ffmpeg_with_progress` 工作流 + ETA 计算细节** 都在 `pipeline/batch.rs` 的 doc comment 里——读代码注释,不在这里重复。
 
 **`EncodeError → ErrorCategory` 映射**(process_one_file 错误路径使用):
 
@@ -1642,7 +1622,8 @@ where
 | `UserCancel` | `Cancelled` | 1:1 |
 
 `Event::Error` 是 fatal-only,所以"per-file encode 失败"走 `EncodingRecord.error` 字段,这里只处理**真 fatal**(setup / 系统错误)。映射函数在 `job.rs` 里,作为 `pub(crate) fn encode_error_category(e: &EncodeError) -> ErrorCategory` 存在,便于测试。
-| `job.rs`（新） | `start_controller() -> ControllerHandle` | 编排：后台线程 + mpsc + 现有 `transcode_batch`（**复用 CLI 路径的纯函数，不 fork**）+ 新 `run_ffmpeg_with_progress`；job.rs 是 thin glue，把现有 pieces 装成 actor |
+
+| `job.rs` | `start_controller() -> ControllerHandle` | 编排：后台线程 + mpsc + 现有 `transcode_batch`（**复用 CLI 路径的纯函数，不 fork**）+ 新 `run_ffmpeg_with_progress`；job.rs 是 thin glue，把现有 pieces 装成 actor |
 
 **Controller 启动时加载 AppConfig**（U21 增量）：
 - `config::path::resolve_config()` 拿路径（`$RENENCODER_CONFIG` > `<app_dir>/rencoder.toml`）
@@ -1651,7 +1632,7 @@ where
 - `init_encoder_cache(app_config.encode.as_ref().and_then(|e| e.nv).unwrap_or(false))`
 - 失败 → `Event::Error(ConfigError)` 后线程退出
 - 这把 controller 与 CLI 拉到同一配置源——GUI 不再绕开 `rencoder.toml` |
-| `job.rs`（新） | `pub enum Command` / `pub enum Event` | 消息协议（见 §3.8.3） |
+| `job.rs` | `pub enum Command` / `pub enum Event` | 消息协议（见 §3.8.3） |
 
 **CancelToken 与 SIGINT 的关系**(修正之前的错误描述):**没有"共享 token"**——两个 actor 完全独立(§3.8.2 的承诺),SIGINT 在 GUI 路径里**不是特殊路径**。
 
