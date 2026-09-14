@@ -1539,11 +1539,55 @@ UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `int
 | 位置 | 类型 / 函数 | 职责 |
 |------|-------------|------|
 | `pipeline/cancel.rs`（新） | `CancelToken` | `Arc<AtomicBool>` + `cancel()` / `is_cancelled()` |
-| `pipeline/batch.rs` | `run_ffmpeg_with_progress(argv, cancel, on_progress)` | `cmd.spawn()` 替代 `cmd.output()`，支持 cancel + progress 回调；CLI 路径的同步 ffmpeg 编排保留不动 |
+| `pipeline/batch.rs` | `run_ffmpeg_with_progress(argv, cancel, total_duration_secs, on_progress)` | `cmd.spawn()` 替代 `cmd.output()`，支持 cancel + progress 回调；CLI 路径的同步 ffmpeg 编排保留不动。`total_duration_secs` 用于 ETA 计算（`None` → eta_secs=None） |
 | `pipeline/batch.rs` | `transcode_single_with_progress(...)` | GUI 路径：复用 CLI 的 probe + partial detection + skip + argv 逻辑(共享 `encode_prepare` helper)，把 ffmpeg 调用换成 `run_ffmpeg_with_progress`；CancelToken 真正能 kill 子进程 |
 | `job.rs`（新） | `process_one_file(...)` | 从 controller StartBatch 循环里抽出的 per-file 逻辑；接受泛型 `encode_fn` 闭包，让测试注入 mock encoder（不需 ffmpeg 即可验证消息协议契约） |
-| `data/store.rs` | `read_records(path) -> Vec<EncodingRecord>` | 单 Parquet 文件回读；多文件 glob + limit/after 过滤在 controller |
-| `config/path.rs` | `resolve_data_dir() -> PathBuf` | controller 在响应 `Command::LoadHistory` 时调此拿到数据目录(`$RENENCODER_DATA_DIR` > `<app_dir>/data`);**不**走 `Command::LoadHistory` 的 payload,UI 不需要知道路径 |
+| `data/store.rs` | `read_records(path) -> Result<Vec<EncodingRecord>, EncodeError>` | 单 Parquet 文件回读；多文件 glob + limit/after 过滤在 controller |
+| `config/path.rs` | `resolve_data_dir() -> Option<PathBuf>` | controller 在响应 `Command::LoadHistory` 时调此拿到数据目录(`$RENENCODER_DATA_DIR` > `<app_dir>/data`);**不**走 `Command::LoadHistory` 的 payload,UI 不需要知道路径 |
+
+**`FfmpegProgress` struct**（U21 §3.8.3 `Event::Progress` 的源数据,`run_ffmpeg_with_progress` 每 ~0.5s emit 一次）:
+
+```rust
+pub struct FfmpegProgress {
+    pub frame: u64,          // 已编码帧数
+    pub fps: f64,            // 当前编码 FPS
+    pub speed: f64,          // 编码速度倍率（1.0 = 实时;0=N/A）
+    pub time_secs: f64,       // 已编码时长（来自 ffmpeg 的 `out_time_us`）
+    pub eta_secs: Option<f64>,// (total - time) / speed;speed<0.001 或 total=None 时为 None
+}
+```
+
+ETA 计算:`speed >= 0.001` 才返回 Some——低于该阈值视为"N/A"或刚启动,UI 显示"—"而不是几分钟的不稳定数字。`last_speed` 单独追踪,确保 `speed=0` 的 mid-block 不会让 ETA 在该 block 内变 None。
+
+**`run_ffmpeg_with_progress` 工作流**:
+
+1. `cmd.spawn()`(非 `cmd.output()`)拿 `Child` 句柄,可 kill
+2. 后台线程读 stderr 累积尾部 20 行(失败时塞 `ErrorContext.ffmpeg_stderr_tail`)
+3. 主线程读 stdout,逐行解析 `key=value`(`-progress pipe:1` 模式 ffmpeg 输出格式)
+4. 关键 keys:`frame` / `fps` / `speed` / `out_time_us` / `out_time_ms` / `progress`(continue | end)
+5. 每次解析到 `progress=continue` 或 `progress=end`:emit 一个 `FfmpegProgress`,end 时退出
+6. 每次 `progress` 之间轮询 `cancel.is_cancelled()` —— 是则 kill child + 返回 `Err(Cancelled, ...)`
+7. 全部事件 emit 完 + child 自然退出 → 等 `child.wait()`,非零退出码 → `Err(FfmpegNonzeroExit, ..., stderr_tail)`
+
+**`process_one_file` testability surface**(§8 item 43):
+
+```rust
+fn process_one_file<F>(
+    task: &TranscodeTask,
+    params: &EncodeParams,
+    cache: &EncoderCache,
+    config: &Config,
+    cancel: &CancelToken,
+    index: usize, total: usize,
+    encode_fn: &mut F,
+    emit: &Sender<Event>,
+) -> Result<EncodingRecord, ProcessError>
+where
+    F: FnMut(&TranscodeTask, &EncodeParams, &EncoderCache, &Config, &CancelToken, &mut dyn FnMut(FfmpegProgress))
+        -> Result<EncodingRecord, EncodeError>;
+```
+
+内部 emit 三件事:`FileStarted` (前) / `Progress` × N (中) / `FileCompleted` (后)。返回 `Err(ProcessError::Encode(e))` 让 caller 发 `Event::Error`;`Err(ProcessError::EventSend)` 表示 UI dropped receiver,应 abort batch。
 | `job.rs`（新） | `start_controller() -> ControllerHandle` | 编排：后台线程 + mpsc + 现有 `transcode_batch`（**复用 CLI 路径的纯函数，不 fork**）+ 新 `run_ffmpeg_with_progress`；job.rs 是 thin glue，把现有 pieces 装成 actor |
 
 **Controller 启动时加载 AppConfig**（U21 增量）：
