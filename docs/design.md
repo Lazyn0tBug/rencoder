@@ -1756,7 +1756,7 @@ enum Msg {
 fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>) {
     match msg {
 
-fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &UnboundedSender<Command>) {
+fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>) {
     match msg {
         Msg::UserClickedStart => drop(cmd_tx.send(Command::StartBatch { /* ... */ })),
         Msg::UserClickedCancel => drop(cmd_tx.send(Command::Cancel)),
