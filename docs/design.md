@@ -1953,7 +1953,7 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 25 | lib 不为 UI 新增 `Serialize` 派生（保持 `thiserror` 原样，actor 间传 Rust 类型无需序列化） | ✅ |
 | 26 | `Event::Error` 仅 fatal；per-file 失败走 `EncodingRecord.error` 字段 | ✅ |
 | 27 | 双轨 state：mpsc 实时事件 + Parquet 持久化；`Command::LoadHistory` 触发回读（v1 不触发,v1.1 启用） | ✅ |
-| 28 | Channel 策略：`UnboundedSender`（单 batch 下背压风险极低） | ✅ |
+| 28 | Channel 策略：`crossbeam_channel::Sender<Command>`（`unbounded()` 返回的类型；`Sender<T>` 是 `UnboundedSender<T>` 的别名，UI 与 lib 都用 `Sender` 简洁写法） | ✅ |
 | 29 | lib 内部 `CancelToken`（`Arc<AtomicBool>`）由 UI `Command::Cancel` 与 SIGINT handler 共享 | ✅ |
 | 30 | Log 行在 lib 透传；UI reducer 层设上限（`VecDeque` 1000 行） | ✅ |
 | 31 | `Command::Cancel` 中止整批（包括当前文件），与 SIGINT 等价；不暴露"仅跳过当前文件" | ✅ |
