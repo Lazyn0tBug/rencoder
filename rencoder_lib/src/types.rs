@@ -146,6 +146,50 @@ pub struct EncodeParams {
     // separate `enable_nv` field here would be dead state.
 }
 
+impl EncodeParams {
+    /// Build a full `EncodeParams` from the loaded `AppConfig`'s
+    /// `encode` section. Missing fields fall back to defaults.
+    ///
+    /// This is the single source of truth for "how a TOML `[encode]`
+    /// block becomes an `EncodeParams`". Both the CLI and the GUI
+    /// (`rencoder_ui::msg::build_encode_params_from_config`) call this
+    /// — the GUI helper existed first and was duplicated, this commit
+    /// consolidates.
+    ///
+    /// Note: `target` is always `Target::default()` — currently
+    /// `[encode] target` is parsed but not consumed by
+    /// `transcode_single`. If/when target becomes per-batch
+    /// controllable, this function picks it up automatically.
+    pub fn from_encode_config(
+        encode: Option<&crate::config::app::EncodeConfig>,
+    ) -> Self {
+        use crate::config::app::EncodeConfig;
+        let default_enc = EncodeConfig::default();
+        let enc: &EncodeConfig = encode.unwrap_or(&default_enc);
+        let format = enc
+            .format
+            .map(VideoFormat::from)
+            .unwrap_or(VideoFormat::Av1);
+        let (is_crf, bitrate_or_crf) = if enc.crf == 0 {
+            (false, enc.bitrate.unwrap_or(5000))
+        } else {
+            (true, enc.crf)
+        };
+        Self {
+            format,
+            bitrate_or_crf,
+            is_crf,
+            target: Target::default(),
+            extensions: enc.extensions.clone().unwrap_or_default(),
+            extra_args: vec![],
+            max_fps: MaxFpsConfig {
+                max_fps: enc.max_fps.unwrap_or(0) as f64,
+                eps: 0.05,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Target {
     File(PathBuf),

@@ -229,43 +229,15 @@ fn apply_event(state: &mut AppState, evt: Event) {
     }
 }
 
-/// Build an [`EncodeParams`] from the loaded `AppConfig`. Mirrors
-/// what `Config::from_encode_config` does at the runtime layer, plus
-/// the full set of fields the GUI needs (extensions, extra_args,
-/// target, etc).
-///
-/// Note: `target` is always `Target::default()` — CLI `Config::from_encode_config`
-/// also ignores `[encode] target` (the field exists in the schema but
-/// isn't currently consumed by transcode_single). L1 review finding.
+/// Build an [`EncodeParams`] from the loaded `AppConfig`. This is
+/// a thin wrapper around the canonical helper in the lib
+/// (`rencoder_lib::types::EncodeParams::from_encode_config`) so
+/// there's a single source of truth for "how a TOML `[encode]`
+/// block becomes an `EncodeParams`".
 fn build_encode_params_from_config(
     config: &rencoder_lib::config::app::AppConfig,
 ) -> rencoder_lib::types::EncodeParams {
-    use rencoder_lib::config::app::EncodeConfig;
-    use rencoder_lib::types::{EncodeParams, Target, VideoFormat};
-
-    // Use a local default sentinel to avoid a temporary-value borrow
-    // (EncodeConfig doesn't impl Clone; reference-compare via as_ref).
-    let default_enc = EncodeConfig::default();
-    let enc: &EncodeConfig = config.encode.as_ref().unwrap_or(&default_enc);
-    // Default format: AV1 (matches rencoder_cli default behavior).
-    let format = enc.format.map(VideoFormat::from).unwrap_or(VideoFormat::Av1);
-    let (is_crf, bitrate_or_crf) = if enc.crf == 0 {
-        (false, enc.bitrate.unwrap_or(5000))
-    } else {
-        (true, enc.crf)
-    };
-    EncodeParams {
-        format,
-        bitrate_or_crf,
-        is_crf,
-        target: Target::default(),
-        extensions: enc.extensions.clone().unwrap_or_default(),
-        extra_args: vec![],
-        max_fps: rencoder_lib::types::MaxFpsConfig {
-            max_fps: enc.max_fps.unwrap_or(0) as f64,
-            eps: 0.05,
-        },
-    }
+    rencoder_lib::types::EncodeParams::from_encode_config(config.encode.as_ref())
 }
 
 /// Check whether a path's extension matches any of the user's
