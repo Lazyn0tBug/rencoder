@@ -1599,7 +1599,43 @@ where
 - 这把 controller 与 CLI 拉到同一配置源——GUI 不再绕开 `rencoder.toml` |
 | `job.rs`（新） | `pub enum Command` / `pub enum Event` | 消息协议（见 §3.8.3） |
 
-**CancelToken 共享**：UI `Command::Cancel` 与 SIGINT handler（lib 内部安装，可选）共享同一个 `Arc<AtomicBool>`，等价语义——UI 按钮和 Ctrl-C 都把同一个 token 置位。
+**CancelToken 与 SIGINT 的关系**(修正之前的错误描述):**没有"共享 token"**——两个 actor 完全独立(§3.8.2 的承诺),SIGINT 在 GUI 路径里**不是特殊路径**。
+
+GUI 路径(`rencoder_ui`):
+
+```
+[SIGINT window event] ─┐
+                        ├─► UI Msg::UserClickedCancel ─► reduce() ─► Command::Cancel ─► lib actor
+[Cancel button click]  ─┘                                                                              │
+                                                                                                         ▼
+                                                                                         cancel_token.cancel()
+                                                                                                         │
+                                                                                                         ▼
+                                                                                         run_ffmpeg_with_progress 轮询
+                                                                                                         │
+                                                                                                         ▼
+                                                                                         child.kill() + partial output 由
+                                                                                         encode_prepare partial detection
+                                                                                         处理(下次启动自动重转)
+```
+
+- SIGINT 是 **UI event**,跟 button click 同级——dioxus/wry 把它翻译成 window event,UI reducer 转成 `Msg::UserClickedCancel`,再发 `Command::Cancel`。
+- `cancel_token` 是 **lib actor 内部状态**,**只** 由 `Command::Cancel` 置位,没有跨 actor 共享。
+- **lib actor 不安装 SIGINT handler**(§3.8.1 "不 复用 rencoder_cli::signal")——Ctrl-C 由 wry 在 webview 层捕获,变成 window event 后走标准 UI event 路径。
+
+CLI 路径(`rencoder_cli`,对照):
+
+```
+[terminal SIGINT] ─► ctrlc::set_handler (lib 安装) ─► fs::remove partial output + exit(1)
+                                                                       │
+                                                                       ▼
+                                                          ffmpeg 子进程被 process exit 杀掉
+```
+
+- CLI 路径走 lib 的 `ctrlc::set_handler` 直接做清理(§3.4.5),不走 cancel_token。
+- 两条路径独立,各自清理:CLI 用 signal handler 删 partial + exit;GUI 用 cancel_token 杀 ffmpeg + 下次启动自动 partial 检测。
+
+**为什么这样分**:两层 actor 各自处理自己的"取消"事件,不共享内存,符合 §3.8.2 "无共享变量"。GUI 的 cancel_token 完全属于 lib 内部;SIGINT 在 GUI 里只是众多 UI event 之一(其他还有 button click、key press、window resize 等)。
 
 **log 过滤/节流**：lib 透传所有 ffmpeg stderr 行（不解析、不丢弃），上限/截断由 UI reducer 在 state 层做（`VecDeque` 限 1000 行）。
 
