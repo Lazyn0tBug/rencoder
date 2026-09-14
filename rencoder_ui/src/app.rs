@@ -70,6 +70,8 @@ pub fn App() -> Element {
                 p { class: "error", "Last error: {err}" }
             }
             p { class: "batch", "Batch: {batch_state}" }
+            ProgressPanel { state: state }
+            LogPanel { state: state }
             p { class: "history", "History: {history_count} records" }
             div { class: "controls",
                 button {
@@ -92,6 +94,75 @@ pub fn App() -> Element {
                         state_for_history.with_mut(|s| reduce(s, Msg::UserClickedLoadHistory, &tx_for_history, &cfg));
                     },
                     "Load History"
+                }
+            }
+        }
+    }
+}
+
+/// Per-file progress table (v1.1). Reads `state.progress`
+/// (HashMap<file_index, ProgressInfo>) and renders one row per
+/// active file. Empty when no batch is running.
+#[component]
+fn ProgressPanel(state: Signal<AppState>) -> Element {
+    let progress = state.read().progress.clone();
+    if progress.is_empty() {
+        return rsx! { p { class: "muted", "(no active progress)" } };
+    }
+    let mut rows: Vec<(usize, crate::msg::ProgressInfo)> =
+        progress.into_iter().collect();
+    rows.sort_by_key(|(i, _)| *i);
+    rsx! {
+        table { class: "progress-table",
+            thead { tr {
+                th { "File" }
+                th { "Frame" }
+                th { "FPS" }
+                th { "Speed" }
+                th { "Time (s)" }
+                th { "ETA (s)" }
+            } }
+            tbody {
+                for (idx, info) in rows {
+                    tr {
+                        td { "{idx}" }
+                        td { "{info.frame}" }
+                        td { "{info.fps:.1}" }
+                        td { "{info.speed:.2}x" }
+                        td { "{info.time_secs:.1}" }
+                        td { if let Some(e) = info.eta_secs { "{e:.0}" } else { "—" } }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// stderr log ring buffer view (v1.1). Reads `state.log`
+/// (VecDeque<LogLine>, capped at 1000 per §3.8.6 / item 30).
+/// Shows last 100 lines newest-first.
+#[component]
+fn LogPanel(state: Signal<AppState>) -> Element {
+    let log = state.read().log.clone();
+    if log.is_empty() {
+        return rsx! { p { class: "muted", "(no log output)" } };
+    }
+    let lines: Vec<crate::msg::LogLine> = {
+        let mut v: Vec<_> = log.iter().rev().take(100).cloned().collect();
+        v.reverse();
+        v
+    };
+    let rendered: Vec<(String, usize, String)> = lines
+        .iter()
+        .map(|l| (l.at.format("%H:%M:%S").to_string(), l.file_index, l.line.clone()))
+        .collect();
+    rsx! {
+        div { class: "log-window",
+            for (time, file, msg) in rendered {
+                div { class: "log-line",
+                    span { class: "time", "{time}" }
+                    span { class: "file", "[{file}]" }
+                    span { class: "msg", " {msg}" }
                 }
             }
         }
