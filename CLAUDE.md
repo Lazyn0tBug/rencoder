@@ -9,6 +9,10 @@ Rust rewrite of `encode.zsh` and `video_fps_stats.zsh`: smart video transcoding 
 
 Design source of truth: `docs/design.md`. Update the doc first when behavior changes.
 
+**Doc scope split:**
+- `docs/design.md` describes **WHAT/WHY** (architecture, contracts, constraints, design rationale). New abstractions get a one-line entry in §3.8.6's "新增" table.
+- Implementation details (signatures, struct fields, work flows, thresholds) live in **`///` rustdoc comments** in the code itself. Generated with `cargo doc --no-deps`. Reviewers should reject design-doc additions that duplicate what rustdoc already says.
+
 ## Single-directory app (U18)
 
 Rencoder is delivered and runs as a single self-contained directory:

@@ -3,15 +3,19 @@
 //! cancel button sets the flag, and so does SIGINT (via the handler
 //! installed in `rencoder_cli::signal`).
 //!
-//! Implementation: `Arc<AtomicBool>` with `SeqCst` ordering — cancel
-//! is rare (one per batch), SeqCst's stronger guarantees are cheap
-//! at this frequency and the cost of missing a cancel is "user
-//! presses cancel and encode keeps running", so over-synchronize
-//! rather than risk the race.
+//! # Implementation
 //!
-//! Used by `run_ffmpeg_with_progress` (U21, §3.8.6) to poll the flag
-//! between ffmpeg progress reads; on detection, the child process is
-//! killed and partial output is cleaned up by the existing
+//! `Arc<AtomicBool>` with `SeqCst` ordering. Cancel is rare
+//! (one per batch), SeqCst's stronger guarantees are cheap at this
+//! frequency, and the cost of missing a cancel is "user presses
+//! cancel and encode keeps running" — over-synchronize rather than
+//! risk the race.
+//!
+//! # Used by
+//!
+//! `run_ffmpeg_with_progress` (U21, §3.8.6) polls the flag between
+//! ffmpeg progress reads; on detection, the child process is killed
+//! and partial output is cleaned up by the existing
 //! `PartialOutputHandle` mechanism.
 
 use std::sync::atomic::{AtomicBool, Ordering};

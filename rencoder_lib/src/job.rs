@@ -286,11 +286,23 @@ enum ProcessError {
 /// - `Event::Progress { ... }` per FfmpegProgress callback (during)
 /// - `Event::FileCompleted { index, record }` (on Ok return)
 ///
-/// Map an `EncodeError` (from the encode closure) to the appropriate
-/// `ErrorCategory` for `Event::Error`. Per design §3.8.6 mapping table:
-///   Io → IoError, Ffmpeg → FfmpegSpawnFailed, Probe → ProbeFailed,
-///   InvalidParam / FpsParse → ConfigError,
-///   EncoderNotFound → EncoderSelectionFailed, UserCancel → Cancelled.
+/// Map an [`EncodeError`] (from the encode closure) to the appropriate
+/// [`ErrorCategory`] for [`Event::Error`]. See design §3.8.6 for the
+/// full mapping table:
+///
+/// | `EncodeError`       | `ErrorCategory`         |
+/// |---------------------|-------------------------|
+/// | `Io(_)`             | `IoError`               |
+/// | `Ffmpeg(_)`         | `FfmpegSpawnFailed`    |
+/// | `Probe(_)`          | `ProbeFailed`           |
+/// | `InvalidParam(_)`   | `ConfigError`           |
+/// | `EncoderNotFound(_)`| `EncoderSelectionFailed`|
+/// | `FpsParse(_)`       | `ConfigError`           |
+/// | `UserCancel`        | `Cancelled`             |
+///
+/// `Event::Error` is fatal-only; per-file encode failures travel
+/// through `EncodingRecord.error` instead. This function is only
+/// called on the rare setup-level error path in `process_one_file`.
 pub(crate) fn encode_error_category(e: &EncodeError) -> ErrorCategory {
     match e {
         EncodeError::Io(_) => ErrorCategory::IoError,
@@ -400,12 +412,39 @@ impl ControllerHandle {
     }
 }
 
-/// Spawn the lib actor and return the message-passing handle. The
-/// caller (UI) gets `(cmd_tx, evt_rx)` to drive the actor. The actor
-/// thread lives until `cmd_tx` is dropped — at which point the
-/// thread's `recv()` returns `None` and the thread exits.
+/// Spawn the lib actor and return the message-passing handle.
 ///
-/// Single-batch in flight at a time (§3.4 / §3.8.1).
+/// # Lifecycle
+///
+/// Caller (UI) gets `(cmd_tx, evt_rx)` to drive the actor. The actor
+/// thread lives until `cmd_tx` is dropped — at which point the
+/// thread's `recv()` returns `None` and the thread exits. As the
+/// LAST event before that, the actor emits
+/// `Event::ActorExited` with an `ExitReason`, so the UI knows
+/// WHY the controller stopped (clean shutdown, fatal error, or
+/// cancel) before the channel goes silent.
+///
+/// # Single-batch constraint
+///
+/// One batch in flight at a time (§3.4 / §3.8.1). Second
+/// `Command::StartBatch` while one is running returns
+/// `Event::Error(ConfigError)` rather than queueing.
+///
+/// # Internal init
+///
+/// Once at startup, the actor:
+/// 1. Resolves config via [`resolve_config`] (handles
+///    `$RENENCODER_CONFIG`).
+/// 2. Loads [`AppConfig`] (auto-creates default if missing —
+///    same behavior as CLI).
+/// 3. Constructs runtime [`Config`] via
+///    [`Config::from_encode_config`].
+/// 4. Initializes [`EncoderCache`] with `enable_nv` from
+///    `encode.nv`.
+/// 5. Falls into the command loop.
+///
+/// Any init failure emits `Event::Error(ConfigError)` then the
+/// thread exits — UI sees the error + then no more events.
 pub fn start_controller() -> ControllerHandle {
     let (cmd_tx, cmd_rx) = unbounded::<Command>();
     let (evt_tx, evt_rx) = unbounded::<Event>();

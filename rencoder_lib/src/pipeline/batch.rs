@@ -39,14 +39,29 @@ use crate::utils::fs::output_path_for;
 /// Per-file callback fired after the record is built.
 type ResultCallback = dyn Fn(&EncodingRecord);
 
-/// Transcode a single file. Pure encode: probe + skip + argv + ffmpeg.
-/// Returns the work-analysis record; probe failures (e.g. corrupt/
-/// unreadable input) surface as `Ok(record)` with `Outcome::Failed`.
-/// ffmpeg failures land in `EncodingRecord.outcome = Failed` with
-/// stderr captured for the `ErrorContext`.
+/// Transcode a single file (CLI path).
 ///
-/// **U19**: no `current_output` or `task_ctx` params. Lifecycle
-/// logging and signal-handler Guard construction live in
+/// # Flow
+///
+/// 1. Probe + partial-output detection + skip-decision + argv-build
+///    via `encode_prepare` (shared with the GUI path).
+/// 2. If prepare says Ready → run ffmpeg via `transcode_with_argv`
+///    (sync, stderr inherited).
+/// 3. Build the final [`EncodingRecord`] via `build_encode_record`
+///    (shared).
+///
+/// # Failure modes
+///
+/// Probe failures (corrupt/unreadable input) surface as
+/// `Ok(record)` with `outcome = Failed` (not `Err`) — per-file
+/// failures are part of the record stream, not exceptions. ffmpeg
+/// failures land in `outcome = Failed` with stderr captured for the
+/// `ErrorContext`.
+///
+/// # Lifecycle integration (U19)
+///
+/// No `current_output` or `task_ctx` params. Lifecycle logging and
+/// signal-handler Guard construction live in
 /// [`crate::pipeline::task::TaskManager::run`]; `transcode_single`
 /// focuses on encode. Callers (CLI / tests) wrap the call via
 /// `TaskManager` when they need scaffold logs and Guard registration.
@@ -89,10 +104,16 @@ pub fn transcode_single(
 }
 
 /// Sibling to [`transcode_single`] for the GUI / actor path (U21).
-/// Same probe + partial detection + skip + argv logic (shared via
-/// [`encode_prepare`]), but uses [`run_ffmpeg_with_progress`] for
-/// cancellable, event-driven ffmpeg execution. `cancel` is polled
-/// between progress reads; `on_progress` is invoked once per
+///
+/// # Shared vs divergent
+///
+/// **Shared** with `transcode_single` via `encode_prepare` (probe +
+/// partial detect + skip + argv-build) and `build_encode_record`
+/// (record construction). Both paths produce the same record shape.
+///
+/// **Divergent**: this one uses [`run_ffmpeg_with_progress`] (cancellable,
+/// event-driven) instead of `run_ffmpeg_with_stderr` (sync). `cancel`
+/// is polled between progress reads; `on_progress` is invoked once per
 /// `progress=continue` / `progress=end` block from ffmpeg.
 pub fn transcode_single_with_progress(
     task: &TranscodeTask,
@@ -150,6 +171,10 @@ enum EncodePrepareResult {
 /// (GUI). Performs the probe + partial-output-detection + skip-decision +
 /// argv-build steps so both paths agree on what work to do; only the
 /// actual ffmpeg invocation differs.
+///
+/// Returns `EncodePrepareResult::{Ready, Skipped, FailedProbe}` so
+/// the caller can build either a final `EncodingRecord` (skipped /
+/// failed-probe) or proceed to invoke ffmpeg.
 fn encode_prepare(
     task: &TranscodeTask,
     params: &EncodeParams,
@@ -245,7 +270,9 @@ fn encode_prepare(
 }
 
 /// Inner helper for [`transcode_single`] (CLI path). Invokes ffmpeg
-/// with stderr-capture and blocks until exit.
+/// with stderr-capture via [`run_ffmpeg_with_stderr`] and blocks until
+/// exit. Then calls [`build_encode_record`] to construct the final
+/// `EncodingRecord` from ffmpeg's exit result.
 #[allow(clippy::too_many_arguments)]
 fn transcode_with_argv(
     task: &TranscodeTask,
@@ -691,6 +718,20 @@ fn stderr_tail(stderr: &str, n: usize) -> String {
 /// parse key=value lines, then emitted once per `progress=continue`
 /// / `progress=end` block.
 #[derive(Clone, Debug, Default)]
+/// Per-file progress snapshot emitted by
+/// [`run_ffmpeg_with_progress`] every ~0.5s (one per ffmpeg progress
+/// block). Fed into the GUI via the closure passed to
+/// [`transcode_single_with_progress`] and surfaced as
+/// [`Event::Progress`](crate::job::Event::Progress).
+///
+/// # ETA threshold
+///
+/// `eta_secs` is `Some` only when `speed >= 0.001`. Below that, ffmpeg
+/// is either starting up (no useful estimate yet) or stalled (N/A),
+/// so the UI shows "—" instead of an unstable minutes-count. A
+/// separate `last_speed` is tracked inside
+/// `run_ffmpeg_with_progress` so a mid-block `speed=0` line doesn't
+/// flip ETA to `None` within the same progress block.
 pub struct FfmpegProgress {
     pub frame: u64,
     pub fps: f64,
@@ -722,8 +763,33 @@ pub struct FfmpegProgress {
 ///   `ErrorContext.ffmpeg_stderr_tail` payload on failure.
 ///
 /// Returns the same `Result<(), (ErrorCategory, String, String)>`
-/// shape as `run_ffmpeg_with_stderr` so the controller can wrap
-/// both uniformly.
+/// Spawn ffmpeg with cancellable, event-driven execution (GUI path).
+///
+/// # Work flow
+///
+/// 1. `cmd.spawn()` (not `cmd.output()`) — we hold a `Child` handle
+///    so we can kill it mid-stream.
+/// 2. Background thread reads stderr, accumulating the last 20 lines
+///    into a buffer. On failure this becomes
+///    `ErrorContext.ffmpeg_stderr_tail`.
+/// 3. Main thread reads stdout line-by-line, parsing the
+///    `-progress pipe:1` key=value format from ffmpeg.
+/// 4. Keys: `frame` / `fps` / `speed` / `out_time_us` (or
+///    `out_time_ms`) / `progress` (`continue` | `end`).
+/// 5. Each `progress=continue` or `progress=end` line emits one
+///    [`FfmpegProgress`] via the caller's closure; `end` also breaks
+///    the read loop.
+/// 6. Between progress lines, polls `cancel.is_cancelled()` — if set,
+///    kills the child and returns `Err((Cancelled, ...))`.
+/// 7. After stdout closes: `child.wait()`. Non-zero exit code →
+///    `Err((FfmpegNonzeroExit, msg, stderr_tail))`.
+///
+/// # CLI vs GUI
+///
+/// CLI path uses `run_ffmpeg_with_stderr` (sync `cmd.output()`,
+/// stderr inherited to terminal). This function is the GUI/actor
+/// path. Both have the same `Result<(), (ErrorCategory, String, String)>`
+/// shape so the controller can wrap both uniformly.
 pub fn run_ffmpeg_with_progress(
     argv: &[String],
     cancel: &CancelToken,
