@@ -543,8 +543,6 @@ pub fn dry_run_batch<'a, I>(
 where
     I: IntoIterator<Item = &'a PathBuf>,
 {
-    use crate::types::{EncodingOutcome, SkippedReason};
-
     let mut records = Vec::new();
     for file in files {
         let output_path = output_path_for(file, params.format);
@@ -555,19 +553,12 @@ where
         let prepare = encode_prepare(&task, params, _cache, config, Utc::now(), Instant::now());
         match prepare {
             EncodePrepareResult::Ready { .. } => {
-                // Plan: encode would actually run. Mark as
-                // Succeeded (planned). Use OutputExists as the
-                // placeholder skipped-reason — we override outcome
-                // to Succeeded below.
-                let mut r = make_skipped_record(
-                    &task,
-                    params,
-                    Utc::now(),
-                    None,
-                    SkippedReason::OutputExists,
-                );
-                r.outcome = EncodingOutcome::Succeeded;
-                records.push(r);
+                // Plan: encode would actually run. Build a fresh
+                // record with Succeeded outcome (don't go through
+                // make_skipped_record — that uses Skipped(SameCodec)
+                // or OutputExists internally and we'd be overriding
+                // the outcome).
+                records.push(make_planned_ready_record(&task, params, Utc::now()));
             }
             EncodePrepareResult::Skipped(r) | EncodePrepareResult::FailedProbe(r) => {
                 records.push(r);
@@ -575,6 +566,51 @@ where
         }
     }
     records
+}
+
+/// Build a "dry-run planned success" record: same metadata fields as
+/// `make_skipped_record` (probe + source info populated) but outcome
+/// is `Succeeded` and `ended_at` is `None` (no actual run yet).
+fn make_planned_ready_record(
+    task: &TranscodeTask,
+    params: &EncodeParams,
+    started_at: chrono::DateTime<chrono::Utc>,
+) -> EncodingRecord {
+    let source_size_bytes = std::fs::metadata(&task.input).map(|m| m.len()).unwrap_or(0);
+    let source_meta = probe_video_metadata_quick(task);
+    EncodingRecord {
+        source_path: task.input.to_string_lossy().into_owned(),
+        source_size_bytes,
+        source_codec: source_meta.as_ref().and_then(|m| m.codec.clone()),
+        source_container: source_meta.as_ref().and_then(|m| m.container.clone()),
+        source_width: source_meta.as_ref().and_then(|m| m.width),
+        source_height: source_meta.as_ref().and_then(|m| m.height),
+        source_fps: source_meta.as_ref().and_then(|m| m.best_fps()),
+        source_duration_secs: source_meta.as_ref().and_then(|m| m.duration_secs),
+        source_bit_rate_bps: source_meta.as_ref().and_then(|m| m.bit_rate),
+
+        started_at,
+        // No actual end time — this is a plan, not a run record.
+        ended_at: None,
+        encoding_duration_secs: None,
+        encoder_selected: None,
+        encoder_settings: encoder_settings_from_params(params),
+        ffmpeg_argv: Vec::new(),
+        ffmpeg_stderr_tail: String::new(),
+
+        // The planned output path (ffmpeg hasn't run, but we know
+        // what it WOULD produce).
+        output_path: task.output.as_ref().map(|p| {
+            p.to_string_lossy().into_owned()
+        }),
+        output_size_bytes: None,
+        output_duration_secs: None,
+        output_codec: None,
+        compression_ratio: None,
+
+        outcome: EncodingOutcome::Succeeded,
+        error: None,
+    }
 }
 
 /// Extract the target path (file or directory) from `EncodeParams.target`

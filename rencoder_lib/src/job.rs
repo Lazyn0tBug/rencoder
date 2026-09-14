@@ -850,10 +850,6 @@ mod mock_tests {
         std::thread::spawn(move || {
             let mut next_batch_id: BatchId = 0;
             let mut encode_fn = mock_fn;
-            let _cache = EncoderCache {
-                encoders_output: String::new(),
-                has_nvidia: false,
-            };
             let mut cancel_token = cancel_token;
             while let Ok(cmd) = cmd_rx.recv() {
                 match cmd {
@@ -937,10 +933,16 @@ mod mock_tests {
                         // the mock encode_fn must NOT be invoked
                         // (this is enforced by the test that uses a
                         // panicking mock). Build records via lib's
-                        // dry_run_batch.
+                        // dry_run_batch — dry_run_batch accepts a
+                        // cache but ignores it (encode_prepare doesn't
+                        // consult NV for dry-run), so we pass a dummy.
+                        let dummy_cache = EncoderCache {
+                            encoders_output: String::new(),
+                            has_nvidia: false,
+                        };
                         let records = crate::pipeline::batch::dry_run_batch(
                             &params,
-                            &_cache,
+                            &dummy_cache,
                             &Config::default(),
                             files.iter(),
                         );
