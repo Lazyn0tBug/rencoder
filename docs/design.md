@@ -1483,18 +1483,33 @@ Topic 设计意图：dispatch 由 UI 端 reducer 用 `match` 完成，路由成�
 
 ```rust
 pub struct ControllerHandle {
-    cmd_tx: UnboundedSender<Command>,
-    evt_rx: UnboundedReceiver<Event>,
+    cmd_tx: Sender<Command>,           // crossbeam unbounded
+    evt_rx: Receiver<Event>,
 }
 
 pub fn start_controller() -> ControllerHandle;
+
+impl ControllerHandle {
+    /// Cloneable handle for sending Commands. UI typically clones
+    /// this once per component that needs to dispatch (Start /
+    /// Cancel / Load History buttons).
+    pub fn command_sender(&self) -> Sender<Command>;
+
+    /// Destructures into the raw pair. Single-use — once the
+    /// receiver is taken, the handle is consumed. Preferred pattern:
+    /// `let ControllerHandle { cmd_tx, evt_rx } = handle.into_split();`
+    pub fn into_split(self) -> (Sender<Command>, Receiver<Event>);
+}
 ```
 
-UI 启动时调一次，拿到 `(cmd_tx, evt_rx)`，然后再不管 lib 内部。
+UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `into_split()` 把两端分给不同持有者:cmd_tx 给多个 UI 组件(可克隆),evt_rx 给顶层 coroutine(独占消费)。
 
-- `cmd_tx`：可克隆供多个 UI 组件使用（开始按钮、取消按钮、历史按钮）。
-- `evt_rx`：由顶层 `use_coroutine` 独占消费；不广播、不多订阅者——保证单消费者的因果序。
-- Channel 策略：`UnboundedSender`（单 batch 下每秒最多 ~50 个事件，UI 永远消费得过来；如未来有背压风险再换 `bounded + DropOldest`）。
+- `cmd_tx`：可克隆,供多个 UI 组件使用(开始按钮、取消按钮、历史按钮)。
+- `evt_rx`：由顶层 `use_coroutine` 独占消费;不广播、不多订阅者——保证单消费者的因果序。`crossbeam_channel::Receiver` 是 single-consumer,无法 clone——这正是我们想要的(避免事件分发歧义)。
+- Channel 策略:`crossbeam unbounded`(`std::sync::mpsc` 无 unbounded 变体)。单 batch 下每秒最多 ~50 个事件,UI 永远消费得过来;如未来有背压风险再换 `bounded + DropOldest`。
+- Actor 线程命名:`rencoder-controller`,便于 thread 列表里识别。
+
+**Lib 内部细节**:actor 线程启动时一次性加载 `AppConfig`(经 `resolve_config` + `AppConfig::load` + `Config::from_encode_config`)+ 初始化 `EncoderCache`(从 `encode.nv`)。失败 → emit `Event::Error(ConfigError)` + 线程退出(UI 看到错误 + 之后无事件,知道 actor 死了)。
 
 #### 3.8.5 状态与持久化的双轨
 
