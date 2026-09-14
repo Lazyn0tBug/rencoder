@@ -391,9 +391,14 @@ where
 /// - `evt_rx`: single consumer — the UI's top-level coroutine drains
 ///   it and dispatches into its reducer. Multi-consumer would break
 ///   event ordering.
+/// - `config`: the loaded [`AppConfig`] (auto-created if missing,
+///   matching CLI behavior). UI reads this to derive `EncodeParams`
+///   for `Command::StartBatch` instead of using defaults. Cheap to
+///   clone (`Arc<AppConfig>`).
 pub struct ControllerHandle {
     pub(crate) cmd_tx: Sender<Command>,
     pub(crate) evt_rx: Receiver<Event>,
+    pub(crate) config: Arc<AppConfig>,
 }
 
 impl ControllerHandle {
@@ -401,6 +406,15 @@ impl ControllerHandle {
     /// clones this once per component that needs to dispatch.
     pub fn command_sender(&self) -> Sender<Command> {
         self.cmd_tx.clone()
+    }
+
+    /// Get the loaded config (cheap Arc clone). UI uses this to read
+    /// `encode.format` / `encode.crf` / `encode.nv` / `encode.extensions`
+    /// for `Command::StartBatch`. Always `Some` — the controller
+    /// thread exits if config load failed (UI sees `Event::Error`
+    /// then no more events).
+    pub fn config(&self) -> Arc<AppConfig> {
+        Arc::clone(&self.config)
     }
 
     /// Take the event receiver. Single-use — only one consumer.
@@ -449,33 +463,45 @@ pub fn start_controller() -> ControllerHandle {
     let (cmd_tx, cmd_rx) = unbounded::<Command>();
     let (evt_tx, evt_rx) = unbounded::<Event>();
 
+    // Load AppConfig once here so the same Arc is shared with both:
+    // - the actor thread (needs Config + AppConfig for derive / cache)
+    // - ControllerHandle (UI reads encode.* via .config())
+    //
+    // On load failure, emit Event::Error so the UI sees the reason;
+    // fall back to defaults so the controller can still spawn (UI sees
+    // the error then no more events).
+    let (config, app_config) = match load_and_share_config(&evt_tx) {
+        Some(pair) => pair,
+        None => (
+            Arc::new(Config::default()),
+            Arc::new(AppConfig::default()),
+        ),
+    };
+
+    let config_for_thread = Arc::clone(&config);
+    let app_config_for_thread = Arc::clone(&app_config);
+
     std::thread::Builder::new()
         .name("rencoder-controller".into())
-        .spawn(move || run_actor(cmd_rx, evt_tx))
+        .spawn(move || {
+            run_actor(cmd_rx, evt_tx, config_for_thread, app_config_for_thread)
+        })
         .expect("spawn controller thread");
 
-    ControllerHandle { cmd_tx, evt_rx }
+    ControllerHandle {
+        cmd_tx,
+        evt_rx,
+        config: app_config,
+    }
 }
 
-fn run_actor(cmd_rx: Receiver<Command>, evt_tx: Sender<Event>) {
-    // Init once for the controller's lifetime. Both load paths can
-    // fail; on either failure we emit Event::Error and exit the
-    // actor thread (UI sees the error then no more events).
-
-    // Resolve + load AppConfig (creates default file if missing —
-    // matches CLI behavior; see AppConfig::load).
-    let config_path = match resolve_config() {
-        Some(p) => p,
-        None => {
-            let _ = evt_tx.send(Event::Error {
-                category: ErrorCategory::ConfigError,
-                message: "could not determine config path (no $RENENCODER_CONFIG, \
-                          binary dir unavailable)"
-                    .into(),
-            });
-            return;
-        }
-    };
+/// Load AppConfig + derive runtime Config. Emit `Event::Error`
+/// (ConfigError) on either failure and return None so the caller
+/// falls back to defaults.
+fn load_and_share_config(
+    evt_tx: &Sender<Event>,
+) -> Option<(Arc<Config>, Arc<AppConfig>)> {
+    let config_path = resolve_config()?;
     let app_config = match AppConfig::load(&config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -483,10 +509,22 @@ fn run_actor(cmd_rx: Receiver<Command>, evt_tx: Sender<Event>) {
                 category: ErrorCategory::ConfigError,
                 message: format!("failed to load {}: {e}", config_path.display()),
             });
-            return;
+            return None;
         }
     };
     let config = Config::from_encode_config(app_config.encode.as_ref());
+    Some((Arc::new(config), Arc::new(app_config)))
+}
+
+fn run_actor(
+    cmd_rx: Receiver<Command>,
+    evt_tx: Sender<Event>,
+    config: Arc<Config>,
+    app_config: Arc<AppConfig>,
+) {
+    // Init once for the controller's lifetime. AppConfig + Config
+    // already loaded by start_controller; we just derive Cache
+    // from `encode.nv`.
 
     let enable_nv = app_config
         .encode
@@ -503,7 +541,7 @@ fn run_actor(cmd_rx: Receiver<Command>, evt_tx: Sender<Event>) {
             return;
         }
     };
-    drop(app_config); // explicit: not used after this point
+    drop(app_config); // not used after this point (config is derived)
 
     let mut next_batch_id: BatchId = 0;
     // Set when a batch is running; gates StartBatch to one at a time.
@@ -692,7 +730,11 @@ mod controller_tests {
     fn handle_into_split_returns_both_halves() {
         let (cmd_tx, _) = unbounded::<Command>();
         let (_, evt_rx) = unbounded::<Event>();
-        let handle = ControllerHandle { cmd_tx, evt_rx };
+        let handle = ControllerHandle {
+            cmd_tx,
+            evt_rx,
+            config: Arc::new(crate::config::app::AppConfig::default()),
+        };
         let (_tx, _rx) = handle.into_split();
     }
 }

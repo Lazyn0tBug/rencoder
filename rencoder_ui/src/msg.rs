@@ -80,7 +80,12 @@ pub enum Msg {
 /// Reduce a message into a state change; emit Commands to the lib
 /// actor as needed. Returns the (possibly) updated state by
 /// ownership since we may need to replace it entirely.
-pub fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>) {
+pub fn reduce(
+    state: &mut AppState,
+    msg: Msg,
+    cmd_tx: &Sender<Command>,
+    config: &rencoder_lib::config::app::AppConfig,
+) {
     match msg {
         Msg::UserSelectedDir(path) => {
             state.input_dir = Some(path);
@@ -90,20 +95,38 @@ pub fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>) {
                 state.last_error = Some("no input dir selected".into());
                 return;
             };
-            // v1: hardcoded AV1 / CRF 45. Real impl reads from AppConfig.
-            let params = rencoder_lib::types::EncodeParams::default();
-            // Stub file list — for now, the user is expected to have
-            // placed files in the dir. Real impl: glob + filter.
-            let files = std::fs::read_dir(&dir)
+            // Derive EncodeParams from loaded AppConfig (v1.1: no more
+            // hardcoded defaults). Per `Config::from_encode_config` but
+            // we need the FULL EncodeParams, not just the runtime
+            // Config (which strips max_fps etc).
+            let params = build_encode_params_from_config(config);
+            // Collect files in the directory, filtered by config's
+            // extensions if any (v1.1: extension filter).
+            let extensions = config
+                .encode
+                .as_ref()
+                .and_then(|e| e.extensions.clone())
+                .unwrap_or_default();
+            let files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
                 .map(|rd| {
                     rd.flatten()
                         .map(|e| e.path())
                         .filter(|p| p.is_file())
+                        .filter(|p| extension_matches(p, &extensions))
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
             if files.is_empty() {
-                state.last_error = Some(format!("no files in {}", dir.display()));
+                let detail = if extensions.is_empty() {
+                    format!("no files in {}", dir.display())
+                } else {
+                    format!(
+                        "no files in {} matching extensions {:?}",
+                        dir.display(),
+                        extensions
+                    )
+                };
+                state.last_error = Some(detail);
                 return;
             }
             state.last_error = None;
@@ -206,10 +229,67 @@ fn apply_event(state: &mut AppState, evt: Event) {
     }
 }
 
+/// Build an [`EncodeParams`] from the loaded `AppConfig`. Mirrors
+/// what `Config::from_encode_config` does at the runtime layer, plus
+/// the full set of fields the GUI needs (extensions, extra_args,
+/// target, etc).
+fn build_encode_params_from_config(
+    config: &rencoder_lib::config::app::AppConfig,
+) -> rencoder_lib::types::EncodeParams {
+    use rencoder_lib::config::app::EncodeConfig;
+    use rencoder_lib::types::{EncodeParams, Target, VideoFormat};
+
+    // Use a local default sentinel to avoid a temporary-value borrow
+    // (EncodeConfig doesn't impl Clone; reference-compare via as_ref).
+    let default_enc = EncodeConfig::default();
+    let enc: &EncodeConfig = config.encode.as_ref().unwrap_or(&default_enc);
+    // Default format: AV1 (matches rencoder_cli default behavior).
+    let format = enc.format.map(VideoFormat::from).unwrap_or(VideoFormat::Av1);
+    let (is_crf, bitrate_or_crf) = if enc.crf == 0 {
+        (false, enc.bitrate.unwrap_or(5000))
+    } else {
+        (true, enc.crf)
+    };
+    EncodeParams {
+        format,
+        bitrate_or_crf,
+        is_crf,
+        target: Target::default(),
+        extensions: enc.extensions.clone().unwrap_or_default(),
+        extra_args: vec![],
+        max_fps: rencoder_lib::types::MaxFpsConfig {
+            max_fps: enc.max_fps.unwrap_or(0) as f64,
+            eps: 0.05,
+        },
+    }
+}
+
+/// Check whether a path's extension matches any of the user's
+/// configured extension filters. Empty `extensions` means "all".
+/// Match is case-insensitive and ignores the leading dot.
+fn extension_matches(path: &std::path::Path, extensions: &[String]) -> bool {
+    if extensions.is_empty() {
+        return true;
+    }
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    let ext_lower = ext.to_ascii_lowercase();
+    extensions.iter().any(|e| {
+        let trimmed = e.trim_start_matches('.').to_ascii_lowercase();
+        trimmed == ext_lower
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rencoder_lib::config::app::AppConfig;
     use rencoder_lib::types::{EncoderSettings, EncodingOutcome, ErrorContext};
+
+    fn default_config() -> AppConfig {
+        AppConfig::default()
+    }
 
     fn sample_record() -> EncodingRecord {
         EncodingRecord {
@@ -249,7 +329,7 @@ mod tests {
         let mut state = AppState::default();
         let tx = cmd_tx();
         let p = PathBuf::from("/some/dir");
-        reduce(&mut state, Msg::UserSelectedDir(p.clone()), &tx);
+        reduce(&mut state, Msg::UserSelectedDir(p.clone()), &tx, &default_config());
         assert_eq!(state.input_dir, Some(p));
     }
 
@@ -257,7 +337,7 @@ mod tests {
     fn user_clicked_start_without_dir_records_error() {
         let mut state = AppState::default();
         let tx = cmd_tx();
-        reduce(&mut state, Msg::UserClickedStart, &tx);
+        reduce(&mut state, Msg::UserClickedStart, &tx, &default_config());
         assert!(state.last_error.is_some());
         assert!(state.batch.is_none());
     }
@@ -265,7 +345,7 @@ mod tests {
     #[test]
     fn batch_started_creates_batch_info() {
         let mut state = AppState::default();
-        reduce(&mut state, Msg::Lib(Event::BatchStarted { id: 1, total_files: 5 }), &cmd_tx());
+        reduce(&mut state, Msg::Lib(Event::BatchStarted { id: 1, total_files: 5 }), &cmd_tx(), &default_config());
         let b = state.batch.as_ref().unwrap();
         assert_eq!(b.id, 1);
         assert_eq!(b.total_files, 5);
@@ -277,8 +357,8 @@ mod tests {
     fn progress_event_after_finished_is_ignored() {
         let mut state = AppState::default();
         let tx = cmd_tx();
-        reduce(&mut state, Msg::Lib(Event::BatchStarted { id: 1, total_files: 2 }), &tx);
-        reduce(&mut state, Msg::Lib(Event::BatchCompleted { records: vec![] }), &tx);
+        reduce(&mut state, Msg::Lib(Event::BatchStarted { id: 1, total_files: 2 }), &tx, &default_config());
+        reduce(&mut state, Msg::Lib(Event::BatchCompleted { records: vec![] }), &tx, &default_config());
         // Now feed a Progress — should be ignored because finished.
         reduce(
             &mut state,
@@ -291,6 +371,7 @@ mod tests {
                 eta_secs: None,
             }),
             &tx,
+            &default_config(),
         );
         assert!(state.progress.is_empty());
     }
@@ -307,6 +388,7 @@ mod tests {
                     line: format!("line {i}"),
                 }),
                 &tx,
+                &default_config(),
             );
         }
         assert_eq!(state.log.len(), 1000);
@@ -325,6 +407,7 @@ mod tests {
             &mut state,
             Msg::Lib(Event::HistoryLoaded { records: vec![rec.clone()] }),
             &tx,
+            &default_config(),
         );
         assert_eq!(state.history.len(), 1);
         assert_eq!(state.history[0].source_path, "/a.mp4");
@@ -334,11 +417,12 @@ mod tests {
     fn batch_cancelled_sets_cancelled_and_finished() {
         let mut state = AppState::default();
         let tx = cmd_tx();
-        reduce(&mut state, Msg::Lib(Event::BatchStarted { id: 1, total_files: 5 }), &tx);
+        reduce(&mut state, Msg::Lib(Event::BatchStarted { id: 1, total_files: 5 }), &tx, &default_config());
         reduce(
             &mut state,
             Msg::Lib(Event::BatchCancelled { completed: 2, total: 5 }),
             &tx,
+            &default_config(),
         );
         let b = state.batch.as_ref().unwrap();
         assert!(b.cancelled);
@@ -350,13 +434,14 @@ mod tests {
     fn file_completed_appends_record_to_batch() {
         let mut state = AppState::default();
         let tx = cmd_tx();
-        reduce(&mut state, Msg::Lib(Event::BatchStarted { id: 1, total_files: 2 }), &tx);
+        reduce(&mut state, Msg::Lib(Event::BatchStarted { id: 1, total_files: 2 }), &tx, &default_config());
         let mut rec = sample_record();
         rec.source_path = "/first.mp4".into();
         reduce(
             &mut state,
             Msg::Lib(Event::FileCompleted { index: 0, record: rec.clone() }),
             &tx,
+            &default_config(),
         );
         assert_eq!(state.batch.as_ref().unwrap().records.len(), 1);
         assert_eq!(state.batch.as_ref().unwrap().records[0].source_path, "/first.mp4");
@@ -373,6 +458,7 @@ mod tests {
                 message: "ffmpeg not found".into(),
             }),
             &tx,
+            &default_config(),
         );
         assert_eq!(state.last_error.as_deref(), Some("ffmpeg not found"));
     }
@@ -383,5 +469,70 @@ mod tests {
         // struct-literal it from outside. This just ensures the
         // type is reachable from this crate (compile-time check).
         let _: Option<ErrorContext> = None;
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn build_encode_params_uses_config() {
+        use rencoder_lib::config::app::{AppConfig, EncodeConfig, FormatArg};
+        let mut cfg = AppConfig::default();
+        cfg.encode = Some(EncodeConfig {
+            format: Some(FormatArg::Hevc),
+            crf: 28,
+            ..Default::default()
+        });
+        let params = build_encode_params_from_config(&cfg);
+        assert_eq!(params.format, rencoder_lib::types::VideoFormat::Hevc);
+        assert!(params.is_crf);
+        assert_eq!(params.bitrate_or_crf, 28);
+    }
+
+    #[test]
+    fn build_encode_params_defaults_when_section_missing() {
+        let cfg = AppConfig::default();
+        let params = build_encode_params_from_config(&cfg);
+        // Default format is AV1; default crf=45 → is_crf=true.
+        assert_eq!(params.format, rencoder_lib::types::VideoFormat::Av1);
+        assert!(params.is_crf);
+        assert_eq!(params.bitrate_or_crf, 45);
+    }
+
+    #[test]
+    fn extension_matches_empty_means_all() {
+        assert!(extension_matches(&PathBuf::from("/foo.mp4"), &[]));
+        assert!(extension_matches(&PathBuf::from("/foo.bar"), &[]));
+    }
+
+    #[test]
+    fn extension_matches_case_insensitive() {
+        assert!(extension_matches(
+            &PathBuf::from("/FOO.MP4"),
+            &["mp4".into()]
+        ));
+        assert!(extension_matches(
+            &PathBuf::from("/foo.mp4"),
+            &["MP4".into()]
+        ));
+    }
+
+    #[test]
+    fn extension_matches_strips_leading_dot() {
+        assert!(extension_matches(
+            &PathBuf::from("/foo.mp4"),
+            &[".mp4".into()]
+        ));
+    }
+
+    #[test]
+    fn extension_matches_rejects_non_matching() {
+        assert!(!extension_matches(
+            &PathBuf::from("/foo.txt"),
+            &["mp4".into(), "mkv".into()]
+        ));
+        // File with no extension is rejected when filter is non-empty.
+        assert!(!extension_matches(
+            &PathBuf::from("/foo"),
+            &["mp4".into()]
+        ));
     }
 }

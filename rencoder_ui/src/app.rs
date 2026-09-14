@@ -5,8 +5,11 @@
 
 use dioxus::prelude::*;
 
+use std::sync::Arc;
+
 use crossbeam_channel::Sender;
 
+use rencoder_lib::config::app::AppConfig;
 use rencoder_lib::job::{start_controller, Command};
 
 use crate::msg::{reduce, AppState, Msg};
@@ -15,15 +18,22 @@ use crate::msg::{reduce, AppState, Msg};
 pub fn App() -> Element {
     let mut state = use_signal(AppState::default);
     let mut cmd_tx: Signal<Option<Sender<Command>>> = use_signal(|| None);
+    // Loaded AppConfig from start_controller — read by reduce() to
+    // derive EncodeParams from config.encode.* (no more defaults).
+    let mut config: Signal<Arc<AppConfig>> =
+        use_signal(|| Arc::new(AppConfig::default()));
 
     use_coroutine(move |_rx: UnboundedReceiver<()>| {
         let handle = start_controller();
+        let cfg = handle.config();
         let (tx, evt_rx) = handle.into_split();
         let tx_for_loop = tx.clone();
         cmd_tx.set(Some(tx));
+        config.set(cfg);
         async move {
             while let Ok(evt) = evt_rx.recv() {
-                state.with_mut(|s| reduce(s, Msg::Lib(evt), &tx_for_loop));
+                let cfg = config.read().clone();
+                state.with_mut(|s| reduce(s, Msg::Lib(evt), &tx_for_loop, &cfg));
             }
         }
     });
@@ -63,19 +73,22 @@ pub fn App() -> Element {
             div { class: "controls",
                 button {
                     onclick: move |_| {
-                        state_for_start.with_mut(|s| reduce(s, Msg::UserClickedStart, &tx_for_start));
+                        let cfg = config.read().clone();
+                        state_for_start.with_mut(|s| reduce(s, Msg::UserClickedStart, &tx_for_start, &cfg));
                     },
                     "Start"
                 }
                 button {
                     onclick: move |_| {
-                        state_for_cancel.with_mut(|s| reduce(s, Msg::UserClickedCancel, &tx_for_cancel));
+                        let cfg = config.read().clone();
+                        state_for_cancel.with_mut(|s| reduce(s, Msg::UserClickedCancel, &tx_for_cancel, &cfg));
                     },
                     "Cancel"
                 }
                 button {
                     onclick: move |_| {
-                        state_for_history.with_mut(|s| reduce(s, Msg::UserClickedLoadHistory, &tx_for_history));
+                        let cfg = config.read().clone();
+                        state_for_history.with_mut(|s| reduce(s, Msg::UserClickedLoadHistory, &tx_for_history, &cfg));
                     },
                     "Load History"
                 }
