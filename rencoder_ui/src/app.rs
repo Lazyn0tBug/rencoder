@@ -65,7 +65,11 @@ pub fn App() -> Element {
     rsx! {
         div { class: "app",
             h1 { "Rencoder" }
-            DirPicker { state: state }
+            DirPicker {
+                state: state,
+                cmd_tx: cmd_tx,
+                config: config,
+            }
             if let Some(err) = last_error {
                 p { class: "error", "Last error: {err}" }
             }
@@ -205,10 +209,18 @@ fn LogPanel(state: Signal<AppState>) -> Element {
 
 /// Directory picker (v1.1: plain text input; v1.2 may add native).
 /// Reads current state.input_dir for display; on input change,
-/// dispatches `Msg::UserSelectedDir` so the reducer records the
-/// new path for the next `UserClickedStart` to use.
+/// dispatches `Msg::UserSelectedDir` through the reducer (so any
+/// future reducer logic on this event — validation, logging,
+/// persistence — fires).
+///
+/// `cmd_tx` and `config` are wrapped in `Signal` so Dioxus's
+/// `#[component]` macro can derive `PartialEq` for prop comparison.
 #[component]
-fn DirPicker(state: Signal<AppState>) -> Element {
+fn DirPicker(
+    state: Signal<AppState>,
+    cmd_tx: Signal<Option<Sender<Command>>>,
+    config: Signal<std::sync::Arc<AppConfig>>,
+) -> Element {
     let current = state.read().input_dir.clone();
     rsx! {
         div { class: "dir-picker",
@@ -229,7 +241,12 @@ fn DirPicker(state: Signal<AppState>) -> Element {
                         return;
                     }
                     let path = std::path::PathBuf::from(&s);
-                    state.with_mut(|st| st.input_dir = Some(path));
+                    // cmd_tx is Option<Sender> (None while actor
+                    // initializes); only dispatch if available.
+                    if let Some(tx) = cmd_tx.read().clone() {
+                        let cfg = config.read().clone();
+                        state.with_mut(|st| reduce(st, Msg::UserSelectedDir(path), &tx, &cfg));
+                    }
                 },
             }
         }
