@@ -33,7 +33,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::fs_perms;
 use crate::types::VideoFormat;
@@ -111,7 +111,7 @@ parallel = true
 
 /// Top-level user-facing config. Both sections are optional; missing
 /// sections fall back to their per-action defaults.
-#[derive(Debug, Default, Deserialize, PartialEq)]
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     #[serde(default)]
@@ -127,7 +127,7 @@ fn default_crf() -> u32 {
     45
 }
 
-#[derive(Debug, Default, Deserialize, PartialEq)]
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct EncodeConfig {
     pub format: Option<FormatArg>,
@@ -150,7 +150,7 @@ pub struct EncodeConfig {
     pub encoders: Option<EncodersConfig>,
 }
 
-#[derive(Debug, Default, Deserialize, PartialEq)]
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AnalyzeConfig {
     pub format: Option<AnalyzeFormatArg>,
@@ -159,7 +159,7 @@ pub struct AnalyzeConfig {
     pub output: Option<PathBuf>,
 }
 
-#[derive(Debug, Default, Deserialize, PartialEq)]
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct EncodersConfig {
     pub av1: Option<String>,
@@ -202,6 +202,22 @@ impl AppConfig {
         Ok(cfg)
     }
 
+    /// Save this config back to `path` (typically the path that
+    /// [`AppConfig::load`] read from). Uses the same atomic tmp +
+    /// rename pattern as the auto-create path in `load`, so a
+    /// concurrent reader either sees the old file or the new one
+    /// — never half-written bytes.
+    ///
+    /// Returns `ConfigError::TomlSer` if the in-memory config can't
+    /// be serialized (e.g. invalid `format` enum). The error is
+    /// raised from `save` rather than from a future editor so the
+    /// UI surfaces it next to the Save button rather than at
+    /// arbitrary edit time.
+    pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
+        let toml = toml::to_string_pretty(self)?;
+        write_atomic(path, toml.as_bytes())
+    }
+
     /// Validate that all set values are sensible. Today this checks
     /// `max_fps` is in the canonical set, `bitrate` is non-zero when
     /// set, and `crf` is within libsvtav1's documented 0..=63 range;
@@ -235,7 +251,7 @@ impl AppConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum FormatArg {
     X264,
@@ -259,7 +275,7 @@ impl From<FormatArg> for VideoFormat {
 /// `AnalyzeFormatArg` (defined in `rencoder_cli/src/args.rs`) but with
 /// serde-derived `Deserialize` for TOML. The two stay in sync; a small
 /// mapping in `main.rs` is the bridge.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum AnalyzeFormatArg {
     Csv,
@@ -274,6 +290,8 @@ pub enum ConfigError {
     Io(#[from] std::io::Error),
     #[error("toml parse error: {0}")]
     Toml(#[from] toml::de::Error),
+    #[error("toml serialize error: {0}")]
+    TomlSer(#[from] toml::ser::Error),
     #[error("invalid value for {field}: {value}")]
     InvalidValue { field: String, value: String },
 }
@@ -330,6 +348,63 @@ mod tests {
 
     fn unique_temp_dir(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("rencoder_test_{label}_{}", std::process::id()))
+    }
+
+    #[test]
+    fn save_roundtrip_preserves_user_changes() {
+        // Load default config (auto-creates), mutate encode
+        // fields, save, reload, verify the mutations round-trip.
+        let dir = unique_temp_dir("save_roundtrip");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rencoder.toml");
+
+        let mut cfg = AppConfig::load(&path).expect("load");
+        cfg.encode.as_mut().unwrap().crf = 23;
+        cfg.encode.as_mut().unwrap().bitrate = Some(8000);
+        cfg.encode.as_mut().unwrap().max_fps = Some(60);
+        cfg.encode.as_mut().unwrap().extensions = Some(vec!["mp4".into(), "mov".into()]);
+
+        cfg.save(&path).expect("save");
+
+        let reloaded = AppConfig::load(&path).expect("reload after save");
+        assert_eq!(reloaded.encode.as_ref().unwrap().crf, 23);
+        assert_eq!(reloaded.encode.as_ref().unwrap().bitrate, Some(8000));
+        assert_eq!(reloaded.encode.as_ref().unwrap().max_fps, Some(60));
+        assert_eq!(
+            reloaded.encode.as_ref().unwrap().extensions.as_ref().unwrap(),
+            &vec!["mp4".to_string(), "mov".to_string()]
+        );
+
+        // Atomic write: no .tmp file should be left behind.
+        let tmp = path.with_extension("toml.tmp");
+        assert!(!tmp.exists(), "atomic write must consume the tmp");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn save_overwrites_existing_file_atomically() {
+        // Write a file, modify via save (should rename-replace the
+        // existing file, not leave the old content lying around).
+        let dir = unique_temp_dir("save_overwrite");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rencoder.toml");
+
+        let _ = AppConfig::load(&path); // auto-create
+        let original = std::fs::read_to_string(&path).unwrap();
+        assert!(original.contains("crf"));
+
+        let mut cfg = AppConfig::load(&path).expect("reload");
+        cfg.encode.as_mut().unwrap().crf = 17; // change one field
+        cfg.save(&path).unwrap();
+
+        let new = std::fs::read_to_string(&path).unwrap();
+        assert!(new.contains("crf = 17"));
+        assert_ne!(original, new);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
