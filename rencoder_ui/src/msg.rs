@@ -233,6 +233,10 @@ fn apply_event(state: &mut AppState, evt: Event) {
 /// what `Config::from_encode_config` does at the runtime layer, plus
 /// the full set of fields the GUI needs (extensions, extra_args,
 /// target, etc).
+///
+/// Note: `target` is always `Target::default()` — CLI `Config::from_encode_config`
+/// also ignores `[encode] target` (the field exists in the schema but
+/// isn't currently consumed by transcode_single). L1 review finding.
 fn build_encode_params_from_config(
     config: &rencoder_lib::config::app::AppConfig,
 ) -> rencoder_lib::types::EncodeParams {
