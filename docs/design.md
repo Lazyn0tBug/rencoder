@@ -1860,6 +1860,11 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 41 | CLI encode summary 增加 `PartialSkip` 独立分类(`PartialOutput` 不计入 `Skipped` 也不计入 `Failed`) | ✅ |
 | 42 | Per-frame Progress 事件接线：`transcode_single_with_progress` + controller 把 `FfmpegProgress` 包成 `Event::Progress`；CancelToken 真正能 kill 当前 ffmpeg 子进程 | ✅ |
 | 43 | Mock 测试层：`process_one_file` + `run_actor` 抽出允许注入 encode 闭包，验证消息协议契约不需要 ffmpeg；覆盖 event sequence / busy rejection / cancel / LoadHistory 过滤 | ✅ |
+| 44 | `run_ffmpeg_with_progress` 签名带 `total_duration_secs: Option<f64>`(ETA 计算输入)；`FfmpegProgress` 5 字段 struct 定义;cancel 阈值 `speed >= 0.001` 才返回 Some(eta) | ✅ |
+| 45 | `process_one_file` 抽出 `encode_fn: &mut F` 闭包参数让 mock 测试注入；`ProcessError` enum 区分 Encode vs EventSend(后者表示 UI dropped receiver,batch 应 abort) | ✅ |
+| 46 | `load_history(data_dir, limit, after)` 显式接受 data_dir 参数(不读 env var)——让 mock 测试 parallel-safe,env vars 是 process-global 会 race | ✅ |
+| 47 | `rencoder_lib::job::EncodingRecord` 重新导出——UI 需要命名 `Event::FileCompleted` / `BatchCompleted` 携带的 record 类型 | ✅ |
+| 48 | `rencoder_ui` crate bootstrap(Dioxus desktop 0.6)：reducer + 9 个 unit test;App 组件 wire ControllerHandle via `use_coroutine` + `use_signal`;v1 仅有 Start/Cancel/Load History 按钮 + 极简状态显示(rich 组件留 v1.1) | ✅ |
 
 ---
 
