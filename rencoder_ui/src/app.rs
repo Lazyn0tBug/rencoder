@@ -58,9 +58,12 @@ pub fn App() -> Element {
     let mut state_for_start = state;
     let mut state_for_cancel = state;
     let mut state_for_history = state;
-    let tx_for_start = tx.clone();
-    let tx_for_cancel = tx.clone();
-    let tx_for_history = tx.clone();
+    // Pre-clone tx for each button (each `move ||` captures one
+    // clone independently — Sender is Clone).
+    let tx_start = tx.clone();
+    let tx_cancel = tx.clone();
+    let tx_history = tx.clone();
+    let tx_preview = tx.clone();
 
     rsx! {
         div { class: "app",
@@ -78,27 +81,35 @@ pub fn App() -> Element {
             LogPanel { state: state }
             p { class: "history", "History: {history_count} records" }
             HistoryPanel { state: state }
+            DryRunPanel { state: state }
             div { class: "controls",
                 button {
                     onclick: move |_| {
                         let cfg = config.read().clone();
-                        state_for_start.with_mut(|s| reduce(s, Msg::UserClickedStart, &tx_for_start, &cfg));
+                        state_for_start.with_mut(|s| reduce(s, Msg::UserClickedStart, &tx_start, &cfg));
                     },
                     "Start"
                 }
                 button {
                     onclick: move |_| {
                         let cfg = config.read().clone();
-                        state_for_cancel.with_mut(|s| reduce(s, Msg::UserClickedCancel, &tx_for_cancel, &cfg));
+                        state_for_cancel.with_mut(|s| reduce(s, Msg::UserClickedCancel, &tx_cancel, &cfg));
                     },
                     "Cancel"
                 }
                 button {
                     onclick: move |_| {
                         let cfg = config.read().clone();
-                        state_for_history.with_mut(|s| reduce(s, Msg::UserClickedLoadHistory, &tx_for_history, &cfg));
+                        state_for_history.with_mut(|s| reduce(s, Msg::UserClickedLoadHistory, &tx_history, &cfg));
                     },
                     "Load History"
+                }
+                button {
+                    onclick: move |_| {
+                        let cfg = config.read().clone();
+                        state_for_start.with_mut(|s| reduce(s, Msg::UserClickedPreview, &tx_preview, &cfg));
+                    },
+                    "Preview (Dry Run)"
                 }
             }
         }
@@ -169,6 +180,37 @@ fn HistoryPanel(state: Signal<AppState>) -> Element {
                         td { if let Some(p) = &r.output_path { "{p}" } else { "—" } }
                         td { if let Some(d) = r.encoding_duration_secs { "{d:.1}" } else { "—" } }
                         td { if let Some(s) = r.output_size_bytes { "{s}" } else { "—" } }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Dry-run results table (Tier 2 #6). Reads `state.dry_run_results`
+/// (populated by `Event::DryRunFinished` from `Command::DryRun`).
+/// Shows what WOULD happen at each file — SameCodec skipped,
+/// OutputExists skipped, PartialOutput skipped, FailedProbe, or
+/// Succeeded (planned). No ffmpeg actually ran.
+#[component]
+fn DryRunPanel(state: Signal<AppState>) -> Element {
+    let results = state.read().dry_run_results.clone();
+    if results.is_empty() {
+        return rsx! { p { class: "muted", "(no dry-run results yet — click Preview)" } };
+    }
+    rsx! {
+        table { class: "dryrun-table",
+            thead { tr {
+                th { "Source" }
+                th { "Planned outcome" }
+                th { "Output" }
+            } }
+            tbody {
+                for r in results.iter() {
+                    tr {
+                        td { "{r.source_path}" }
+                        td { "{r.outcome:?}" }
+                        td { if let Some(p) = &r.output_path { "{p}" } else { "—" } }
                     }
                 }
             }

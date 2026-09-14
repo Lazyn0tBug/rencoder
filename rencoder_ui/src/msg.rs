@@ -27,6 +27,10 @@ pub struct AppState {
     pub log: VecDeque<LogLine>,
     /// History loaded via LoadHistory command.
     pub history: Vec<EncodingRecord>,
+    /// Dry-run results: populated by Preview (Command::DryRun) →
+    /// Event::DryRunFinished. Cleared on each new dry-run.
+    #[allow(dead_code)] // populated in #64; UI panel rendering land
+    pub dry_run_results: Vec<EncodingRecord>,
     /// Currently selected input directory (set via start_view).
     pub input_dir: Option<PathBuf>,
     /// Last fatal error (if any).
@@ -74,6 +78,12 @@ pub enum Msg {
     UserClickedStart,
     UserClickedCancel,
     UserClickedLoadHistory,
+    // UserClickedPreview — wired up in app.rs Preview button. The
+    // variant is always constructed in production code; clippy's
+    // dead_code lint triggers here because no test in this module
+    // exercises the preview flow directly. Tests live in the UI
+    // integration suite (manual / playwright).
+    UserClickedPreview,
     Lib(Event),
 }
 
@@ -134,6 +144,39 @@ pub fn reduce(
             state.log.clear();
             let _ = cmd_tx.send(Command::StartBatch { params, files });
         }
+        Msg::UserClickedPreview => {
+            // Dry-run: clear previous results, build params from
+            // config, dispatch Command::DryRun.
+            state.dry_run_results.clear();
+            state.last_error = None;
+            let Some(dir) = state.input_dir.clone() else {
+                state.last_error = Some("no input dir selected".into());
+                return;
+            };
+            let params = build_encode_params_from_config(config);
+            let extensions = config
+                .encode
+                .as_ref()
+                .and_then(|e| e.extensions.clone())
+                .unwrap_or_default();
+            let files: Vec<_> = std::fs::read_dir(&dir)
+                .map(|rd| {
+                    rd.flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.is_file())
+                        .filter(|p| extension_matches(p, &extensions))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if files.is_empty() {
+                state.last_error = Some(format!(
+                    "no files in {} for preview",
+                    dir.display()
+                ));
+                return;
+            }
+            let _ = cmd_tx.send(Command::DryRun { params, files });
+        }
         Msg::UserClickedCancel => {
             let _ = cmd_tx.send(Command::Cancel);
         }
@@ -185,6 +228,9 @@ fn apply_event(state: &mut AppState, evt: Event) {
                     eta_secs,
                 },
             );
+        }
+        Event::DryRunFinished { records } => {
+            state.dry_run_results = records;
         }
         Event::FileCompleted { record, .. } => {
             // Move the record's outcome into BatchInfo.records for
