@@ -1464,6 +1464,21 @@ pub enum Event {
     // State topic
     HistoryLoaded { records: Vec<EncodingRecord> },
 
+    // Lifecycle topic (actor shutdown)
+    /// Actor thread is shutting down. **Last** event sent before the
+    /// channel closes. `reason` distinguishes clean vs error vs cancelled
+    /// shutdown — lets the UI display "controller stopped: <reason>"
+    /// instead of going blank on channel close.
+    ///
+    /// Without this, UI only learns lib exited via `evt_rx.recv()`
+    /// returning `Err` (channel disconnected). That's an implicit
+    /// signal that carries no reason, no error category, no
+    /// recovery affordance.
+    ///
+    /// Lifecycle symmetry: `Start` is construction (no message),
+    /// `Exit` is one explicit message before disconnect.
+    ActorExited { reason: ExitReason },
+
     // Error topic（仅 fatal；per-file 失败走 EncodingRecord.error）
     /// 仅 fatal 错误；payload 故意精简为 `(category, message)`。
     ///
@@ -1486,6 +1501,21 @@ pub enum ErrorCategory {
     ConfigError,             // 配置解析/校验失败
     Cancelled,               // 批被取消（Cancelled 错误 vs `Event::BatchCancelled` 生命周期事件）
     IoError,                 // 磁盘 / 权限 / path 错误无法继续
+}
+
+/// Actor thread shutdown reason — last event before `evt_tx` drops.
+/// `Clean` = actor finished a batch and has no more work (UI can
+/// restart by re-calling `start_controller()` if needed). `Error`
+/// = fatal — actor thread exited because something broke. `Cancelled`
+/// = the actor received `Command::Cancel` and decided to exit (rare;
+/// normally a Cancel just stops the in-flight batch, the actor
+/// stays alive waiting for next Start).
+///
+/// `#[non_exhaustive]` (consistent with ErrorCategory / SkippedReason).
+pub enum ExitReason {
+    Clean,
+    Error(crate::error::EncodeError),
+    Cancelled,
 }
 
 Topic 设计意图：dispatch 由 UI 端 reducer 用 `match` 完成，路由成本零；不需要单独的 `topic: Topic` 字段或多 channel。
