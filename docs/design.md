@@ -1628,6 +1628,20 @@ where
 ```
 
 内部 emit 三件事:`FileStarted` (前) / `Progress` × N (中) / `FileCompleted` (后)。返回 `Err(ProcessError::Encode(e))` 让 caller 发 `Event::Error`;`Err(ProcessError::EventSend)` 表示 UI dropped receiver,应 abort batch。
+
+**`EncodeError → ErrorCategory` 映射**(process_one_file 错误路径使用):
+
+| `EncodeError` variant | `ErrorCategory` | 理由 |
+|---------------------|----------------|------|
+| `Io(_)` | `IoError` | 1:1 |
+| `Ffmpeg(_)` | `FfmpegSpawnFailed` | 错误来自 `transcode_single_with_progress` 内部——per-file ffmpeg 错误已转 `Ok(Failed record)` 不走这条路径,剩下的都是 spawn/setup 失败 |
+| `Probe(_)` | `ProbeFailed` | 1:1 (但 `transcode_single_with_progress` 通常把 probe 失败转 `Ok(Failed record)`) |
+| `InvalidParam(_)` | `ConfigError` | 配置 / 参数错误 |
+| `EncoderNotFound(_)` | `EncoderSelectionFailed` | 1:1 |
+| `FpsParse(_)` | `ConfigError` | 配置 / 解析错误 |
+| `UserCancel` | `Cancelled` | 1:1 |
+
+`Event::Error` 是 fatal-only,所以"per-file encode 失败"走 `EncodingRecord.error` 字段,这里只处理**真 fatal**(setup / 系统错误)。映射函数在 `job.rs` 里,作为 `pub(crate) fn encode_error_category(e: &EncodeError) -> ErrorCategory` 存在,便于测试。
 | `job.rs`（新） | `start_controller() -> ControllerHandle` | 编排：后台线程 + mpsc + 现有 `transcode_batch`（**复用 CLI 路径的纯函数，不 fork**）+ 新 `run_ffmpeg_with_progress`；job.rs 是 thin glue，把现有 pieces 装成 actor |
 
 **Controller 启动时加载 AppConfig**（U21 增量）：
