@@ -213,6 +213,12 @@ fn LogPanel(state: Signal<AppState>) -> Element {
 /// future reducer logic on this event — validation, logging,
 /// persistence — fires).
 ///
+/// The input is a Dioxus-controlled component backed by `use_signal`.
+/// Signal updates drive the displayed value, so external mutations
+/// of `state.input_dir` (e.g. from a future "Reset" button) re-render
+/// the field — fixing M3 (the bare `value:` attribute only sets the
+/// initial value and doesn't re-sync after first render).
+///
 /// `cmd_tx` and `config` are wrapped in `Signal` so Dioxus's
 /// `#[component]` macro can derive `PartialEq` for prop comparison.
 #[component]
@@ -221,23 +227,52 @@ fn DirPicker(
     cmd_tx: Signal<Option<Sender<Command>>>,
     config: Signal<std::sync::Arc<AppConfig>>,
 ) -> Element {
-    let current = state.read().input_dir.clone();
+    // Local signal mirrors state.input_dir so the input is
+    // Dioxus-controlled (signal updates drive value re-render).
+    // On mount, seed from current state.
+    let mut local = use_signal(|| {
+        state
+            .read()
+            .input_dir
+            .clone()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    });
+    // Re-sync from state when external updates happen (e.g. a future
+    // "Reset" button or LoadHistory clearing the dir). Only update
+    // when state diverges from the local value — avoids stomping
+    // on user typing-in-progress.
+    let state_value = state
+        .read()
+        .input_dir
+        .clone()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if local.read().as_str() != state_value.as_str() {
+        local.set(state_value);
+    }
+
     rsx! {
         div { class: "dir-picker",
             label { "Input directory: " }
-            if let Some(d) = &current {
-                span { class: "current", "{d.display()}" }
+            if state.read().input_dir.is_some() {
+                span { class: "current",
+                    "{state.read().input_dir.as_ref().unwrap().display()}" }
             } else {
                 span { class: "muted", "(none)" }
             }
             input {
                 r#type: "text",
                 placeholder: "/path/to/videos",
-                value: current.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+                value: "{local}",
                 oninput: move |e| {
                     let s = e.value();
+                    // Mirror typed value into local immediately so
+                    // the field doesn't snap back to a stale value.
+                    local.set(s.clone());
                     if s.is_empty() {
-                        // Empty input → no-op (keep previous selection)
+                        // Empty input → no-op for the reducer
+                        // (keep previous selection).
                         return;
                     }
                     let path = std::path::PathBuf::from(&s);
