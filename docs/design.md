@@ -375,8 +375,8 @@ rencoder_ui/
 │   ├── mod.rs
 │   ├── start_view.rs     # 选择目录 / 配置 / 开始
 │   ├── progress_view.rs  # 当前文件、ETA、批进度
-│   ├── log_view.rs       # VecDeque<LogLine> 渲染
-│   └── history_view.rs   # 历史记录列表
+│   └── log_view.rs       # VecDeque<LogLine> 渲染
+│   └── history_view.rs   # 历史记录列表（v1.1——见 §3.8.7 v1 limitations）
 └── msg.rs                # Msg 枚举 + reduce() 函数
 ```
 
@@ -1384,6 +1384,17 @@ cargo-dist 0.32 不支持 `dmg` installer 类型（只支持 msi/shell/powershel
 
 ### 3.8 GUI 前端（rencoder_ui，U21 计划）
 
+**Tier breakdown**:
+
+| Tier | 内容 | 状态 |
+|------|------|------|
+| **U21 (v1)** | actor 模型 + Command/Event 协议 + 三按钮 UI (Start / Cancel) + batch + progress 极简显示 + AppConfig 加载 + actor thread 错误处理 | bootstrap 完成（rencoder_ui crate） |
+| **v1.1** | DirPicker + EncodeParams 从 AppConfig + 扩展名过滤 + 三个 Panel (Progress/Log/History) + History 回读 | §3.8.7 limitations 表 |
+| **v1.2** | Native 文件对话框 + preset/max_fps passthrough | future work |
+| **Future** | 多批 + 非 Unix 平台 | deferred |
+
+本节后续内容（§3.8.1–§3.8.8）描述全部 v1+v1.1+v1.2 的完整设计意图;具体哪些项属于哪一档,见 §3.8.7 limitations 表。
+
 #### 3.8.1 框架与形态
 
 - **Dioxus desktop (0.6)**：纯 Rust、wry webview 后端，与 Tauri 同层但避免 IPC JSON 序列化税（每条 `Progress` 事件不跨 IPC 边界）。
@@ -1519,7 +1530,7 @@ UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `int
 | 持久 | `<app_dir>/data/encoding-*.parquet` | 永久 |
 
 - 批结束：lib 写 Parquet + 发 `Event::BatchCompleted`。
-- UI 启动：发 `Command::LoadHistory` → lib 读 Parquet → 发 `Event::HistoryLoaded` 填充历史视图。
+- **History 回读（v1.1 启用）**:UI 启动时发 `Command::LoadHistory { limit, after }` → lib 读 Parquet → 发 `Event::HistoryLoaded` 填充历史视图。v1 不展示历史(见 §3.8.7 limitations),但 Parquet 仍在写,数据可用。
 - 这是 event sourcing 的两面：state 是 event log 的 fold，event log 是 append-only 真相源。
 
 #### 3.8.6 lib 内部实现要点
@@ -1542,8 +1553,7 @@ UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `int
 | `pipeline/batch.rs` | `run_ffmpeg_with_progress(argv, cancel, total_duration_secs, on_progress)` | `cmd.spawn()` 替代 `cmd.output()`，支持 cancel + progress 回调；CLI 路径的同步 ffmpeg 编排保留不动。`total_duration_secs` 用于 ETA 计算（`None` → eta_secs=None） |
 | `pipeline/batch.rs` | `transcode_single_with_progress(...)` | GUI 路径：复用 CLI 的 probe + partial detection + skip + argv 逻辑(共享 `encode_prepare` helper)，把 ffmpeg 调用换成 `run_ffmpeg_with_progress`；CancelToken 真正能 kill 子进程 |
 | `job.rs`（新） | `process_one_file(...)` | 从 controller StartBatch 循环里抽出的 per-file 逻辑；接受泛型 `encode_fn` 闭包，让测试注入 mock encoder（不需 ffmpeg 即可验证消息协议契约） |
-| `data/store.rs` | `read_records(path) -> Result<Vec<EncodingRecord>, EncodeError>` | 单 Parquet 文件回读；多文件 glob + limit/after 过滤在 controller |
-| `config/path.rs` | `resolve_data_dir() -> Option<PathBuf>` | controller 在响应 `Command::LoadHistory` 时调此拿到数据目录(`$RENENCODER_DATA_DIR` > `<app_dir>/data`);**不**走 `Command::LoadHistory` 的 payload,UI 不需要知道路径 |
+| `data/store.rs` | `read_records(path) -> Result<Vec<EncodingRecord>, EncodeError>` | 单 Parquet 文件回读（v1 不使用——见 §3.8.7 limitations）;v1.1 才接 `Command::LoadHistory` |
 
 **`FfmpegProgress` struct**（U21 §3.8.3 `Event::Progress` 的源数据,`run_ffmpeg_with_progress` 每 ~0.5s emit 一次）:
 
@@ -1654,7 +1664,8 @@ struct AppState {
     progress: HashMap<usize, ProgressInfo>,
     /// stderr log ring buffer(§3.8.6:上限 1000 行)
     log: VecDeque<LogLine>,
-    /// 历史记录(由 `Command::LoadHistory` 填充)
+    /// 历史记录(v1.1 启用——v1 不展示历史)
+    #[allow(dead_code)]
     history: Vec<EncodingRecord>,
     /// UI 侧选中的输入目录(由 DirPicker 设置,Start 按钮读取)
     input_dir: Option<PathBuf>,
@@ -1697,6 +1708,8 @@ enum Msg {
     UserSelectedDir(PathBuf),
     UserClickedStart,
     UserClickedCancel,
+    /// v1.1——v1 不展示历史。
+    #[allow(dead_code)]
     UserClickedLoadHistory,
     Lib(Event),
 }
@@ -1894,28 +1907,28 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 24 | UI 与 lib 通过 `Command`（in）+ `Event`（out）消息通信，actor 模型，互不直接调用 | ✅ |
 | 25 | lib 不为 UI 新增 `Serialize` 派生（保持 `thiserror` 原样，actor 间传 Rust 类型无需序列化） | ✅ |
 | 26 | `Event::Error` 仅 fatal；per-file 失败走 `EncodingRecord.error` 字段 | ✅ |
-| 27 | 双轨 state：mpsc 实时事件 + Parquet 持久化；`Command::LoadHistory` 触发回读 | ✅ |
+| 27 | 双轨 state：mpsc 实时事件 + Parquet 持久化；`Command::LoadHistory` 触发回读（v1 不触发,v1.1 启用） | ✅ |
 | 28 | Channel 策略：`UnboundedSender`（单 batch 下背压风险极低） | ✅ |
 | 29 | lib 内部 `CancelToken`（`Arc<AtomicBool>`）由 UI `Command::Cancel` 与 SIGINT handler 共享 | ✅ |
 | 30 | Log 行在 lib 透传；UI reducer 层设上限（`VecDeque` 1000 行） | ✅ |
 | 31 | `Command::Cancel` 中止整批（包括当前文件），与 SIGINT 等价；不暴露"仅跳过当前文件" | ✅ |
-| 32 | `Command::LoadHistory { limit: Option<usize>, after: Option<DateTime<Utc>> }` 含 payload，避免后续加字段成 breaking change | ✅ |
+| 32 | `Command::LoadHistory { limit: Option<usize>, after: Option<DateTime<Utc>> }` 含 payload，避免后续加字段成 breaking change（v1 不发,v1.1 启用） | ✅ |
 | 33 | `pub enum Command` 和 `pub enum Event` 加 `#[non_exhaustive]`，新增 variant 不破坏 exhaustive match | ✅ |
 | 34 | `ErrorCategory` 在 §3.8.3 内联列出 7 个 variant（§3.2 类型定义同步） | ✅ |
 | 35 | §3.8 GUI 范围 Unix-only（matches §1.3）；wry/Dioxus 非 Unix 支持 deferred | ✅ |
 | 36 | `ErrorCategory` 加 `#[non_exhaustive]`（U21，对齐 `Command` / `Event`）；`Event::Error` 故意只带 `(category, message)` 不带 stderr_tail | ✅ |
 | 37 | `ErrorContext` 加 `#[non_exhaustive]`（U21，对齐 `ErrorCategory`）；外部 crate 不可构造,字段读取仍可 | ✅ |
 | 38 | §3.8.7 定义 `BatchInfo` / `ProgressInfo` / `LogLine` 三个 UI state struct,让 reducer 可独立 unit-test | ✅ |
-| 39 | `Command::LoadHistory` 不带 path 字段；controller 用 `config::path::resolve_data_dir()` 自解析（honors `$RENENCODER_DATA_DIR`） | ✅ |
+| 39 | `Command::LoadHistory` 不带 path 字段；controller 用 `config::path::resolve_data_dir()` 自解析（honors `$RENENCODER_DATA_DIR`,v1.1 启用） | ✅ |
 | 40 | Partial-output 检测(U21)：output duration < source - 1s → partial → 删 + 重转；probe 失败视作 partial；删除失败 → `Skipped(PartialOutput)` | ✅ |
 | 41 | CLI encode summary 增加 `PartialSkip` 独立分类(`PartialOutput` 不计入 `Skipped` 也不计入 `Failed`) | ✅ |
 | 42 | Per-frame Progress 事件接线：`transcode_single_with_progress` + controller 把 `FfmpegProgress` 包成 `Event::Progress`；CancelToken 真正能 kill 当前 ffmpeg 子进程 | ✅ |
-| 43 | Mock 测试层：`process_one_file` + `run_actor` 抽出允许注入 encode 闭包，验证消息协议契约不需要 ffmpeg；覆盖 event sequence / busy rejection / cancel / LoadHistory 过滤 | ✅ |
+| 43 | Mock 测试层：`process_one_file` + `run_actor` 抽出允许注入 encode 闭包，验证消息协议契约不需要 ffmpeg；覆盖 event sequence / busy rejection / cancel / LoadHistory 过滤（LoadHistory 测试 v1.1 触发） | ✅ |
 | 44 | `run_ffmpeg_with_progress` 签名带 `total_duration_secs: Option<f64>`(ETA 计算输入)；`FfmpegProgress` 5 字段 struct 定义;cancel 阈值 `speed >= 0.001` 才返回 Some(eta) | ✅ |
 | 45 | `process_one_file` 抽出 `encode_fn: &mut F` 闭包参数让 mock 测试注入；`ProcessError` enum 区分 Encode vs EventSend(后者表示 UI dropped receiver,batch 应 abort) | ✅ |
-| 46 | `load_history(data_dir, limit, after)` 显式接受 data_dir 参数(不读 env var)——让 mock 测试 parallel-safe,env vars 是 process-global 会 race | ✅ |
+| 46 | `load_history(data_dir, limit, after)` 显式接受 data_dir 参数(不读 env var)——让 mock 测试 parallel-safe,env vars 是 process-global 会 race（v1.1 启用） | ✅ |
 | 47 | `rencoder_lib::job::EncodingRecord` 重新导出——UI 需要命名 `Event::FileCompleted` / `BatchCompleted` 携带的 record 类型 | ✅ |
-| 48 | `rencoder_ui` crate bootstrap(Dioxus desktop 0.6)：reducer + 9 个 unit test;App 组件 wire ControllerHandle via `use_coroutine` + `use_signal`;v1 仅有 Start/Cancel/Load History 按钮 + 极简状态显示(rich 组件留 v1.1) | ✅ |
+| 48 | `rencoder_ui` crate bootstrap(Dioxus desktop 0.6)：reducer + 9 个 unit test;App 组件 wire ControllerHandle via `use_coroutine` + `use_signal`;v1 三按钮 (Start/Cancel)+ 极简状态显示;Load History 按钮存在但 v1 不显示历史(v1.1 启用 HistoryPanel) | ✅ |
 
 ---
 
