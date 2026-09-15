@@ -2,20 +2,22 @@
 //!
 //! Entry point — actual UI lives in `app` and state/reducer
 //! lives in `msg`. This split keeps each file focused and testable.
+//!
+//! The previous attempt (Tiers follow-up) used `LaunchBuilder +
+//! with_custom_head + asset_dir = "assets"` to load a separate
+//! `style.css`. That produced a "Dioxus App" window with a black
+//! background — the App() component never rendered. Most likely
+//! root cause: my LaunchBuilder call signature was wrong
+//! (`with_cfg` doesn't take a `desktop::Config` directly the way I
+//! assumed; the asset bundling path is also brittle in cargo-dist
+//! packaged binaries). Reverting to the simple `dioxus::launch`
+//! and inlining the styles as a `<style>` element inside App()
+//! instead. CSS becomes part of the rendered DOM, no asset
+//! bundling, no file path resolution at runtime.
 
 mod app;
 mod msg;
 
 fn main() {
-    // Tiers follow-up: load the basic layout CSS so the panels
-    // are actually visible. Without this, the default browser
-    // layout stacks everything vertically and most panels render
-    // below the fold (h1 + buttons only on a typical screen).
-    // `asset_dir = "assets"` in Cargo.toml tells dioxus-desktop
-    // (wry) to expose `style.css` at the binary's runtime path.
-    let head = r#"<link rel="stylesheet" href="style.css">"#.to_string();
-    let config = dioxus::desktop::Config::new().with_custom_head(head);
-    dioxus::LaunchBuilder::new()
-        .with_cfg(config)
-        .launch(app::App);
+    dioxus::launch(app::App);
 }
