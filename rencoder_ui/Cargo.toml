@@ -17,6 +17,13 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 name = "rencoder-ui"
 path = "src/main.rs"
 
+# Tell cargo to pick up the assets/ directory so `with_custom_head`
+# can find style.css at runtime (Dioxus 0.6 desktop uses wry,
+# which serves files relative to the binary's working dir by default
+# — declaring it here keeps the path stable).
+[package.metadata.dioxus]
+asset_dir = "assets"
+
 # Opt into cargo-dist. `publish = false` (U21) makes cargo-dist
 # skip this package by default; `dist = true` overrides. The CLI
 # is auto-detected (publish = true), the lib has no `[[bin]]`,

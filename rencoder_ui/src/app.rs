@@ -69,22 +69,47 @@ pub fn App() -> Element {
     rsx! {
         div { class: "app",
             h1 { "Rencoder" }
-            DirPicker {
-                state: state,
-                cmd_tx: cmd_tx,
-                config: config,
+            main {
+                DirPicker {
+                    state: state,
+                    cmd_tx: cmd_tx,
+                    config: config,
+                }
+                if let Some(ref err) = last_error {
+                    p { class: "error", "Last error: {err}" }
+                }
+                p { class: "batch", "Batch: {batch_state}" }
+                // Empty-state hint: if no data is loaded yet (no
+                // history, no dry-run, no analyze results, no
+                // progress, no log) and no error, show a single
+                // welcome card explaining what the buttons do.
+                // The hint disappears as soon as any of the panels
+                // populates. Reads state via fresh `state.read()`
+                // because `s` was already dropped above.
+                if state.read().history.is_empty()
+                    && state.read().dry_run_results.is_empty()
+                    && state.read().analyze_results.is_empty()
+                    && state.read().progress.is_empty()
+                    && state.read().log.is_empty()
+                    && last_error.is_none()
+                {
+                    div { class: "empty-hint",
+                        p { "Get started:" }
+                        p { strong { "Pick a directory" " " } "above, then:" }
+                        p { "• " strong { "Preview" } " to see what would encode" }
+                        p { "• " strong { "Analyze" } " to probe file metadata" }
+                        p { "• " strong { "Start" } " to run the actual encode batch" }
+                        p { "• " strong { "Load History" } " to see past runs" }
+                    }
+                }
+                ProgressPanel { state: state }
+                LogPanel { state: state }
+                p { class: "history", "History: {history_count} records" }
+                HistoryPanel { state: state }
+                DryRunPanel { state: state }
+                SettingsPanel { config: config }
+                AnalyzePanel { state: state }
             }
-            if let Some(err) = last_error {
-                p { class: "error", "Last error: {err}" }
-            }
-            p { class: "batch", "Batch: {batch_state}" }
-            ProgressPanel { state: state }
-            LogPanel { state: state }
-            p { class: "history", "History: {history_count} records" }
-            HistoryPanel { state: state }
-            DryRunPanel { state: state }
-            SettingsPanel { config: config }
-            AnalyzePanel { state: state }
             div { class: "controls",
                 button {
                     onclick: move |_| {
