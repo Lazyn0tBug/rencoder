@@ -1147,9 +1147,18 @@ log "task N/M (source) interrupted" 而不是光秃秃的 path。同步把 `epri
 - **运行时是单目录应用**：binary 自己 resolve 出父目录（`current_exe().parent()`），
   所有持久化状态（config / log / data）从 `<app_dir>` 派生。U17 的 `./rencoder.toml`
   / `./log/` / `./data/` CWD 相对路径不再是默认行为。
-- **dist 镜像运行时布局**：`scripts/dist.sh` 把 target 产物 + LICENSE +
-  README + config 模板拷进 `dist/<app>-<triple>/`，形成 ready-to-run 单目录应用。
-  解压后直接 `./rencoder ...`，无需 mkdir 或额外配置。
+- **dist 镜像运行时布局**：`scripts/dist.sh` 把 `rencoder_cli` 和
+  `rencoder_ui` 两份 target 产物都打成 tarball，各自配 LICENSE +
+  README + config 模板拷进 `dist/<app>-<triple>/`，形成 ready-to-run
+  单目录应用。解压后直接 `./rencoder ...`（CLI）或 `./rencoder-ui`
+  （UI），无需 mkdir 或额外配置。两个 tarball 是独立的（每份带自己
+  的 `rencoder.toml` + `log/` + `data/`）—— 用户挑一个装；不合并
+  成单 tarball 是因为"一个 app_dir 一个 binary"是 U18 的部署形状
+  约束（docs/smart_code.md §3.6），两份 binary 共享状态是另一种
+  部署模式，不在 U18 范围。CLI 与 UI 二进制都可独立跑。
+  - `rencoder_ui` 需要在 `rencoder_ui/Cargo.toml` 显式
+    `[package.metadata.dist] dist = true`（U21: `publish = false`，
+    cargo-dist 0.32 默认跳过 `publish = false` 的 package）。
 
 **配置文件路径解析顺序**（`config_path::resolve`）：
 1. `$RENENCODER_CONFIG`（最高优先级）—— 显式覆盖，read-only fs / 调试用

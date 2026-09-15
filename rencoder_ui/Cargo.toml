@@ -16,3 +16,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 [[bin]]
 name = "rencoder-ui"
 path = "src/main.rs"
+
+# Opt into cargo-dist. `publish = false` (U21) makes cargo-dist
+# skip this package by default; `dist = true` overrides. The CLI
+# is auto-detected (publish = true), the lib has no `[[bin]]`,
+# and the UI is the third package needing explicit opt-in.
+[package.metadata.dist]
+dist = true
