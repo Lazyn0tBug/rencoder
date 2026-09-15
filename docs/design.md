@@ -806,6 +806,43 @@ pub fn records_to_csv(records: &[AnalysisRecord]) -> String;
 
 #[cfg(feature = "parallel-analyze")]
 pub fn analyze_records_parallel(files: &[PathBuf]) -> Result<Vec<AnalysisRecord>, EncodeError>;
+
+/// U22 / Tier 3 #9: 进度上报的并行变体。`F` = probe 闭包(同
+/// `analyze_records_with_probe_parallel` 的 test seam),`P` = 进度闭包,
+/// 在每个 rayon worker 完成自己任务时被调一次(per-file,不是 per-packet)。
+///
+/// 顺序非确定:rayon worker 完成顺序与输入顺序无关。`P` 收到的 `done` 计数
+/// 单调递增;`last` 字段让 closure 知道"刚完成哪个文件"以便发 event。
+///
+/// 进度闭包不返回错误;如果想做背压(throttle / 缓冲)在 closure 内部做,
+/// 不在 lib 接口。
+#[cfg(feature = "parallel-analyze")]
+pub fn analyze_records_with_probe_and_progress_parallel<F, P>(
+    files: &[PathBuf],
+    probe: F,
+    progress: P,
+) -> Vec<AnalysisRecord>;
+
+/// U22: 进度闭包的 payload。`done` / `total` / `failed` 三个 usize +
+/// `last: Option<AnalyzedFile>` 携带最近一个文件的结果(成功 path / 失败
+/// path + error)。`AnalyzedFile` 是独立 type——不复用 AnalysisRecord,
+/// 后者没 `ProbeFailed` outcome 字段,复用会污染 success path。
+pub struct AnalyzeProgress {
+    pub done: usize,
+    pub total: usize,
+    pub failed: usize,
+    pub last: Option<AnalyzedFile>,
+}
+
+pub struct AnalyzedFile {
+    pub path: PathBuf,
+    pub outcome: FileOutcome,  // Ok | ProbeFailed(EncodeError)
+}
+
+pub enum FileOutcome {
+    Ok,
+    ProbeFailed(EncodeError),
+}
 ```
 
 CLI 输出双轨：
@@ -815,6 +852,10 @@ CLI 输出双轨：
 - `-o FILE`：CSV 写到文件而不是 stdout。
 
 聚合在 Polars 中完成：`group_by(fps).agg([count, sum(duration_secs)])`。失败探测的行有空 `fps`/`codec`/`duration_secs`，保留 `path`/`file_bytes` 便于下游 `WHERE fps IS NULL` 筛选。
+
+**并行分析进度上报**（U22 / Tier 3 #9）：GUI 路径需要在 `analyze_records_parallel` 跑的时候给 UI 推
+进度。设计选择见 §3.4 "分析进度上报"——核心是 closure-injection 到 rayon `par_iter()` 层（不是 c-probe
+FFI 层），per-file 完成后回调发 `Event::AnalyzeProgress`。
 
 #### C FFI 桥接层（可选特性 `c-probe`）
 
@@ -1254,6 +1295,73 @@ CLI 输出 summary
 若 -v：detailed() → 写入输出文件
 ```
 
+#### 分析进度上报（U22 / Tier 3 #9）
+
+GUI 路径需要在并行 analyze 跑的时候给 UI 推进度。三个设计选择必须说清：
+
+**1. 进度上报在哪一层？**——c-probe FFI 层 vs rayon orchestrator 层。
+
+选项 A：在 `video_probe.c` 里加 progress callback（C → Rust closure）。每包回调一次，
+per-packet 精度。**否决**——c-probe 桥的单一设计规则是"stateless, 每次 open/close 自己的
+`AVFormatContext`"，加 callback 意味着跨 FFI 边界的 `void*` userdata + `Box<dyn FnMut + Send>`，
+破坏 stateless 约束。更关键的是：单文件 probe 的耗时极低（c-probe 10-50ms / CLI 30-100ms），
+c-probe 一次函数调用的开销本身就占大头，加 callback 路径会让"小文件 N 个"的总耗时被 callback
+穿越放大。"大文件慢"的情况同样在 C 侧（libavformat 读 I/O 才是耗时来源，Rust FFI 怎么绕都绕不过），
+per-packet 进度改变不了这个事实。
+
+选项 B：在 rayon `par_iter()` 层加 closure-injection 的 progress 回调。每个 worker 在自己的
+任务完成后调一次 `(done, total, failed, last)` 进 Rust closure，闭包捕获 `Sender<Event>` 直
+接发到 lib actor 的 channel。**采纳**——pure Rust，backend-agnostic（c-probe 和 CLI fallback
+都拿到进度），复用 `analyze_records_with_probe_parallel` 的 test-seam 模式。
+
+**2. 多文件展示什么？**——逐文件 echo vs 整体计数器。
+
+不是二选一。**复合**：
+- **整体计数器**（B）= UI 进度面板的内容。`done` / `total` / `failed` 三个整数 + `last`
+  字段（最近一个完成的文件 path + outcome）。文本形态 `47/100 (3 failed)`，v1 先不上视觉
+  进度条（CSS bar 后续迭代）。
+- **逐文件 echo**（A）= LogPanel / stderr 的内容。每文件一条 `log::warn!`（失败时）或
+  `log::info!`（成功时）。**v1 默认仅 failure log**——成功 case 在 `Event::AnalyzeFinished`
+  里给 records 表 summary，不在进度过程中逐条噪扰。失败 log 复用 `analyze_records_with_probe_parallel`
+  已有的 `log::warn!("probe failed for {}: {e}", path.display())`，新代码不增加新日志路径。
+- 两者通过同一个 actor 出来，但语义不同：A 是"结果/错误流"，B 是"进度信号"。
+
+**3. 失败怎么数？**——按文件每任务计一次。rayon `par_iter().map()` 每个文件只跑一次（没有
+重试逻辑），所以"一文件一 failure"是天然语义；同文件多次 probe 失败是实现 bug，不该
+出现在接口语义里。`failed` 计数等于 `records` 里 `outcome = ProbeFailed` 的行数，UI 端
+可以直接对账。
+
+**v1 限制**（明确写进 §3.8.7）：`Command::Analyze` 不响应 `Command::Cancel`。
+analyze 本身快（最坏 5-10s/文件 × 1000 文件 / N cores ≈ 几分钟），cancel 价值低；加 cancel
+路径要让 rayon worker 在每个文件开始前 poll `AtomicBool`，测试矩阵翻倍。v2 再加。SIGINT
+也不影响 analyze 批——`Command::Analyze` 走 `Event::AnalyzeFinished` 干净结束，而不是
+`BatchCancelled`。
+
+**协议 shape**（细节在 `rencoder_lib/src/job.rs` rustdoc）：
+
+```rust
+// Command
+Command::Analyze { files: Vec<PathBuf> },
+
+// Event —— 1 × Started + N × Progress + 1 × Finished
+Event::AnalyzeStarted { total: usize },
+Event::AnalyzeProgress {
+    done: usize, total: usize, failed: usize,
+    last: Option<AnalyzedFile>,           // 新 type（不复用 AnalysisRecord，
+                                          // 不污染 success path 的字段）
+},
+Event::AnalyzeFinished { records: Vec<AnalysisRecord>, failed_count: usize },
+```
+
+为什么不复用 `EncodingRecord` / `AnalysisRecord` 当 `last` 字段：前者是 encode 路径的输出，
+后者是"成功 + None-metric"行，没有 "ProbeFailed" 的 outcome 字段。`AnalyzedFile { path,
+outcome: FileOutcome }` 是新 type，`FileOutcome` 只两个 variant（`Ok` / `ProbeFailed(EncodeError)`），
+干净不污染。
+
+**为什么不 chunked 进度**：按 1000 文件算，1000 × ~24 byte channel 消息 = 24 KB 总流量，
+crossbeam unbounded channel 1M msg/s 量级，总开销 ~0.001s。不 chunked 让 UI 不需要自己
+throttle state 更新——简单胜过微小优化。
+
 ---
 
 ### 3.6 部署布局（U18）
@@ -1423,6 +1531,7 @@ pub enum Command {
     StartBatch { params: EncodeParams, files: Vec<PathBuf> },
     /// 中止当前批（包括正在处理的单文件）：等效于 SIGINT 但由 UI 触发。
     /// 单文件跳过不暴露——用户要么让当前文件跑完，要么按 Cancel 中整批。
+    /// **不**影响 `Command::Analyze` 批（v1 限制——见 §3.4 "分析进度上报"）。
     Cancel,
     /// 从 `<app_dir>/data/encoding-*.parquet` 回读历史。
     /// - `limit`：返回最多 N 条最新记录；`None` 表示全部
@@ -1431,6 +1540,15 @@ pub enum Command {
         limit: Option<usize>,
         after: Option<chrono::DateTime<chrono::Utc>>,
     },
+    /// 并行分析一批文件（U22 / Tier 3 #9）——只 probe 不 encode。
+    /// 协议：`AnalyzeStarted { total }` → N × `AnalyzeProgress { done, total,
+    /// failed, last }` → `AnalyzeFinished { records, failed_count }`。
+    /// 协议 shape 与"为什么这样"见 §3.4 "分析进度上报"。
+    Analyze { files: Vec<PathBuf> },
+    /// 把当前加载的 `AppConfig` 写回原路径（U21 / Tier 2 #8）—— Save 按钮
+    /// 走这条；lib 内部 `AppConfig::save(&config_path)`，发 `Event::ConfigSaved`
+    /// 或 `Event::Error`。
+    SaveConfig,
 }
 ```
 
@@ -1463,6 +1581,30 @@ pub enum Event {
 
     // State topic
     HistoryLoaded { records: Vec<EncodingRecord> },
+    /// Config save round-trip（U21 / Tier 2 #8）—— UI Save 按钮触发；
+    /// path 是 lib 实际写到的文件（`ControllerHandle::config_path`）。
+    /// 失败走 `Event::Error` 而不是这个 variant。
+    ConfigSaved { path: PathBuf },
+
+    // Analyze topic (U22 / Tier 3 #9) —— 见 §3.4 "分析进度上报"
+    /// `Command::Analyze` 接收后、第一个文件 probe 之前发。`total` =
+    /// `files.len()`，给 UI 端一个清晰的"开始"信号和总数。
+    AnalyzeStarted { total: usize },
+    /// 每个文件 probe 完成后发一次。`done` / `total` / `failed` 单调
+    /// 递增；`last` 让 UI 能显示"刚完成哪个文件"（结果流，A 模式）。
+    /// 顺序非确定（rayon worker race），UI 只看 `done` 计数。
+    AnalyzeProgress {
+        done: usize,
+        total: usize,
+        failed: usize,
+        last: Option<AnalyzedFile>,
+    },
+    /// 整批结束。`failed_count` 应等于 `records` 里 `outcome =
+    /// ProbeFailed` 的行数（设计约束——UI 端可对账）。
+    AnalyzeFinished {
+        records: Vec<AnalysisRecord>,
+        failed_count: usize,
+    },
 
     // Lifecycle topic (actor shutdown)
     /// Actor thread is shutting down. **Last** event sent before the
@@ -1590,6 +1732,10 @@ UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `int
 | `job.rs` | `encode_error_category(&EncodeError) -> ErrorCategory` | 编码错误 → UI 展示分类的映射 |
 | `job.rs` | `Command::DryRun { params, files }` | Dry-run 入口(V1.1):跟 StartBatch 同样的 busy-gate,但 emit `Event::DryRunFinished` 而不是 `BatchCompleted` |
 | `job.rs` | `Event::DryRunFinished { records }` | Dry-run 结果:planned outcomes,**没有**实际 ffmpeg 输出 |
+| `analyzer/records.rs` | `analyze_records_with_probe_and_progress_parallel<F, P>` | U22 / Tier 3 #9：并行 + 进度 closure-injection。`F` 是 probe 闭包（同 `analyze_records_with_probe_parallel`），`P: Fn(AnalyzeProgress) + Send + Sync` 在每个 worker 完成时调一次。`AnalyzeProgress { done, total, failed, last }` 4 字段 |
+| `analyzer/records.rs` | `AnalyzeProgress` struct + `AnalyzedFile { path, outcome: FileOutcome }` + `FileOutcome { Ok, ProbeFailed(EncodeError) }` | U22：进度回调 payload。`AnalyzedFile` 是新 type（不复用 `AnalysisRecord`——后者没有 `ProbeFailed` outcome 字段，复用得加 `error: Option<_>` 污染 success path）|
+| `job.rs` | `Command::Analyze { files }` arm | U22：调用 `analyze_records_with_probe_and_progress_parallel` with `probe = probe_video_metadata_auto`，`progress = |p| evt_tx.send(Event::AnalyzeProgress { ... })`。先发 `AnalyzeStarted { total }`，批结束发 `AnalyzeFinished`。**走** busy-gate（v1 限制——UI 不能同时跑 analyze + encode；analyze 是 read-only，理论上可与 encode 并存，但 v1 简化起见跟 DryRun 一致复用 busy-gate）|
+| `job.rs` | `Event::AnalyzeStarted` / `Event::AnalyzeProgress` / `Event::AnalyzeFinished` | U22：见 §3.8.3。`Event::AnalyzeProgress` 在 mock actor 里是 no-op（test seam，ref-count 即可）|
 | `data/store.rs` | `read_records(path)` | 单 Parquet 文件回读(v1 不使用,v1.1 启用) |
 
 **`process_one_file` testability surface**(§8 item 43)——这是 §3.8 唯一保留的函数签名,因为它**解释了为何要抽出这个 helper**(测试性):
@@ -1709,6 +1855,26 @@ struct AppState {
     /// Reason the actor thread exited. `Some` after `ActorExited`;
     /// `None` while alive or before any exit has happened.
     last_exit: Option<ExitReason>,
+    /// 当前 analyze 批的进度(U22 / Tier 3 #9)。`None` = 没在跑或还没
+    /// 收到 `AnalyzeStarted`。`done` / `total` / `failed` 单调递增——
+    /// reducer 不去重,完全信任 lib 推上来的 event sequence。
+    #[allow(dead_code)]
+    analyze_progress: Option<AnalyzeProgressInfo>,
+    /// 上一次 analyze 批的结果(U22)。`AnalyzeFinished` 触发时**覆盖**
+    /// 而不是 append——下一次 analyze 自然取代上一次,跟 history 行为
+    /// 一致;用户点别的按钮不清空。
+    #[allow(dead_code)]
+    analyze_results: Vec<AnalysisRecord>,
+}
+
+/// 当前 analyze 批的进度(§3.8.3 `Event::AnalyzeProgress` 的 UI 镜像)。
+#[allow(dead_code)]
+struct AnalyzeProgressInfo {
+    done: usize,
+    total: usize,
+    failed: usize,
+    /// 最近完成的一个文件 path + outcome(结果流 A 模式——LogPanel 用)。
+    last: Option<AnalyzedFile>,
 }
 
 /// 当前批的元信息;由 `Event::BatchStarted` 写入、`Event::BatchCompleted`/`BatchCancelled` 关闭。
@@ -1749,6 +1915,14 @@ enum Msg {
     /// v1.1——v1 不展示历史。
     #[allow(dead_code)]
     UserClickedLoadHistory,
+    /// 触发并行 analyze 批(U22 / Tier 3 #9)——跟 Start 一样从
+    /// `state.input_dir` 收集文件,发 `Command::Analyze { files }`。
+    #[allow(dead_code)]
+    UserClickedAnalyze,
+    /// 触发 AppConfig 写回原路径(U21 / Tier 2 #8)——Save 按钮
+    /// 走这条,发 `Command::SaveConfig`。
+    #[allow(dead_code)]
+    UserClickedSaveSettings,
     Lib(Event),
 }
 
@@ -1784,6 +1958,18 @@ fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>) {
 - 组件只读 `state`，不直接调 lib。
 - 测试：构造 `Vec<Msg>` 灌进 reducer 断言 `state`——不需 Dioxus runtime。
 
+**Concrete UI 组件**(对照上面的 `AppState` / `Msg`):
+
+| 组件 | 输入 | 渲染什么 |
+|------|------|----------|
+| `DirPicker` | `state: Signal<AppState>`, `cmd_tx: Signal<Option<Sender<Command>>>` | 目录输入框 + 当前选择 path;on change 派 `UserSelectedDir` |
+| `ProgressPanel` | `state: Signal<AppState>` | `state.progress` HashMap → per-file 表格(fps/speed/ETA);空时显示"(no active progress)" |
+| `LogPanel` | `state: Signal<AppState>` | `state.log` 末 100 行 newest-first,带时间戳;空时显示"(no log output)" |
+| `HistoryPanel` | `state: Signal<AppState>` | `state.history` 表(source / outcome / output / duration / size);空时显示"(no history loaded)" |
+| `DryRunPanel` | `state: Signal<AppState>` | `state.dry_run_results` 表(source / planned outcome / output);空时显示"(no dry-run results yet — click Preview)" |
+| `SettingsPanel` | `config: Signal<Arc<AppConfig>>` | 只读展示 `[encode]` 当前值(format / crf / bitrate / extensions / max_fps / nv);text-only 字段编辑留 v1.2 |
+| `AnalyzePanel` (U22) | `state: Signal<AppState>` | analyze 进度文本 `"X/Y (Z failed)"` + `last` 字段(刚完成文件);v1 不带视觉进度条。`state.analyze_results` 末 batch 完成时在下面渲染 records 表(类似 DryRunPanel) |
+
 **v1 已知 limitations**(rencoder_ui 当前 bootstrap 状态):
 
 | 项 | 状态 | 后续 |
@@ -1796,6 +1982,7 @@ fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>) {
 | 文件扩展名过滤 | **无**——Start 读目录下所有文件 | v1.1 用 `encode.extensions` glob |
 | `EncoderSettings.preset` / `max_fps_target` | **未传给 ffmpeg** | v1.1 build_ffmpeg_command 接 `EncodeParams` |
 | Preview / Dry Run | **未实现**——user 无法预览编码结果 | v1.1 加 `Command::DryRun` + `Event::DryRunFinished` |
+| Analyze + progress reporting | **未实现**——UI 不能跑 analyze | v1.1 加 `Command::Analyze` + `Event::AnalyzeProgress` + `AnalyzePanel`;**v1.1 也**不支持 `Command::Cancel` abort analyze 批(见 §3.4 "分析进度上报" v1 限制) |
 | Native 文件选择对话框 | **无**——v1 用 `<input type="text">` | v1.2 调研 `rfd` 或 Dioxus 内建 |
 
 这些限制不影响协议契约（Command/Event 已端到端测试通过 mock_tests），只是 UI 渲染层不完整。
@@ -1977,6 +2164,7 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 48 | `rencoder_ui` crate bootstrap(Dioxus desktop 0.6)：reducer + 9 个 unit test;App 组件 wire ControllerHandle via `use_coroutine` + `use_signal`;v1 三按钮 (Start/Cancel)+ 极简状态显示;Load History 按钮存在但 v1 不显示历史(v1.1 启用 HistoryPanel) | ✅ |
 | 49 | Actor 退出显式信号：`Event::ActorExited { reason: ExitReason }` 作为最后一个 event 在 lib drop `evt_tx` 前发出；UI reducer 设 `controller_alive = false` + `last_exit = Some(reason)`。Lifecycle 对称：start = 构造,exit = 显式消息,中间交互 = Command/Event | ✅ |
 | 50 | Preview / Dry Run (Tier 2 #6):`Command::DryRun { params, files }` 跑 `encode_prepare` 但**不调 ffmpeg**,emit `Event::DryRunFinished { records }`;`dry_run_batch` lib helper 复用 probe + partial + skip 逻辑。UI `Preview` 按钮 → reducer arm → DryRunPanel 渲染 planned outcomes。`encode.nv` 故意忽略——dry-run 不知道也不关心 GPU 是否启用 | ✅ |
+| 51 | Parallel analyze progress (Tier 3 #9):`Command::Analyze { files }` 走 `analyze_records_with_probe_and_progress_parallel` 闭包注入层(不是 c-probe FFI 回调层),emit `Event::AnalyzeStarted { total }` + N × `Event::AnalyzeProgress { done, total, failed, last: Option<AnalyzedFile> }` + `Event::AnalyzeFinished { records, failed_count }`;复合 A+B 显示(进度计数 + per-file log)、failure-only log、AnalyzedFile 新 type(不复用 AnalysisRecord 避免污染 success path)、v1 不响应 `Command::Cancel` 和 SIGINT、v1 走 busy-gate 不与 encode 并发。why 详见 §3.4 "分析进度上报" | ✅ |
 
 ---
 
