@@ -600,9 +600,10 @@ fn make_planned_ready_record(
 
         // The planned output path (ffmpeg hasn't run, but we know
         // what it WOULD produce).
-        output_path: task.output.as_ref().map(|p| {
-            p.to_string_lossy().into_owned()
-        }),
+        output_path: task
+            .output
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned()),
         output_size_bytes: None,
         output_duration_secs: None,
         output_codec: None,

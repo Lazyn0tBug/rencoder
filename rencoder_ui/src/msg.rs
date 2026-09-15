@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use crossbeam_channel::Sender;
 
-use rencoder_lib::job::{Command, Event, EncodingRecord};
+use rencoder_lib::job::{Command, EncodingRecord, Event};
 
 /// Cap on the stderr log ring buffer. Per §3.8.6 + §8 item 30.
 const LOG_RING_CAP: usize = 1000;
@@ -78,6 +78,9 @@ pub enum Msg {
     UserClickedStart,
     UserClickedCancel,
     UserClickedLoadHistory,
+    /// Save the loaded AppConfig back to its original path
+    /// (ControllerHandle::config_path). Wired by Save button.
+    UserClickedSaveSettings,
     // UserClickedPreview — wired up in app.rs Preview button. The
     // variant is always constructed in production code; clippy's
     // dead_code lint triggers here because no test in this module
@@ -169,10 +172,7 @@ pub fn reduce(
                 })
                 .unwrap_or_default();
             if files.is_empty() {
-                state.last_error = Some(format!(
-                    "no files in {} for preview",
-                    dir.display()
-                ));
+                state.last_error = Some(format!("no files in {} for preview", dir.display()));
                 return;
             }
             let _ = cmd_tx.send(Command::DryRun { params, files });
@@ -185,6 +185,13 @@ pub fn reduce(
                 limit: Some(100),
                 after: None,
             });
+        }
+        Msg::UserClickedSaveSettings => {
+            // Round-trip the in-memory AppConfig back to its
+            // original path. The lib does the actual save; we just
+            // dispatch. Result comes back as Event::ConfigSaved or
+            // Event::Error (handled in apply_event).
+            let _ = cmd_tx.send(Command::SaveConfig);
         }
         Msg::Lib(evt) => apply_event(state, evt),
     }
@@ -232,6 +239,12 @@ fn apply_event(state: &mut AppState, evt: Event) {
         Event::DryRunFinished { records } => {
             state.dry_run_results = records;
         }
+        Event::ConfigSaved { path } => {
+            // Show feedback ("saved to ...") for a few ticks. We
+            // don't reset last_error — if Save raced a real error
+            // we want the user to see both. UI decides display.
+            state.last_error = Some(format!("saved to {}", path.display()));
+        }
         Event::FileCompleted { record, .. } => {
             // Move the record's outcome into BatchInfo.records for
             // post-batch display.
@@ -275,7 +288,7 @@ fn apply_event(state: &mut AppState, evt: Event) {
     }
 }
 
-/// Build an [`EncodeParams`] from the loaded `AppConfig`. This is
+/// Build an `EncodeParams` from the loaded `AppConfig`. This is
 /// a thin wrapper around the canonical helper in the lib
 /// (`rencoder_lib::types::EncodeParams::from_encode_config`) so
 /// there's a single source of truth for "how a TOML `[encode]`
@@ -351,7 +364,12 @@ mod tests {
         let mut state = AppState::default();
         let tx = cmd_tx();
         let p = PathBuf::from("/some/dir");
-        reduce(&mut state, Msg::UserSelectedDir(p.clone()), &tx, &default_config());
+        reduce(
+            &mut state,
+            Msg::UserSelectedDir(p.clone()),
+            &tx,
+            &default_config(),
+        );
         assert_eq!(state.input_dir, Some(p));
     }
 
@@ -367,7 +385,15 @@ mod tests {
     #[test]
     fn batch_started_creates_batch_info() {
         let mut state = AppState::default();
-        reduce(&mut state, Msg::Lib(Event::BatchStarted { id: 1, total_files: 5 }), &cmd_tx(), &default_config());
+        reduce(
+            &mut state,
+            Msg::Lib(Event::BatchStarted {
+                id: 1,
+                total_files: 5,
+            }),
+            &cmd_tx(),
+            &default_config(),
+        );
         let b = state.batch.as_ref().unwrap();
         assert_eq!(b.id, 1);
         assert_eq!(b.total_files, 5);
@@ -379,8 +405,21 @@ mod tests {
     fn progress_event_after_finished_is_ignored() {
         let mut state = AppState::default();
         let tx = cmd_tx();
-        reduce(&mut state, Msg::Lib(Event::BatchStarted { id: 1, total_files: 2 }), &tx, &default_config());
-        reduce(&mut state, Msg::Lib(Event::BatchCompleted { records: vec![] }), &tx, &default_config());
+        reduce(
+            &mut state,
+            Msg::Lib(Event::BatchStarted {
+                id: 1,
+                total_files: 2,
+            }),
+            &tx,
+            &default_config(),
+        );
+        reduce(
+            &mut state,
+            Msg::Lib(Event::BatchCompleted { records: vec![] }),
+            &tx,
+            &default_config(),
+        );
         // Now feed a Progress — should be ignored because finished.
         reduce(
             &mut state,
@@ -427,7 +466,9 @@ mod tests {
         rec.source_path = "/a.mp4".into();
         reduce(
             &mut state,
-            Msg::Lib(Event::HistoryLoaded { records: vec![rec.clone()] }),
+            Msg::Lib(Event::HistoryLoaded {
+                records: vec![rec.clone()],
+            }),
             &tx,
             &default_config(),
         );
@@ -439,10 +480,21 @@ mod tests {
     fn batch_cancelled_sets_cancelled_and_finished() {
         let mut state = AppState::default();
         let tx = cmd_tx();
-        reduce(&mut state, Msg::Lib(Event::BatchStarted { id: 1, total_files: 5 }), &tx, &default_config());
         reduce(
             &mut state,
-            Msg::Lib(Event::BatchCancelled { completed: 2, total: 5 }),
+            Msg::Lib(Event::BatchStarted {
+                id: 1,
+                total_files: 5,
+            }),
+            &tx,
+            &default_config(),
+        );
+        reduce(
+            &mut state,
+            Msg::Lib(Event::BatchCancelled {
+                completed: 2,
+                total: 5,
+            }),
             &tx,
             &default_config(),
         );
@@ -456,17 +508,31 @@ mod tests {
     fn file_completed_appends_record_to_batch() {
         let mut state = AppState::default();
         let tx = cmd_tx();
-        reduce(&mut state, Msg::Lib(Event::BatchStarted { id: 1, total_files: 2 }), &tx, &default_config());
+        reduce(
+            &mut state,
+            Msg::Lib(Event::BatchStarted {
+                id: 1,
+                total_files: 2,
+            }),
+            &tx,
+            &default_config(),
+        );
         let mut rec = sample_record();
         rec.source_path = "/first.mp4".into();
         reduce(
             &mut state,
-            Msg::Lib(Event::FileCompleted { index: 0, record: rec.clone() }),
+            Msg::Lib(Event::FileCompleted {
+                index: 0,
+                record: rec.clone(),
+            }),
             &tx,
             &default_config(),
         );
         assert_eq!(state.batch.as_ref().unwrap().records.len(), 1);
-        assert_eq!(state.batch.as_ref().unwrap().records[0].source_path, "/first.mp4");
+        assert_eq!(
+            state.batch.as_ref().unwrap().records[0].source_path,
+            "/first.mp4"
+        );
     }
 
     #[test]
@@ -552,9 +618,6 @@ mod tests {
             &["mp4".into(), "mkv".into()]
         ));
         // File with no extension is rejected when filter is non-empty.
-        assert!(!extension_matches(
-            &PathBuf::from("/foo"),
-            &["mp4".into()]
-        ));
+        assert!(!extension_matches(&PathBuf::from("/foo"), &["mp4".into()]));
     }
 }

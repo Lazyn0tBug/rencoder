@@ -547,9 +547,7 @@ pub fn start_controller() -> ControllerHandle {
 /// `ControllerHandle::config_path` (UI Save needs the original
 /// location). Emit `Event::Error` on either failure and return None
 /// so the caller falls back to defaults.
-fn load_and_share_config(
-    evt_tx: &Sender<Event>,
-) -> Option<(Arc<Config>, Arc<AppConfig>, PathBuf)> {
+fn load_and_share_config(evt_tx: &Sender<Event>) -> Option<(Arc<Config>, Arc<AppConfig>, PathBuf)> {
     let config_path = resolve_config()?;
     let app_config = match AppConfig::load(&config_path) {
         Ok(c) => c,
@@ -715,9 +713,8 @@ fn run_actor(
                     continue;
                 }
 
-                let records = crate::pipeline::batch::dry_run_batch(
-                    &params, &cache, &config, files.iter(),
-                );
+                let records =
+                    crate::pipeline::batch::dry_run_batch(&params, &cache, &config, files.iter());
                 busy.store(false, Ordering::SeqCst);
                 let _ = evt_tx.send(Event::DryRunFinished { records });
             }
@@ -735,21 +732,19 @@ fn run_actor(
                 let _ = evt_tx.send(Event::HistoryLoaded { records });
             }
 
-            Command::SaveConfig => {
-                match app_config.save(&config_path) {
-                    Ok(()) => {
-                        let _ = evt_tx.send(Event::ConfigSaved {
-                            path: config_path.clone(),
-                        });
-                    }
-                    Err(e) => {
-                        let _ = evt_tx.send(Event::Error {
-                            category: ErrorCategory::ConfigError,
-                            message: format!("save failed: {e}"),
-                        });
-                    }
+            Command::SaveConfig => match app_config.save(&config_path) {
+                Ok(()) => {
+                    let _ = evt_tx.send(Event::ConfigSaved {
+                        path: config_path.clone(),
+                    });
                 }
-            }
+                Err(e) => {
+                    let _ = evt_tx.send(Event::Error {
+                        category: ErrorCategory::ConfigError,
+                        message: format!("save failed: {e}"),
+                    });
+                }
+            },
         }
     }
 }
@@ -1484,12 +1479,27 @@ mod mock_tests {
     fn encode_error_category_mapping() {
         // Direct test of the mapping helper. Per design §3.8.6.
         let cases = [
-            (EncodeError::Io(std::io::Error::other("x")), ErrorCategory::IoError),
-            (EncodeError::Ffmpeg("x".into()), ErrorCategory::FfmpegSpawnFailed),
+            (
+                EncodeError::Io(std::io::Error::other("x")),
+                ErrorCategory::IoError,
+            ),
+            (
+                EncodeError::Ffmpeg("x".into()),
+                ErrorCategory::FfmpegSpawnFailed,
+            ),
             (EncodeError::Probe("x".into()), ErrorCategory::ProbeFailed),
-            (EncodeError::InvalidParam("x".into()), ErrorCategory::ConfigError),
-            (EncodeError::EncoderNotFound("x".into()), ErrorCategory::EncoderSelectionFailed),
-            (EncodeError::FpsParse("x".into()), ErrorCategory::ConfigError),
+            (
+                EncodeError::InvalidParam("x".into()),
+                ErrorCategory::ConfigError,
+            ),
+            (
+                EncodeError::EncoderNotFound("x".into()),
+                ErrorCategory::EncoderSelectionFailed,
+            ),
+            (
+                EncodeError::FpsParse("x".into()),
+                ErrorCategory::ConfigError,
+            ),
             (EncodeError::UserCancel, ErrorCategory::Cancelled),
         ];
         for (err, expected) in cases {

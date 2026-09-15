@@ -160,9 +160,7 @@ impl EncodeParams {
     /// `[encode] target` is parsed but not consumed by
     /// `transcode_single`. If/when target becomes per-batch
     /// controllable, this function picks it up automatically.
-    pub fn from_encode_config(
-        encode: Option<&crate::config::app::EncodeConfig>,
-    ) -> Self {
+    pub fn from_encode_config(encode: Option<&crate::config::app::EncodeConfig>) -> Self {
         use crate::config::app::EncodeConfig;
         let default_enc = EncodeConfig::default();
         let enc: &EncodeConfig = encode.unwrap_or(&default_enc);

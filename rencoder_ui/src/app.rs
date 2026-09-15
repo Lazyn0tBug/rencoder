@@ -20,8 +20,7 @@ pub fn App() -> Element {
     let mut cmd_tx: Signal<Option<Sender<Command>>> = use_signal(|| None);
     // Loaded AppConfig from start_controller — read by reduce() to
     // derive EncodeParams from config.encode.* (no more defaults).
-    let mut config: Signal<Arc<AppConfig>> =
-        use_signal(|| Arc::new(AppConfig::default()));
+    let mut config: Signal<Arc<AppConfig>> = use_signal(|| Arc::new(AppConfig::default()));
 
     use_coroutine(move |_rx: UnboundedReceiver<()>| {
         let handle = start_controller();
@@ -64,6 +63,7 @@ pub fn App() -> Element {
     let tx_cancel = tx.clone();
     let tx_history = tx.clone();
     let tx_preview = tx.clone();
+    let tx_save = tx.clone();
 
     rsx! {
         div { class: "app",
@@ -82,6 +82,7 @@ pub fn App() -> Element {
             p { class: "history", "History: {history_count} records" }
             HistoryPanel { state: state }
             DryRunPanel { state: state }
+            SettingsPanel { config: config }
             div { class: "controls",
                 button {
                     onclick: move |_| {
@@ -96,6 +97,13 @@ pub fn App() -> Element {
                         state_for_cancel.with_mut(|s| reduce(s, Msg::UserClickedCancel, &tx_cancel, &cfg));
                     },
                     "Cancel"
+                }
+                button {
+                    onclick: move |_| {
+                        let cfg = config.read().clone();
+                        state_for_start.with_mut(|s| reduce(s, Msg::UserClickedSaveSettings, &tx_save, &cfg));
+                    },
+                    "Save Settings"
                 }
                 button {
                     onclick: move |_| {
@@ -125,8 +133,7 @@ fn ProgressPanel(state: Signal<AppState>) -> Element {
     if progress.is_empty() {
         return rsx! { p { class: "muted", "(no active progress)" } };
     }
-    let mut rows: Vec<(usize, crate::msg::ProgressInfo)> =
-        progress.into_iter().collect();
+    let mut rows: Vec<(usize, crate::msg::ProgressInfo)> = progress.into_iter().collect();
     rows.sort_by_key(|(i, _)| *i);
     rsx! {
         table { class: "progress-table",
@@ -218,8 +225,31 @@ fn DryRunPanel(state: Signal<AppState>) -> Element {
     }
 }
 
+/// Settings display (Tier 2 #8). Shows the loaded encode fields
+/// so the user knows what they're about to save. Read-only
+/// (editing lives in the TOML file; the Save button in App's
+/// controls round-trips the in-memory config back to disk).
+#[component]
+fn SettingsPanel(config: Signal<std::sync::Arc<AppConfig>>) -> Element {
+    let cfg = config.read().clone();
+    let enc = cfg.encode.clone().unwrap_or_default();
+    rsx! {
+        div { class: "settings-panel",
+            h3 { "Settings (current load)" }
+            p { class: "muted", "Loaded from AppConfig (round-trip target of Save Settings)." }
+            p { "format: " strong { if let Some(f) = &enc.format { "{f:?}" } else { "default (Av1)" } } }
+            p { "crf: " strong { "{enc.crf}" }
+                 "  bitrate: " strong { if let Some(b) = enc.bitrate { "{b}" } else { "—" } } }
+            p { "extensions: " strong { if let Some(e) = &enc.extensions { "{e:?}" } else { "[] (all)" } } }
+            p { "max_fps: " strong { if let Some(m) = enc.max_fps { "{m}" } else { "off" } }
+                 "  nv: " strong { if let Some(n) = enc.nv { "{n}" } else { "off" } } }
+            p { class: "muted", "Edit values by hand in the TOML file, then click Save Settings to round-trip." }
+        }
+    }
+}
+
 /// stderr log ring buffer view (v1.1). Reads `state.log`
-/// (VecDeque<LogLine>, capped at 1000 per §3.8.6 / item 30).
+/// (`VecDeque<LogLine>`, capped at 1000 per §3.8.6 / item 30).
 /// Shows last 100 lines newest-first.
 #[component]
 fn LogPanel(state: Signal<AppState>) -> Element {
@@ -234,7 +264,13 @@ fn LogPanel(state: Signal<AppState>) -> Element {
     };
     let rendered: Vec<(String, usize, String)> = lines
         .iter()
-        .map(|l| (l.at.format("%H:%M:%S").to_string(), l.file_index, l.line.clone()))
+        .map(|l| {
+            (
+                l.at.format("%H:%M:%S").to_string(),
+                l.file_index,
+                l.line.clone(),
+            )
+        })
         .collect();
     rsx! {
         div { class: "log-window",
