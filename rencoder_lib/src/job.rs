@@ -96,6 +96,12 @@ pub enum Command {
         /// `started_at >= t`.
         after: Option<DateTime<Utc>>,
     },
+    /// Save the currently-loaded `AppConfig` back to its original
+    /// path (`ControllerHandle::config_path`). Used by the UI
+    /// "Save" button after editing. No payload — the lib reads the
+    /// in-memory config it has. Emits `Event::ConfigSaved` on
+    /// success / `Event::Error` on failure.
+    SaveConfig,
 }
 
 // =====================================================================
@@ -175,6 +181,11 @@ pub enum Event {
     /// view (limit + after applied); empty vec is valid (no records
     /// match the filter).
     HistoryLoaded { records: Vec<EncodingRecord> },
+
+    /// Result of a `Command::SaveConfig` — the config was written
+    /// to disk. The path is included so the UI can show feedback
+    /// like "saved to /path/to/rencoder.toml".
+    ConfigSaved { path: PathBuf },
 
     // ---- Error topic (fatal only) ----
     /// Fatal-only error. Per §3.8.3 item 26 + §8 item 36:
@@ -508,18 +519,25 @@ pub fn start_controller() -> ControllerHandle {
 
     let config_for_thread = Arc::clone(&config);
     let app_config_for_thread = Arc::clone(&app_config);
+    let config_path_for_thread = config_path.clone();
 
     std::thread::Builder::new()
-        .name("rencoder-controller".into())
+        .name("renencoder-controller".into())
         .spawn(move || {
-            run_actor(cmd_rx, evt_tx, config_for_thread, app_config_for_thread)
+            run_actor(
+                cmd_rx,
+                evt_tx,
+                config_for_thread,
+                app_config_for_thread,
+                config_path_for_thread,
+            )
         })
         .expect("spawn controller thread");
 
     ControllerHandle {
         cmd_tx,
         evt_rx,
-        config: app_config,
+        config: app_config.clone(),
         config_path,
     }
 }
@@ -552,6 +570,7 @@ fn run_actor(
     evt_tx: Sender<Event>,
     config: Arc<Config>,
     app_config: Arc<AppConfig>,
+    config_path: PathBuf,
 ) {
     // Init once for the controller's lifetime. AppConfig + Config
     // already loaded by start_controller; we just derive Cache
@@ -572,7 +591,8 @@ fn run_actor(
             return;
         }
     };
-    drop(app_config); // not used after this point (config is derived)
+    // `app_config` is still held (referenced by `config_path`
+    // for the SaveConfig handler). Don't drop yet.
 
     let mut next_batch_id: BatchId = 0;
     // Set when a batch is running; gates StartBatch to one at a time.
@@ -713,6 +733,22 @@ fn run_actor(
             Command::LoadHistory { limit, after } => {
                 let records = load_history(resolve_data_dir(), limit, after);
                 let _ = evt_tx.send(Event::HistoryLoaded { records });
+            }
+
+            Command::SaveConfig => {
+                match app_config.save(&config_path) {
+                    Ok(()) => {
+                        let _ = evt_tx.send(Event::ConfigSaved {
+                            path: config_path.clone(),
+                        });
+                    }
+                    Err(e) => {
+                        let _ = evt_tx.send(Event::Error {
+                            category: ErrorCategory::ConfigError,
+                            message: format!("save failed: {e}"),
+                        });
+                    }
+                }
             }
         }
     }
@@ -943,6 +979,10 @@ mod mock_tests {
                         let records = load_history(data_dir.clone(), limit, after);
                         let _ = evt_tx.send(Event::HistoryLoaded { records });
                     }
+                    // SaveConfig is exercised by the UI flow (which
+                    // talks to the production actor). The mock actor
+                    // has no app_config to save — no-op here.
+                    Command::SaveConfig => {}
                     Command::DryRun { params, files } => {
                         // Mock actor: dry-run is purely prepare-step;
                         // the mock encode_fn must NOT be invoked
