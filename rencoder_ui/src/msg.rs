@@ -141,38 +141,37 @@ pub fn reduce(
             state.input_dir = Some(path);
         }
         Msg::UserClickedStart => {
-            let Some(dir) = state.input_dir.clone() else {
-                state.last_error = Some("no input dir selected".into());
-                return;
-            };
             // Derive EncodeParams from loaded AppConfig (v1.1: no more
             // hardcoded defaults). Per `Config::from_encode_config` but
             // we need the FULL EncodeParams, not just the runtime
             // Config (which strips max_fps etc).
             let params = build_encode_params_from_config(config);
-            // Collect files in the directory, filtered by config's
-            // extensions if any (v1.1: extension filter).
-            let extensions = config
-                .encode
-                .as_ref()
-                .and_then(|e| e.extensions.clone())
-                .unwrap_or_default();
-            let files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-                .map(|rd| {
-                    rd.flatten()
-                        .map(|e| e.path())
-                        .filter(|p| p.is_file())
-                        .filter(|p| extension_matches(p, &extensions))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+            let Some(files) = collect_input_files(state, config) else {
+                state.last_error = Some("no input dir selected".into());
+                return;
+            };
             if files.is_empty() {
+                // Start's error message is extensions-aware (a
+                // helpful hint when the filter excludes everything).
+                // Preview and Analyze use a simpler "no files in
+                // {dir}" since they don't operate on extensions in
+                // the same way (Preview's user is just checking
+                // "what would encode"; Analyze's user wants any file
+                // the probe can read).
+                let extensions = config
+                    .encode
+                    .as_ref()
+                    .and_then(|e| e.extensions.clone())
+                    .unwrap_or_default();
                 let detail = if extensions.is_empty() {
-                    format!("no files in {}", dir.display())
+                    format!(
+                        "no files in {}",
+                        state.input_dir.as_ref().unwrap().display()
+                    )
                 } else {
                     format!(
                         "no files in {} matching extensions {:?}",
-                        dir.display(),
+                        state.input_dir.as_ref().unwrap().display(),
                         extensions
                     )
                 };
@@ -189,29 +188,18 @@ pub fn reduce(
             // config, dispatch Command::DryRun.
             state.dry_run_results.clear();
             state.last_error = None;
-            let Some(dir) = state.input_dir.clone() else {
+            let Some(files) = collect_input_files(state, config) else {
                 state.last_error = Some("no input dir selected".into());
                 return;
             };
-            let params = build_encode_params_from_config(config);
-            let extensions = config
-                .encode
-                .as_ref()
-                .and_then(|e| e.extensions.clone())
-                .unwrap_or_default();
-            let files: Vec<_> = std::fs::read_dir(&dir)
-                .map(|rd| {
-                    rd.flatten()
-                        .map(|e| e.path())
-                        .filter(|p| p.is_file())
-                        .filter(|p| extension_matches(p, &extensions))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
             if files.is_empty() {
-                state.last_error = Some(format!("no files in {} for preview", dir.display()));
+                state.last_error = Some(format!(
+                    "no files in {} for preview",
+                    state.input_dir.as_ref().unwrap().display()
+                ));
                 return;
             }
+            let params = build_encode_params_from_config(config);
             let _ = cmd_tx.send(Command::DryRun { params, files });
         }
         Msg::UserClickedCancel => {
@@ -231,46 +219,32 @@ pub fn reduce(
             let _ = cmd_tx.send(Command::SaveConfig);
         }
         Msg::UserClickedAnalyze => {
-            // U22 / Tier 3 #9: same file-collection logic as
-            // UserClickedStart (read state.input_dir, apply
-            // extension filter from config.encode.extensions). We
-            // dispatch Command::Analyze instead of StartBatch —
+            // U22 / Tier 3 #9: file collection via the shared
+            // collect_input_files helper (U22 review-delta #3).
+            // Dispatches Command::Analyze instead of StartBatch —
             // read-only probe, no ffmpeg.
             //
-            // File collection is duplicated from UserClickedStart
-            // rather than extracted into a helper, because
-            // extraction would couple the two flows (e.g. sharing
-            // the empty-list error message); the duplication is
-            // 10 lines and the two flows can evolve independently.
-            state.dry_run_results.clear();
+            // Note (U22 review-delta #4): we do NOT clear
+            // state.dry_run_results here. Analyze is not a dry-run;
+            // the previous preview's results should remain visible
+            // until the user explicitly runs another Preview. The
+            // clear was a copy-paste from UserClickedPreview.
             state.last_error = None;
-            let Some(dir) = state.input_dir.clone() else {
+            let Some(files) = collect_input_files(state, config) else {
                 state.last_error = Some("no input dir selected".into());
                 return;
             };
-            let extensions = config
-                .encode
-                .as_ref()
-                .and_then(|e| e.extensions.clone())
-                .unwrap_or_default();
-            let files: Vec<_> = std::fs::read_dir(&dir)
-                .map(|rd| {
-                    rd.flatten()
-                        .map(|e| e.path())
-                        .filter(|p| p.is_file())
-                        .filter(|p| extension_matches(p, &extensions))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
             if files.is_empty() {
-                state.last_error = Some(format!("no files in {} for analyze", dir.display()));
+                state.last_error = Some(format!(
+                    "no files in {} for analyze",
+                    state.input_dir.as_ref().unwrap().display()
+                ));
                 return;
             }
-            // Clear stale state for the new batch. analyze_progress
-            // gets reset on the next AnalyzeStarted event (the lib
-            // is the source of truth for `total`); analyze_results
-            // is overwritten on AnalyzeFinished (per task #73
-            // description: keep until next analyze).
+            // analyze_progress gets reset on the next AnalyzeStarted
+            // event (the lib is the source of truth for `total`);
+            // analyze_results is overwritten on AnalyzeFinished
+            // (per task #73 description: keep until next analyze).
             let _ = cmd_tx.send(Command::Analyze { files });
         }
         Msg::Lib(evt) => apply_event(state, evt),
@@ -440,6 +414,45 @@ fn build_encode_params_from_config(
     rencoder_lib::types::EncodeParams::from_encode_config(config.encode.as_ref())
 }
 
+/// Collect input files for an action (Start, Preview, Analyze)
+/// from `state.input_dir`, filtered by the configured extensions
+/// from `config.encode.extensions` (empty = all).
+///
+/// Returns the file list (empty if the dir has no matching files).
+/// The caller is responsible for:
+/// - setting `state.input_dir` is `Some`
+/// - choosing the action-specific empty-dir error message
+///   (e.g. "no files in {dir} for analyze" vs the
+///   extension-aware variant for Start)
+///
+/// U22 review-delta #3: this helper replaces the three near-
+/// identical file-collection blocks that previously lived inline
+/// in the Start / Preview / Analyze reducer arms. The block was
+/// drifting (3 different empty-list error messages). Centralizing
+/// here means the file-collection logic now has one place to
+/// evolve, and each arm picks its own error wording.
+fn collect_input_files(
+    state: &AppState,
+    config: &rencoder_lib::config::app::AppConfig,
+) -> Option<Vec<std::path::PathBuf>> {
+    let dir = state.input_dir.as_ref()?;
+    let extensions = config
+        .encode
+        .as_ref()
+        .and_then(|e| e.extensions.clone())
+        .unwrap_or_default();
+    let files: Vec<_> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_file())
+                .filter(|p| extension_matches(p, &extensions))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some(files)
+}
+
 /// Check whether a path's extension matches any of the user's
 /// configured extension filters. Empty `extensions` means "all".
 /// Match is case-insensitive and ignores the leading dot.
@@ -575,36 +588,88 @@ mod tests {
     }
 
     #[test]
+    fn analyze_progress_probe_failed_round_trips() {
+        // U22 review-delta #9: assert the ProbeFailed variant of
+        // FileOutcome also round-trips through the reducer. The
+        // analyze_progress_updates_state test only exercises
+        // FileOutcome::Ok; this pins the other variant.
+        use rencoder_lib::analyzer::records::{AnalyzedFile, FileOutcome};
+        let mut state = AppState::default();
+        reduce(
+            &mut state,
+            Msg::Lib(Event::AnalyzeStarted { total: 1 }),
+            &cmd_tx(),
+            &default_config(),
+        );
+        let probe_err = rencoder_lib::error::EncodeError::Probe("mock probe fail".into());
+        reduce(
+            &mut state,
+            Msg::Lib(Event::AnalyzeProgress {
+                done: 1,
+                total: 1,
+                failed: 1,
+                last: Some(AnalyzedFile {
+                    path: PathBuf::from("/bad.mp4"),
+                    outcome: FileOutcome::ProbeFailed(probe_err),
+                }),
+            }),
+            &cmd_tx(),
+            &default_config(),
+        );
+        let info = state.analyze_progress.as_ref().unwrap();
+        let last = info.last.as_ref().unwrap();
+        assert_eq!(last.path, PathBuf::from("/bad.mp4"));
+        match &last.outcome {
+            FileOutcome::ProbeFailed(e) => {
+                // The error message should be preserved through
+                // the round-trip. Format with Debug since EncodeError
+                // doesn't impl Display via a fixed pattern.
+                let debug = format!("{e:?}");
+                assert!(debug.contains("mock probe fail"), "got: {debug}");
+            }
+            FileOutcome::Ok => panic!("expected ProbeFailed, got Ok"),
+            // #[non_exhaustive] wildcard: future variants
+            // (v2's Cancelled) won't carry a probe-error message,
+            // so this test's contract doesn't apply. Fail loudly
+            // so a refactor that changes the test inputs is
+            // caught.
+            _ => panic!("unexpected FileOutcome variant in test payload"),
+        }
+    }
+
+    #[test]
     fn analyze_finished_replaces_results() {
-        // Build state with a stale seed record (not via Default +
-        // assignment, to satisfy `field_reassign_with_default`).
-        let stale = rencoder_lib::analyzer::records::AnalysisRecord {
-            path: PathBuf::from("/stale.mp4"),
-            fps: Some(30),
-            codec: Some("h264".into()),
-            duration_secs: Some(1.0),
-            file_bytes: 0,
-        };
+        // Build state with a stale seed record via `AnalysisRecord::new`
+        // (U22 review-delta #5: `#[non_exhaustive]` blocks struct-
+        // expression syntax cross-crate; the constructor is the
+        // supported entry point for downstream).
+        let stale = rencoder_lib::analyzer::records::AnalysisRecord::new(
+            PathBuf::from("/stale.mp4"),
+            Some(30),
+            Some("h264".into()),
+            Some(1.0),
+            0,
+        );
         let mut state = AppState {
             analyze_results: vec![stale],
             ..Default::default()
         };
         // Finished with new records overwrites.
         let new_records = vec![
-            rencoder_lib::analyzer::records::AnalysisRecord {
-                path: PathBuf::from("/new1.mp4"),
-                fps: None, // failed
-                codec: None,
-                duration_secs: None,
-                file_bytes: 0,
-            },
-            rencoder_lib::analyzer::records::AnalysisRecord {
-                path: PathBuf::from("/new2.mp4"),
-                fps: Some(60),
-                codec: Some("av1".into()),
-                duration_secs: Some(2.0),
-                file_bytes: 100,
-            },
+            rencoder_lib::analyzer::records::AnalysisRecord::new(
+                PathBuf::from("/new1.mp4"),
+                None, // failed
+                None,
+                None,
+                0,
+            ),
+            rencoder_lib::analyzer::records::AnalysisRecord::new(
+                PathBuf::from("/new2.mp4"),
+                Some(60),
+                Some("av1".into()),
+                Some(2.0),
+                100,
+            ),
         ];
         reduce(
             &mut state,
@@ -624,6 +689,39 @@ mod tests {
         // last_error surfaces the failure count (1 failed).
         assert!(state.last_error.is_some());
         assert!(state.last_error.unwrap().contains("1 failed"));
+    }
+
+    #[test]
+    fn analyze_finished_with_no_failures_clears_last_error() {
+        // U22 review-delta #2: pin the AnalyzeFinished arm's
+        // "clear last_error on success" branch. Currently only
+        // the "set last_error on failure" path is tested (in
+        // analyze_finished_replaces_results). A regression that
+        // dropped the `else { last_error = None }` arm would
+        // silently leave stale errors visible after a successful
+        // analyze.
+        // Simulate the empty-dir error from UserClickedAnalyze's
+        // guard (msg.rs's start-without-dir pattern). Use
+        // struct-literal init (not Default + assignment) to
+        // satisfy `field_reassign_with_default`.
+        let mut state = AppState {
+            last_error: Some("no files in /tmp for analyze".into()),
+            ..Default::default()
+        };
+        reduce(
+            &mut state,
+            Msg::Lib(Event::AnalyzeFinished {
+                records: vec![],
+                failed_count: 0,
+            }),
+            &cmd_tx(),
+            &default_config(),
+        );
+        assert!(
+            state.last_error.is_none(),
+            "successful AnalyzeFinished should clear stale last_error, got: {:?}",
+            state.last_error
+        );
     }
 
     #[test]

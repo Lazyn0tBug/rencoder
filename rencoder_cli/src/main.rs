@@ -233,20 +233,20 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
         manager.run(&tasks, "analyze", target_path(&target), |task, _ctx| {
             let file_bytes = std::fs::metadata(&task.input).map(|m| m.len()).unwrap_or(0);
             match probe_video_metadata(&task.input) {
-                Ok(metadata) => Ok(rencoder_lib::analyzer::records::AnalysisRecord {
-                    path: task.input.clone(),
-                    fps: metadata.best_fps().map(|f| f.round() as u32),
-                    codec: metadata.codec,
-                    duration_secs: metadata.duration_secs,
+                Ok(metadata) => Ok(rencoder_lib::analyzer::records::AnalysisRecord::new(
+                    task.input.clone(),
+                    metadata.best_fps().map(|f| f.round() as u32),
+                    metadata.codec,
+                    metadata.duration_secs,
                     file_bytes,
-                }),
-                Err(_) => Ok(rencoder_lib::analyzer::records::AnalysisRecord {
-                    path: task.input.clone(),
-                    fps: None,
-                    codec: None,
-                    duration_secs: None,
+                )),
+                Err(_) => Ok(rencoder_lib::analyzer::records::AnalysisRecord::new(
+                    task.input.clone(),
+                    None,
+                    None,
+                    None,
                     file_bytes,
-                }),
+                )),
             }
         })
     };

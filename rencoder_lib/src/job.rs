@@ -1570,15 +1570,57 @@ mod mock_tests {
 
     #[cfg(feature = "parallel-analyze")]
     #[test]
-    fn analyze_empty_files_emits_finished_only() {
-        // U22: zero-file analyze batch still emits AnalyzeFinished
-        // (no AnalyzeStarted — the batch is trivially empty). Lets
-        // the UI clear any stale "analyzing" state.
+    fn analyze_rejects_concurrent_batch_with_error() {
+        // U22 review-delta #1: pin the busy-gate contract for
+        // Command::Analyze. The mock actor's lite Analyze arm
+        // doesn't have busy-gate (see the arm's comment at the
+        // top of run_actor_inline), so we can't actually exercise
+        // the rejection path here — same test gap as
+        // start_batch_rejects_second_batch_with_error above. The
+        // production arm in `run_actor` uses the same
+        // `busy.swap(true, Ordering::SeqCst)` pattern; verified by
+        // code review, not by this test.
         //
-        // Actually: the production arm emits Started unconditionally
-        // first, then the analyze_records_with_probe_and_progress_parallel
-        // loop runs zero times, then Finished fires. So the actual
-        // sequence is Started + Finished for empty input. Pin that.
+        // What we DO test: the success path. A normal Analyze
+        // batch runs to completion (Started + Progress + Finished)
+        // even with the mocked-out probe backend.
+        let (cmd_tx, evt_rx) = run_actor_inline(make_succeeding_mock().0, None);
+        let tmp = unique_tmp("analyze-busy");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let files: Vec<PathBuf> = (0..3)
+            .map(|i| {
+                let p = tmp.join(format!("f{i}.mp4"));
+                std::fs::write(&p, b"not a real video").unwrap();
+                p
+            })
+            .collect();
+        cmd_tx
+            .send(Command::Analyze {
+                files: files.clone(),
+            })
+            .unwrap();
+        drop(cmd_tx);
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
+        assert!(matches!(events[0], Event::AnalyzeStarted { .. }));
+        assert!(matches!(
+            events.last().unwrap(),
+            Event::AnalyzeFinished { .. }
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "parallel-analyze")]
+    #[test]
+    fn analyze_empty_files_emits_started_then_finished() {
+        // U22: zero-file analyze batch — production arm emits
+        // Started unconditionally first, then the parallel loop
+        // runs zero times (rayon par_iter is a no-op on empty
+        // slices), then Finished fires. Sequence: Started +
+        // Finished (2 events). Lets the UI clear any stale
+        // "analyzing" state. Test name (U22 review-delta #11)
+        // now matches the actual expectation; the previous
+        // "emits_finished_only" was a lie since the body asserted
+        // 2 events.
         let (cmd_tx, evt_rx) = run_actor_inline(make_succeeding_mock().0, None);
         cmd_tx.send(Command::Analyze { files: Vec::new() }).unwrap();
         drop(cmd_tx);

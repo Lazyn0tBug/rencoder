@@ -21,13 +21,53 @@ use crate::types::VideoStats;
 
 /// One row per input file. Failed probes yield a row with `path` and
 /// `file_bytes` set but metric fields `None`.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// `#[non_exhaustive]` (U22 review-delta #5): this struct is part of
+/// the lib's public surface — re-exported, carried by
+/// `Event::AnalyzeFinished.records`. The `non_exhaustive` attribute
+/// prevents cross-crate struct-expression construction (even with
+/// `..Default::default()` — that's only allowed within the defining
+/// crate). External consumers wanting to build `AnalysisRecord`
+/// values (e.g. UI tests seeding state) must use
+/// [`AnalysisRecord::new`]. Matches the protection on `Command` /
+/// `Event` / `FileOutcome` (see docs/design.md §8 item 33).
+#[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct AnalysisRecord {
     pub path: PathBuf,
     pub fps: Option<u32>,
     pub codec: Option<String>,
     pub duration_secs: Option<f64>,
     pub file_bytes: u64,
+}
+
+impl AnalysisRecord {
+    /// Construct an `AnalysisRecord` from outside the defining
+    /// crate. Required because `#[non_exhaustive]` blocks
+    /// cross-crate struct-expression syntax.
+    ///
+    /// `path` and `file_bytes` are always set; the metric fields
+    /// (`fps` / `codec` / `duration_secs`) are `None` for failed
+    /// probes (matching the per-file failure contract of
+    /// `analyze_records` and the parallel variants). The lib's own
+    /// probe paths build the struct directly without going
+    /// through `new`; this constructor is the supported entry
+    /// point for downstream (UI tests, future consumers).
+    pub fn new(
+        path: PathBuf,
+        fps: Option<u32>,
+        codec: Option<String>,
+        duration_secs: Option<f64>,
+        file_bytes: u64,
+    ) -> Self {
+        Self {
+            path,
+            fps,
+            codec,
+            duration_secs,
+            file_bytes,
+        }
+    }
 }
 
 /// U22 / Tier 3 #9: per-file progress callback payload for
@@ -842,6 +882,67 @@ mod tests {
         let max_failed = ticks.iter().map(|t| t.failed).max().unwrap();
         assert_eq!(max_done, 10, "final done count = 10");
         assert_eq!(max_failed, 5, "final failed count = 5 (indices 0,2,4,6,8)");
+
+        // U22 review-delta #7: assert the per-tick `last` field
+        // carries FileOutcome::ProbeFailed for failed ticks (and
+        // Ok for successful ones), and the path matches one of
+        // the input paths. Without this, a regression that
+        // silently dropped the Err variant or pointed `last` at
+        // the wrong file wouldn't be caught.
+        let input_paths: std::collections::HashSet<PathBuf> = files.iter().cloned().collect();
+        for tick in &ticks {
+            let last = tick.last.as_ref().expect("last is Some per tick");
+            // The path is one of the input paths.
+            assert!(
+                input_paths.contains(&last.path),
+                "tick.last.path {:?} not in input files",
+                last.path
+            );
+            // The outcome matches: even-indexed files (0, 2, 4, 6, 8)
+            // failed, odd-indexed succeeded. The name pattern is
+            // "/f/{idx:02}.mp4" — recover idx from the path.
+            let name = last.path.file_name().unwrap().to_string_lossy();
+            let idx: usize = name
+                .trim_start_matches('0')
+                .trim_end_matches(".mp4")
+                .parse()
+                .unwrap_or(0);
+            match &last.outcome {
+                FileOutcome::Ok => assert!(
+                    !idx.is_multiple_of(2),
+                    "even index {idx} should have failed, got Ok"
+                ),
+                FileOutcome::ProbeFailed(_) => assert!(
+                    idx.is_multiple_of(2),
+                    "odd index {idx} should have succeeded, got ProbeFailed"
+                ),
+            }
+        }
+    }
+
+    #[cfg(feature = "parallel-analyze")]
+    #[test]
+    fn progress_empty_input_emits_no_ticks() {
+        // U22 review-delta #8: pin the contract for
+        // `files.len() == 0`. rayon par_iter on an empty slice is
+        // a no-op, so the closure never fires; the returned
+        // records Vec is empty. The actor arm's behavior for
+        // empty input is tested separately (job::tests::
+        // analyze_empty_files_emits_started_then_finished); this
+        // test pins the lib-level contract independently.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let call_count = AtomicUsize::new(0);
+        let probe = |_path: &Path| -> Result<VideoMetadata, EncodeError> {
+            call_count.fetch_add(1, Ordering::SeqCst);
+            Ok(VideoMetadata::default())
+        };
+        let progress = |_p: AnalyzeProgress| {
+            // Should never fire on empty input.
+            panic!("progress closure called on empty input");
+        };
+        let records = analyze_records_with_probe_and_progress_parallel(&[], probe, progress);
+        assert!(records.is_empty());
+        assert_eq!(call_count.load(Ordering::SeqCst), 0);
     }
 
     #[cfg(feature = "parallel-analyze")]
