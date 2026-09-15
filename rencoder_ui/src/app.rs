@@ -66,18 +66,16 @@ pub fn App() -> Element {
     let tx_save = tx.clone();
     let tx_analyze = tx.clone();
 
-    // CSS inlined as a <style> child of the root div. The browser
-    // applies it regardless of where in the DOM it lives. The
-    // previous attempt used `with_custom_head` + a separate file
-    // in `assets/`, which produced a "Dioxus App" window with a
-    // black background (App() never rendered, likely because the
-    // launch config / asset path didn't survive cargo-dist
-    // packaging). Inlining sidesteps both questions.
-    let css = include_str!("../assets/style.css");
+    // CSS Tiers follow-up: temporarily removed the inline <style>
+    // element to debug whether the previous "black window" was
+    // caused by the App() launch path or by the inline style
+    // element. Re-add it via `document::Stylesheet` (which
+    // renders into the head, not the body) once the launch
+    // path is confirmed working.
+    let _css = include_str!("../assets/style.css");
 
     rsx! {
         div { class: "app",
-            style { dangerous_inner_html: "{css}" }
             h1 { "Rencoder" }
             main {
                 DirPicker {
