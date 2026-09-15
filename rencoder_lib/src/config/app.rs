@@ -123,11 +123,18 @@ pub struct AppConfig {
 /// Default CRF value (libsvtav1 medium quality). Sentinel `0` switches
 /// to bitrate mode at the ffmpeg CLI layer; this default keeps the
 /// quality mode unless the user explicitly opts out.
+///
+/// Used by both the `#[serde(default = "...")]` attribute on
+/// `EncodeConfig::crf` (so a missing TOML key deserializes to 45) AND
+/// by the manual `Default` impl on `EncodeConfig` (so the in-memory
+/// `EncodeConfig::default()` matches the deserialized value). Without
+/// the manual impl, `Default` would fall through to `u32::default() = 0`
+/// — flipping `is_crf` to false and silently switching to bitrate mode.
 fn default_crf() -> u32 {
     45
 }
 
-#[derive(Debug, Default, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct EncodeConfig {
     pub format: Option<FormatArg>,
@@ -150,7 +157,26 @@ pub struct EncodeConfig {
     pub encoders: Option<EncodersConfig>,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize, PartialEq)]
+// Manual `Default` so the in-memory default matches the TOML
+// deserialization default. `#[derive(Default)]` would use `u32::default()
+// = 0` for `crf`, flipping `is_crf` to false and silently switching
+// to bitrate mode. The doc on `default_crf` explains the why.
+impl Default for EncodeConfig {
+    fn default() -> Self {
+        Self {
+            format: None,
+            bitrate: None,
+            crf: default_crf(),
+            max_fps: None,
+            nv: None,
+            extensions: None,
+            output_dir: None,
+            encoders: None,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AnalyzeConfig {
     pub format: Option<AnalyzeFormatArg>,
@@ -159,7 +185,7 @@ pub struct AnalyzeConfig {
     pub output: Option<PathBuf>,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct EncodersConfig {
     pub av1: Option<String>,
@@ -371,7 +397,13 @@ mod tests {
         assert_eq!(reloaded.encode.as_ref().unwrap().bitrate, Some(8000));
         assert_eq!(reloaded.encode.as_ref().unwrap().max_fps, Some(60));
         assert_eq!(
-            reloaded.encode.as_ref().unwrap().extensions.as_ref().unwrap(),
+            reloaded
+                .encode
+                .as_ref()
+                .unwrap()
+                .extensions
+                .as_ref()
+                .unwrap(),
             &vec!["mp4".to_string(), "mov".to_string()]
         );
 
