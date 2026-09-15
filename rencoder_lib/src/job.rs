@@ -412,10 +412,13 @@ where
 ///   matching CLI behavior). UI reads this to derive `EncodeParams`
 ///   for `Command::StartBatch` instead of using defaults. Cheap to
 ///   clone (`Arc<AppConfig>`).
+/// - `config_path`: the path the AppConfig was loaded from
+///   (`resolve_config()` result; UI uses this to save back).
 pub struct ControllerHandle {
     pub(crate) cmd_tx: Sender<Command>,
     pub(crate) evt_rx: Receiver<Event>,
     pub(crate) config: Arc<AppConfig>,
+    pub(crate) config_path: PathBuf,
 }
 
 impl ControllerHandle {
@@ -432,6 +435,13 @@ impl ControllerHandle {
     /// then no more events).
     pub fn config(&self) -> Arc<AppConfig> {
         Arc::clone(&self.config)
+    }
+
+    /// Get the path the AppConfig was loaded from. UI uses this
+    /// for `Command::SaveConfig` — saves back to the same path
+    /// (`$RENENCODER_CONFIG` env override honored on write too).
+    pub fn config_path(&self) -> PathBuf {
+        self.config_path.clone()
     }
 
     /// Take the event receiver. Single-use — only one consumer.
@@ -487,11 +497,12 @@ pub fn start_controller() -> ControllerHandle {
     // On load failure, emit Event::Error so the UI sees the reason;
     // fall back to defaults so the controller can still spawn (UI sees
     // the error then no more events).
-    let (config, app_config) = match load_and_share_config(&evt_tx) {
-        Some(pair) => pair,
+    let (config, app_config, config_path) = match load_and_share_config(&evt_tx) {
+        Some((c, a, p)) => (c, a, p),
         None => (
             Arc::new(Config::default()),
             Arc::new(AppConfig::default()),
+            PathBuf::from("(unavailable)"),
         ),
     };
 
@@ -509,15 +520,18 @@ pub fn start_controller() -> ControllerHandle {
         cmd_tx,
         evt_rx,
         config: app_config,
+        config_path,
     }
 }
 
-/// Load AppConfig + derive runtime Config. Emit `Event::Error`
-/// (ConfigError) on either failure and return None so the caller
-/// falls back to defaults.
+/// Load AppConfig + derive runtime Config. Returns the loaded
+/// path too so the controller can hand it back via
+/// `ControllerHandle::config_path` (UI Save needs the original
+/// location). Emit `Event::Error` on either failure and return None
+/// so the caller falls back to defaults.
 fn load_and_share_config(
     evt_tx: &Sender<Event>,
-) -> Option<(Arc<Config>, Arc<AppConfig>)> {
+) -> Option<(Arc<Config>, Arc<AppConfig>, PathBuf)> {
     let config_path = resolve_config()?;
     let app_config = match AppConfig::load(&config_path) {
         Ok(c) => c,
@@ -530,7 +544,7 @@ fn load_and_share_config(
         }
     };
     let config = Config::from_encode_config(app_config.encode.as_ref());
-    Some((Arc::new(config), Arc::new(app_config)))
+    Some((Arc::new(config), Arc::new(app_config), config_path))
 }
 
 fn run_actor(
@@ -770,6 +784,7 @@ mod controller_tests {
             cmd_tx,
             evt_rx,
             config: Arc::new(crate::config::app::AppConfig::default()),
+            config_path: std::path::PathBuf::from("(test)"),
         };
         let (_tx, _rx) = handle.into_split();
     }
