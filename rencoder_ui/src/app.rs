@@ -64,6 +64,7 @@ pub fn App() -> Element {
     let tx_history = tx.clone();
     let tx_preview = tx.clone();
     let tx_save = tx.clone();
+    let tx_analyze = tx.clone();
 
     rsx! {
         div { class: "app",
@@ -83,6 +84,7 @@ pub fn App() -> Element {
             HistoryPanel { state: state }
             DryRunPanel { state: state }
             SettingsPanel { config: config }
+            AnalyzePanel { state: state }
             div { class: "controls",
                 button {
                     onclick: move |_| {
@@ -118,6 +120,13 @@ pub fn App() -> Element {
                         state_for_start.with_mut(|s| reduce(s, Msg::UserClickedPreview, &tx_preview, &cfg));
                     },
                     "Preview (Dry Run)"
+                }
+                button {
+                    onclick: move |_| {
+                        let cfg = config.read().clone();
+                        state_for_start.with_mut(|s| reduce(s, Msg::UserClickedAnalyze, &tx_analyze, &cfg));
+                    },
+                    "Analyze"
                 }
             }
         }
@@ -244,6 +253,107 @@ fn SettingsPanel(config: Signal<std::sync::Arc<AppConfig>>) -> Element {
             p { "max_fps: " strong { if let Some(m) = enc.max_fps { "{m}" } else { "off" } }
                  "  nv: " strong { if let Some(n) = enc.nv { "{n}" } else { "off" } } }
             p { class: "muted", "Edit values by hand in the TOML file, then click Save Settings to round-trip." }
+        }
+    }
+}
+
+/// U22 / Tier 3 #9 + #9e: analyze panel.
+///
+/// Three display layers (per docs/design.md §3.4 "最终结果的展示约定"):
+///
+/// 1. **Live progress** (when `state.analyze_progress.is_some()`):
+///    text `"X/Y done (Z failed)"` + a "just completed: X.mp4" hint
+///    from the latest `AnalyzedFile`. Counter is monotonic from
+///    the lib; `last` is in completion order (rayon race) — the
+///    panel renders it as informational, not authoritative.
+///
+/// 2. **Failed-first results table** (when `state.analyze_results`
+///    is non-empty): the records are partitioned inline via
+///    `Vec::partition` by `r.fps.is_none()`. Failed section on top
+///    (operator scans for "what broke"), succeeded section below
+///    with a muted separator.
+///
+/// 3. **Idle state** (no batch running, no results yet):
+///    "(no analyze results yet — click Analyze)" hint.
+///
+/// v1 has no visual progress bar — design says text-only first,
+/// CSS bar is a future iteration.
+#[component]
+fn AnalyzePanel(state: Signal<AppState>) -> Element {
+    use rencoder_lib::analyzer::records::AnalysisRecord;
+    let s = state.read();
+
+    // Layer 1: live progress text.
+    let progress_text = s.analyze_progress.as_ref().map(|p| {
+        let last_hint = match &p.last {
+            Some(f) => format!(" — last: {}", f.path.display()),
+            None => String::new(),
+        };
+        format!(
+            "Analyzing: {}/{} done ({} failed){}",
+            p.done, p.total, p.failed, last_hint
+        )
+    });
+
+    // Layer 2: failed-first partition.
+    // `Vec::partition` is a stable partition: failed and succeeded
+    // each preserve input order. See docs/design.md §3.4 "最终结果
+    // 的展示约定" and #9e commit 01a8b48 for the rationale.
+    let (failed, succeeded): (Vec<&AnalysisRecord>, Vec<&AnalysisRecord>) =
+        s.analyze_results.iter().partition(|r| r.fps.is_none());
+
+    if s.analyze_results.is_empty() && s.analyze_progress.is_none() {
+        return rsx! { p { class: "muted", "(no analyze results yet — click Analyze)" } };
+    }
+
+    rsx! {
+        div { class: "analyze-panel",
+            h3 { "Analyze" }
+            if let Some(text) = progress_text {
+                p { class: "progress", "{text}" }
+            }
+            if !s.analyze_results.is_empty() {
+                if !failed.is_empty() {
+                    h4 { class: "failed-header", "Failed ({failed.len()})" }
+                    table { class: "analyze-failed-table",
+                        thead { tr {
+                            th { "Path" }
+                            th { "File bytes" }
+                        } }
+                        tbody {
+                            for r in failed.iter() {
+                                tr {
+                                    td { "{r.path.display()}" }
+                                    td { "{r.file_bytes}" }
+                                }
+                            }
+                        }
+                    }
+                }
+                if !succeeded.is_empty() {
+                    p { class: "muted separator", "── succeeded ({succeeded.len()}) ──" }
+                    table { class: "analyze-succeeded-table",
+                        thead { tr {
+                            th { "Path" }
+                            th { "FPS" }
+                            th { "Codec" }
+                            th { "Duration (s)" }
+                            th { "Bytes" }
+                        } }
+                        tbody {
+                            for r in succeeded.iter() {
+                                tr {
+                                    td { "{r.path.display()}" }
+                                    td { if let Some(fps) = r.fps { "{fps}" } else { "—" } }
+                                    td { if let Some(c) = &r.codec { "{c}" } else { "—" } }
+                                    td { if let Some(d) = r.duration_secs { "{d:.1}" } else { "—" } }
+                                    td { "{r.file_bytes}" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }

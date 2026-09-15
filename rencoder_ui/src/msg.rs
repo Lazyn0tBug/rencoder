@@ -35,6 +35,38 @@ pub struct AppState {
     pub input_dir: Option<PathBuf>,
     /// Last fatal error (if any).
     pub last_error: Option<String>,
+    /// U22 / Tier 3 #9: current analyze batch progress, if any.
+    /// `None` = no batch running (or never started). Set on
+    /// `Event::AnalyzeStarted`; updated on each `Event::AnalyzeProgress`.
+    /// Reducer does NOT validate `done` < `total` — trust the lib
+    /// monotonically increasing counts (see docs/design.md §3.4
+    /// "分析进度上报"). Cleared on next `AnalyzeStarted`.
+    #[allow(dead_code)]
+    pub analyze_progress: Option<AnalyzeProgressInfo>,
+    /// U22: last analyze batch's records. Set on `Event::AnalyzeFinished`.
+    /// **Overwrite** semantics — a new analyze batch replaces the
+    /// previous one (like `state.history` behavior). User actions
+    /// other than Analyze don't clear this.
+    #[allow(dead_code)]
+    pub analyze_results: Vec<rencoder_lib::analyzer::records::AnalysisRecord>,
+}
+
+/// U22: UI-side mirror of `Event::AnalyzeProgress`. Kept as a
+/// separate struct (not a 1:1 alias) so the UI can evolve the
+/// shape independently from the lib event payload if needed.
+#[derive(Debug)]
+#[allow(dead_code)] // populated in #73; UI panel reads it
+pub struct AnalyzeProgressInfo {
+    pub done: usize,
+    pub total: usize,
+    pub failed: usize,
+    /// Last completed file in **completion order** (rayon workers
+    /// race). The UI renders this as a "just completed: X" hint —
+    /// NOT "next in input order" (per docs/design.md §3.4
+    /// "最终结果的展示约定"). After the batch ends, this stays
+    /// as the last file seen (not cleared) until the next
+    /// `AnalyzeStarted` overwrites it.
+    pub last: Option<rencoder_lib::analyzer::records::AnalyzedFile>,
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +113,11 @@ pub enum Msg {
     /// Save the loaded AppConfig back to its original path
     /// (ControllerHandle::config_path). Wired by Save button.
     UserClickedSaveSettings,
+    /// U22 / Tier 3 #9: trigger a parallel analyze batch from the
+    /// current `state.input_dir` (same file collection as
+    /// `UserClickedStart` but dispatches `Command::Analyze` instead
+    /// of `Command::StartBatch`). Wired by the Analyze button.
+    UserClickedAnalyze,
     // UserClickedPreview — wired up in app.rs Preview button. The
     // variant is always constructed in production code; clippy's
     // dead_code lint triggers here because no test in this module
@@ -193,6 +230,49 @@ pub fn reduce(
             // Event::Error (handled in apply_event).
             let _ = cmd_tx.send(Command::SaveConfig);
         }
+        Msg::UserClickedAnalyze => {
+            // U22 / Tier 3 #9: same file-collection logic as
+            // UserClickedStart (read state.input_dir, apply
+            // extension filter from config.encode.extensions). We
+            // dispatch Command::Analyze instead of StartBatch —
+            // read-only probe, no ffmpeg.
+            //
+            // File collection is duplicated from UserClickedStart
+            // rather than extracted into a helper, because
+            // extraction would couple the two flows (e.g. sharing
+            // the empty-list error message); the duplication is
+            // 10 lines and the two flows can evolve independently.
+            state.dry_run_results.clear();
+            state.last_error = None;
+            let Some(dir) = state.input_dir.clone() else {
+                state.last_error = Some("no input dir selected".into());
+                return;
+            };
+            let extensions = config
+                .encode
+                .as_ref()
+                .and_then(|e| e.extensions.clone())
+                .unwrap_or_default();
+            let files: Vec<_> = std::fs::read_dir(&dir)
+                .map(|rd| {
+                    rd.flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.is_file())
+                        .filter(|p| extension_matches(p, &extensions))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if files.is_empty() {
+                state.last_error = Some(format!("no files in {} for analyze", dir.display()));
+                return;
+            }
+            // Clear stale state for the new batch. analyze_progress
+            // gets reset on the next AnalyzeStarted event (the lib
+            // is the source of truth for `total`); analyze_results
+            // is overwritten on AnalyzeFinished (per task #73
+            // description: keep until next analyze).
+            let _ = cmd_tx.send(Command::Analyze { files });
+        }
         Msg::Lib(evt) => apply_event(state, evt),
     }
 }
@@ -238,6 +318,67 @@ fn apply_event(state: &mut AppState, evt: Event) {
         }
         Event::DryRunFinished { records } => {
             state.dry_run_results = records;
+        }
+        Event::AnalyzeStarted { total } => {
+            // U22: reset progress for the new batch. analyze_results
+            // is preserved (overwrite happens on AnalyzeFinished, not
+            // here — keeps the previous batch's table visible while
+            // the new one is in flight, until the new Finished
+            // arrives).
+            state.analyze_progress = Some(AnalyzeProgressInfo {
+                done: 0,
+                total,
+                failed: 0,
+                last: None,
+            });
+        }
+        Event::AnalyzeProgress {
+            done,
+            total,
+            failed,
+            last,
+        } => {
+            // U22: monotonic counts from the lib. We don't validate
+            // (done <= total, etc.) — the lib is the source of truth.
+            // The struct itself stays Some once Started fired; we
+            // just overwrite the fields. This makes the latest
+            // tick's `last` available to AnalyzePanel as a
+            // "just completed: X" hint.
+            state.analyze_progress = Some(AnalyzeProgressInfo {
+                done,
+                total,
+                failed,
+                last,
+            });
+        }
+        Event::AnalyzeFinished {
+            records,
+            failed_count,
+        } => {
+            // U22: overwrite analyze_results (preserved until next
+            // batch). Keep analyze_progress as-is so the panel can
+            // still show "X/Y done" after the batch ends; the next
+            // AnalyzeStarted will reset it.
+            //
+            // Cross-check: the lib sends failed_count ==
+            // records.iter().filter(|r| r.fps.is_none()).count().
+            // We don't assert it here (lib is the source of truth)
+            // but the invariant is tested in
+            // job::tests::analyze_emits_started_progress_finished_sequence.
+            state.analyze_results = records;
+            // Surface failed count via last_error if any failed,
+            // so the user gets feedback even if the panel is
+            // scrolled past. Otherwise clear last_error (it may
+            // have been set by UserClickedAnalyze's empty-dir check).
+            if failed_count > 0 {
+                state.last_error = Some(format!(
+                    "analyze done: {} files, {} failed",
+                    state.analyze_results.len(),
+                    failed_count
+                ));
+            } else {
+                state.last_error = None;
+            }
         }
         Event::ConfigSaved { path } => {
             // Show feedback ("saved to ...") for a few ticks. We
@@ -371,6 +512,118 @@ mod tests {
             &default_config(),
         );
         assert_eq!(state.input_dir, Some(p));
+    }
+
+    // U22 / Tier 3 #9: analyze reducer + Event handlers.
+    //
+    // Three contracts pinned:
+    // 1. UserClickedAnalyze collects files from state.input_dir
+    //    (filtered by config.encode.extensions) and dispatches
+    //    Command::Analyze. Empty dir → last_error set, no dispatch.
+    // 2. Event::AnalyzeProgress updates state.analyze_progress in
+    //    place (monotonic counts from the lib are trusted as-is).
+    // 3. Event::AnalyzeFinished REPLACES state.analyze_results
+    //    (overwrite semantics — old batch replaced by new).
+
+    #[test]
+    fn user_clicked_analyze_without_dir_records_error() {
+        let mut state = AppState::default();
+        let tx = cmd_tx();
+        reduce(&mut state, Msg::UserClickedAnalyze, &tx, &default_config());
+        assert!(state.last_error.is_some());
+        assert!(state.last_error.unwrap().contains("no input dir"));
+    }
+
+    #[test]
+    fn analyze_progress_updates_state() {
+        let mut state = AppState::default();
+        // First the Started event sets the initial state.
+        reduce(
+            &mut state,
+            Msg::Lib(Event::AnalyzeStarted { total: 10 }),
+            &cmd_tx(),
+            &default_config(),
+        );
+        assert!(state.analyze_progress.is_some());
+        let info = state.analyze_progress.as_ref().unwrap();
+        assert_eq!(info.done, 0);
+        assert_eq!(info.total, 10);
+        assert_eq!(info.failed, 0);
+        assert!(info.last.is_none());
+
+        // Then a Progress event updates counts and last.
+        reduce(
+            &mut state,
+            Msg::Lib(Event::AnalyzeProgress {
+                done: 5,
+                total: 10,
+                failed: 1,
+                last: Some(rencoder_lib::analyzer::records::AnalyzedFile {
+                    path: PathBuf::from("/x.mp4"),
+                    outcome: rencoder_lib::analyzer::records::FileOutcome::Ok,
+                }),
+            }),
+            &cmd_tx(),
+            &default_config(),
+        );
+        let info = state.analyze_progress.as_ref().unwrap();
+        assert_eq!(info.done, 5);
+        assert_eq!(info.total, 10);
+        assert_eq!(info.failed, 1);
+        assert!(info.last.is_some());
+        assert_eq!(info.last.as_ref().unwrap().path, PathBuf::from("/x.mp4"));
+    }
+
+    #[test]
+    fn analyze_finished_replaces_results() {
+        // Build state with a stale seed record (not via Default +
+        // assignment, to satisfy `field_reassign_with_default`).
+        let stale = rencoder_lib::analyzer::records::AnalysisRecord {
+            path: PathBuf::from("/stale.mp4"),
+            fps: Some(30),
+            codec: Some("h264".into()),
+            duration_secs: Some(1.0),
+            file_bytes: 0,
+        };
+        let mut state = AppState {
+            analyze_results: vec![stale],
+            ..Default::default()
+        };
+        // Finished with new records overwrites.
+        let new_records = vec![
+            rencoder_lib::analyzer::records::AnalysisRecord {
+                path: PathBuf::from("/new1.mp4"),
+                fps: None, // failed
+                codec: None,
+                duration_secs: None,
+                file_bytes: 0,
+            },
+            rencoder_lib::analyzer::records::AnalysisRecord {
+                path: PathBuf::from("/new2.mp4"),
+                fps: Some(60),
+                codec: Some("av1".into()),
+                duration_secs: Some(2.0),
+                file_bytes: 100,
+            },
+        ];
+        reduce(
+            &mut state,
+            Msg::Lib(Event::AnalyzeFinished {
+                records: new_records.clone(),
+                failed_count: 1,
+            }),
+            &cmd_tx(),
+            &default_config(),
+        );
+        assert_eq!(state.analyze_results.len(), 2);
+        assert_eq!(state.analyze_results[0].path, PathBuf::from("/new1.mp4"));
+        assert_eq!(state.analyze_results[1].path, PathBuf::from("/new2.mp4"));
+        // Stale record gone.
+        let stale = PathBuf::from("/stale.mp4");
+        assert!(state.analyze_results.iter().all(|r| r.path != stale));
+        // last_error surfaces the failure count (1 failed).
+        assert!(state.last_error.is_some());
+        assert!(state.last_error.unwrap().contains("1 failed"));
     }
 
     #[test]
