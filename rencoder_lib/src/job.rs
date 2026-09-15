@@ -28,9 +28,11 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 
+use crate::analyzer::records::{analyze_records_with_probe_and_progress_parallel, AnalyzeProgress};
 use crate::config::app::AppConfig;
 use crate::config::path::resolve_data_dir;
 use crate::config::{path::resolve_config, Config};
+use crate::data::extract::probe_video_metadata_auto;
 use crate::error::EncodeError;
 use crate::pipeline::batch::{transcode_single_with_progress, FfmpegProgress};
 use crate::pipeline::cache::init_encoder_cache;
@@ -102,6 +104,27 @@ pub enum Command {
     /// in-memory config it has. Emits `Event::ConfigSaved` on
     /// success / `Event::Error` on failure.
     SaveConfig,
+    /// Start a parallel analyze batch (U22 / Tier 3 #9).
+    ///
+    /// The lib actor probes each file (c-probe if enabled, ffprobe
+    /// CLI fallback otherwise — same dispatcher as
+    /// `analyze_records_parallel`) and emits:
+    ///   1. `Event::AnalyzeStarted { total: files.len() }` once,
+    ///   2. `Event::AnalyzeProgress { done, total, failed, last }`
+    ///      once per file completion (rayon workers may fire out of
+    ///      input order; `done` / `failed` are monotonic counters),
+    ///   3. `Event::AnalyzeFinished { records, failed_count }` once.
+    ///
+    /// **v1 limitations** (see docs/design.md §3.4 "分析进度上报"):
+    /// - Busy-gate: cannot run alongside `StartBatch` / `DryRun` (same
+    ///   gate). The second concurrent batch gets `Event::Error`
+    ///   ("another batch is already running") instead.
+    /// - No `Command::Cancel` support: analyze batches are read-only
+    ///   and short-lived; cancellation requires per-worker
+    ///   `AtomicBool` polling that doubles the test matrix.
+    /// - SIGINT does not interrupt analyze: `Event::AnalyzeFinished`
+    ///   fires cleanly, not `BatchCancelled`.
+    Analyze { files: Vec<PathBuf> },
 }
 
 // =====================================================================
@@ -186,6 +209,50 @@ pub enum Event {
     /// to disk. The path is included so the UI can show feedback
     /// like "saved to /path/to/rencoder.toml".
     ConfigSaved { path: PathBuf },
+
+    // ---- Analyze topic (U22 / Tier 3 #9) ----
+    // See docs/design.md §3.4 "分析进度上报" for the full protocol
+    // (Started + N×Progress + Finished) and the failure-counting /
+    // non-deterministic-order / failed-first-display rationale.
+    //
+    // These three variants are emitted by `run_actor` when it
+    // receives `Command::Analyze { files }`. The lib invokes
+    // `analyze_records_with_probe_and_progress_parallel` (defined
+    // in `crate::analyzer::records`) with a progress closure that
+    // converts each per-file `AnalyzeProgress` into the matching
+    // `Event::AnalyzeProgress` below.
+    //
+    // Display convention (design doc §3.4 "最终结果的展示约定"):
+    // - Live `done` / `failed` counters are monotonic; UI uses them
+    //   as the main progress signal.
+    // - `last` field is the just-completed file in *completion
+    //   order* (rayon workers race) — operator reads it as
+    //   "just completed: X.mp4", not "next in input order".
+    // - The final `Vec<AnalysisRecord>` is in input order
+    //   (`par_iter().collect()` preserves it).
+    /// `Command::Analyze` accepted; analysis about to start.
+    /// `total` is the count of files (== `Command::Analyze.files.len()`).
+    AnalyzeStarted { total: usize },
+    /// Emitted once per file completion (rayon workers may fire
+    /// non-deterministically). `done` is the cumulative count of
+    /// files probed (including failures); `total` is constant; the
+    /// `done` / `total` ratio is the UI's progress gauge.
+    /// `failed` is the cumulative count of files that probed Err.
+    /// `last` is `Some(file)` for the file that just completed —
+    /// operator reads it as "just completed" indicator.
+    AnalyzeProgress {
+        done: usize,
+        total: usize,
+        failed: usize,
+        last: Option<crate::analyzer::records::AnalyzedFile>,
+    },
+    /// Whole batch done. `failed_count == records.iter().filter(|r|
+    /// r.fps.is_none()).count()` (invariants — UI can cross-check).
+    /// `records` is in input order (rayon `par_iter().collect()`).
+    AnalyzeFinished {
+        records: Vec<crate::analyzer::records::AnalysisRecord>,
+        failed_count: usize,
+    },
 
     // ---- Error topic (fatal only) ----
     /// Fatal-only error. Per §3.8.3 item 26 + §8 item 36:
@@ -745,6 +812,58 @@ fn run_actor(
                     });
                 }
             },
+
+            Command::Analyze { files } => {
+                // U22 / Tier 3 #9: parallel analyze with per-file
+                // progress events. Busy-gate so we don't overlap with
+                // StartBatch / DryRun — operator can only have one
+                // kind of batch in flight. v1 doesn't support
+                // Command::Cancel abort; the rayon par_iter runs to
+                // completion and AnalyzeFinished fires cleanly.
+                if busy.swap(true, Ordering::SeqCst) {
+                    let _ = evt_tx.send(Event::Error {
+                        category: ErrorCategory::ConfigError,
+                        message: "another batch is already running".into(),
+                    });
+                    continue;
+                }
+
+                let total = files.len();
+                let _ = evt_tx.send(Event::AnalyzeStarted { total });
+
+                // Progress closure: convert each rayon worker tick
+                // into an Event on the lib→UI channel. The closure
+                // captures `evt_tx` by reference; `Sender<Event>` is
+                // Sync, so the `Fn + Sync + Send` bound required by
+                // rayon is satisfied.
+                let progress = |p: AnalyzeProgress| {
+                    let _ = evt_tx.send(Event::AnalyzeProgress {
+                        done: p.done,
+                        total: p.total,
+                        failed: p.failed,
+                        last: p.last,
+                    });
+                };
+
+                let records = analyze_records_with_probe_and_progress_parallel(
+                    &files,
+                    probe_video_metadata_auto,
+                    progress,
+                );
+
+                // failed_count invariant: equals
+                // records.iter().filter(|r| r.fps.is_none()).count().
+                // The probe-progress closure already counted
+                // failures (atomic increment), so we re-derive from
+                // the final records to keep the contract testable.
+                let failed_count = records.iter().filter(|r| r.fps.is_none()).count();
+
+                busy.store(false, Ordering::SeqCst);
+                let _ = evt_tx.send(Event::AnalyzeFinished {
+                    records,
+                    failed_count,
+                });
+            }
         }
     }
 }
@@ -997,6 +1116,38 @@ mod mock_tests {
                             files.iter(),
                         );
                         let _ = evt_tx.send(Event::DryRunFinished { records });
+                    }
+                    // Analyze is exercised here with a lite version
+                    // of the production arm (no busy-gate — that's
+                    // the same atomic-swap pattern tested in
+                    // start_batch_rejects_second_batch_with_error).
+                    // Uses the real probe function so we get real
+                    // Started + N×Progress + Finished sequences.
+                    // Tests create temp files (which fail to probe)
+                    // and verify the event shape; success/failure
+                    // semantics of the closure are tested separately
+                    // in analyzer::records::tests.
+                    Command::Analyze { files } => {
+                        let total = files.len();
+                        let _ = evt_tx.send(Event::AnalyzeStarted { total });
+                        let progress = |p: AnalyzeProgress| {
+                            let _ = evt_tx.send(Event::AnalyzeProgress {
+                                done: p.done,
+                                total: p.total,
+                                failed: p.failed,
+                                last: p.last,
+                            });
+                        };
+                        let records = analyze_records_with_probe_and_progress_parallel(
+                            &files,
+                            probe_video_metadata_auto,
+                            progress,
+                        );
+                        let failed_count = records.iter().filter(|r| r.fps.is_none()).count();
+                        let _ = evt_tx.send(Event::AnalyzeFinished {
+                            records,
+                            failed_count,
+                        });
                     }
                 }
             }
@@ -1346,6 +1497,112 @@ mod mock_tests {
         }
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "parallel-analyze")]
+    #[test]
+    fn analyze_emits_started_progress_finished_sequence() {
+        // U22 / Tier 3 #9: send Command::Analyze with 3 temp files
+        // (random bytes — they fail to probe, but the actor still
+        // emits the full Started + N×Progress + Finished event
+        // sequence). Verifies the actor's Command::Analyze arm.
+        //
+        // The closure-injection semantics of
+        // analyze_records_with_probe_and_progress_parallel (per-file
+        // tick, monotonic done, FileOutcome variants) are tested
+        // separately in analyzer::records::tests — this test only
+        // pins the actor's emit sequence.
+        let tmp = unique_tmp("analyze");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let files: Vec<PathBuf> = (0..3)
+            .map(|i| {
+                let p = tmp.join(format!("f{i}.mp4"));
+                std::fs::write(&p, b"not a real video").unwrap();
+                p
+            })
+            .collect();
+
+        let (cmd_tx, evt_rx) = run_actor_inline(make_succeeding_mock().0, None);
+        cmd_tx
+            .send(Command::Analyze {
+                files: files.clone(),
+            })
+            .unwrap();
+        drop(cmd_tx);
+
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
+        // Expected: 1 AnalyzeStarted + 3 AnalyzeProgress + 1 AnalyzeFinished.
+        assert_eq!(events.len(), 5, "expected 5 events, got: {events:?}");
+        // First event: AnalyzeStarted with total = 3.
+        match &events[0] {
+            Event::AnalyzeStarted { total } => assert_eq!(*total, 3),
+            _ => panic!("expected AnalyzeStarted first, got: {:?}", events[0]),
+        }
+        // Middle 3 events: AnalyzeProgress, all with total = 3.
+        for evt in &events[1..4] {
+            match evt {
+                Event::AnalyzeProgress { total, last, .. } => {
+                    assert_eq!(*total, 3);
+                    assert!(last.is_some(), "every Progress tick should carry last");
+                }
+                _ => panic!("expected AnalyzeProgress, got: {evt:?}"),
+            }
+        }
+        // Last event: AnalyzeFinished with 3 records in input order
+        // and failed_count = 3 (all probes fail on garbage files).
+        match events.last().unwrap() {
+            Event::AnalyzeFinished {
+                records,
+                failed_count,
+            } => {
+                assert_eq!(*failed_count, 3);
+                assert_eq!(records.len(), 3);
+                // Input order: f0, f1, f2 (par_iter().collect() preserves).
+                for (i, r) in records.iter().enumerate() {
+                    assert_eq!(r.path, files[i]);
+                    assert!(r.fps.is_none(), "garbage file → fps = None");
+                }
+            }
+            _ => panic!("expected AnalyzeFinished last, got: {:?}", events.last()),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "parallel-analyze")]
+    #[test]
+    fn analyze_empty_files_emits_finished_only() {
+        // U22: zero-file analyze batch still emits AnalyzeFinished
+        // (no AnalyzeStarted — the batch is trivially empty). Lets
+        // the UI clear any stale "analyzing" state.
+        //
+        // Actually: the production arm emits Started unconditionally
+        // first, then the analyze_records_with_probe_and_progress_parallel
+        // loop runs zero times, then Finished fires. So the actual
+        // sequence is Started + Finished for empty input. Pin that.
+        let (cmd_tx, evt_rx) = run_actor_inline(make_succeeding_mock().0, None);
+        cmd_tx.send(Command::Analyze { files: Vec::new() }).unwrap();
+        drop(cmd_tx);
+
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
+        assert_eq!(
+            events.len(),
+            2,
+            "expected Started + Finished, got: {events:?}"
+        );
+        match &events[0] {
+            Event::AnalyzeStarted { total } => assert_eq!(*total, 0),
+            _ => panic!("expected AnalyzeStarted"),
+        }
+        match &events[1] {
+            Event::AnalyzeFinished {
+                records,
+                failed_count,
+            } => {
+                assert!(records.is_empty());
+                assert_eq!(*failed_count, 0);
+            }
+            _ => panic!("expected AnalyzeFinished"),
+        }
     }
 
     #[test]
