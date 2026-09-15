@@ -1362,6 +1362,19 @@ outcome: FileOutcome }` 是新 type，`FileOutcome` 只两个 variant（`Ok` / `
 crossbeam unbounded channel 1M msg/s 量级，总开销 ~0.001s。不 chunked 让 UI 不需要自己
 throttle state 更新——简单胜过微小优化。
 
+**最终结果的展示约定（U22 #9e）**：
+
+| Surface | 顺序 | 理由 |
+|---|---|---|
+| `Event::AnalyzeProgress.last` 字段 | 完成序（乱） | "just completed" 指示符，operator 看到的是"刚跑完哪个"，不是"按输入序该跑完哪个"。重排需 buffer，复杂度高，价值低 |
+| `Event::AnalyzeProgress.done` / `failed` 计数 | 单调递增 | 主进度信号，反映实时工作流。必须保留实时性 |
+| `log::warn!` per-file failure 行 | 线程交错 | CLI 端，只在 failure 时出现；post-mortem 用时间戳或 `[file_index]` 前缀排序 |
+| 最终 `Vec<AnalysisRecord>` (`Event::AnalyzeFinished.records`) | **输入顺序** | `par_iter().collect()` 保证；CSV / 下游工具 / 调试都需要 |
+| `AnalyzePanel` 渲染 (`state.analyze_results`) | **failed-first** | operator 跑完看结果时最关心"哪几个挂了"。`Vec::partition` by `r.fps.is_none()`，stable partition 保持组内输入序。**只动 UI 渲染层,不动 lib / CLI**(灰度发布:CLI summary 维持现状,以后需要时再统一) |
+| `LogPanel` (`state.log`) | 时间序 | live 流,runtime 行为。failure 通过 `Event::LogLine` 进来时按时间序,与 `AnalyzePanel` 的"结果优先"分工不冲突 |
+
+分工:**live = time order, final = failure-first**。两个约定分别服务 operator 的不同动作(看 live tail 抓异常上下文,看 final panel 找失败文件),不互相干扰。
+
 ---
 
 ### 3.6 部署布局（U18）
@@ -1968,7 +1981,7 @@ fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>) {
 | `HistoryPanel` | `state: Signal<AppState>` | `state.history` 表(source / outcome / output / duration / size);空时显示"(no history loaded)" |
 | `DryRunPanel` | `state: Signal<AppState>` | `state.dry_run_results` 表(source / planned outcome / output);空时显示"(no dry-run results yet — click Preview)" |
 | `SettingsPanel` | `config: Signal<Arc<AppConfig>>` | 只读展示 `[encode]` 当前值(format / crf / bitrate / extensions / max_fps / nv);text-only 字段编辑留 v1.2 |
-| `AnalyzePanel` (U22) | `state: Signal<AppState>` | analyze 进度文本 `"X/Y (Z failed)"` + `last` 字段(刚完成文件);v1 不带视觉进度条。`state.analyze_results` 末 batch 完成时在下面渲染 records 表(类似 DryRunPanel) |
+| `AnalyzePanel` (U22) | `state: Signal<AppState>` | analyze 进度文本 `"X/Y (Z failed)"` + `last` 字段(刚完成文件);v1 不带视觉进度条。`state.analyze_results` 末 batch 完成时在下面渲染 records 表(类似 DryRunPanel)**按 outcome 分区显示:failed 在上 succeeded 在下,中间 muted 分隔行**(`Vec::partition` by `r.fps.is_none()`,stable partition 保持组内输入序)。lib 不抽 `partition_by_outcome` helper——单 consumer 且 inline 1 行,等 CLI 也要用时再抽 |
 
 **v1 已知 limitations**(rencoder_ui 当前 bootstrap 状态):
 
