@@ -1,27 +1,35 @@
 //! Dioxus App component (U21 §3.8.7).
 //!
-//! Tiers follow-up refactor (Strategy 2 per the architectural
-//! review): keep the lib's `crossbeam-channel` boundary intact
-//! and drain events on a dedicated `std::thread`. The thread
-//! mutates Dioxus `Signal`s directly via `with_mut` / `set`,
-//! which Dioxus 0.6 supports across thread boundaries (the
-//! signal's underlying storage is `Send + Sync`).
+//! Strategy 2 (per the architectural review): keep the lib's
+//! `crossbeam-channel` boundary intact and drain events on a
+//! dedicated `std::thread`. The thread mutates Dioxus `Signal`s
+//! directly via `with_mut` / `set`, which Dioxus 0.6 supports
+//! across thread boundaries (the signal's underlying storage
+//! is `Send + Sync`).
 //!
-//!   [Polars/Rayon worker thread] ---send--->  crossbeam evt_tx
-//!                                                    |
-//!                                                    v
-//!                                            crossbeam evt_rx
-//!                                                    |
-//!                                                    v
-//!                                          [std::thread::spawn]
-//!                                          blocks on rx.recv()
-//!                                          calls state.with_mut
-//!                                          (triggers Dioxus re-render)
+//! ```
+//! [Polars/Rayon worker thread] ---send--->  crossbeam evt_tx
+//!                                                   |
+//!                                                   v
+//!                                           crossbeam evt_rx
+//!                                                   |
+//!                                                   v
+//!                                         [std::thread::spawn]
+//!                                         blocks on rx.recv()
+//!                                         calls state.with_mut
+//!                                         (triggers Dioxus re-render)
+//! ```
 //!
 //! No `use_coroutine`, no `async`, no `futures` crate, no
 //! intermediate mpsc bridge. The executor is never blocked
 //! because the blocking recv runs on a dedicated OS thread,
 //! not in Dioxus's task scheduler.
+//!
+//! **UI structure** (§3.8.7.2): 4 pages with TopBar tabs + Exit,
+//! per-page button in top-right, footer log strip across all
+//! pages. Page routing via `state.active_page: Page` (testable
+//! through the reducer). No auto-switch between Setup and Task
+//! pages — user navigates manually.
 
 use dioxus::desktop;
 use dioxus::prelude::*;
@@ -30,45 +38,25 @@ use std::sync::Arc;
 
 use crossbeam_channel::Sender;
 
-use rencoder_lib::analyzer::records::AnalysisRecord;
 use rencoder_lib::config::app::AppConfig;
 use rencoder_lib::job::{start_controller, Command};
 
-use crate::msg::{reduce, AppState, Msg};
+use crate::msg::{reduce, AppState, BatchPhase, Msg, Page, TaskId, TaskQueue};
 
-/// CSS (Tiers follow-up). Inlined as a <style> child of the
-/// root div via Dioxus's `dangerous_inner_html` so it's part
-/// of the rendered DOM and doesn't need a separate file lookup
-/// at runtime.
+/// CSS inlined as a `<style>` child of the root div via Dioxus's
+/// `dangerous_inner_html` so it's part of the rendered DOM and
+/// doesn't need a separate file lookup at runtime.
 const CSS: &str = include_str!("../assets/style.css");
 
 #[component]
 pub fn App() -> Element {
-    // Signals live in the component body so the buttons and the
-    // background thread can both read/copy them. `Signal<T>` is
-    // `Copy` in Dioxus 0.6, so the thread closure can capture
-    // a copy and the buttons capture another copy of the same
-    // underlying storage.
-    // Strategy 2 (design §3.9.2): `use_signal_sync` returns
-    // `Signal<T, SyncStorage>` (parking_lot RwLock backend, Send +
-    // Sync). Required because the background drain thread captures
-    // copies of these signals and mutates them across thread
-    // boundaries. Default `use_signal` is `Signal<T, UnsyncStorage>`
-    // (RefCell backend, !Send) — E0277 on `std::thread::spawn`.
-    // `state` is read/copied into the buttons and panels below; only
-    // `config` and `cmd_tx` are directly `.set(...)` here. Marking
-    // `state` non-`mut` keeps the warning clean.
     let state: Signal<AppState, SyncStorage> = use_signal_sync(AppState::default);
     let mut config: Signal<Arc<AppConfig>, SyncStorage> =
         use_signal_sync(|| Arc::new(AppConfig::default()));
     let mut cmd_tx: Signal<Option<Sender<Command>>, SyncStorage> = use_signal_sync(|| None);
 
-    // One-shot setup: start the controller, wire the channels
-    // into the signals, spawn the event-drain thread. Runs once
-    // per App() mount (Dioxus calls use_hook on the first render
-    // and skips it on re-renders). The thread lives as long as
-    // the component (until the App() unmounts, which for the
-    // desktop main view is the process lifetime).
+    // One-shot setup: start the controller, wire the channels,
+    // spawn the event-drain thread. Runs once per App() mount.
     use_hook(|| {
         let handle = start_controller();
         let cfg = handle.config();
@@ -76,28 +64,14 @@ pub fn App() -> Element {
         config.set(cfg);
         cmd_tx.set(Some(tx.clone()));
 
-        // Capture signal copies for the thread closure. These
-        // are the same underlying storage the App() body uses
-        // for `state.read()` and the buttons' `state.with_mut()`.
         let mut state_thread = state;
         let config_thread = config;
         let cmd_tx_thread = cmd_tx;
-        // Thread name per design §3.9.5 (`rencoder-ui-drain`) so
-        // the OS thread list and crash dumps identify the UI's
-        // event-pump worker. `Builder::spawn` returns
-        // `io::Result<JoinHandle>` — the thread is started in
-        // `use_hook` which only runs once per App mount, so a
-        // spawn failure here is unrecoverable and we panic with
-        // context.
         std::thread::Builder::new()
             .name("rencoder-ui-drain".to_string())
             .spawn(move || {
                 while let Ok(evt) = evt_rx.recv() {
                     let cfg = config_thread.read().clone();
-                    // cmd_tx is needed by reduce() for any
-                    // user-input events that the reducer decides
-                    // to re-dispatch. We read it fresh each time
-                    // because it's set by use_hook above.
                     let tx_for_reduce = cmd_tx_thread.read().clone();
                     if let Some(tx) = tx_for_reduce {
                         state_thread.with_mut(|s| reduce(s, Msg::Lib(evt), &tx, &cfg));
@@ -107,105 +81,176 @@ pub fn App() -> Element {
             .expect("rencoder-ui-drain: failed to spawn event-pump thread");
     });
 
-    let s = state.read();
-    let history_count = s.history.len();
-    let batch_state = s
-        .batch
-        .as_ref()
-        .map(|b| format!("#{} ({} of {})", b.id, b.records.len(), b.total_files))
-        .unwrap_or_else(|| "idle".to_string());
-    let last_error = s.last_error.clone();
-    drop(s);
-
-    let tx_holder = cmd_tx.read().clone();
-    let Some(tx) = tx_holder else {
+    // If cmd_tx isn't set yet (use_hook hasn't run), show
+    // "Initializing actor..." placeholder. Otherwise render the
+    // top-bar + active page.
+    let _cmd_tx_ready = cmd_tx.read().is_some();
+    if !_cmd_tx_ready {
         return rsx! {
             style { dangerous_inner_html: "{CSS}" }
             div { class: "app",
-                h1 { "Rencoder" }
-                p { "Initializing actor..." }
+                header { class: "app-header",
+                    span { class: "brand", "RENENCODER" }
+                }
+                div { class: "page",
+                    p { class: "muted", "Initializing actor..." }
+                }
             }
         };
-    };
+    }
 
-    let tx_start = tx.clone();
-    let tx_cancel = tx.clone();
-    let tx_history = tx.clone();
-    let tx_preview = tx.clone();
-    let tx_save = tx.clone();
-    let tx_analyze = tx.clone();
-
-    let mut state_for_start = state;
-    let mut state_for_cancel = state;
-    let mut state_for_history = state;
+    // Page routing — read active_page, render the right page.
+    let active_page = state.read().active_page;
+    let last_error = state.read().last_error.clone();
 
     rsx! {
         style { dangerous_inner_html: "{CSS}" }
         div { class: "app",
-            h1 { "Rencoder" }
-            main {
-                DirPicker {
-                    state: state,
-                    cmd_tx: cmd_tx,
-                    config: config,
-                }
-                if let Some(ref err) = last_error {
-                    p { class: "error", "Last error: {err}" }
-                }
-                p { class: "batch", "Batch: {batch_state}" }
-                ProgressPanel { state: state }
-                LogPanel { state: state }
-                p { class: "history", "History: {history_count} records" }
-                HistoryPanel { state: state }
-                DryRunPanel { state: state }
-                SettingsPanel { config: config }
-                AnalyzePanel { state: state }
+            TopBar { state: state, cmd_tx: cmd_tx, config: config }
+            if let Some(ref err) = last_error {
+                div { class: "global-error", "{err}" }
             }
-            div { class: "controls",
-                button {
-                    onclick: move |_| {
-                        let cfg = config.read().clone();
-                        state_for_start.with_mut(|s| reduce(s, Msg::UserClickedStart, &tx_start, &cfg));
-                    },
-                    "Start"
+            div { class: "page",
+                match active_page {
+                    Page::Setup => rsx! { SetupPage { state: state, cmd_tx: cmd_tx, config: config } },
+                    Page::Task => rsx! { TaskPage { state: state, cmd_tx: cmd_tx, config: config } },
+                    Page::History => rsx! { HistoryPage { state: state, cmd_tx: cmd_tx, config: config } },
+                    Page::Log => rsx! { LogPage { state: state } },
                 }
-                button {
-                    onclick: move |_| {
-                        let cfg = config.read().clone();
-                        state_for_cancel.with_mut(|s| reduce(s, Msg::UserClickedCancel, &tx_cancel, &cfg));
-                    },
-                    "Cancel"
-                }
-                button {
-                    onclick: move |_| {
-                        let cfg = config.read().clone();
-                        state_for_start.with_mut(|s| reduce(s, Msg::UserClickedSaveSettings, &tx_save, &cfg));
-                    },
-                    "Save Settings"
-                }
-                button {
-                    onclick: move |_| {
-                        let cfg = config.read().clone();
-                        state_for_history.with_mut(|s| reduce(s, Msg::UserClickedLoadHistory, &tx_history, &cfg));
-                    },
-                    "Load History"
-                }
-                button {
-                    onclick: move |_| {
-                        let cfg = config.read().clone();
-                        state_for_start.with_mut(|s| reduce(s, Msg::UserClickedPreview, &tx_preview, &cfg));
-                    },
-                    "Preview (Dry Run)"
-                }
-                button {
-                    onclick: move |_| {
-                        let cfg = config.read().clone();
-                        state_for_start.with_mut(|s| reduce(s, Msg::UserClickedAnalyze, &tx_analyze, &cfg));
-                    },
-                    "Analyze"
-                }
-                ExitButton {}
             }
+            FooterLog { state: state }
+        }
+    }
+}
+
+// ============================================================================
+// TopBar — 4 tabs + Exit button (visible on all pages)
+// ============================================================================
+
+#[component]
+fn TopBar(
+    state: Signal<AppState, SyncStorage>,
+    cmd_tx: Signal<Option<Sender<Command>>, SyncStorage>,
+    config: Signal<Arc<AppConfig>, SyncStorage>,
+) -> Element {
+    let active = state.read().active_page;
+    let tx_exit = cmd_tx.read().clone();
+    let tx_tab_setup = cmd_tx.read().clone();
+    let tx_tab_task = cmd_tx.read().clone();
+    let tx_tab_history = cmd_tx.read().clone();
+    let tx_tab_log = cmd_tx.read().clone();
+
+    rsx! {
+        header { class: "top-bar",
+            span { class: "brand", "RENENCODER" }
+            nav { class: "tabs",
+                button {
+                    class: if active == Page::Setup { "tab tab-active" } else { "tab" },
+                    onclick: move |_| {
+                        let cfg = config.read().clone();
+                        if let Some(tx) = tx_tab_setup.clone() {
+                            state.with_mut(|s| reduce(s, Msg::UserClickedTab(Page::Setup), &tx, &cfg));
+                        }
+                    },
+                    "SETUP"
+                }
+                button {
+                    class: if active == Page::Task { "tab tab-active" } else { "tab" },
+                    onclick: move |_| {
+                        let cfg = config.read().clone();
+                        if let Some(tx) = tx_tab_task.clone() {
+                            state.with_mut(|s| reduce(s, Msg::UserClickedTab(Page::Task), &tx, &cfg));
+                        }
+                    },
+                    "TASK"
+                }
+                button {
+                    class: if active == Page::History { "tab tab-active" } else { "tab" },
+                    onclick: move |_| {
+                        let cfg = config.read().clone();
+                        if let Some(tx) = tx_tab_history.clone() {
+                            state.with_mut(|s| reduce(s, Msg::UserClickedTab(Page::History), &tx, &cfg));
+                        }
+                    },
+                    "HISTORY"
+                }
+                button {
+                    class: if active == Page::Log { "tab tab-active" } else { "tab" },
+                    onclick: move |_| {
+                        let cfg = config.read().clone();
+                        if let Some(tx) = tx_tab_log.clone() {
+                            state.with_mut(|s| reduce(s, Msg::UserClickedTab(Page::Log), &tx, &cfg));
+                        }
+                    },
+                    "LOG"
+                }
+            }
+            div { class: "top-bar-right",
+                if let Some(tx) = tx_exit {
+                    button {
+                        class: "exit-btn",
+                        onclick: move |_| {
+                            // v1 Exit semantics (per §3.8.7.4):
+                            // active phase -> Command::Cancel,
+                            // then window().close() (after
+                            // BatchCancelled in v1.1; v1 close
+                            // immediately after dispatch).
+                            // None/Done -> close immediately.
+                            let phase = state.read().tasks.active.as_ref().map(|t| t.phase);
+                            match phase {
+                                Some(BatchPhase::Analyzing) | Some(BatchPhase::Encoding) => {
+                                    let _ = tx.send(Command::Cancel);
+                                }
+                                _ => {}
+                            }
+                            desktop::window().close();
+                        },
+                        "Exit"
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// SetupPage — DirPicker + Settings + Start button (top-right)
+// ============================================================================
+
+#[component]
+fn SetupPage(
+    state: Signal<AppState, SyncStorage>,
+    cmd_tx: Signal<Option<Sender<Command>>, SyncStorage>,
+    config: Signal<Arc<AppConfig>, SyncStorage>,
+) -> Element {
+    let cfg = config.read().clone();
+    let tx_opt = cmd_tx.read().clone();
+    let active = state.read().tasks.active.clone();
+    let input_dir = state.read().input_dir.clone();
+
+    // Start button enabled iff dir picked AND no active task.
+    let can_start = input_dir.is_some() && active.is_none();
+
+    rsx! {
+        section { class: "setup-page",
+            header { class: "page-header",
+                span { class: "section-label", "[ SETUP ]" }
+                div { class: "page-header-right",
+                    if let Some(tx) = tx_opt {
+                        button {
+                            class: "primary-btn",
+                            disabled: !can_start,
+                            onclick: move |_| {
+                                let cfg = config.read().clone();
+                                state.with_mut(|s| reduce(s, Msg::UserClickedStart, &tx, &cfg));
+                            },
+                            "Start ▸"
+                        }
+                    }
+                }
+            }
+            DirPicker { state: state, cmd_tx: cmd_tx, config: config }
+            SettingsPanel { config: cfg }
         }
     }
 }
@@ -214,24 +259,26 @@ pub fn App() -> Element {
 fn DirPicker(
     state: Signal<AppState, SyncStorage>,
     cmd_tx: Signal<Option<Sender<Command>>, SyncStorage>,
-    config: Signal<std::sync::Arc<AppConfig>, SyncStorage>,
+    config: Signal<Arc<AppConfig>, SyncStorage>,
 ) -> Element {
+    let input_dir = state.read().input_dir.clone();
+    let active_phase = state.read().tasks.active.as_ref().map(|t| t.phase);
+    // Picker disabled unless no active task.
+    let enabled = active_phase.is_none() || matches!(active_phase, Some(BatchPhase::Done));
+
     rsx! {
         div { class: "dir-picker",
-            label { "Input directory: " }
-            if state.read().input_dir.is_some() {
-                span { class: "current",
-                    "{state.read().input_dir.as_ref().unwrap().display()}" }
-            } else {
-                span { class: "muted", "(none)" }
+            label { class: "section-label", "INPUT DIRECTORY" }
+            div { class: "dir-display",
+                if let Some(ref d) = input_dir {
+                    span { class: "path", "{d.display()}" }
+                } else {
+                    span { class: "muted", "(none)" }
+                }
             }
             button {
-                // rfd::FileDialog::pick_folder blocks until the user
-                // closes the dialog. Runs on the Dioxus main thread
-                // (onclick handler) — required on macOS where
-                // NSOpenPanel must run on the main thread. Sync API
-                // is the right fit: no need to wire a use_future
-                // around AsyncFileDialog for a one-shot pick.
+                class: "secondary-btn",
+                disabled: !enabled,
                 onclick: move |_| {
                     if let Some(path) = rfd::FileDialog::new()
                         .set_title("Choose input directory")
@@ -245,28 +292,239 @@ fn DirPicker(
                         }
                     }
                 },
-                "Pick directory..."
+                "pick directory"
             }
         }
     }
 }
 
 #[component]
-fn ExitButton() -> Element {
+fn SettingsPanel(config: Arc<AppConfig>) -> Element {
+    let enc = config.encode.clone().unwrap_or_default();
     rsx! {
-        button {
-            // v1: just close the window — no Command::Cancel sent
-            // to the lib actor (limitation documented in design
-            // §3.8.7 v1 limitations). When Dioxus's runtime
-            // exits after the last window closes, the OS reaps
-            // the lib actor + drain thread. If a batch was in
-            // flight, partial output is cleaned up on the next
-            // start by encode_prepare's existing partial
-            // detection — no new work added.
-            onclick: move |_| {
-                desktop::window().close();
-            },
-            "Exit"
+        div { class: "settings-panel",
+            label { class: "section-label", "SETTINGS" }
+            dl { class: "kv-list",
+                dt { "codec" }
+                dd { if let Some(f) = &enc.format { "{f:?}" } else { "av1 (default)" } }
+                dt { "crf" }
+                dd { "{enc.crf}" }
+                dt { "bitrate" }
+                dd { if let Some(b) = enc.bitrate { "{b}" } else { "—" } }
+                dt { "max_fps" }
+                dd { if let Some(m) = enc.max_fps { "{m}" } else { "off" } }
+                dt { "extensions" }
+                dd { if let Some(e) = &enc.extensions { "{e:?}" } else { "default (all)" } }
+                dt { "nv" }
+                dd { if let Some(n) = enc.nv { "{n}" } else { "off" } }
+            }
+            p { class: "muted", "Edit values by hand in rencoder.toml, then click Save Settings (v1.2)." }
+        }
+    }
+}
+
+// ============================================================================
+// TaskPage — BatchStatus + TaskPlan + Progress + Start/Cancel (contextual)
+// ============================================================================
+
+#[component]
+fn TaskPage(
+    state: Signal<AppState, SyncStorage>,
+    cmd_tx: Signal<Option<Sender<Command>>, SyncStorage>,
+    config: Signal<Arc<AppConfig>, SyncStorage>,
+) -> Element {
+    let active = state.read().tasks.active.clone();
+    let history = state.read().task_history.clone();
+    let progress = state.read().progress.clone();
+
+    rsx! {
+        section { class: "task-page",
+            header { class: "page-header",
+                span { class: "section-label", "[ TASK ]" }
+                div { class: "page-header-right",
+                    TaskPageButton { state: state, cmd_tx: cmd_tx, config: config }
+                }
+            }
+            if let Some(task) = active.as_ref() {
+                BatchStatus {
+                    task_id: task.task_id.as_str().to_string(),
+                    phase: task.phase,
+                    total_files: task.total_files,
+                    to_encode: task.to_encode,
+                    to_skip: task.to_skip,
+                    cancelled: task.cancelled,
+                }
+                if !task.dry_run_records.is_empty() {
+                    div { class: "task-plan-panel",
+                        span { class: "section-label", "TASK PLAN" }
+                        div { class: "plan-table-wrap",
+                            for r in task.dry_run_records.iter() {
+                                div { class: "plan-row",
+                                    span { class: "path", "{r.source_path}" }
+                                    span {
+                                        class: match r.outcome {
+                                            rencoder_lib::types::EncodingOutcome::Succeeded => "outcome-encode",
+                                            rencoder_lib::types::EncodingOutcome::Failed => "outcome-fail",
+                                            _ => "outcome-skip",
+                                        },
+                                        "{r.outcome:?}"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if !progress.is_empty() {
+                    ProgressPanel { state: state }
+                }
+            } else if let Some(latest) = history.first() {
+                // After Done: show last completed task's stats.
+                BatchStatus {
+                    task_id: latest.task_id.as_str().to_string(),
+                    phase: latest.phase,
+                    total_files: latest.total_files,
+                    to_encode: latest.to_encode,
+                    to_skip: latest.to_skip,
+                    cancelled: latest.cancelled,
+                }
+                if !latest.records.is_empty() {
+                    p { class: "muted",
+                        "Last completed task: {latest.task_id.as_str()} (moved to history)"
+                    }
+                }
+            } else {
+                p { class: "muted", "No task running. Pick a directory and click Start." }
+            }
+        }
+    }
+}
+
+/// Contextual button on Task page — label + enabled state depend
+/// on the active task's phase.
+#[component]
+fn TaskPageButton(
+    state: Signal<AppState, SyncStorage>,
+    cmd_tx: Signal<Option<Sender<Command>>, SyncStorage>,
+    config: Signal<Arc<AppConfig>, SyncStorage>,
+) -> Element {
+    let active = state.read().tasks.active.clone();
+    let history = state.read().task_history.clone();
+    let phase = active.as_ref().map(|t| t.phase);
+    let cfg = config.read().clone();
+    let tx_opt = cmd_tx.read().clone();
+    let Some(tx) = tx_opt else {
+        return rsx! { span {} };
+    };
+
+    match phase {
+        None if !history.is_empty() => {
+            // Done state with history: re-arm Start.
+            let tx_s = tx.clone();
+            let cfg_s = cfg.clone();
+            rsx! {
+                button {
+                    class: "primary-btn",
+                    onclick: move |_| {
+                        state.with_mut(|s| reduce(s, Msg::UserClickedStart, &tx_s, &cfg_s));
+                    },
+                    "Start ▸"
+                }
+            }
+        }
+        None => rsx! { span {} },
+        Some(BatchPhase::Analyzing) => {
+            let tx_c = tx.clone();
+            rsx! {
+                button {
+                    class: "secondary-btn",
+                    onclick: move |_| {
+                        state.with_mut(|s| reduce(s, Msg::UserClickedCancel, &tx_c, &cfg));
+                    },
+                    "Cancel ✕"
+                }
+            }
+        }
+        Some(BatchPhase::AwaitingConfirm) => {
+            let active = state.read().tasks.active.clone();
+            let to_encode = active.as_ref().map(|t| t.to_encode).unwrap_or(0);
+            let tx_s1 = tx.clone();
+            let cfg_s1 = cfg.clone();
+            let tx_s2 = tx.clone();
+            let cfg_s2 = cfg.clone();
+            rsx! {
+                button {
+                    class: "primary-btn",
+                    onclick: move |_| {
+                        state.with_mut(|s| reduce(s, Msg::UserClickedStart, &tx_s1, &cfg_s1));
+                    },
+                    "encode {to_encode} files ▸"
+                }
+                button {
+                    class: "secondary-btn",
+                    onclick: move |_| {
+                        state.with_mut(|s| reduce(s, Msg::UserClickedCancel, &tx_s2, &cfg_s2));
+                    },
+                    "Cancel ✕"
+                }
+            }
+        }
+        Some(BatchPhase::Encoding) => {
+            let tx_c = tx.clone();
+            rsx! {
+                button {
+                    class: "secondary-btn",
+                    onclick: move |_| {
+                        state.with_mut(|s| reduce(s, Msg::UserClickedCancel, &tx_c, &cfg));
+                    },
+                    "Cancel ✕"
+                }
+            }
+        }
+        Some(BatchPhase::Done) => {
+            // Active task is Done — shouldn't happen (move to
+            // history). Show empty.
+            rsx! { span {} }
+        }
+    }
+}
+
+#[component]
+fn BatchStatus(
+    task_id: String,
+    phase: BatchPhase,
+    total_files: usize,
+    to_encode: usize,
+    to_skip: usize,
+    cancelled: bool,
+) -> Element {
+    let badge = match phase {
+        BatchPhase::Analyzing => "[● ANALYZING]",
+        BatchPhase::AwaitingConfirm => "[● AWAITING]",
+        BatchPhase::Encoding => "[● ENCODING]",
+        BatchPhase::Done => "[● DONE]",
+    };
+    let badge_class = match phase {
+        BatchPhase::Analyzing | BatchPhase::AwaitingConfirm | BatchPhase::Encoding => {
+            "badge badge-active"
+        }
+        BatchPhase::Done => "badge badge-done",
+    };
+    rsx! {
+        div { class: "batch-status",
+            div { class: "batch-status-row",
+                span { class: "task-id", "BATCH {task_id}" }
+                span { class: "{badge_class}", "{badge}" }
+            }
+            if total_files > 0 {
+                div { class: "batch-status-row",
+                    span { class: "code", "{total_files} files" }
+                    span { class: "code", "→ {to_encode} to encode" }
+                    span { class: "code", "→ {to_skip} skipped" }
+                }
+            }
+            if cancelled {
+                p { class: "muted", "cancelled" }
+            }
         }
     }
 }
@@ -280,26 +538,66 @@ fn ProgressPanel(state: Signal<AppState, SyncStorage>) -> Element {
     let mut rows: Vec<(usize, crate::msg::ProgressInfo)> = progress.into_iter().collect();
     rows.sort_by_key(|(i, _)| *i);
     rsx! {
-        table { class: "progress-table",
-            thead { tr {
-                th { "File" }
-                th { "Frame" }
-                th { "FPS" }
-                th { "Speed" }
-                th { "Time (s)" }
-                th { "ETA (s)" }
-            } }
-            tbody {
-                for (idx, info) in rows {
-                    tr {
-                        td { "{idx}" }
-                        td { "{info.frame}" }
-                        td { "{info.fps:.1}" }
-                        td { "{info.speed:.2}x" }
-                        td { "{info.time_secs:.1}" }
-                        td { if let Some(e) = info.eta_secs { "{e:.0}" } else { "—" } }
+        div { class: "progress-panel",
+            label { class: "section-label", "PROGRESS" }
+            table { class: "progress-table",
+                thead { tr {
+                        th { "FILE" }
+                        th { "FRAME" }
+                        th { "FPS" }
+                        th { "SPEED" }
+                        th { "ETA (s)" }
+                } }
+                tbody {
+                    for (idx, info) in rows {
+                        tr {
+                            td { "{idx}" }
+                            td { "{info.frame}" }
+                            td { "{info.fps:.1}" }
+                            td { "{info.speed:.2}x" }
+                            td { if let Some(e) = info.eta_secs { "{e:.0}" } else { "—" } }
+                        }
                     }
                 }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// HistoryPage — Parquet-loaded records + Refresh button
+// ============================================================================
+
+#[component]
+fn HistoryPage(
+    state: Signal<AppState, SyncStorage>,
+    cmd_tx: Signal<Option<Sender<Command>>, SyncStorage>,
+    config: Signal<Arc<AppConfig>, SyncStorage>,
+) -> Element {
+    let history = state.read().history.clone();
+    let tx_opt = cmd_tx.read().clone();
+
+    rsx! {
+        section { class: "history-page",
+            header { class: "page-header",
+                span { class: "section-label", "[ HISTORY ]" }
+                div { class: "page-header-right",
+                    if let Some(tx) = tx_opt {
+                        button {
+                            class: "secondary-btn",
+                            onclick: move |_| {
+                                let cfg = config.read().clone();
+                                state.with_mut(|s| reduce(s, Msg::UserClickedLoadHistory, &tx, &cfg));
+                            },
+                            "Refresh ⟳"
+                        }
+                    }
+                }
+            }
+            if history.is_empty() {
+                p { class: "muted", "(no history loaded)" }
+            } else {
+                HistoryPanel { state: state }
             }
         }
     }
@@ -308,146 +606,55 @@ fn ProgressPanel(state: Signal<AppState, SyncStorage>) -> Element {
 #[component]
 fn HistoryPanel(state: Signal<AppState, SyncStorage>) -> Element {
     let history = state.read().history.clone();
-    if history.is_empty() {
-        return rsx! { p { class: "muted", "(no history loaded)" } };
-    }
+    let rows: Vec<(String, String, String, String)> = history
+        .iter()
+        .map(|r| {
+            (
+                r.started_at.format("%Y-%m-%d %H:%M").to_string(),
+                r.source_path.clone(),
+                format!("{:?}", r.outcome),
+                r.output_size_bytes
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "—".into()),
+            )
+        })
+        .collect();
     rsx! {
-        table { class: "history-table",
-            thead { tr {
-                th { "Source" }
-                th { "Outcome" }
-                th { "Output" }
-                th { "Duration (s)" }
-                th { "Size (B)" }
-            } }
-            tbody {
-                for r in history.iter() {
-                    tr {
-                        td { "{r.source_path}" }
-                        td { "{r.outcome:?}" }
-                        td { if let Some(p) = &r.output_path { "{p}" } else { "—" } }
-                        td { if let Some(d) = r.encoding_duration_secs { "{d:.1}" } else { "—" } }
-                        td { if let Some(s) = r.output_size_bytes { "{s}" } else { "—" } }
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[component]
-fn DryRunPanel(state: Signal<AppState, SyncStorage>) -> Element {
-    let results = state.read().dry_run_results.clone();
-    if results.is_empty() {
-        return rsx! { p { class: "muted", "(no dry-run results yet — click Preview)" } };
-    }
-    rsx! {
-        table { class: "dryrun-table",
-            thead { tr {
-                th { "Source" }
-                th { "Planned outcome" }
-                th { "Output" }
-            } }
-            tbody {
-                for r in results.iter() {
-                    tr {
-                        td { "{r.source_path}" }
-                        td { "{r.outcome:?}" }
-                        td { if let Some(p) = &r.output_path { "{p}" } else { "—" } }
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[component]
-fn SettingsPanel(config: Signal<std::sync::Arc<AppConfig>, SyncStorage>) -> Element {
-    let cfg = config.read().clone();
-    let enc = cfg.encode.clone().unwrap_or_default();
-    rsx! {
-        div { class: "settings-panel",
-            h3 { "Settings (current load)" }
-            p { class: "muted", "Loaded from AppConfig (round-trip target of Save Settings)." }
-            p { "format: " strong { if let Some(f) = &enc.format { "{f:?}" } else { "default (Av1)" } } }
-            p { "crf: " strong { "{enc.crf}" }
-                 "  bitrate: " strong { if let Some(b) = enc.bitrate { "{b}" } else { "—" } } }
-            p { "extensions: " strong { if let Some(e) = &enc.extensions { "{e:?}" } else { "[] (all)" } } }
-            p { "max_fps: " strong { if let Some(m) = enc.max_fps { "{m}" } else { "off" } }
-                 "  nv: " strong { if let Some(n) = enc.nv { "{n}" } else { "off" } } }
-            p { class: "muted", "Edit values by hand in the TOML file, then click Save Settings to round-trip." }
-        }
-    }
-}
-
-#[component]
-fn AnalyzePanel(state: Signal<AppState, SyncStorage>) -> Element {
-    let s = state.read();
-    let progress_text = s.analyze_progress.as_ref().map(|p| {
-        let last_hint = match &p.last {
-            Some(f) => format!(" — last: {}", f.path.display()),
-            None => String::new(),
-        };
-        format!(
-            "Analyzing: {}/{} done ({} failed){}",
-            p.done, p.total, p.failed, last_hint
-        )
-    });
-    let (failed, succeeded): (Vec<&AnalysisRecord>, Vec<&AnalysisRecord>) =
-        s.analyze_results.iter().partition(|r| r.fps.is_none());
-
-    if s.analyze_results.is_empty() && s.analyze_progress.is_none() {
-        return rsx! { p { class: "muted", "(no analyze results yet — click Analyze)" } };
-    }
-
-    rsx! {
-        div { class: "analyze-panel",
-            h3 { "Analyze" }
-            if let Some(text) = progress_text {
-                p { class: "progress", "{text}" }
-            }
-            if !s.analyze_results.is_empty() {
-                if !failed.is_empty() {
-                    h4 { class: "failed-header", "Failed ({failed.len()})" }
-                    table { class: "analyze-failed-table",
-                        thead { tr {
-                            th { "Path" }
-                            th { "File bytes" }
-                        } }
-                        tbody {
-                            for r in failed.iter() {
-                                tr {
-                                    td { "{r.path.display()}" }
-                                    td { "{r.file_bytes}" }
-                                }
-                            }
-                        }
-                    }
-                }
-                if !succeeded.is_empty() {
-                    p { class: "muted separator", "── succeeded ({succeeded.len()}) ──" }
-                    table { class: "analyze-succeeded-table",
-                        thead { tr {
-                            th { "Path" }
-                            th { "FPS" }
-                            th { "Codec" }
-                            th { "Duration (s)" }
-                            th { "Bytes" }
-                        } }
-                        tbody {
-                            for r in succeeded.iter() {
-                                tr {
-                                    td { "{r.path.display()}" }
-                                    td { if let Some(fps) = r.fps { "{fps}" } else { "—" } }
-                                    td { if let Some(c) = &r.codec { "{c}" } else { "—" } }
-                                    td { if let Some(d) = r.duration_secs { "{d:.1}" } else { "—" } }
-                                    td { "{r.file_bytes}" }
-                                }
-                            }
+        div { class: "history-panel",
+            table { class: "history-table",
+                thead { tr {
+                        th { "WHEN" }
+                        th { "SOURCE" }
+                        th { "OUTCOME" }
+                        th { "SIZE" }
+                } }
+                tbody {
+                    for r in rows.iter() {
+                        tr {
+                            td { "{r.0}" }
+                            td { class: "path", "{r.1}" }
+                            td { "{r.2}" }
+                            td { "{r.3}" }
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+// ============================================================================
+// LogPage — full log scrollback + Clear button
+// ============================================================================
+
+#[component]
+fn LogPage(state: Signal<AppState, SyncStorage>) -> Element {
+    rsx! {
+        section { class: "log-page",
+            header { class: "page-header",
+                span { class: "section-label", "[ LOG ]" }
+            }
+            LogPanel { state: state }
         }
     }
 }
@@ -458,13 +665,10 @@ fn LogPanel(state: Signal<AppState, SyncStorage>) -> Element {
     if log.is_empty() {
         return rsx! { p { class: "muted", "(no log output)" } };
     }
-    let lines: Vec<crate::msg::LogLine> = {
-        let mut v: Vec<_> = log.iter().rev().take(100).cloned().collect();
-        v.reverse();
-        v
-    };
-    let rendered: Vec<(String, usize, String)> = lines
+    let lines: Vec<crate::msg::LogLine> = log.iter().rev().take(1000).cloned().collect();
+    let rendered: Vec<_> = lines
         .iter()
+        .rev()
         .map(|l| {
             (
                 l.at.format("%H:%M:%S").to_string(),
@@ -485,3 +689,49 @@ fn LogPanel(state: Signal<AppState, SyncStorage>) -> Element {
         }
     }
 }
+
+// ============================================================================
+// FooterLog — last 5 lines on every page
+// ============================================================================
+
+#[component]
+fn FooterLog(state: Signal<AppState, SyncStorage>) -> Element {
+    let log = state.read().log.clone();
+    let lines: Vec<_> = log.iter().rev().take(5).cloned().collect();
+    let rendered: Vec<(String, usize, String)> = lines
+        .iter()
+        .rev()
+        .map(|l| {
+            (
+                l.at.format("%H:%M:%S").to_string(),
+                l.file_index,
+                l.line.clone(),
+            )
+        })
+        .collect();
+    let empty = rendered.is_empty();
+    rsx! {
+        footer { class: "log-footer",
+            span { class: "section-label", "LOG · last 5 lines" }
+            div { class: "log-footer-lines",
+                if empty {
+                    span { class: "muted", "(no log output)" }
+                }
+                for entry in rendered.iter() {
+                    div { class: "log-line",
+                        span { class: "time", "{entry.0}" }
+                        span { class: "file", "[{entry.1}]" }
+                        span { class: "msg", " {entry.2}" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Suppress unused-warnings for fields used by future v1.1
+// (TaskQueue.pending / AppState.viewing_task used once we lift capacity)
+// ============================================================================
+#[allow(dead_code)]
+fn _unused_field_type_hints(_: TaskQueue, _: TaskId) {}

@@ -3,86 +3,234 @@
 //! The view layer is purely a function of state; state changes
 //! only via `reduce(state, msg, cmd_tx)` which also dispatches
 //! Commands back to the lib actor as needed.
+//!
+//! **Workflow state machine** (§3.8.7.1):
+//!
+//! ```text
+//! [None]  --UserClickedStart-->  [Analyzing]
+//!                                     |
+//!                                     v
+//!                              [AwaitingConfirm]
+//!                                     |
+//!                                     +-- UserClickedStart (dispatches Command::StartBatch)
+//!                                     v
+//!                                [Encoding]
+//!                                     |
+//!                  +-- BatchCompleted ---+
+//!                  +-- BatchCancelled ---+--> [Done] (moves to task_history)
+//!                  +-- Error (Encoding) -+
+//! ```
+//!
+//! v1 invariant: TaskQueue capacity = 1. Gating unit is task
+//! existence (`tasks.active.is_some()`), not batch id (batch_id
+//! is a lib-side mapping field that doesn't participate in
+//! gating decisions).
 
-use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use crossbeam_channel::Sender;
 
 use rencoder_lib::job::{Command, EncodingRecord, Event};
+use rencoder_lib::types::EncodingOutcome;
 
 /// Cap on the stderr log ring buffer. Per §3.8.6 + §8 item 30.
 const LOG_RING_CAP: usize = 1000;
 
+/// Lifecycle phase of a task. Drives the Task page header badge,
+/// the contextual button label, and the dir picker's enabled state
+/// (§3.8.7.1 state machine).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchPhase {
+    /// `Command::DryRun` dispatched; awaiting `Event::DryRunFinished`.
+    /// Dir picker disabled. Cancel button shown (best-effort).
+    Analyzing,
+    /// DryRun done; user must explicitly confirm before encoding
+    /// begins. Start button label flips to "encode N files".
+    /// Dir picker disabled.
+    AwaitingConfirm,
+    /// `Command::StartBatch` dispatched; awaiting `BatchCompleted`
+    /// / `BatchCancelled` / `Event::Error`. Progress bar active.
+    /// Dir picker disabled. Cancel button shown.
+    Encoding,
+    /// Final state after the batch lifecycle ends. Dir picker
+    /// re-enables. Start button re-arms (clicking it transitions
+    /// back to `Analyzing` for a new cycle).
+    Done,
+}
+
+/// 4 page tabs (per §3.8.7.2). `Setup` is the initial value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Page {
+    #[default]
+    Setup,
+    Task,
+    History,
+    Log,
+}
+
+/// UI-side task id — timestamp-based `yyyymmddhhmmss` (per spec).
+/// Queue and history share the same id space; the id is preserved
+/// across active -> history moves (no re-key).
+///
+/// Format: `chrono::Local::now().format("%Y%m%d%H%M%S")` -> 14
+/// chars. Same-second collisions get a `-N` suffix (allocated by
+/// `TaskQueue::next_task_id`).
+///
+/// Session-unique only. Cross-session uniqueness is handled by the
+/// lib's batch_id + Parquet reload (per §3.8.7.4 limitations).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TaskId(String);
+
+impl TaskId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Top-level UI state — single source of truth for all views.
-#[allow(dead_code)] // fields are populated by the reducer; UI views read them
 #[derive(Debug, Default)]
 pub struct AppState {
-    /// Currently running batch, if any.
-    pub batch: Option<BatchInfo>,
-    /// per-file progress keyed by file_index.
-    pub progress: std::collections::HashMap<usize, ProgressInfo>,
+    /// Task queue (v1: capacity = 1). All tasks share the lib
+    /// actor via busy-gate. Guard on `tasks.active.is_some()` —
+    /// task is the gating unit, not batch id.
+    pub tasks: TaskQueue,
+    /// Session-completed tasks, newest-first. Inserted on
+    /// BatchCompleted / BatchCancelled / Encoding-phase Error.
+    /// `task_history` is session UX cache; the primary store is
+    /// Parquet (`encoding-*.parquet`, written by lib on every
+    /// `BatchCompleted`). v1.1 reload via `Command::LoadHistory`
+    /// gives cross-session `state.history` (per-file records).
+    pub task_history: Vec<TaskInfo>,
+    /// Active page tab (§3.8.7.2). Default `Setup`. Tab clicks
+    /// dispatch `Msg::UserClickedTab(Page)` -> reducer writes
+    /// this field (testable).
+    pub active_page: Page,
+    /// Currently-viewed task on the `[TASK]` page. v1: always
+    /// `tasks.active.task_id` when active is Some; v1.1: user
+    /// can switch between active and history entries.
+    pub viewing_task: Option<TaskId>,
+    /// per-file progress keyed by file_index. v1: single active
+    /// task's progress. v1.1: `HashMap<TaskId, HashMap<...>>`.
+    pub progress: HashMap<usize, ProgressInfo>,
     /// stderr log ring buffer (newest last).
     pub log: VecDeque<LogLine>,
-    /// History loaded via LoadHistory command.
+    /// History loaded via `Command::LoadHistory` from Parquet
+    /// (cross-session records). Different concept from
+    /// `task_history` (this-session UX cache).
     pub history: Vec<EncodingRecord>,
-    /// Dry-run results: populated by Preview (Command::DryRun) →
-    /// Event::DryRunFinished. Cleared on each new dry-run.
-    #[allow(dead_code)] // populated in #64; UI panel rendering land
-    pub dry_run_results: Vec<EncodingRecord>,
-    /// Currently selected input directory (set via start_view).
+    /// Currently selected input directory (set via DirPicker).
     pub input_dir: Option<PathBuf>,
-    /// Last fatal error (if any).
+    /// Last fatal error (any source). UI renders it as the global
+    /// status badge.
     pub last_error: Option<String>,
-    /// U22 / Tier 3 #9: current analyze batch progress, if any.
-    /// `None` = no batch running (or never started). Set on
-    /// `Event::AnalyzeStarted`; updated on each `Event::AnalyzeProgress`.
-    /// Reducer does NOT validate `done` < `total` — trust the lib
-    /// monotonically increasing counts (see docs/design.md §3.4
-    /// "分析进度上报"). Cleared on next `AnalyzeStarted`.
-    #[allow(dead_code)]
-    pub analyze_progress: Option<AnalyzeProgressInfo>,
-    /// U22: last analyze batch's records. Set on `Event::AnalyzeFinished`.
-    /// **Overwrite** semantics — a new analyze batch replaces the
-    /// previous one (like `state.history` behavior). User actions
-    /// other than Analyze don't clear this.
-    #[allow(dead_code)]
-    pub analyze_results: Vec<rencoder_lib::analyzer::records::AnalysisRecord>,
 }
 
-/// U22: UI-side mirror of `Event::AnalyzeProgress`. Kept as a
-/// separate struct (not a 1:1 alias) so the UI can evolve the
-/// shape independently from the lib event payload if needed.
-#[derive(Debug)]
-#[allow(dead_code)] // populated in #73; UI panel reads it
-pub struct AnalyzeProgressInfo {
-    pub done: usize,
-    pub total: usize,
-    pub failed: usize,
-    /// Last completed file in **completion order** (rayon workers
-    /// race). The UI renders this as a "just completed: X" hint —
-    /// NOT "next in input order" (per docs/design.md §3.4
-    /// "最终结果的展示约定"). After the batch ends, this stays
-    /// as the last file seen (not cleared) until the next
-    /// `AnalyzeStarted` overwrites it.
-    pub last: Option<rencoder_lib::analyzer::records::AnalyzedFile>,
+/// Task queue. v1: capacity = 1, `pending` always empty. v1.1
+/// lifts capacity to N and uses `pending` for FIFO queuing.
+///
+/// `current_second_count` tracks same-second TaskId collisions
+/// (per spec: `-N` suffix when `TaskId::new` is called twice
+/// in the same second).
+#[derive(Debug, Default)]
+pub struct TaskQueue {
+    /// v1: 1. v1.1: N (configurable via `RENENCODER_MAX_CONCURRENT`
+    /// env var or AppConfig field).
+    pub capacity: usize,
+    /// Currently-active task. v1: at most 1.
+    pub active: Option<TaskInfo>,
+    /// Pending tasks (v1: always empty). v1.1: FIFO.
+    pub pending: Vec<TaskInfo>,
+    /// Same-second TaskId collision counter. Key: base timestamp
+    /// string (`yyyymmddhhmmss`); Value: next available N suffix.
+    /// Monotonically incremented even on aborted tasks (so
+    /// TaskIds stay unique within a second).
+    current_second_count: HashMap<String, usize>,
 }
 
+impl TaskQueue {
+    #[allow(dead_code)] // used by tests; future v1.1 entry path
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            active: None,
+            pending: Vec::new(),
+            current_second_count: HashMap::new(),
+        }
+    }
+
+    /// Allocate a fresh TaskId for the current second. First call
+    /// in a given second returns the bare timestamp; subsequent
+    /// calls return `-N` suffixed forms.
+    pub fn next_task_id(&mut self) -> TaskId {
+        let base = Local::now().format("%Y%m%d%H%M%S").to_string();
+        let count = self.current_second_count.entry(base.clone()).or_insert(0);
+        let id = if *count == 0 {
+            TaskId(base)
+        } else {
+            TaskId(format!("{}-{}", base, count))
+        };
+        *count += 1;
+        id
+    }
+
+    /// True iff a new task can be started (capacity has room).
+    /// v1 with capacity=1: returns true only when `active` is None.
+    pub fn has_room(&self) -> bool {
+        let total = (self.active.is_some() as usize) + self.pending.len();
+        total < self.capacity
+    }
+}
+
+/// Single task's metadata. v1: always appears in
+/// `TaskQueue.active` (capacity=1); v1.1: may also appear in
+/// `pending`.
+///
+/// `task_id` is the UI-side gating identity; `batch_id` is the
+/// lib-side mapping (per `Event::BatchStarted.id`) and is `None`
+/// until the lib accepts the task.
+#[allow(dead_code)] // populated by reducer; some fields not yet read by UI components
 #[derive(Debug, Clone)]
-pub struct BatchInfo {
-    pub id: u64,
+pub struct TaskInfo {
+    /// UI-side id, allocated by `TaskQueue::next_task_id`.
+    pub task_id: TaskId,
+    /// Lib-side batch id mapping. `None` until `Event::BatchStarted`.
+    pub batch_id: Option<u64>,
+    /// Lifecycle phase.
+    pub phase: BatchPhase,
+    /// Input directory captured at Start time.
+    pub dir: PathBuf,
+    /// Total file count discovered by DryRun.
     pub total_files: usize,
-    /// Set to true once Cancel lands; subsequent Progress events ignored.
+    /// Files that would actually be encoded (outcome =
+    /// `Succeeded`). Set on `Event::DryRunFinished`.
+    pub to_encode: usize,
+    /// Files that would NOT be encoded (outcome = `Skipped(...)`
+    /// or `Failed`). Set on `Event::DryRunFinished`.
+    pub to_skip: usize,
+    /// Files encoded so far during `Encoding`. Updated on each
+    /// `Event::FileCompleted`.
+    pub encoded: usize,
+    /// Set true once Cancel lands; reducer ignores subsequent
+    /// `Event::Progress` / `FileCompleted` until `BatchCancelled`
+    /// or new `BatchStarted`.
     pub cancelled: bool,
-    /// Set to true once BatchCompleted or BatchCancelled fires.
+    /// Set true once `BatchCompleted` / `BatchCancelled` /
+    /// Encoding-phase `Event::Error` fires. Combined with
+    /// `phase = Done` for re-arm.
     pub finished: bool,
-    /// Records accumulated so far.
+    /// Records accumulated during `Encoding`. `FileCompleted`
+    /// pushes one per file; `BatchCompleted` replaces with the
+    /// lib's authoritative vec.
     pub records: Vec<EncodingRecord>,
+    /// Records from the DryRun phase. Kept until the next task
+    /// lifecycle starts.
+    pub dry_run_records: Vec<EncodingRecord>,
 }
 
+#[allow(dead_code)] // fields populated by lib, not all read yet by UI
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // fields populated by reducer, read by UI views (yet to be written)
 pub struct ProgressInfo {
     pub frame: u64,
     pub fps: f64,
@@ -92,7 +240,6 @@ pub struct ProgressInfo {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // fields populated by reducer, read by UI views (yet to be written)
 pub struct LogLine {
     pub file_index: usize,
     pub line: String,
@@ -105,31 +252,55 @@ pub struct LogLine {
 #[allow(clippy::large_enum_variant)] // same rationale as Event — single mpsc emission
 #[derive(Debug)]
 pub enum Msg {
-    #[allow(dead_code)] // DirPicker component will produce this
+    /// User picked a directory. Updates `state.input_dir`.
+    /// Rejected if a task is in active phase (defense-in-depth;
+    /// the picker is also disabled in the UI).
     UserSelectedDir(PathBuf),
+    /// **Polymorphic** Start button:
+    ///   - phase None / Done: dispatch `Command::DryRun` + create task
+    ///   - phase AwaitingConfirm: dispatch `Command::StartBatch`
+    ///   - phase Analyzing / Encoding: rejected (busy-gate)
     UserClickedStart,
+    /// Phase-aware Cancel:
+    ///   - Analyzing / Encoding: set `cancelled = true` + dispatch `Command::Cancel`
+    ///   - AwaitingConfirm: clear `tasks.active` (no command)
+    ///   - None / Done: ignored
     UserClickedCancel,
+    /// Reload history records from disk (Parquet). Manual
+    /// dispatch via Refresh button. v1.1 auto-dispatch on app
+    /// start deferred.
+    #[allow(dead_code)]
     UserClickedLoadHistory,
-    /// Save the loaded AppConfig back to its original path
-    /// (ControllerHandle::config_path). Wired by Save button.
+    /// Save the loaded AppConfig back to its original path.
+    /// Wired by Save button (v1: removed — see §3.8.7.2; kept
+    /// for v1.1).
+    #[allow(dead_code)]
     UserClickedSaveSettings,
-    /// U22 / Tier 3 #9: trigger a parallel analyze batch from the
-    /// current `state.input_dir` (same file collection as
-    /// `UserClickedStart` but dispatches `Command::Analyze` instead
-    /// of `Command::StartBatch`). Wired by the Analyze button.
-    UserClickedAnalyze,
-    // UserClickedPreview — wired up in app.rs Preview button. The
-    // variant is always constructed in production code; clippy's
-    // dead_code lint triggers here because no test in this module
-    // exercises the preview flow directly. Tests live in the UI
-    // integration suite (manual / playwright).
-    UserClickedPreview,
+    /// User clicked a top-bar tab. Reducer writes
+    /// `state.active_page`. No lib command.
+    UserClickedTab(Page),
+    /// Wrapper for lib -> UI events. All lib events flow
+    /// through here; reducer routes them in `apply_event`.
     Lib(Event),
 }
 
 /// Reduce a message into a state change; emit Commands to the lib
-/// actor as needed. Returns the (possibly) updated state by
-/// ownership since we may need to replace it entirely.
+/// actor as needed.
+///
+/// **Phase-aware `UserClickedStart`** (§3.8.7.1):
+///   - `None` / `Done` -> build params, collect files, dispatch
+///     `Command::DryRun`, optimistically transition to `Analyzing`
+///   - `AwaitingConfirm` -> dispatch `Command::StartBatch`,
+///     transition phase to `Encoding`
+///   - `Analyzing` / `Encoding` -> set `last_error = "task in
+///     progress"`, return early (busy-gate)
+///
+/// **Phase-aware `UserClickedCancel`**:
+///   - `Analyzing` / `Encoding`: set `cancelled = true`, dispatch
+///     `Command::Cancel`. The lib respects cancel_token only
+///     during encoding (Analyze is best-effort).
+///   - `AwaitingConfirm`: clear `tasks.active` (no command)
+///   - `None` / `Done`: ignored
 pub fn reduce(
     state: &mut AppState,
     msg: Msg,
@@ -138,72 +309,107 @@ pub fn reduce(
 ) {
     match msg {
         Msg::UserSelectedDir(path) => {
+            if let Some(t) = &state.tasks.active {
+                if !matches!(t.phase, BatchPhase::Done) {
+                    return;
+                }
+            }
             state.input_dir = Some(path);
         }
         Msg::UserClickedStart => {
-            // Derive EncodeParams from loaded AppConfig (v1.1: no more
-            // hardcoded defaults). Per `Config::from_encode_config` but
-            // we need the FULL EncodeParams, not just the runtime
-            // Config (which strips max_fps etc).
-            let params = build_encode_params_from_config(config);
-            let Some(files) = collect_input_files(state, config) else {
-                state.last_error = Some("no input dir selected".into());
-                return;
-            };
-            if files.is_empty() {
-                // Start's error message is extensions-aware (a
-                // helpful hint when the filter excludes everything).
-                // Preview and Analyze use a simpler "no files in
-                // {dir}" since they don't operate on extensions in
-                // the same way (Preview's user is just checking
-                // "what would encode"; Analyze's user wants any file
-                // the probe can read).
-                let extensions = config
-                    .encode
-                    .as_ref()
-                    .and_then(|e| e.extensions.clone())
-                    .unwrap_or_default();
-                let detail = if extensions.is_empty() {
-                    format!(
-                        "no files in {}",
-                        state.input_dir.as_ref().unwrap().display()
-                    )
-                } else {
-                    format!(
-                        "no files in {} matching extensions {:?}",
-                        state.input_dir.as_ref().unwrap().display(),
-                        extensions
-                    )
-                };
-                state.last_error = Some(detail);
-                return;
+            let phase = state.tasks.active.as_ref().map(|t| t.phase);
+            match phase {
+                None | Some(BatchPhase::Done) => {
+                    // Capacity check (v1: capacity=1, only fires
+                    // when active is None, so always true here).
+                    if !state.tasks.has_room() {
+                        state.last_error = Some("task queue full".into());
+                        return;
+                    }
+                    if state.input_dir.is_none() {
+                        state.last_error = Some("no input dir selected".into());
+                        return;
+                    }
+                    let params = build_encode_params_from_config(config);
+                    let Some(files) = collect_input_files(state, config) else {
+                        state.last_error = Some("no input dir selected".into());
+                        return;
+                    };
+                    if files.is_empty() {
+                        let extensions = config
+                            .encode
+                            .as_ref()
+                            .and_then(|e| e.extensions.clone())
+                            .unwrap_or_default();
+                        let detail = if extensions.is_empty() {
+                            format!(
+                                "no files in {}",
+                                state.input_dir.as_ref().unwrap().display()
+                            )
+                        } else {
+                            format!(
+                                "no files in {} matching extensions {:?}",
+                                state.input_dir.as_ref().unwrap().display(),
+                                extensions
+                            )
+                        };
+                        state.last_error = Some(detail);
+                        return;
+                    }
+                    state.last_error = None;
+                    state.progress.clear();
+                    state.log.clear();
+
+                    let task_id = state.tasks.next_task_id();
+                    let dir = state.input_dir.clone().unwrap();
+                    let total_files = files.len();
+                    state.tasks.active = Some(TaskInfo {
+                        task_id: task_id.clone(),
+                        batch_id: None,
+                        phase: BatchPhase::Analyzing,
+                        dir,
+                        total_files,
+                        to_encode: 0,
+                        to_skip: 0,
+                        encoded: 0,
+                        cancelled: false,
+                        finished: false,
+                        records: Vec::new(),
+                        dry_run_records: Vec::new(),
+                    });
+                    state.viewing_task = Some(task_id);
+                    let _ = cmd_tx.send(Command::DryRun { params, files });
+                }
+                Some(BatchPhase::AwaitingConfirm) => {
+                    let params = build_encode_params_from_config(config);
+                    let Some(files) = collect_input_files(state, config) else {
+                        return;
+                    };
+                    if let Some(t) = state.tasks.active.as_mut() {
+                        t.phase = BatchPhase::Encoding;
+                        t.records.clear();
+                    }
+                    let _ = cmd_tx.send(Command::StartBatch { params, files });
+                }
+                Some(BatchPhase::Analyzing) | Some(BatchPhase::Encoding) => {
+                    state.last_error = Some("task in progress".into());
+                }
             }
-            state.last_error = None;
-            state.progress.clear();
-            state.log.clear();
-            let _ = cmd_tx.send(Command::StartBatch { params, files });
-        }
-        Msg::UserClickedPreview => {
-            // Dry-run: clear previous results, build params from
-            // config, dispatch Command::DryRun.
-            state.dry_run_results.clear();
-            state.last_error = None;
-            let Some(files) = collect_input_files(state, config) else {
-                state.last_error = Some("no input dir selected".into());
-                return;
-            };
-            if files.is_empty() {
-                state.last_error = Some(format!(
-                    "no files in {} for preview",
-                    state.input_dir.as_ref().unwrap().display()
-                ));
-                return;
-            }
-            let params = build_encode_params_from_config(config);
-            let _ = cmd_tx.send(Command::DryRun { params, files });
         }
         Msg::UserClickedCancel => {
-            let _ = cmd_tx.send(Command::Cancel);
+            let phase = state.tasks.active.as_ref().map(|t| t.phase);
+            match phase {
+                Some(BatchPhase::Analyzing) | Some(BatchPhase::Encoding) => {
+                    if let Some(t) = state.tasks.active.as_mut() {
+                        t.cancelled = true;
+                    }
+                    let _ = cmd_tx.send(Command::Cancel);
+                }
+                Some(BatchPhase::AwaitingConfirm) => {
+                    state.tasks.active = None;
+                }
+                None | Some(BatchPhase::Done) => {}
+            }
         }
         Msg::UserClickedLoadHistory => {
             let _ = cmd_tx.send(Command::LoadHistory {
@@ -212,40 +418,10 @@ pub fn reduce(
             });
         }
         Msg::UserClickedSaveSettings => {
-            // Round-trip the in-memory AppConfig back to its
-            // original path. The lib does the actual save; we just
-            // dispatch. Result comes back as Event::ConfigSaved or
-            // Event::Error (handled in apply_event).
             let _ = cmd_tx.send(Command::SaveConfig);
         }
-        Msg::UserClickedAnalyze => {
-            // U22 / Tier 3 #9: file collection via the shared
-            // collect_input_files helper (U22 review-delta #3).
-            // Dispatches Command::Analyze instead of StartBatch —
-            // read-only probe, no ffmpeg.
-            //
-            // Note (U22 review-delta #4): we do NOT clear
-            // state.dry_run_results here. Analyze is not a dry-run;
-            // the previous preview's results should remain visible
-            // until the user explicitly runs another Preview. The
-            // clear was a copy-paste from UserClickedPreview.
-            state.last_error = None;
-            let Some(files) = collect_input_files(state, config) else {
-                state.last_error = Some("no input dir selected".into());
-                return;
-            };
-            if files.is_empty() {
-                state.last_error = Some(format!(
-                    "no files in {} for analyze",
-                    state.input_dir.as_ref().unwrap().display()
-                ));
-                return;
-            }
-            // analyze_progress gets reset on the next AnalyzeStarted
-            // event (the lib is the source of truth for `total`);
-            // analyze_results is overwritten on AnalyzeFinished
-            // (per task #73 description: keep until next analyze).
-            let _ = cmd_tx.send(Command::Analyze { files });
+        Msg::UserClickedTab(page) => {
+            state.active_page = page;
         }
         Msg::Lib(evt) => apply_event(state, evt),
     }
@@ -254,16 +430,18 @@ pub fn reduce(
 fn apply_event(state: &mut AppState, evt: Event) {
     match evt {
         Event::BatchStarted { id, total_files } => {
-            state.batch = Some(BatchInfo {
-                id,
-                total_files,
-                cancelled: false,
-                finished: false,
-                records: Vec::with_capacity(total_files),
-            });
+            // AwaitingConfirm -> Encoding. Record lib's
+            // batch_id on the active task (id-as-mapping; not a
+            // gating decision per §3.8.7.4).
+            if let Some(t) = state.tasks.active.as_mut() {
+                t.batch_id = Some(id);
+                t.total_files = total_files;
+                t.phase = BatchPhase::Encoding;
+                t.records.clear();
+            }
         }
         Event::FileStarted { .. } => {
-            // Could update a "current file" display; v1 just lets
+            // Could update a "current file" display; v1 lets
             // Progress / FileCompleted drive the view.
         }
         Event::Progress {
@@ -274,8 +452,8 @@ fn apply_event(state: &mut AppState, evt: Event) {
             time_secs,
             eta_secs,
         } => {
-            if let Some(batch) = &state.batch {
-                if batch.finished || batch.cancelled {
+            if let Some(t) = &state.tasks.active {
+                if t.finished || t.cancelled {
                     return;
                 }
             }
@@ -291,94 +469,73 @@ fn apply_event(state: &mut AppState, evt: Event) {
             );
         }
         Event::DryRunFinished { records } => {
-            state.dry_run_results = records;
-        }
-        Event::AnalyzeStarted { total } => {
-            // U22: reset progress for the new batch. analyze_results
-            // is preserved (overwrite happens on AnalyzeFinished, not
-            // here — keeps the previous batch's table visible while
-            // the new one is in flight, until the new Finished
-            // arrives).
-            state.analyze_progress = Some(AnalyzeProgressInfo {
-                done: 0,
-                total,
-                failed: 0,
-                last: None,
-            });
-        }
-        Event::AnalyzeProgress {
-            done,
-            total,
-            failed,
-            last,
-        } => {
-            // U22: monotonic counts from the lib. We don't validate
-            // (done <= total, etc.) — the lib is the source of truth.
-            // The struct itself stays Some once Started fired; we
-            // just overwrite the fields. This makes the latest
-            // tick's `last` available to AnalyzePanel as a
-            // "just completed: X" hint.
-            state.analyze_progress = Some(AnalyzeProgressInfo {
-                done,
-                total,
-                failed,
-                last,
-            });
-        }
-        Event::AnalyzeFinished {
-            records,
-            failed_count,
-        } => {
-            // U22: overwrite analyze_results (preserved until next
-            // batch). Keep analyze_progress as-is so the panel can
-            // still show "X/Y done" after the batch ends; the next
-            // AnalyzeStarted will reset it.
+            // Analyzing -> AwaitingConfirm. Compute
+            // to_encode / to_skip from records.
             //
-            // Cross-check: the lib sends failed_count ==
-            // records.iter().filter(|r| r.fps.is_none()).count().
-            // We don't assert it here (lib is the source of truth)
-            // but the invariant is tested in
-            // job::tests::analyze_emits_started_progress_finished_sequence.
-            state.analyze_results = records;
-            // Surface failed count via last_error if any failed,
-            // so the user gets feedback even if the panel is
-            // scrolled past. Otherwise clear last_error (it may
-            // have been set by UserClickedAnalyze's empty-dir check).
-            if failed_count > 0 {
-                state.last_error = Some(format!(
-                    "analyze done: {} files, {} failed",
-                    state.analyze_results.len(),
-                    failed_count
-                ));
-            } else {
-                state.last_error = None;
+            // EncodingOutcome match scope: DryRun records only
+            // carry `Succeeded` / `Skipped(...)` / `Failed` —
+            // ReducedFps requires running ffmpeg to detect
+            // source-fps > cap, so it cannot appear here (DryRun
+            // doesn't invoke ffmpeg). Matching only `Succeeded`
+            // is correct.
+            //
+            // Cancel-during-Analyzing guard: if user clicked
+            // Cancel during Analyzing (set `cancelled = true`),
+            // DryRunFinished still arrives — discard it.
+            let cancelled = state
+                .tasks
+                .active
+                .as_ref()
+                .map(|t| t.cancelled)
+                .unwrap_or(false);
+            if cancelled {
+                state.tasks.active = None;
+                return;
+            }
+            if let Some(t) = state.tasks.active.as_mut() {
+                t.dry_run_records = records.clone();
+                t.to_encode = records
+                    .iter()
+                    .filter(|r| matches!(r.outcome, EncodingOutcome::Succeeded))
+                    .count();
+                t.to_skip = t.total_files - t.to_encode;
+                t.phase = BatchPhase::AwaitingConfirm;
             }
         }
+        Event::AnalyzeStarted { .. }
+        | Event::AnalyzeProgress { .. }
+        | Event::AnalyzeFinished { .. } => {
+            // U22 standalone Analyze no longer used by the UI
+            // (Start auto-DryRun subsumes it). Silently drop.
+        }
         Event::ConfigSaved { path } => {
-            // Show feedback ("saved to ...") for a few ticks. We
-            // don't reset last_error — if Save raced a real error
-            // we want the user to see both. UI decides display.
             state.last_error = Some(format!("saved to {}", path.display()));
         }
         Event::FileCompleted { record, .. } => {
-            // Move the record's outcome into BatchInfo.records for
-            // post-batch display.
-            if let Some(batch) = state.batch.as_mut() {
-                batch.records.push(record);
+            if let Some(t) = state.tasks.active.as_mut() {
+                t.records.push(record);
+                t.encoded += 1;
             }
-            state.progress.clear(); // simplified: clear per-file on completion
         }
         Event::BatchCompleted { records } => {
-            if let Some(batch) = state.batch.as_mut() {
-                batch.records = records;
-                batch.finished = true;
+            // Move-to-history (per §3.8.7.1): tasks.active.take()
+            // -> set phase = Done -> task_history.insert(0, t).
+            let done = state.tasks.active.take();
+            if let Some(mut t) = done {
+                t.records = records;
+                t.finished = true;
+                t.phase = BatchPhase::Done;
+                state.task_history.insert(0, t);
             }
             state.progress.clear();
         }
         Event::BatchCancelled { completed, total } => {
-            if let Some(batch) = state.batch.as_mut() {
-                batch.cancelled = true;
-                batch.finished = true;
+            let done = state.tasks.active.take();
+            if let Some(mut t) = done {
+                t.cancelled = true;
+                t.finished = true;
+                t.phase = BatchPhase::Done;
+                state.task_history.insert(0, t);
             }
             state.last_error = Some(format!("cancelled after {completed}/{total}"));
         }
@@ -397,6 +554,26 @@ fn apply_event(state: &mut AppState, evt: Event) {
         }
         Event::Error { message, .. } => {
             state.last_error = Some(message);
+            // Per §3.8.7.1: during Encoding, move to history
+            // (task did run, even if it failed); during
+            // Analyzing, drop without history (task never
+            // started); AwaitingConfirm is no-op (lib hasn't
+            // been asked to do anything yet).
+            let active = state.tasks.active.take();
+            match active {
+                Some(mut t) if matches!(t.phase, BatchPhase::Encoding) => {
+                    t.finished = true;
+                    t.phase = BatchPhase::Done;
+                    state.task_history.insert(0, t);
+                }
+                Some(t) if matches!(t.phase, BatchPhase::Analyzing) => {
+                    drop(t);
+                }
+                Some(t) => {
+                    state.tasks.active = Some(t);
+                }
+                None => {}
+            }
         }
         // #[non_exhaustive] future variants — silently drop.
         _ => {}
@@ -414,27 +591,17 @@ fn build_encode_params_from_config(
     rencoder_lib::types::EncodeParams::from_encode_config(config.encode.as_ref())
 }
 
-/// Collect input files for an action (Start, Preview, Analyze)
-/// from `state.input_dir`, filtered by the configured extensions
-/// from `config.encode.extensions` (empty = all).
+/// Collect input files from `state.input_dir`, filtered by the
+/// configured extensions from `config.encode.extensions`
+/// (empty = all).
 ///
-/// Returns the file list (empty if the dir has no matching files).
-/// The caller is responsible for:
-/// - setting `state.input_dir` is `Some`
-/// - choosing the action-specific empty-dir error message
-///   (e.g. "no files in {dir} for analyze" vs the
-///   extension-aware variant for Start)
-///
-/// U22 review-delta #3: this helper replaces the three near-
-/// identical file-collection blocks that previously lived inline
-/// in the Start / Preview / Analyze reducer arms. The block was
-/// drifting (3 different empty-list error messages). Centralizing
-/// here means the file-collection logic now has one place to
-/// evolve, and each arm picks its own error wording.
+/// Returns `None` if no input dir is selected; otherwise returns
+/// the file list (possibly empty). Caller decides action-specific
+/// empty-dir error message.
 fn collect_input_files(
     state: &AppState,
     config: &rencoder_lib::config::app::AppConfig,
-) -> Option<Vec<std::path::PathBuf>> {
+) -> Option<Vec<PathBuf>> {
     let dir = state.input_dir.as_ref()?;
     let extensions = config
         .encode
@@ -456,17 +623,17 @@ fn collect_input_files(
 /// Check whether a path's extension matches any of the user's
 /// configured extension filters. Empty `extensions` means "all".
 /// Match is case-insensitive and ignores the leading dot.
-fn extension_matches(path: &std::path::Path, extensions: &[String]) -> bool {
+fn extension_matches(path: &Path, extensions: &[String]) -> bool {
     if extensions.is_empty() {
         return true;
     }
-    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
-        return false;
+    let ext: String = match path.extension().and_then(|e| e.to_str()) {
+        Some(e) => e.to_ascii_lowercase(),
+        None => return false,
     };
-    let ext_lower = ext.to_ascii_lowercase();
     extensions.iter().any(|e| {
         let trimmed = e.trim_start_matches('.').to_ascii_lowercase();
-        trimmed == ext_lower
+        trimmed == ext
     })
 }
 
@@ -474,15 +641,15 @@ fn extension_matches(path: &std::path::Path, extensions: &[String]) -> bool {
 mod tests {
     use super::*;
     use rencoder_lib::config::app::AppConfig;
-    use rencoder_lib::types::{EncoderSettings, EncodingOutcome, ErrorContext};
+    use rencoder_lib::types::{EncoderSettings, EncodingOutcome};
 
     fn default_config() -> AppConfig {
         AppConfig::default()
     }
 
-    fn sample_record() -> EncodingRecord {
+    fn sample_record(path: &str, outcome: EncodingOutcome) -> EncodingRecord {
         EncodingRecord {
-            source_path: "/x.mp4".into(),
+            source_path: path.into(),
             source_size_bytes: 0,
             source_codec: None,
             source_container: None,
@@ -491,7 +658,7 @@ mod tests {
             source_fps: None,
             source_duration_secs: None,
             source_bit_rate_bps: None,
-            started_at: chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
+            started_at: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
             ended_at: None,
             encoding_duration_secs: None,
             encoder_selected: None,
@@ -503,9 +670,14 @@ mod tests {
             output_duration_secs: None,
             output_codec: None,
             compression_ratio: None,
-            outcome: EncodingOutcome::Succeeded,
+            outcome,
             error: None,
         }
+    }
+
+    fn sample_skipped(path: &str) -> EncodingRecord {
+        use rencoder_lib::types::SkippedReason;
+        sample_record(path, EncodingOutcome::Skipped(SkippedReason::SameCodec))
     }
 
     fn cmd_tx() -> Sender<Command> {
@@ -513,9 +685,18 @@ mod tests {
         tx
     }
 
+    /// Construct a minimal valid `AppState` with the v1 task
+    /// queue capacity (1) initialised.
+    fn fresh_state() -> AppState {
+        AppState {
+            tasks: TaskQueue::new(1),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn user_selected_dir_sets_input_dir() {
-        let mut state = AppState::default();
+        let mut state = fresh_state();
         let tx = cmd_tx();
         let p = PathBuf::from("/some/dir");
         reduce(
@@ -527,251 +708,121 @@ mod tests {
         assert_eq!(state.input_dir, Some(p));
     }
 
-    // U22 / Tier 3 #9: analyze reducer + Event handlers.
-    //
-    // Three contracts pinned:
-    // 1. UserClickedAnalyze collects files from state.input_dir
-    //    (filtered by config.encode.extensions) and dispatches
-    //    Command::Analyze. Empty dir → last_error set, no dispatch.
-    // 2. Event::AnalyzeProgress updates state.analyze_progress in
-    //    place (monotonic counts from the lib are trusted as-is).
-    // 3. Event::AnalyzeFinished REPLACES state.analyze_results
-    //    (overwrite semantics — old batch replaced by new).
-
     #[test]
-    fn user_clicked_analyze_without_dir_records_error() {
-        let mut state = AppState::default();
+    fn user_selected_dir_rejected_when_task_active() {
+        let mut state = fresh_state();
         let tx = cmd_tx();
-        reduce(&mut state, Msg::UserClickedAnalyze, &tx, &default_config());
-        assert!(state.last_error.is_some());
-        assert!(state.last_error.unwrap().contains("no input dir"));
-    }
-
-    #[test]
-    fn analyze_progress_updates_state() {
-        let mut state = AppState::default();
-        // First the Started event sets the initial state.
+        // Active task in Analyzing phase.
+        state.tasks.active = Some(TaskInfo {
+            task_id: TaskId("20260101000000".into()),
+            batch_id: None,
+            phase: BatchPhase::Analyzing,
+            dir: PathBuf::from("/x"),
+            total_files: 0,
+            to_encode: 0,
+            to_skip: 0,
+            encoded: 0,
+            cancelled: false,
+            finished: false,
+            records: vec![],
+            dry_run_records: vec![],
+        });
         reduce(
             &mut state,
-            Msg::Lib(Event::AnalyzeStarted { total: 10 }),
-            &cmd_tx(),
+            Msg::UserSelectedDir(PathBuf::from("/y")),
+            &tx,
             &default_config(),
         );
-        assert!(state.analyze_progress.is_some());
-        let info = state.analyze_progress.as_ref().unwrap();
-        assert_eq!(info.done, 0);
-        assert_eq!(info.total, 10);
-        assert_eq!(info.failed, 0);
-        assert!(info.last.is_none());
-
-        // Then a Progress event updates counts and last.
-        reduce(
-            &mut state,
-            Msg::Lib(Event::AnalyzeProgress {
-                done: 5,
-                total: 10,
-                failed: 1,
-                last: Some(rencoder_lib::analyzer::records::AnalyzedFile {
-                    path: PathBuf::from("/x.mp4"),
-                    outcome: rencoder_lib::analyzer::records::FileOutcome::Ok,
-                }),
-            }),
-            &cmd_tx(),
-            &default_config(),
-        );
-        let info = state.analyze_progress.as_ref().unwrap();
-        assert_eq!(info.done, 5);
-        assert_eq!(info.total, 10);
-        assert_eq!(info.failed, 1);
-        assert!(info.last.is_some());
-        assert_eq!(info.last.as_ref().unwrap().path, PathBuf::from("/x.mp4"));
-    }
-
-    #[test]
-    fn analyze_progress_probe_failed_round_trips() {
-        // U22 review-delta #9: assert the ProbeFailed variant of
-        // FileOutcome also round-trips through the reducer. The
-        // analyze_progress_updates_state test only exercises
-        // FileOutcome::Ok; this pins the other variant.
-        use rencoder_lib::analyzer::records::{AnalyzedFile, FileOutcome};
-        let mut state = AppState::default();
-        reduce(
-            &mut state,
-            Msg::Lib(Event::AnalyzeStarted { total: 1 }),
-            &cmd_tx(),
-            &default_config(),
-        );
-        let probe_err = rencoder_lib::error::EncodeError::Probe("mock probe fail".into());
-        reduce(
-            &mut state,
-            Msg::Lib(Event::AnalyzeProgress {
-                done: 1,
-                total: 1,
-                failed: 1,
-                last: Some(AnalyzedFile {
-                    path: PathBuf::from("/bad.mp4"),
-                    outcome: FileOutcome::ProbeFailed(probe_err),
-                }),
-            }),
-            &cmd_tx(),
-            &default_config(),
-        );
-        let info = state.analyze_progress.as_ref().unwrap();
-        let last = info.last.as_ref().unwrap();
-        assert_eq!(last.path, PathBuf::from("/bad.mp4"));
-        match &last.outcome {
-            FileOutcome::ProbeFailed(e) => {
-                // The error message should be preserved through
-                // the round-trip. Format with Debug since EncodeError
-                // doesn't impl Display via a fixed pattern.
-                let debug = format!("{e:?}");
-                assert!(debug.contains("mock probe fail"), "got: {debug}");
-            }
-            FileOutcome::Ok => panic!("expected ProbeFailed, got Ok"),
-            // #[non_exhaustive] wildcard: future variants
-            // (v2's Cancelled) won't carry a probe-error message,
-            // so this test's contract doesn't apply. Fail loudly
-            // so a refactor that changes the test inputs is
-            // caught.
-            _ => panic!("unexpected FileOutcome variant in test payload"),
-        }
-    }
-
-    #[test]
-    fn analyze_finished_replaces_results() {
-        // Build state with a stale seed record via `AnalysisRecord::new`
-        // (U22 review-delta #5: `#[non_exhaustive]` blocks struct-
-        // expression syntax cross-crate; the constructor is the
-        // supported entry point for downstream).
-        let stale = rencoder_lib::analyzer::records::AnalysisRecord::new(
-            PathBuf::from("/stale.mp4"),
-            Some(30),
-            Some("h264".into()),
-            Some(1.0),
-            0,
-        );
-        let mut state = AppState {
-            analyze_results: vec![stale],
-            ..Default::default()
-        };
-        // Finished with new records overwrites.
-        let new_records = vec![
-            rencoder_lib::analyzer::records::AnalysisRecord::new(
-                PathBuf::from("/new1.mp4"),
-                None, // failed
-                None,
-                None,
-                0,
-            ),
-            rencoder_lib::analyzer::records::AnalysisRecord::new(
-                PathBuf::from("/new2.mp4"),
-                Some(60),
-                Some("av1".into()),
-                Some(2.0),
-                100,
-            ),
-        ];
-        reduce(
-            &mut state,
-            Msg::Lib(Event::AnalyzeFinished {
-                records: new_records.clone(),
-                failed_count: 1,
-            }),
-            &cmd_tx(),
-            &default_config(),
-        );
-        assert_eq!(state.analyze_results.len(), 2);
-        assert_eq!(state.analyze_results[0].path, PathBuf::from("/new1.mp4"));
-        assert_eq!(state.analyze_results[1].path, PathBuf::from("/new2.mp4"));
-        // Stale record gone.
-        let stale = PathBuf::from("/stale.mp4");
-        assert!(state.analyze_results.iter().all(|r| r.path != stale));
-        // last_error surfaces the failure count (1 failed).
-        assert!(state.last_error.is_some());
-        assert!(state.last_error.unwrap().contains("1 failed"));
-    }
-
-    #[test]
-    fn analyze_finished_with_no_failures_clears_last_error() {
-        // U22 review-delta #2: pin the AnalyzeFinished arm's
-        // "clear last_error on success" branch. Currently only
-        // the "set last_error on failure" path is tested (in
-        // analyze_finished_replaces_results). A regression that
-        // dropped the `else { last_error = None }` arm would
-        // silently leave stale errors visible after a successful
-        // analyze.
-        // Simulate the empty-dir error from UserClickedAnalyze's
-        // guard (msg.rs's start-without-dir pattern). Use
-        // struct-literal init (not Default + assignment) to
-        // satisfy `field_reassign_with_default`.
-        let mut state = AppState {
-            last_error: Some("no files in /tmp for analyze".into()),
-            ..Default::default()
-        };
-        reduce(
-            &mut state,
-            Msg::Lib(Event::AnalyzeFinished {
-                records: vec![],
-                failed_count: 0,
-            }),
-            &cmd_tx(),
-            &default_config(),
-        );
-        assert!(
-            state.last_error.is_none(),
-            "successful AnalyzeFinished should clear stale last_error, got: {:?}",
-            state.last_error
-        );
+        assert!(state.input_dir.is_none());
     }
 
     #[test]
     fn user_clicked_start_without_dir_records_error() {
-        let mut state = AppState::default();
+        let mut state = fresh_state();
         let tx = cmd_tx();
         reduce(&mut state, Msg::UserClickedStart, &tx, &default_config());
         assert!(state.last_error.is_some());
-        assert!(state.batch.is_none());
+        assert!(state.last_error.unwrap().contains("no input dir"));
+        assert!(state.tasks.active.is_none());
     }
 
     #[test]
-    fn batch_started_creates_batch_info() {
-        let mut state = AppState::default();
+    fn user_clicked_start_with_active_task_records_busy_error() {
+        let mut state = fresh_state();
+        let tx = cmd_tx();
+        state.tasks.active = Some(TaskInfo {
+            task_id: TaskId("20260101000000".into()),
+            batch_id: None,
+            phase: BatchPhase::Analyzing,
+            dir: PathBuf::from("/x"),
+            total_files: 5,
+            to_encode: 0,
+            to_skip: 0,
+            encoded: 0,
+            cancelled: false,
+            finished: false,
+            records: vec![],
+            dry_run_records: vec![],
+        });
+        state.input_dir = Some(PathBuf::from("/y"));
+        reduce(&mut state, Msg::UserClickedStart, &tx, &default_config());
+        assert_eq!(
+            state.last_error.as_deref(),
+            Some("task in progress"),
+            "second Start click during Analyzing should be rejected"
+        );
+    }
+
+    #[test]
+    fn batch_started_records_batch_id_as_mapping() {
+        let mut state = fresh_state();
+        // Drive into AwaitingConfirm.
+        state.tasks.active = Some(TaskInfo {
+            task_id: TaskId("20260101000000".into()),
+            batch_id: None,
+            phase: BatchPhase::AwaitingConfirm,
+            dir: PathBuf::from("/x"),
+            total_files: 5,
+            to_encode: 4,
+            to_skip: 1,
+            encoded: 0,
+            cancelled: false,
+            finished: false,
+            records: vec![],
+            dry_run_records: vec![],
+        });
         reduce(
             &mut state,
             Msg::Lib(Event::BatchStarted {
-                id: 1,
+                id: 7,
                 total_files: 5,
             }),
             &cmd_tx(),
             &default_config(),
         );
-        let b = state.batch.as_ref().unwrap();
-        assert_eq!(b.id, 1);
-        assert_eq!(b.total_files, 5);
-        assert!(!b.finished);
-        assert!(!b.cancelled);
+        let t = state.tasks.active.as_ref().unwrap();
+        assert_eq!(t.batch_id, Some(7));
+        assert_eq!(t.phase, BatchPhase::Encoding);
     }
 
     #[test]
     fn progress_event_after_finished_is_ignored() {
-        let mut state = AppState::default();
+        let mut state = fresh_state();
         let tx = cmd_tx();
-        reduce(
-            &mut state,
-            Msg::Lib(Event::BatchStarted {
-                id: 1,
-                total_files: 2,
-            }),
-            &tx,
-            &default_config(),
-        );
-        reduce(
-            &mut state,
-            Msg::Lib(Event::BatchCompleted { records: vec![] }),
-            &tx,
-            &default_config(),
-        );
-        // Now feed a Progress — should be ignored because finished.
+        state.tasks.active = Some(TaskInfo {
+            task_id: TaskId("20260101000000".into()),
+            batch_id: None,
+            phase: BatchPhase::Encoding,
+            dir: PathBuf::from("/x"),
+            total_files: 2,
+            to_encode: 2,
+            to_skip: 0,
+            encoded: 0,
+            cancelled: false,
+            finished: true, // simulate post-BatchCompleted but still in active
+            records: vec![],
+            dry_run_records: vec![],
+        });
         reduce(
             &mut state,
             Msg::Lib(Event::Progress {
@@ -790,7 +841,7 @@ mod tests {
 
     #[test]
     fn log_ring_caps_at_1000() {
-        let mut state = AppState::default();
+        let mut state = fresh_state();
         let tx = cmd_tx();
         for i in 0..1500 {
             reduce(
@@ -804,17 +855,15 @@ mod tests {
             );
         }
         assert_eq!(state.log.len(), 1000);
-        // The first 500 are dropped, so the oldest should be "line 500".
         let first = state.log.front().unwrap();
         assert_eq!(first.line, "line 500");
     }
 
     #[test]
     fn history_loaded_replaces_history() {
-        let mut state = AppState::default();
+        let mut state = fresh_state();
         let tx = cmd_tx();
-        let mut rec = sample_record();
-        rec.source_path = "/a.mp4".into();
+        let rec = sample_record("/a.mp4", EncodingOutcome::Succeeded);
         reduce(
             &mut state,
             Msg::Lib(Event::HistoryLoaded {
@@ -828,18 +877,23 @@ mod tests {
     }
 
     #[test]
-    fn batch_cancelled_sets_cancelled_and_finished() {
-        let mut state = AppState::default();
+    fn batch_cancelled_moves_to_task_history() {
+        let mut state = fresh_state();
         let tx = cmd_tx();
-        reduce(
-            &mut state,
-            Msg::Lib(Event::BatchStarted {
-                id: 1,
-                total_files: 5,
-            }),
-            &tx,
-            &default_config(),
-        );
+        state.tasks.active = Some(TaskInfo {
+            task_id: TaskId("20260101000000".into()),
+            batch_id: Some(1),
+            phase: BatchPhase::Encoding,
+            dir: PathBuf::from("/x"),
+            total_files: 5,
+            to_encode: 5,
+            to_skip: 0,
+            encoded: 2,
+            cancelled: false,
+            finished: false,
+            records: vec![],
+            dry_run_records: vec![],
+        });
         reduce(
             &mut state,
             Msg::Lib(Event::BatchCancelled {
@@ -849,27 +903,36 @@ mod tests {
             &tx,
             &default_config(),
         );
-        let b = state.batch.as_ref().unwrap();
-        assert!(b.cancelled);
-        assert!(b.finished);
+        // Active should be None; history has the task with same id.
+        assert!(state.tasks.active.is_none());
+        assert_eq!(state.task_history.len(), 1);
+        let h = &state.task_history[0];
+        assert_eq!(h.task_id, TaskId("20260101000000".into()));
+        assert!(h.cancelled);
+        assert!(h.finished);
+        assert_eq!(h.phase, BatchPhase::Done);
         assert_eq!(state.last_error.as_deref(), Some("cancelled after 2/5"));
     }
 
     #[test]
-    fn file_completed_appends_record_to_batch() {
-        let mut state = AppState::default();
+    fn file_completed_pushes_record_and_increments_encoded() {
+        let mut state = fresh_state();
         let tx = cmd_tx();
-        reduce(
-            &mut state,
-            Msg::Lib(Event::BatchStarted {
-                id: 1,
-                total_files: 2,
-            }),
-            &tx,
-            &default_config(),
-        );
-        let mut rec = sample_record();
-        rec.source_path = "/first.mp4".into();
+        state.tasks.active = Some(TaskInfo {
+            task_id: TaskId("20260101000000".into()),
+            batch_id: Some(1),
+            phase: BatchPhase::Encoding,
+            dir: PathBuf::from("/x"),
+            total_files: 2,
+            to_encode: 2,
+            to_skip: 0,
+            encoded: 0,
+            cancelled: false,
+            finished: false,
+            records: vec![],
+            dry_run_records: vec![],
+        });
+        let rec = sample_record("/first.mp4", EncodingOutcome::Succeeded);
         reduce(
             &mut state,
             Msg::Lib(Event::FileCompleted {
@@ -879,16 +942,15 @@ mod tests {
             &tx,
             &default_config(),
         );
-        assert_eq!(state.batch.as_ref().unwrap().records.len(), 1);
-        assert_eq!(
-            state.batch.as_ref().unwrap().records[0].source_path,
-            "/first.mp4"
-        );
+        let t = state.tasks.active.as_ref().unwrap();
+        assert_eq!(t.records.len(), 1);
+        assert_eq!(t.records[0].source_path, "/first.mp4");
+        assert_eq!(t.encoded, 1);
     }
 
     #[test]
     fn error_event_sets_last_error() {
-        let mut state = AppState::default();
+        let mut state = fresh_state();
         let tx = cmd_tx();
         reduce(
             &mut state,
@@ -903,23 +965,220 @@ mod tests {
     }
 
     #[test]
+    fn error_during_encoding_moves_task_to_history() {
+        // Per §3.8.7.1: Encoding-phase Error is a completed
+        // task (it ran); goes to task_history.
+        let mut state = fresh_state();
+        let tx = cmd_tx();
+        state.tasks.active = Some(TaskInfo {
+            task_id: TaskId("20260101000000".into()),
+            batch_id: Some(1),
+            phase: BatchPhase::Encoding,
+            dir: PathBuf::from("/x"),
+            total_files: 5,
+            to_encode: 5,
+            to_skip: 0,
+            encoded: 1,
+            cancelled: false,
+            finished: false,
+            records: vec![],
+            dry_run_records: vec![],
+        });
+        reduce(
+            &mut state,
+            Msg::Lib(Event::Error {
+                category: rencoder_lib::types::ErrorCategory::FfmpegNonzeroExit,
+                message: "encode failed".into(),
+            }),
+            &tx,
+            &default_config(),
+        );
+        assert!(state.tasks.active.is_none());
+        assert_eq!(state.task_history.len(), 1);
+        let h = &state.task_history[0];
+        assert_eq!(h.phase, BatchPhase::Done);
+        assert!(h.finished);
+    }
+
+    #[test]
+    fn error_during_analyzing_drops_without_history() {
+        // Per §3.8.7.1: Analyzing-phase Error means task never
+        // started; not filed in task_history.
+        let mut state = fresh_state();
+        let tx = cmd_tx();
+        state.tasks.active = Some(TaskInfo {
+            task_id: TaskId("20260101000000".into()),
+            batch_id: None,
+            phase: BatchPhase::Analyzing,
+            dir: PathBuf::from("/x"),
+            total_files: 5,
+            to_encode: 0,
+            to_skip: 0,
+            encoded: 0,
+            cancelled: false,
+            finished: false,
+            records: vec![],
+            dry_run_records: vec![],
+        });
+        reduce(
+            &mut state,
+            Msg::Lib(Event::Error {
+                category: rencoder_lib::types::ErrorCategory::ConfigError,
+                message: "another batch is already running".into(),
+            }),
+            &tx,
+            &default_config(),
+        );
+        assert!(state.tasks.active.is_none());
+        assert!(state.task_history.is_empty());
+    }
+
+    #[test]
+    fn dry_run_finished_computes_to_encode_and_to_skip() {
+        let mut state = fresh_state();
+        let tx = cmd_tx();
+        state.tasks.active = Some(TaskInfo {
+            task_id: TaskId("20260101000000".into()),
+            batch_id: None,
+            phase: BatchPhase::Analyzing,
+            dir: PathBuf::from("/x"),
+            total_files: 3,
+            to_encode: 0,
+            to_skip: 0,
+            encoded: 0,
+            cancelled: false,
+            finished: false,
+            records: vec![],
+            dry_run_records: vec![],
+        });
+        let records = vec![
+            sample_record("/a.mp4", EncodingOutcome::Succeeded),
+            sample_skipped("/b.mp4"),
+            sample_record("/c.mp4", EncodingOutcome::Failed),
+        ];
+        reduce(
+            &mut state,
+            Msg::Lib(Event::DryRunFinished { records }),
+            &tx,
+            &default_config(),
+        );
+        let t = state.tasks.active.as_ref().unwrap();
+        assert_eq!(t.phase, BatchPhase::AwaitingConfirm);
+        assert_eq!(t.to_encode, 1);
+        assert_eq!(t.to_skip, 2);
+        assert_eq!(t.dry_run_records.len(), 3);
+    }
+
+    #[test]
+    fn cancel_during_analyzing_drops_dry_run_finished() {
+        // Phantom-AwaitingConfirm guard: cancel during Analyzing,
+        // then DryRunFinished arrives -> drop, not a phantom plan.
+        let mut state = fresh_state();
+        let tx = cmd_tx();
+        state.tasks.active = Some(TaskInfo {
+            task_id: TaskId("20260101000000".into()),
+            batch_id: None,
+            phase: BatchPhase::Analyzing,
+            dir: PathBuf::from("/x"),
+            total_files: 1,
+            to_encode: 0,
+            to_skip: 0,
+            encoded: 0,
+            cancelled: false,
+            finished: false,
+            records: vec![],
+            dry_run_records: vec![],
+        });
+        // User cancels (Cancel sends Command::Cancel + sets
+        // cancelled = true per §3.8.7.1 cancel-during-Analyzing
+        // race fix).
+        reduce(&mut state, Msg::UserClickedCancel, &tx, &default_config());
+        assert!(state.tasks.active.as_ref().unwrap().cancelled);
+        // DryRun still arrives — should drop without
+        // transitioning to AwaitingConfirm.
+        reduce(
+            &mut state,
+            Msg::Lib(Event::DryRunFinished {
+                records: vec![sample_record("/a.mp4", EncodingOutcome::Succeeded)],
+            }),
+            &tx,
+            &default_config(),
+        );
+        assert!(state.tasks.active.is_none());
+        assert!(state.task_history.is_empty());
+    }
+
+    #[test]
+    fn user_clicked_tab_updates_active_page() {
+        let mut state = fresh_state();
+        let tx = cmd_tx();
+        reduce(
+            &mut state,
+            Msg::UserClickedTab(Page::History),
+            &tx,
+            &default_config(),
+        );
+        assert_eq!(state.active_page, Page::History);
+        reduce(
+            &mut state,
+            Msg::UserClickedTab(Page::Task),
+            &tx,
+            &default_config(),
+        );
+        assert_eq!(state.active_page, Page::Task);
+    }
+
+    #[test]
+    fn task_id_collision_gets_suffix() {
+        // Two TaskIds allocated in the same second get -N suffix.
+        // (Don't actually sleep — fake by direct construction;
+        // the counter logic is what's under test.)
+        let mut q = TaskQueue::new(1);
+        let base = q.next_task_id();
+        let id2 = q.next_task_id();
+        assert_eq!(id2.as_str(), format!("{}-1", base.as_str()));
+        let id3 = q.next_task_id();
+        assert_eq!(id3.as_str(), format!("{}-2", base.as_str()));
+    }
+
+    #[test]
+    fn has_room_respects_capacity() {
+        let mut q = TaskQueue::new(1);
+        assert!(q.has_room());
+        q.active = Some(TaskInfo {
+            task_id: TaskId("t".into()),
+            batch_id: None,
+            phase: BatchPhase::Analyzing,
+            dir: PathBuf::from("/x"),
+            total_files: 0,
+            to_encode: 0,
+            to_skip: 0,
+            encoded: 0,
+            cancelled: false,
+            finished: false,
+            records: vec![],
+            dry_run_records: vec![],
+        });
+        assert!(!q.has_room());
+    }
+
+    #[test]
     fn error_context_construction_smoke() {
-        // Smoke: ErrorContext is #[non_exhaustive] so we can't
-        // struct-literal it from outside. This just ensures the
-        // type is reachable from this crate (compile-time check).
+        use rencoder_lib::types::ErrorContext;
         let _: Option<ErrorContext> = None;
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)]
     fn build_encode_params_uses_config() {
         use rencoder_lib::config::app::{AppConfig, EncodeConfig, FormatArg};
-        let mut cfg = AppConfig::default();
-        cfg.encode = Some(EncodeConfig {
-            format: Some(FormatArg::Hevc),
-            crf: 28,
+        let cfg = AppConfig {
+            encode: Some(EncodeConfig {
+                format: Some(FormatArg::Hevc),
+                crf: 28,
+                ..Default::default()
+            }),
             ..Default::default()
-        });
+        };
         let params = build_encode_params_from_config(&cfg);
         assert_eq!(params.format, rencoder_lib::types::VideoFormat::Hevc);
         assert!(params.is_crf);
@@ -930,7 +1189,6 @@ mod tests {
     fn build_encode_params_defaults_when_section_missing() {
         let cfg = AppConfig::default();
         let params = build_encode_params_from_config(&cfg);
-        // Default format is AV1; default crf=45 → is_crf=true.
         assert_eq!(params.format, rencoder_lib::types::VideoFormat::Av1);
         assert!(params.is_crf);
         assert_eq!(params.bitrate_or_crf, 45);
@@ -968,7 +1226,6 @@ mod tests {
             &PathBuf::from("/foo.txt"),
             &["mp4".into(), "mkv".into()]
         ));
-        // File with no extension is rejected when filter is non-empty.
         assert!(!extension_matches(&PathBuf::from("/foo"), &["mp4".into()]));
     }
 }
