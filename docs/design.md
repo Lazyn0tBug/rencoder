@@ -1858,6 +1858,13 @@ struct AppState {
     /// 给当前 active task 分配的映射(per `Event::BatchStarted.id`),
     /// 不参与 gating 决策(per review 反馈,避免 id-as-coincidence 反模式)。
     tasks: TaskQueue,
+    /// Session 内已完成任务的索引(newest-first)。Done transition 时
+    /// reducer 从 `tasks.active` 取出 task,**保留 TaskId**,insert
+    /// 到这里——queue 和 history 共享同一 ID 空间,跨两者的查找用
+    /// 同一 TaskId 即可。**进程退出时丢失**(纯内存)。
+    /// `state.history: Vec<EncodingRecord>` 是不同概念——从 Parquet
+    /// 读的历史记录,cross-session 持久化;v1.1 启用。
+    task_history: Vec<TaskInfo>,
     /// 当前 active page tab(`§3.8.7.2`)。`Setup` 是 app 启动默认值;
     /// 4 个 page 之间不自动切换(用户手动点 tab)。在 `[SETUP]` 点
     /// Start 后 batch 在后台跑,UI 停留在 `[SETUP]`,用户自己点
@@ -1976,9 +1983,34 @@ struct TaskInfo {
     dry_run_records: Vec<EncodingRecord>,
 }
 
-/// UI-side task id(包装 u64 让 reducer 里的 guard 类型可读)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-struct TaskId(u64);
+/// UI-side task id — timestamp-based(`yyyymmddhhmmss` 格式 per 你的
+/// spec),queue 和 history 共享同一 ID 空间。任务从 active → history
+/// 移动时 TaskId 保持不变(没有 re-key),所以跨 queue/history 查找
+/// 同一任务的代码路径统一。
+///
+/// **Format**: `chrono::Local::now().format("%Y%m%d%H%M%S")` → 14
+/// char 字符串如 `20260916142301`。Lexicographic 排序 = 时间排序。
+///
+/// **Collision handling**: 同秒内多次 `TaskId::new()`(rapid click
+/// Start 后 Cancel 又 Start)用 `-N` 后缀区分——`20260916142301`,
+/// `20260916142301-1`, `20260916142301-2`。reducer 维护一个
+/// `current_second_counts: HashMap<String, usize>` 来分配后缀。
+///
+/// **Why not u64 counter**: u64 counter 也行(单调递增,简单),但
+/// timestamp 形式对用户可读(看 TaskId 就知道任务大概什么时候开始),
+/// 也方便 log 排序。tradeoff:14 chars vs 8 bytes。
+///
+/// **Time zone**: 用 `chrono::Local` 不是 `Utc`。单用户 desktop app,
+/// 看 ID 的人 = 生成 ID 的机器,本地时间更有意义。Cross-timezone
+/// 场景(旅行)不适用(用户不会在两台机器上跑同一个 task queue)。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TaskId(String);
+
+impl TaskId {
+    fn new() -> Self {
+        TaskId(chrono::Local::now().format("%Y%m%d%H%M%S").to_string())
+    }
+}
 
 /// Task queue,v1 capacity = 1。`active` 是当前正在跑(Analyzing /
 /// AwaitingConfirm / Encoding)或刚完成(Done)的 task;v1.1 加
@@ -2211,40 +2243,53 @@ fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>, config: &App
         }
         Msg::Lib(Event::HistoryLoaded { records }) => { state.history = records; }
         Msg::Lib(Event::BatchCompleted { records }) => {
-            if let Some(t) = state.tasks.active.as_mut() {
+            // **Move to history on Done** (per spec: queue 和 history
+            // 共享 TaskId 空间,完成的任务归入 history 不 re-key)。
+            // `tasks.active.take()` 移除 task 并返回 ownership;insert
+            // 到 `task_history` 前置(newest-first)。
+            let done = state.tasks.active.take();
+            if let Some(mut t) = done {
                 t.records = records;
                 t.finished = true;
                 t.phase = BatchPhase::Done;
+                state.task_history.insert(0, t);
             }
             state.progress.clear();
         }
         Msg::Lib(Event::BatchCancelled { completed, total }) => {
-            if let Some(t) = state.tasks.active.as_mut() {
+            // Same move-to-history pattern as BatchCompleted。
+            let done = state.tasks.active.take();
+            if let Some(mut t) = done {
                 t.cancelled = true;
                 t.finished = true;
                 t.phase = BatchPhase::Done;
+                state.task_history.insert(0, t);
             }
             state.last_error = Some(format!("cancelled after {completed}/{total}"));
         }
         Msg::Lib(Event::Error { message, .. }) => {
-            state.last_error = Some(message);
-            // During Encoding: transition to Done so dir picker
-            // re-enables. During Analyzing: the optimistic phase
-            // transition is wrong if lib rejected the DryRun
-            // dispatch (busy-gate failed). Clear tasks.active so
-            // user can retry. During AwaitingConfirm: no-op (lib
-            // hasn't been asked to do anything yet).
-            if let Some(t) = state.tasks.active.as_mut() {
-                match t.phase {
-                    BatchPhase::Encoding => {
-                        t.phase = BatchPhase::Done;
-                        t.finished = true;
-                    }
-                    BatchPhase::Analyzing => {
-                        state.tasks.active = None;
-                    }
-                    _ => {}
+            state.last_error = Some(message.clone());
+            // During Encoding: task 跑到一半失败——同样归入 history
+            // (per spec:queue 和 history 共享 TaskId,失败也算完成)。
+            // During Analyzing: lib 拒绝了 DryRun dispatch (busy-gate
+            // 失败),task 从未真正开始——不归入 history(per spec:
+            // "当一个任务完成后"——Analyzing 阶段不算完成)。
+            // During AwaitingConfirm: no-op (lib 还没收到任何 command)。
+            match state.tasks.active.take() {
+                Some(mut t) if matches!(t.phase, BatchPhase::Encoding) => {
+                    t.finished = true;
+                    t.phase = BatchPhase::Done;
+                    state.task_history.insert(0, t);
                 }
+                Some(t) if matches!(t.phase, BatchPhase::Analyzing) => {
+                    // Drop without history entry.
+                    drop(t);
+                }
+                Some(t) => {
+                    // AwaitingConfirm (or other) — restore.
+                    state.tasks.active = Some(t);
+                }
+                None => {}
             }
         }
         // Event::ActorExited handler intentionally absent — see
@@ -2301,6 +2346,8 @@ fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>, config: &App
 **No auto-switch**:用户在 `[SETUP]` 页面点 Start 后,**UI 不自动切换**到 `[TASK]` 页(per §3.8.7.1 product-lens review 反馈——之前的 auto-switch 会把误选目录的用户困在 TASK 页,recovery 需要等分析结束 + 取消 + 切回 SETUP)。Batch 在后台跑,UI 停留在 `[SETUP]`;用户看到 SettingsPanel 下方的 phase 状态变化或自己点 `[TASK]` tab 看进度。Dir picker 锁仍然生效(per `None / AwaitingConfirm` 的 phase 规则)。
 
 **TaskQueue capacity** (v1: 1, v1.1: N):guard 走 `tasks.active.is_some() || tasks.pending.len() >= tasks.capacity`,**不**走 batch id 比较(per review 反馈 ——task 是 gating unit,batch id 只是映射字段)。v1 capacity = 1 意味着最多一个 active task——空 queue 时 `UserClickedStart` 派 DryRun(填 `tasks.active`);active 非空 + phase != Done 时,start 被拒(reducer 设 `last_error`)。v1.1 提升 capacity 到 N 后,多余的 task push 进 `tasks.pending`(FIFO),active 完成时 promote。详见 §3.8.7 `TaskQueue` 结构。
+
+**Move-on-Done transition** (active → history):task 进入 `Done` phase 时(`BatchCompleted` / `BatchCancelled` / Encoding-phase `Error`),reducer 用 `tasks.active.take()` 取出 task,改 phase = Done,然后 `task_history.insert(0, t)` 前置——queue 和 history 共享 `TaskId`,跨两者查找统一。**Error during Analyzing 不归入 history**(DryRun 都没成功,task 从未开始)。Done 的 task 仍展示在 `[TASK]` 页(viewing_task 路由),但 `tasks.active = None` 让 capacity check 通过——用户可以立即 Start 下一个 task。
 
 **Cancel during Analyzing** 是 v1 限制(`§3.8.7.4`):lib 的 `Command::Analyze` handler 跑 `analyze_records_with_probe_and_progress_parallel` 全程不轮询 cancel_token,所以 UI 派 `Command::Cancel` 时 lib 不真正中断分析。`Event::AnalyzeFinished` 仍会到达,UI 把它当正常结果处理(显示完整 records)。v1.1 在 analyze handler 里加 cancel_token 轮询。
 
@@ -2440,6 +2487,7 @@ fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>, config: &App
 | Cancel during Analyzing 是 best-effort | lib 的 `Command::Analyze` handler 不轮询 cancel_token,UI 发 `Command::Cancel` 时 lib 不真正中断。`Event::AnalyzeFinished` 仍到达并被 reducer 当正常结果处理 | v1.1 在 analyze handler 里加 cancel_token 轮询 |
 | `state.analyze_progress` / `state.analyze_results` 字段保留但未 populate | workflow 改造后 Start 自动调 `Command::DryRun`(不是 `Command::Analyze`),analyze state 字段未 populate。代码里还在(`#[allow(dead_code)]`),变成 dead field——AppState 代码块里保留定义以备 v1.1 / U22 重启用 | v1.1 移除 dead 字段 + 删除对应 `Event::Analyze*` reducer arm |
 | `UserClickedLoadHistory` 自动派 on app start | app 启动时 `use_hook` 派一次(per §3.8.7.2 history page);但目前没有显式 init code,history 是空直到用户手动 reload | v1.1 在 `use_hook` 里加 `cmd_tx.send(Command::LoadHistory { limit: Some(100), after: None })` |
+| `task_history` 进程退出即丢失 | `task_history: Vec<TaskInfo>` 只在内存里——session 结束(关 GUI / 进程 crash)后所有 Done 任务都没了。`state.history` (Parquet) 是不同概念,cross-session 持久化 | v1.1 把 task_history 通过 SQLite/JSONL 持久化到 `<app_dir>/data/task-history.jsonl`,启动时 reload |
 | Settings 只读 | `[SETUP]` 页 settings 只显示 `[encode]` 当前值;不支持 inline edit | v1.2 加 inline edit 模式(`<input type="number">` for crf 等)+ dispatch `Command::SaveConfig` |
 
 **v1 安全保证**(从 v1.1 deferred 提前到 v1 实现,per §3.8.7 product-lens / scope-guardian review 反馈):
