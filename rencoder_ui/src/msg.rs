@@ -241,9 +241,39 @@ pub struct ProgressInfo {
 
 #[derive(Debug, Clone)]
 pub struct LogLine {
+    /// File index this log line belongs to. `usize::MAX` (= sentinel
+    /// for "no file context") for lib-internal tracing events;
+    /// 0..N for per-file ffmpeg stderr lines.
     pub file_index: usize,
+    /// Origin of this log line (§3.8.7.5):
+    /// - `FfmpegStderr`: ffmpeg's stderr per-file (via
+    ///   `Event::LogLine`)
+    /// - `LibInternal`: lib's `log::info!` / `log::warn!` events,
+    ///   bridged to tracing and pushed to the UI
+    #[allow(dead_code)] // populated but v1 doesn't differentiate visually;
+                        // v1.2 will use this for color coding
+    pub source: LogSource,
     pub line: String,
     pub at: DateTime<Utc>,
+}
+
+/// Sentinel `file_index` for log lines without a file context
+/// (lib-internal tracing events). `usize::MAX` is well outside
+/// any realistic file count. The display layer (app.rs) maps this
+/// to "(global)" instead of a huge number.
+pub const NO_FILE_INDEX: usize = usize::MAX;
+
+/// Origin of a `LogLine` (§3.8.7.5 unified log pipeline).
+#[allow(dead_code)] // v1: visually treated the same as ffmpeg stderr;
+                    // v1.2 will use this to color-code the log line
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogSource {
+    /// Per-file ffmpeg stderr line (`Event::LogLine`). Has a
+    /// meaningful `file_index`.
+    FfmpegStderr,
+    /// Lib-internal log event bridged via `tracing-log::LogTracer`.
+    /// No file context — `file_index` is `NO_FILE_INDEX`.
+    LibInternal,
 }
 
 /// UI messages. Translating user gestures into Commands happens
@@ -282,6 +312,11 @@ pub enum Msg {
     /// Wrapper for lib -> UI events. All lib events flow
     /// through here; reducer routes them in `apply_event`.
     Lib(Event),
+    /// Lib-internal log line (bridged via tracing-log, pushed
+    /// through a crossbeam channel from the log drain thread).
+    /// v1 source field is fixed to `LogSource::LibInternal`;
+    /// v1.2 may add per-event severity / structured fields.
+    LibLogLine(String),
 }
 
 /// Reduce a message into a state change; emit Commands to the lib
@@ -424,6 +459,17 @@ pub fn reduce(
             state.active_page = page;
         }
         Msg::Lib(evt) => apply_event(state, evt),
+        Msg::LibLogLine(line) => {
+            state.log.push_back(LogLine {
+                file_index: NO_FILE_INDEX,
+                source: LogSource::LibInternal,
+                line,
+                at: Utc::now(),
+            });
+            while state.log.len() > LOG_RING_CAP {
+                state.log.pop_front();
+            }
+        }
     }
 }
 
@@ -542,6 +588,7 @@ fn apply_event(state: &mut AppState, evt: Event) {
         Event::LogLine { file_index, line } => {
             state.log.push_back(LogLine {
                 file_index,
+                source: LogSource::FfmpegStderr,
                 line,
                 at: Utc::now(),
             });

@@ -20,6 +20,12 @@ crossbeam-channel = "0.5"
 # `AsyncFileDialog` in a use_future.
 rfd = "0.14"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# Unified logging (§3.8.7.5): lib emits via `log` facade; UI
+# bridges to tracing via `tracing-log::LogTracer` and writes into
+# `state.log` via a custom MakeWriter + crossbeam channel.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-log = "0.2"
 
 [[bin]]
 name = "rencoder-ui"

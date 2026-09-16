@@ -41,7 +41,10 @@ use crossbeam_channel::Sender;
 use rencoder_lib::config::app::AppConfig;
 use rencoder_lib::job::{start_controller, Command};
 
-use crate::msg::{reduce, AppState, BatchPhase, Msg, Page, TaskId, TaskQueue};
+use crate::msg::{
+    reduce, AppState, BatchPhase, Msg, Page, TaskId, TaskQueue,
+};
+use crate::tracing_init;
 
 /// CSS inlined as a `<style>` child of the root div via Dioxus's
 /// `dangerous_inner_html` so it's part of the rendered DOM and
@@ -79,6 +82,31 @@ pub fn App() -> Element {
                 }
             })
             .expect("rencoder-ui-drain: failed to spawn event-pump thread");
+
+        // Log drain thread (§3.8.7.5 unified log pipeline):
+        // tracing_init owns the Sender side; we cloned the Receiver
+        // out of LOG_RECEIVER and capture state for `with_mut`.
+        // Each line goes through Msg::LibLogLine -> reducer, which
+        // pushes to state.log with source = LogSource::LibInternal.
+        if let Some(rx_ref) = tracing_init::LOG_RECEIVER.get() {
+            let log_rx = rx_ref.clone();
+            let mut state_for_log = state;
+            let cmd_tx_for_log = cmd_tx;
+            let config_for_log = config;
+            std::thread::Builder::new()
+                .name("rencoder-ui-log-drain".to_string())
+                .spawn(move || {
+                    while let Ok(line) = log_rx.recv() {
+                        let cfg = config_for_log.read().clone();
+                        if let Some(tx) = cmd_tx_for_log.read().clone() {
+                            state_for_log.with_mut(|s| {
+                                reduce(s, Msg::LibLogLine(line), &tx, &cfg)
+                            });
+                        }
+                    }
+                })
+                .expect("rencoder-ui-log-drain: failed to spawn log drain thread");
+        }
     });
 
     // If cmd_tx isn't set yet (use_hook hasn't run), show
@@ -666,13 +694,21 @@ fn LogPanel(state: Signal<AppState, SyncStorage>) -> Element {
         return rsx! { p { class: "muted", "(no log output)" } };
     }
     let lines: Vec<crate::msg::LogLine> = log.iter().rev().take(1000).cloned().collect();
-    let rendered: Vec<_> = lines
+    let rendered: Vec<(String, String, String)> = lines
         .iter()
         .rev()
         .map(|l| {
+            // LibInternal lines use file_index = usize::MAX
+            // (sentinel). Render as "(global)" instead of a huge
+            // number; per-file ffmpeg stderr keeps "[N]".
+            let file_label = if l.file_index == crate::msg::NO_FILE_INDEX {
+                "global".to_string()
+            } else {
+                format!("{}", l.file_index)
+            };
             (
                 l.at.format("%H:%M:%S").to_string(),
-                l.file_index,
+                file_label,
                 l.line.clone(),
             )
         })
@@ -698,13 +734,18 @@ fn LogPanel(state: Signal<AppState, SyncStorage>) -> Element {
 fn FooterLog(state: Signal<AppState, SyncStorage>) -> Element {
     let log = state.read().log.clone();
     let lines: Vec<_> = log.iter().rev().take(5).cloned().collect();
-    let rendered: Vec<(String, usize, String)> = lines
+    let rendered: Vec<(String, String, String)> = lines
         .iter()
         .rev()
         .map(|l| {
+            let file_label = if l.file_index == crate::msg::NO_FILE_INDEX {
+                "global".to_string()
+            } else {
+                format!("{}", l.file_index)
+            };
             (
                 l.at.format("%H:%M:%S").to_string(),
-                l.file_index,
+                file_label,
                 l.line.clone(),
             )
         })
