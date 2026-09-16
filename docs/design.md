@@ -1882,17 +1882,78 @@ struct AnalyzeProgressInfo {
 }
 
 /// 当前批的元信息;由 `Event::BatchStarted` 写入、`Event::BatchCompleted`/`BatchCancelled` 关闭。
+///
+/// **Phase-driven lifecycle** (§3.8.7.1): `phase` is set by the
+/// reducer based on dispatched commands and incoming events. v1
+/// invariant: only one batch at a time — `state.batch.is_some()`
+/// means the user can't pick a new directory until phase reaches
+/// `Done`. v1.1 unlocks multi-batch by removing this gate.
 struct BatchInfo {
+    /// Lib-assigned id from `Event::BatchStarted`. v1 is always 1
+    /// (no real counter yet — see §3.8.7.4 limitations); v1.1
+    /// uses the actual lib counter.
     id: u64,
+    /// Lifecycle phase — drives the Task page header badge and
+    /// the contextual button label.
+    phase: BatchPhase,
+    /// Input directory captured at Start time. Self-describing
+    /// (the Task page can show the working path even if the user
+    /// has navigated elsewhere via the now-disabled dir picker).
+    dir: PathBuf,
+    /// Total file count discovered by DryRun (after extensions
+    /// filter). Equals `files.len()` passed to `Command::DryRun`.
     total_files: usize,
-    /// 已完成的 records（每个 `FileCompleted` push 进来;`BatchCompleted` 用 lib 给的
-    /// records 覆盖以保证权威性）
-    records: Vec<EncodingRecord>,
-    /// `cancelled: true` 后 reducer 忽略后续的 `Event::Progress` / `FileCompleted`
-    /// 直到收到 `BatchCancelled` 或新 `BatchStarted`
+    /// Files that would actually be encoded (outcome =
+    /// `Succeeded` or `ReducedFps`). Set on `Event::DryRunFinished`;
+    /// displayed on Task page during `AwaitingConfirm` /
+    /// `Encoding` / `Done`.
+    to_encode: usize,
+    /// Files that would NOT be encoded (outcome = `Skipped(...)`
+    /// or `Failed`). Set on `Event::DryRunFinished`.
+    to_skip: usize,
+    /// Files encoded so far during `Encoding`. Updated by
+    /// `Event::FileCompleted`; displayed in the progress bar.
+    encoded: usize,
+    /// Set to true once Cancel lands; reducer ignores subsequent
+    /// `Event::Progress` / `FileCompleted` until `BatchCancelled`
+    /// or new `BatchStarted`.
     cancelled: bool,
-    /// batch 生命周期结束(`BatchCompleted` 或 `BatchCancelled` 触发后)
+    /// Set to true once `BatchCompleted` / `BatchCancelled` /
+    /// `Event::Error` fires. Combined with `phase = Done` to
+    /// gate re-arming.
     finished: bool,
+    /// Records accumulated during `Encoding` (post-confirm).
+    /// `FileCompleted` pushes one per file; `BatchCompleted`
+    /// replaces with the lib's authoritative vec.
+    records: Vec<EncodingRecord>,
+    /// Records from the DryRun phase. Kept until the next batch
+    /// lifecycle starts so the user can scroll back through the
+    /// plan during `Encoding` / `Done`. Overwritten on each new
+    /// `Event::DryRunFinished`.
+    dry_run_records: Vec<EncodingRecord>,
+}
+
+/// Lifecycle phase of the current batch. Drives the Task page
+/// header badge, the contextual button label, and the dir
+/// picker's enabled state (§3.8.7.1 state machine).
+#[allow(clippy::large_enum_variant)] // only Copy + 4 variants, no payload
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchPhase {
+    /// `Command::DryRun` dispatched; awaiting `Event::DryRunFinished`.
+    /// Dir picker disabled. Cancel button shown (best-effort).
+    Analyzing,
+    /// DryRun done; user must explicitly confirm before encoding
+    /// begins. Start button label flips to "encode N files".
+    /// Dir picker disabled.
+    AwaitingConfirm,
+    /// `Command::StartBatch` dispatched; awaiting `BatchCompleted` /
+    /// `BatchCancelled` / `Event::Error`. Progress bar active.
+    /// Dir picker disabled. Cancel button shown.
+    Encoding,
+    /// Final state after the batch lifecycle ends. Dir picker
+    /// re-enables. Start button re-arms (clicking it transitions
+    /// back to `Analyzing` for a new cycle).
+    Done,
 }
 
 /// 单文件进度;由 `Event::Progress` 更新
@@ -1913,48 +1974,174 @@ struct LogLine {
 }
 
 enum Msg {
+    /// User picked a directory via native folder dialog (§3.8.7
+    /// `DirPicker` row). Updates `state.input_dir`. Rejected if
+    /// a batch is active (no effect, no error — the picker is
+    /// disabled in the UI during active phases anyway).
     UserSelectedDir(PathBuf),
+    /// **2-phase semantic** (§3.8.7.1 state machine). The Start
+    /// button label changes per phase, but the message stays the
+    /// same — the reducer dispatches based on current `BatchPhase`:
+    ///   - `None` / `Done`  → `Command::DryRun` (begin analysis)
+    ///   - `AwaitingConfirm` → `Command::StartBatch` (user confirmed)
+    ///   - `Analyzing` / `Encoding` → ignored (busy-gate)
     UserClickedStart,
+    /// Cancel current operation. Best-effort during `Analyzing`
+    /// (lib's Analyze handler doesn't poll cancel_token — see
+    /// §3.8.7.4 limitations). During `Encoding`, dispatches
+    /// `Command::Cancel` to the lib actor (which kills ffmpeg
+    /// via cancel_token). During `AwaitingConfirm`, clears the
+    /// local batch state (no command needed).
     UserClickedCancel,
-    /// v1.1——v1 不展示历史。
+    /// Reload history records from disk. Auto-dispatched on app
+    /// start (§3.8.7 history page); manual dispatch via the
+    /// Refresh button on the `[HISTORY]` page.
     #[allow(dead_code)]
     UserClickedLoadHistory,
-    /// 触发并行 analyze 批(U22 / Tier 3 #9)——跟 Start 一样从
-    /// `state.input_dir` 收集文件,发 `Command::Analyze { files }`。
-    #[allow(dead_code)]
-    UserClickedAnalyze,
     /// 触发 AppConfig 写回原路径(U21 / Tier 2 #8)——Save 按钮
     /// 走这条,发 `Command::SaveConfig`。
     #[allow(dead_code)]
     UserClickedSaveSettings,
+    /// Wrapper for lib → UI events. All lib events flow through
+    /// here; reducer routes them in `apply_event`.
     Lib(Event),
 }
 
 /// 唯一的状态变更入口。所有视图只读 state;所有写都走这里。
-fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>) {
+///
+/// **Phase-aware `UserClickedStart`** (§3.8.7.1):
+///
+/// ```text
+///   ┌─ phase == None      → build params, collect files,
+///   │                       state.batch = Some(Analyzing { .. }),
+///   │                       send Command::DryRun
+///   │
+///   ├─ phase == Done      → same as None (re-arm)
+///   │
+///   ├─ phase == AwaitingConfirm
+///   │                     → state.batch.phase = Encoding,
+///   │                       state.batch.records.clear(),
+///   │                       send Command::StartBatch
+///   │
+///   └─ phase == Analyzing | Encoding
+///                         → set last_error "task in progress",
+///                           return early (busy-gate)
+/// ```
+///
+/// **Phase-aware `UserClickedCancel`**:
+///   - `Analyzing` / `Encoding`: send `Command::Cancel`. The lib
+///     respects cancel_token only during encoding (the analyze
+///     path doesn't poll cancel — best-effort; see §3.8.7.4).
+///   - `AwaitingConfirm`: clear `state.batch` locally (no
+///     command needed — DryRun already finished, lib is idle).
+///   - `None` / `Done`: ignored (no-op).
+fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>, config: &AppConfig) {
     match msg {
-
-fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>) {
-    match msg {
-        Msg::UserClickedStart => drop(cmd_tx.send(Command::StartBatch { /* ... */ })),
-        Msg::UserClickedCancel => drop(cmd_tx.send(Command::Cancel)),
-        Msg::UserOpenedHistory => drop(cmd_tx.send(Command::LoadHistory { limit: Some(100), after: None })),
+        Msg::UserSelectedDir(path) => {
+            // Reject while a batch is active (UI also disables
+            // the picker — defense-in-depth in case the user
+            // manages to click via keyboard nav).
+            if let Some(b) = &state.batch {
+                if !matches!(b.phase, BatchPhase::Done) {
+                    return;
+                }
+            }
+            state.input_dir = Some(path);
+        }
+        Msg::UserClickedStart => {
+            // (full implementation lives in rencoder_ui/src/msg.rs;
+            // the skeleton below documents the dispatch logic)
+            let phase = state.batch.as_ref().map(|b| b.phase);
+            match phase {
+                None | Some(BatchPhase::Done) => {
+                    // Collect files, build params, dispatch DryRun,
+                    // optimistically transition to Analyzing.
+                }
+                Some(BatchPhase::AwaitingConfirm) => {
+                    // Dispatch StartBatch, transition phase to Encoding.
+                }
+                Some(BatchPhase::Analyzing) | Some(BatchPhase::Encoding) => {
+                    state.last_error = Some("task in progress".into());
+                }
+            }
+        }
+        Msg::UserClickedCancel => {
+            let phase = state.batch.as_ref().map(|b| b.phase);
+            match phase {
+                Some(BatchPhase::Analyzing) | Some(BatchPhase::Encoding) => {
+                    let _ = cmd_tx.send(Command::Cancel);
+                }
+                Some(BatchPhase::AwaitingConfirm) => {
+                    state.batch = None;  // abandon the analysis
+                }
+                None | Some(BatchPhase::Done) => {}
+            }
+        }
+        Msg::UserClickedLoadHistory => {
+            let _ = cmd_tx.send(Command::LoadHistory { limit: Some(100), after: None });
+        }
+        Msg::UserClickedSaveSettings => {
+            let _ = cmd_tx.send(Command::SaveConfig);
+        }
+        Msg::Lib(Event::DryRunFinished { records }) => {
+            // Transition Analyzing → AwaitingConfirm.
+            // Compute to_encode / to_skip from records.
+            if let Some(b) = state.batch.as_mut() {
+                b.dry_run_records = records.clone();
+                b.to_encode = records.iter().filter(|r| matches!(r.outcome,
+                    EncodingOutcome::Succeeded | EncodingOutcome::ReducedFps)).count();
+                b.to_skip = b.total_files - b.to_encode;
+                b.phase = BatchPhase::AwaitingConfirm;
+            }
+        }
+        Msg::Lib(Event::BatchStarted { id, total_files }) => {
+            // Transition AwaitingConfirm → Encoding (lib accepted
+            // the StartBatch). Update id from lib.
+            if let Some(b) = state.batch.as_mut() {
+                b.id = id;
+                b.total_files = total_files;
+                b.phase = BatchPhase::Encoding;
+                b.records.clear();
+            }
+        }
         Msg::Lib(Event::Progress(p)) => { state.progress.insert(p.file_index, p); }
         Msg::Lib(Event::LogLine(l)) => {
             state.log.push_back(l);
             while state.log.len() > 1000 { state.log.pop_front(); }
         }
         Msg::Lib(Event::HistoryLoaded { records }) => { state.history = records; }
-        // Msg::Lib(Event::ActorExited { reason }) handler was removed
-        // when the event pump switched to use_signal_sync + std::thread
-        // (see §3.9). The lib's `Event::ActorExited` is still emitted,
-        // but the UI drain thread exits naturally on the next recv()
-        // when the lib drops its sender — no controller_alive flag
-        // needed in the UI. If we add a v2 UI-side restart button,
-        // the actor's contact channel is `ControllerHandle::restart()`
-        // (not yet implemented), not a `Msg::Lib(Event::ActorExited)`
-        // reducer arm.
-        // ...
+        Msg::Lib(Event::BatchCompleted { records }) => {
+            if let Some(b) = state.batch.as_mut() {
+                b.records = records;
+                b.finished = true;
+                b.phase = BatchPhase::Done;
+            }
+            state.progress.clear();
+        }
+        Msg::Lib(Event::BatchCancelled { completed, total }) => {
+            if let Some(b) = state.batch.as_mut() {
+                b.cancelled = true;
+                b.finished = true;
+                b.phase = BatchPhase::Done;
+            }
+            state.last_error = Some(format!("cancelled after {completed}/{total}"));
+        }
+        Msg::Lib(Event::Error { message, .. }) => {
+            state.last_error = Some(message);
+            // During Encoding: transition to Done so dir picker
+            // re-enables. During Analyzing: lib's analyze is
+            // already aborted (busy-gate failed).
+            if let Some(b) = state.batch.as_mut() {
+                if matches!(b.phase, BatchPhase::Encoding) {
+                    b.phase = BatchPhase::Done;
+                    b.finished = true;
+                }
+            }
+        }
+        // Event::ActorExited handler intentionally absent — see
+        // §3.9 (Strategy 2: drain thread exits naturally when
+        // lib drops its sender).
+        _ => {}
     }
 }
 ```
@@ -1964,34 +2151,187 @@ fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>) {
 - 组件只读 `state`，不直接调 lib。
 - 测试：构造 `Vec<Msg>` 灌进 reducer 断言 `state`——不需 Dioxus runtime。
 
-**Concrete UI 组件**(对照上面的 `AppState` / `Msg`):
+#### 3.8.7.1 Workflow state machine
 
-| 组件 | 输入 | 渲染什么 |
-|------|------|----------|
-| `DirPicker` | `state: Signal<AppState>`, `cmd_tx: Signal<Option<Sender<Command>>>` | **Pick button + native folder dialog** (`rfd::FileDialog::pick_folder`)+ 当前选择 path 显示;on pick 派 `UserSelectedDir`(v1.1 早期版本用 `<input type="text">`,v1.1+ 换成 native dialog——见 v1 limitations 表的更新) |
-| `ProgressPanel` | `state: Signal<AppState>` | `state.progress` HashMap → per-file 表格(fps/speed/ETA);空时显示"(no active progress)" |
-| `LogPanel` | `state: Signal<AppState>` | `state.log` 末 100 行 newest-first,带时间戳;空时显示"(no log output)" |
-| `HistoryPanel` | `state: Signal<AppState>` | `state.history` 表(source / outcome / output / duration / size);空时显示"(no history loaded)" |
-| `DryRunPanel` | `state: Signal<AppState>` | `state.dry_run_results` 表(source / planned outcome / output);空时显示"(no dry-run results yet — click Preview)" |
-| `SettingsPanel` | `config: Signal<Arc<AppConfig>>` | 只读展示 `[encode]` 当前值(format / crf / bitrate / extensions / max_fps / nv);text-only 字段编辑留 v1.2 |
-| `AnalyzePanel` (U22) | `state: Signal<AppState>` | analyze 进度文本 `"X/Y (Z failed)"` + `last` 字段(刚完成文件);v1 不带视觉进度条。`state.analyze_results` 末 batch 完成时在下面渲染 records 表(类似 DryRunPanel)**按 outcome 分区显示:failed 在上 succeeded 在下,中间 muted 分隔行**(`Vec::partition` by `r.fps.is_none()`,stable partition 保持组内输入序)。lib 不抽 `partition_by_outcome` helper——单 consumer 且 inline 1 行,等 CLI 也要用时再抽 |
-| `ExitButton` | — | 单 `<button>`,onclick 调 `dioxus::desktop::window().close()`。v1 不主动停 lib actor——关窗后 Dioxus 退 runtime,进程退出时 OS 回收 actor / drain 线程。若有批在跑,partial output 由 `encode_prepare` partial detection 下次启动自动清(无新增 work)。无 `controller_alive` 字段(同 §3.9 v1 一致) |
+> **TL;DR** — 一个 task 走四个 phase(Analyzing → AwaitingConfirm →
+> Encoding → Done),`BatchPhase` 是唯一真相。Dir picker 在任何 active
+> phase(Analyzing / AwaitingConfirm / Encoding)期间被锁;只有 `Done`
+> 之后才能再选目录。
 
-**v1 已知 limitations**(rencoder_ui 当前 bootstrap 状态):
+**State diagram**:
+
+```text
+                UserClickedStart                          Event::DryRunFinished
+   [None] ─────────────────────────────> [Analyzing] ───────────────────> [AwaitingConfirm]
+      ▲                                     │                                       │
+      │                                     │ Cancel (best-effort)                  │ UserClickedStart
+      │                                     │                                       │  dispatches Command::StartBatch
+      │                                     ▼                                       ▼
+      │                                  [None] (local clear)                  [Encoding]
+      │                                                                         │
+      │                              ┌──────────────────────────────────────────┤
+      │                              │ Event::BatchCompleted                    │
+      │                              │ Event::BatchCancelled                    │
+      │                              │ Event::Error                             │
+      │                              ▼                                          │
+      │                          [Done] ◄────────────────────────────────────────┘
+      │                              │
+      └──────────────── UserClickedStart (re-arm) ─────────────────────────────────┘
+```
+
+**Per-phase semantics**:
+
+| Phase | 来源 | Dir picker | Start btn | Cancel btn | Task page 显示 |
+|-------|------|-----------|-----------|------------|---------------|
+| `None` | initial / post-Cancel | enabled | "Start ▸"(disabled if dir not picked) | hidden | "No task running. Pick a directory and click Start." |
+| `Analyzing` | reducer dispatch DryRun | **disabled** | "Analyzing…" (disabled) | "Cancel ✕" (best-effort — lib's Analyze handler 不轮询 cancel_token) | "probing N files…" + spinner |
+| `AwaitingConfirm` | `Event::DryRunFinished` | **disabled** | "encode N files ▸" (enabled) | "Cancel ✕" (local clear, no lib command) | `BATCH #1` + 12 files / 10 encode / 2 skipped breakdown + TASK PLAN 表 |
+| `Encoding` | `Event::BatchStarted` | **disabled** | "Encoding M/N" (disabled) | "Cancel ✕" (dispatches `Command::Cancel`, lib 终止 ffmpeg via cancel_token) | progress bar + per-file table + ETA |
+| `Done` | `BatchCompleted` / `BatchCancelled` / `Error` | **enabled** | "Start ▸" (re-arms, transitions back to `Analyzing`) | hidden | "BATCH #1 · N encoded / M skipped / 0 failed" |
+
+**Auto-switch 行为**:用户在 `[SETUP]` 页面点 Start 后,UI 自动切换到 `[TASK]` 页(redirect-after-action 模式),让用户立即看到 analysis 展开。点 Start 之前停留在 `[SETUP]`,所以 dir picker 还可用;一旦按下按钮,dir picker 锁,task 页接管。
+
+**Cancel during Analyzing** 是 v1 限制(`§3.8.7.4`):lib 的 `Command::Analyze` handler 跑 `analyze_records_with_probe_and_progress_parallel` 全程不轮询 cancel_token,所以 UI 派 `Command::Cancel` 时 lib 不真正中断分析。`Event::AnalyzeFinished` 仍会到达,UI 把它当正常结果处理(显示完整 records)。v1.1 在 analyze handler 里加 cancel_token 轮询。
+
+**Reducer 路由表**(`Msg::UserClickedStart` 的 dispatch 逻辑)——见上面 `reduce` 代码块注释里的 phase match。
+
+#### 3.8.7.2 Page structure(4 pages + footer log)
+
+> **TL;DR** — 4 个独立 page + 全局 top-bar(tabs + Exit),每 page 一个
+> contextual 按钮(在 page header top-right)。Log 在所有 page 底部
+  都有 footer,full log 在 `[LOG]` page。
+
+**Top-bar 结构**:
+
+```text
+┌─ RENENCODER ───────────────────────────────[Exit]─┐
+│ ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐  │
+│ │SETUP│ │TASK │ │HIST │ │LOG │   │
+│ └─────┘ └─────┘ └─────┘ └─────┘          │
+├──────────────────────────────────────────────┤
+```
+
+- 4 个 page tab 横排,active tab 下划线 + 加粗
+- `[Exit]` 在最右侧,所有 page 可见,调 `dioxus::desktop::window().close()`
+
+**Per-page layout** (active tab 在 page header 的 badge 反映 phase):
+
+| Page | Header | Body | Top-right 按钮 |
+|------|--------|------|---------------|
+| `[SETUP]` | `──[ SETUP ]──────────────────────────` | INPUT DIRECTORY + `[ pick directory ]` + SETTINGS list | `[ Start ▸ ]`(dir 未选时 disabled) |
+| `[TASK]` | `──[ TASK ]────[● <phase> badge]` | BATCH# + 统计 + TASK PLAN + ProgressPanel | `[ Cancel ✕ ]`(active 时)/ `[ Start ▸ ]`(Done 时 re-arm) |
+| `[HISTORY]` | `──[ HISTORY ]───────────────────` | history table(source / outcome / size) | `[ Refresh ⟳ ]` |
+| `[LOG]` | `──[ LOG ]────────────────────────` | 完整 log scrollback(全 1000 行) | `[ Clear ]`(清 log buffer) |
+
+**Footer log** (所有 page 都有):
+
+```text
+├──────────────────────────────────────────────┤
+│ LOG · last 5 lines                            │
+│ 14:23:01 [0] probing file 1/12                │
+│ 14:23:02 [0] av1 1920x1080 @ 30fps             │
+│ ...                                           │
+└──────────────────────────────────────────────┘
+```
+
+- 永远在 page content 下方,占底部 ~5 行高度
+- 同一份 `state.log` 数据(`[LOG]` page 渲染全 buffer;footer 渲染末 5 行)
+- 滚动 `[LOG]` page 时 footer 不动(footer 只是 viewport)
+
+**Active state 默认值**: app 启动时 active tab = `[SETUP]`,除非有未完成的 batch(没 v1 不存在)。
+
+**Concrete 组件** (按 page 分组):
+
+| Page | 组件 | 输入 | 渲染什么 |
+|------|------|------|----------|
+| global | `TopBar` | `active: Page`, `cmd_tx` | 4 tabs + Exit |
+| global | `LogFooter` | `state` | 5 行 log |
+| `[SETUP]` | `DirPicker` | `state`, `cmd_tx` | native folder dialog + 当前 path + disabled when batch active |
+| `[SETUP]` | `SettingsPanel` | `config` | 只读 `[encode]` key/value list |
+| `[TASK]` | `BatchStatus` | `state` | BATCH #N + phase badge + 12 files / 10 encode / 2 skipped 列表 |
+| `[TASK]` | `ProgressPanel` | `state` | 进度条 + per-file table(Encoding 时) |
+| `[TASK]` | `TaskPlanPanel` (NEW,替换 `DryRunPanel`) | `state.batch.dry_run_records` | post-DryRun 的 file list,per-file outcome 标签(ENCODE / SKIP / FAIL) |
+| `[HISTORY]` | `HistoryPanel` | `state.history` | history records 表 |
+| `[LOG]` | `LogPanel` (full version) | `state.log` | 全 1000 行 scrollback |
+
+**Removed**:
+- `UserClickedAnalyze` / `UserClickedPreview` Msg variants(Start 流程 auto-runs analyze)
+- `DryRunPanel`(内容并入 `TaskPlanPanel`)
+- `AnalyzePanel`(无 standalone analyze action)
+- `AnalyzeProgressInfo` / `state.analyze_progress` / `state.analyze_results`(subsumed)
+- 7-button controls bar(替换为 per-page buttons)
+
+#### 3.8.7.3 Visual design tokens
+
+> **TL;DR** — 浅色背景 + 全 mono + 方括号 label + status badge。
+> 设计思路:CLI power-user 的 GUI,不是 SaaS dashboard。
+
+**Theme: 浅色 + warm off-white**(vs dark "ops center"——本项目走白天可用、像 README / 论文样的视觉)。
+
+| Token | Value | 用途 |
+|-------|-------|------|
+| `--bg-app` | `#fafaf9` | app 背景,warm off-white |
+| `--bg-surface` | `#ffffff` | 卡片 / section 背景 |
+| `--bg-elev` | `#f4f4f3` | hover / active surface |
+| `--bg-input` | `#ffffff` | input 字段 |
+| `--border` | `#d4d4d2` | section border (1px) |
+| `--border-strong` | `#a3a3a0` | table row separator |
+| `--border-active` | `#6b6b68` | focus / hover |
+| `--text` | `#1c1c1a` | primary text |
+| `--text-dim` | `#6b6b68` | secondary text |
+| `--text-mute` | `#9a9a97` | labels, hints |
+| `--status-idle` | `#9a9a97` | gray dot |
+| `--status-active` | `#16a34a` | green — ANALYZING / AWAITING / ENCODING |
+| `--status-done` | `#2563eb` | blue — DONE |
+| `--status-warning` | `#d97706` | amber — empty / partial |
+| `--status-error` | `#dc2626` | red — error |
+| `--accent` | `#16a34a` | button primary |
+| `--accent-dim` | `#dcfce7` | button hover bg |
+
+**Typography**:**JetBrains Mono** 全场(variable weight 200–800)。无 sans-serif fallback。Hierarchy 用 weight + size + letter-spacing 实现,不用 font family 切换。
+
+| Token | Size / Weight / Tracking | 用途 |
+|-------|--------------------------|------|
+| `.brand` | 13px / 700 / +0.12em uppercase | top-bar "RENENCODER" |
+| `.section-label` | 11px / 700 / +0.12em uppercase | `[ SETUP ]` `[ TASK ]` 等方括号 label |
+| `.heading` | 13px / 600 | page header line |
+| `.body` | 13px / 400 | 正文 |
+| `.dim` | 12px / 400 / `--text-dim` | secondary |
+| `.mute` | 11px / 400 / `--text-mute` | hints, hints |
+| `.code` | 12px / 500 | 技术值("12 files", "45 crf") |
+| `.path` | 13px / 400 / `--text-dim` | file path(略淡,有 prominence) |
+
+**Status badge 格式**:`[● <phase>]` — 内嵌 dot,color 由 `--status-*` 控制;active phase 的 dot 慢 pulse 动画。
+
+**Section label 格式**:`──[ SETUP ]──────[● AWAITING]───` — 两个 dash line 把 section 头包起来,左边 label,右边 status badge / page button(看 page 类型)。
+
+**动画**:仅必要动画
+- Phase transition:TASK section body fade + slide 4px,180ms ease-out
+- Progress bar width:200ms transition on update
+- Start button hover:bg shift to `--bg-elev`,无 glow / 无 scale
+- 无 scroll-trigger / 无 parallax / 无 first-paint entry animation
+
+**Anti-slop 检查**(为什么 NOT 这些):
+- ❌ Inter / Roboto / system font(本项目用 mono)
+- ❌ purple gradient on white(本项目无 gradient)
+- ❌ glassmorphism / blur / shadow(深度用 bg tone shift,1px border)
+- ❌ emoji icons in code(系统 no-emoji rule + skill 规则)
+- ❌ centered card layouts(本项目用 header + 2-col grid)
+
+**Spacing 节奏**:4 / 8 / 12 / 16 / 24px。所有 gap / padding 用这五个值之一。
+
+#### 3.8.7.4 v1 已知 limitations
 
 | 项 | 状态 | 后续 |
 |----|------|------|
-| `DirPicker` 组件 | **未实现**——`input_dir` 字段在 AppState 但没有 UI 输入 | v1.1 加 `<input>` 元素 + `UserSelectedDir` Msg |
-| `ProgressPanel` 表格 | **未实现**——只显示 batch 状态字符串,没 per-file 进度表 | v1.1 加 `ProgressInfo` 表 |
-| `LogPanel` 滚动 + 时间戳 | **未实现**——只显示空/log 长度,没行内容 | v1.1 加 `LogLine` 滚动列表 |
-| `HistoryPanel` 表格 | **未实现**——只显示 history 长度,没 records 内容 | v1.1 加 records 表 |
-| `EncodeParams` 来源 | **硬编码** `EncodeParams::default()`(AV1/CRF 45) | v1.1 从 `AppConfig::load().encode` 派生 |
-| 文件扩展名过滤 | **无**——Start 读目录下所有文件 | v1.1 用 `encode.extensions` glob |
-| `EncoderSettings.preset` / `max_fps_target` | **未传给 ffmpeg** | v1.1 build_ffmpeg_command 接 `EncodeParams` |
-| Preview / Dry Run | **未实现**——user 无法预览编码结果 | v1.1 加 `Command::DryRun` + `Event::DryRunFinished` |
-| Analyze + progress reporting | **未实现**——UI 不能跑 analyze | v1.1 加 `Command::Analyze` + `Event::AnalyzeProgress` + `AnalyzePanel`;**v1.1 也**不支持 `Command::Cancel` abort analyze 批(见 §3.4 "分析进度上报" v1 限制) |
+| Dir picker 锁 during whole batch lifecycle | v1:dir picker 在 `Analyzing` / `AwaitingConfirm` / `Encoding` 期间都被 disable(per §3.8.7.1),防止用户对 in-flight task 换目录 | v1.1 解锁 Encoding 期间的 picker(per spec point 6)——允许选下一个目录排队 |
+| Cancel during Analyzing 是 best-effort | lib 的 `Command::Analyze` handler 不轮询 cancel_token,UI 发 `Command::Cancel` 时 lib 不真正中断。`Event::AnalyzeFinished` 仍到达并被 reducer 当正常结果处理 | v1.1 在 analyze handler 里加 cancel_token 轮询 |
+| Batch id 永远是 1(v1) | `BatchInfo.id` 是 lib `Event::BatchStarted.id` 的镜像,但 v1 只有单 batch(no counter),所以一直是 1 | v1.1 真正启用 counter,允许多 batch 并存 |
 | UI drain thread panic recovery | **未实现**——v1 不包裹 `use_hook` 里 `std::thread::spawn` 的循环 in `catch_unwind`。如果 `state.with_mut(\|s\| reduce(...))` panic(reducer bug、SIGPIPE 等),所有后续事件被静默吞掉,UI 不响应但 lib 仍在写 channel | v1.1 `use_hook` 里 `std::panic::catch_unwind` 包裹循环 + 暴露 `controller_alive: false` + `last_error`;详见 §3.9.4 |
 | Exit button 不发 Cancel | v1 Exit 只 `window().close()`,不向 lib actor 发 `Command::Cancel`。若用户在批运行中点 Exit,ffmpeg 子进程随进程退出被杀,partial output 由 `encode_prepare` partial detection 下次启动清(同 §3.8.2 partial 处理路径) | v1.1 Exit 先 `Command::Cancel` + 等 `BatchCancelled` event,再 `window().close()`,避免依赖 partial-detection 兜底 |
+| `state.analyze_progress` / `state.analyze_results` 字段已不再使用 | workflow 改造后 Start 自动调 `Command::DryRun`(不是 `Command::Analyze`),analyze state 字段未 populate。代码还在,dead field | v1.1 移除 dead 字段 + 删除对应 `Event::Analyze*` reducer arm |
+| `UserClickedLoadHistory` 自动派 on app start | app 启动时 `use_hook` 派一次(per §3.8.7.2 history page);但目前没有显式 init code,history 是空直到用户手动 reload | v1.1 在 `use_hook` 里加 `cmd_tx.send(Command::LoadHistory { limit: Some(100), after: None })` |
+| Settings 只读 | `[SETUP]` 页 settings 只显示 `[encode]` 当前值;不支持 inline edit | v1.2 加 inline edit 模式(`<input type="number">` for crf 等)+ dispatch `Command::SaveConfig` |
 
 这些限制不影响协议契约（Command/Event 已端到端测试通过 mock_tests），只是 UI 渲染层不完整。
 
