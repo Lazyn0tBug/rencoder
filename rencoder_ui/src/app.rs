@@ -159,55 +159,15 @@ fn TopBar(
 ) -> Element {
     let active = state.read().active_page;
     let tx_exit = cmd_tx.read().clone();
-    let tx_tab_setup = cmd_tx.read().clone();
-    let tx_tab_task = cmd_tx.read().clone();
-    let tx_tab_history = cmd_tx.read().clone();
-    let tx_tab_log = cmd_tx.read().clone();
 
     rsx! {
         header { class: "top-bar",
             span { class: "brand", "RENENCODER" }
             nav { class: "tabs",
-                button {
-                    class: if active == Page::Setup { "tab tab-active" } else { "tab" },
-                    onclick: move |_| {
-                        let cfg = config.read().clone();
-                        if let Some(tx) = tx_tab_setup.clone() {
-                            state.with_mut(|s| reduce(s, Msg::UserClickedTab(Page::Setup), &tx, &cfg));
-                        }
-                    },
-                    "SETUP"
-                }
-                button {
-                    class: if active == Page::Task { "tab tab-active" } else { "tab" },
-                    onclick: move |_| {
-                        let cfg = config.read().clone();
-                        if let Some(tx) = tx_tab_task.clone() {
-                            state.with_mut(|s| reduce(s, Msg::UserClickedTab(Page::Task), &tx, &cfg));
-                        }
-                    },
-                    "TASK"
-                }
-                button {
-                    class: if active == Page::History { "tab tab-active" } else { "tab" },
-                    onclick: move |_| {
-                        let cfg = config.read().clone();
-                        if let Some(tx) = tx_tab_history.clone() {
-                            state.with_mut(|s| reduce(s, Msg::UserClickedTab(Page::History), &tx, &cfg));
-                        }
-                    },
-                    "HISTORY"
-                }
-                button {
-                    class: if active == Page::Log { "tab tab-active" } else { "tab" },
-                    onclick: move |_| {
-                        let cfg = config.read().clone();
-                        if let Some(tx) = tx_tab_log.clone() {
-                            state.with_mut(|s| reduce(s, Msg::UserClickedTab(Page::Log), &tx, &cfg));
-                        }
-                    },
-                    "LOG"
-                }
+                tab_button { state: state, cmd_tx: cmd_tx, config: config, page: Page::Setup, active: active, label: "SETUP" }
+                tab_button { state: state, cmd_tx: cmd_tx, config: config, page: Page::Task, active: active, label: "TASK" }
+                tab_button { state: state, cmd_tx: cmd_tx, config: config, page: Page::History, active: active, label: "HISTORY" }
+                tab_button { state: state, cmd_tx: cmd_tx, config: config, page: Page::Log, active: active, label: "LOG" }
             }
             div { class: "top-bar-right",
                 if let Some(tx) = tx_exit {
@@ -233,6 +193,32 @@ fn TopBar(
                     }
                 }
             }
+        }
+    }
+}
+
+/// One TopBar tab button. Extracted from the old 4-copy inline
+/// closure pattern so each new page (§3.8.7.2's 4 tabs) doesn't
+/// add another copy of the same `onclick` body.
+#[component]
+fn tab_button(
+    state: Signal<AppState, SyncStorage>,
+    cmd_tx: Signal<Option<Sender<Command>>, SyncStorage>,
+    config: Signal<Arc<AppConfig>, SyncStorage>,
+    page: Page,
+    active: Page,
+    label: &'static str,
+) -> Element {
+    rsx! {
+        button {
+            class: if active == page { "tab tab-active" } else { "tab" },
+            onclick: move |_| {
+                let cfg = config.read().clone();
+                if let Some(tx) = cmd_tx.read().clone() {
+                    state.with_mut(|s| reduce(s, Msg::UserClickedTab(page), &tx, &cfg));
+                }
+            },
+            "{label}"
         }
     }
 }
