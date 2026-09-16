@@ -1845,15 +1845,28 @@ Dioxus 端用 reducer 模式（Elm 架构）。所有用户输入转成 `Msg::Us
 
 ```rust
 /// 顶层 UI state。整个 app 一个,所有视图组件读它。
+///
+/// **v1 task queue capacity = 1**(`tasks.capacity`): 同一时刻最多一个
+/// active task。架构上已经为 v1.1 多 task queue 准备好——`TaskQueue`
+/// 用 `active + pending` 二元结构,capacity 提升到 N 时只需把新 task
+/// push 进 `pending` 而不是立刻 dispatch。v1 always-runs immediately
+/// 所以 `pending` 永远为空,但数据结构已经在位。
 struct AppState {
-    /// 当前活跃批的元信息;`None` = 没有批在跑
-    batch: Option<BatchInfo>,
+    /// Task queue(v1: capacity = 1)。所有 task 共享同一个 lib actor,
+    /// 通过 lib 的 busy-gate 串行执行。Guard 走 `tasks.active.is_some()`
+    /// ——task 是 gate 的 unit,**不是 batch id**。Batch id 是 lib-side
+    /// 给当前 active task 分配的映射(per `Event::BatchStarted.id`),
+    /// 不参与 gating 决策(per review 反馈,避免 id-as-coincidence 反模式)。
+    tasks: TaskQueue,
     /// 当前 active page tab(`§3.8.7.2`)。`Setup` 是 app 启动默认值;
     /// 4 个 page 之间不自动切换(用户手动点 tab)。在 `[SETUP]` 点
     /// Start 后 batch 在后台跑,UI 停留在 `[SETUP]`,用户自己点
     /// `[TASK]` tab 看进度——避免误选目录后被强制离开 picker 页
     /// (`§3.8.7.1` product-lens review 反馈)。
     active_page: Page,
+    /// 当前 Task 页展示哪个 task(v1: 总是 `tasks.active`,因为只有
+    /// 一个 slot)。v1.1:用户可在多 active 间切换。
+    viewing_task: Option<TaskId>,
     /// per-file 进度,key 是 file_index(§3.8.3 `Progress.file_index`)
     progress: HashMap<usize, ProgressInfo>,
     /// stderr log ring buffer(§3.8.6:上限 1000 行)
@@ -1905,17 +1918,24 @@ struct AnalyzeProgressInfo {
 ///
 /// **Phase-driven lifecycle** (§3.8.7.1): `phase` is set by the
 /// reducer based on dispatched commands and incoming events. v1
-/// invariant: only one batch at a time — `state.batch.is_some()`
-/// means the user can't pick a new directory until phase reaches
-/// `Done`. v1.1 unlocks multi-batch by removing this gate.
-struct BatchInfo {
-    /// Lib-assigned id from `Event::BatchStarted`. v1 单 batch 模式
-    /// 下 reducer 只接受 id == expected_id 的 BatchStarted(otherwise
-    /// 是另一 batch 的过期 event,drop);expected_id 初始 = 1,每次
-    /// 接受 BatchStarted 后 +1。这样防御 `out-of-order` race——
-    /// rapid Start click + lib's `next_batch_id` 递增 可能让 lib 发
-    /// 出 id > 1 的 BatchStarted;reducer 守护单 batch 语义。
-    id: u64,
+/// 单一 task 的元信息。Task 是 UI 端的 gating unit(per review 反馈
+/// ——guard 走 task 存在性,不是 batch id 巧合)。Lib-side batch id 是
+/// task 的映射字段,在 `Event::BatchStarted` 时填充。
+///
+/// **Phase-driven lifecycle** (§3.8.7.1): `phase` 由 reducer 设置
+///(基于派发的 command + 收到的 event)。v1 capacity = 1,所以这个
+/// struct 总是出现在 `TaskQueue.active`;v1.1 可以出现在 `pending`。
+struct TaskInfo {
+    /// UI-side task id。reducer 自己分配的递增 counter(从 0 开始)。
+    /// **Guard 走 TaskId 比较 + TaskQueue capacity 检查,跟 lib 的
+    /// batch id 解耦**——lib 的 `next_batch_id` 怎么跳不影响 UI 的
+    /// gating 决策(per review feedback:避免 id-as-coincidence 反模式)。
+    task_id: TaskId,
+    /// Lib-side batch id 映射(`Event::BatchStarted.id`)。`None`
+    /// 直到 `Event::BatchStarted`——task 已 submit 但 lib 还没确认
+    /// 时为 None。v1 单 task 模式下通常 0,但 task queue 不依赖
+    /// 此值的连续性。
+    batch_id: Option<u64>,
     /// Lifecycle phase — drives the Task page header badge and
     /// the contextual button label.
     phase: BatchPhase,
@@ -1926,10 +1946,10 @@ struct BatchInfo {
     /// Total file count discovered by DryRun (after extensions
     /// filter). Equals `files.len()` passed to `Command::DryRun`.
     total_files: usize,
-    /// Files that would actually be encoded (outcome =
-    /// `Succeeded` or `ReducedFps`). Set on `Event::DryRunFinished`;
-    /// displayed on Task page during `AwaitingConfirm` /
-    /// `Encoding` / `Done`.
+    /// Files that would actually be encoded (outcome = `Succeeded`) —
+    /// DryRun doesn't invoke ffmpeg, so `ReducedFps` cannot appear
+    /// (per §3.8.2). Set on `Event::DryRunFinished`; displayed on
+    /// Task page during `AwaitingConfirm` / `Encoding` / `Done`.
     to_encode: usize,
     /// Files that would NOT be encoded (outcome = `Skipped(...)`
     /// or `Failed`). Set on `Event::DryRunFinished`.
@@ -1949,15 +1969,39 @@ struct BatchInfo {
     /// `FileCompleted` pushes one per file; `BatchCompleted`
     /// replaces with the lib's authoritative vec.
     records: Vec<EncodingRecord>,
-    /// Records from the DryRun phase. Kept until the next batch
+    /// Records from the DryRun phase. Kept until the next task
     /// lifecycle starts so the user can scroll back through the
     /// plan during `Encoding` / `Done`. Overwritten on each new
     /// `Event::DryRunFinished`.
     dry_run_records: Vec<EncodingRecord>,
 }
 
-/// Lifecycle phase of the current batch. Drives the Task page
-/// header badge, the contextual button label, and the dir
+/// UI-side task id(包装 u64 让 reducer 里的 guard 类型可读)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+struct TaskId(u64);
+
+/// Task queue,v1 capacity = 1。`active` 是当前正在跑(Analyzing /
+/// AwaitingConfirm / Encoding)或刚完成(Done)的 task;v1.1 加
+/// `pending: Vec<TaskInfo>` 之后,新提交的 task 在 `pending` 排队,
+/// active 完成后再 promote。
+///
+/// **Gating unit 是 TaskId / TaskQueue capacity**,不是 batch id——
+/// reducer 的 gate 检查是 `tasks.active.is_some() || tasks.pending.len() >= capacity`,
+/// 然后再决定:capacity 没满 → dispatch DryRun(立即执行, v1)或 push 到
+/// pending(v1.1)。v1 没 pending,所以永远是 `tasks.active.is_some()` 检查。
+struct TaskQueue {
+    /// v1: 1。v1.1: lift to N (configurable; `RENENCODER_MAX_CONCURRENT`
+    /// env var 或 AppConfig 字段)。
+    capacity: usize,
+    /// 当前 active task(v1: 最多 1)。`None` = queue empty。
+    active: Option<TaskInfo>,
+    /// Pending tasks(v1: 永远空)。v1.1: 按 `submitted_at` 顺序 FIFO。
+    pending: Vec<TaskInfo>,
+}
+
+/// Lifecycle phase of a task (per task, not global — different tasks
+/// in the queue can be in different phases in v1.1). Drives the Task
+/// page header badge, the contextual button label, and the dir
 /// picker's enabled state (§3.8.7.1 state machine).
 #[allow(clippy::large_enum_variant)] // only Copy + 4 variants, no payload
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2040,14 +2084,14 @@ enum Msg {
 ///
 /// ```text
 ///   ┌─ phase == None      → build params, collect files,
-///   │                       state.batch = Some(Analyzing { .. }),
+///   │                       tasks.active = Some(Analyzing { .. }),
 ///   │                       send Command::DryRun
 ///   │
 ///   ├─ phase == Done      → same as None (re-arm)
 ///   │
 ///   ├─ phase == AwaitingConfirm
-///   │                     → state.batch.phase = Encoding,
-///   │                       state.batch.records.clear(),
+///   │                     → tasks.active.as_mut().unwrap().phase = Encoding,
+///   │                       tasks.active.as_mut().unwrap().records.clear(),
 ///   │                       send Command::StartBatch
 ///   │
 ///   └─ phase == Analyzing | Encoding
@@ -2059,7 +2103,7 @@ enum Msg {
 ///   - `Analyzing` / `Encoding`: send `Command::Cancel`. The lib
 ///     respects cancel_token only during encoding (the analyze
 ///     path doesn't poll cancel — best-effort; see §3.8.7.4).
-///   - `AwaitingConfirm`: clear `state.batch` locally (no
+///   - `AwaitingConfirm`: clear `tasks.active` locally (no
 ///     command needed — DryRun already finished, lib is idle).
 ///   - `None` / `Done`: ignored (no-op).
 fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>, config: &AppConfig) {
@@ -2068,8 +2112,8 @@ fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>, config: &App
             // Reject while a batch is active (UI also disables
             // the picker — defense-in-depth in case the user
             // manages to click via keyboard nav).
-            if let Some(b) = &state.batch {
-                if !matches!(b.phase, BatchPhase::Done) {
+            if let Some(t) = &state.tasks.active {
+                if !matches!(t.phase, BatchPhase::Done) {
                     return;
                 }
             }
@@ -2078,7 +2122,7 @@ fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>, config: &App
         Msg::UserClickedStart => {
             // (full implementation lives in rencoder_ui/src/msg.rs;
             // the skeleton below documents the dispatch logic)
-            let phase = state.batch.as_ref().map(|b| b.phase);
+            let phase = state.tasks.active.as_ref().map(|t| t.phase);
             match phase {
                 None | Some(BatchPhase::Done) => {
                     // Collect files, build params, dispatch DryRun,
@@ -2093,19 +2137,19 @@ fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>, config: &App
             }
         }
         Msg::UserClickedCancel => {
-            let phase = state.batch.as_ref().map(|b| b.phase);
+            let phase = state.tasks.active.as_ref().map(|t| t.phase);
             match phase {
                 Some(BatchPhase::Analyzing) | Some(BatchPhase::Encoding) => {
                     // Mark locally so DryRunFinished / BatchStarted
                     // arriving after Cancel know to ignore (per
                     // §3.8.7.1 cancel-during-Analyzing race fix).
-                    if let Some(b) = state.batch.as_mut() {
-                        b.cancelled = true;
+                    if let Some(t) = state.tasks.active.as_mut() {
+                        t.cancelled = true;
                     }
                     let _ = cmd_tx.send(Command::Cancel);
                 }
                 Some(BatchPhase::AwaitingConfirm) => {
-                    state.batch = None;  // abandon the analysis
+                    state.tasks.active = None;  // abandon the analysis
                 }
                 None | Some(BatchPhase::Done) => {}
             }
@@ -2136,32 +2180,28 @@ fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>, config: &App
             // DryRunFinished still arrives — discard it so the
             // user doesn't end up on AwaitingConfirm for a batch
             // they thought they cancelled.
-            if let Some(b) = state.batch.as_mut() {
-                if b.cancelled {
-                    state.batch = None;
+            if let Some(t) = state.tasks.active.as_mut() {
+                if t.cancelled {
+                    state.tasks.active = None;
                     return;
                 }
-                b.dry_run_records = records.clone();
-                b.to_encode = records.iter().filter(|r| matches!(r.outcome,
+                t.dry_run_records = records.clone();
+                t.to_encode = records.iter().filter(|r| matches!(r.outcome,
                     EncodingOutcome::Succeeded)).count();
-                b.to_skip = b.total_files - b.to_encode;
-                b.phase = BatchPhase::AwaitingConfirm;
+                t.to_skip = t.total_files - t.to_encode;
+                t.phase = BatchPhase::AwaitingConfirm;
             }
         }
         Msg::Lib(Event::BatchStarted { id, total_files }) => {
             // Transition AwaitingConfirm → Encoding (lib accepted
-            // the StartBatch). Sequence guard: if the event's id
-            // doesn't match our current expected id, drop it —
-            // the rapid-click race the lib's `next_batch_id`
-            // counter can produce out-of-order BatchStarted.
-            if let Some(b) = state.batch.as_mut() {
-                if b.id != id {
-                    // Out-of-order; ignore.
-                    return;
-                }
-                b.total_files = total_files;
-                b.phase = BatchPhase::Encoding;
-                b.records.clear();
+            // the StartBatch). Record lib's batch_id on the active
+            // task (id-as-mapping, **不**参与 gating 决策——per review
+            // feedback,避免 id-as-coincidence 反模式)。
+            if let Some(t) = state.tasks.active.as_mut() {
+                t.batch_id = Some(id);
+                t.total_files = total_files;
+                t.phase = BatchPhase::Encoding;
+                t.records.clear();
             }
         }
         Msg::Lib(Event::Progress(p)) => { state.progress.insert(p.file_index, p); }
@@ -2171,18 +2211,18 @@ fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>, config: &App
         }
         Msg::Lib(Event::HistoryLoaded { records }) => { state.history = records; }
         Msg::Lib(Event::BatchCompleted { records }) => {
-            if let Some(b) = state.batch.as_mut() {
-                b.records = records;
-                b.finished = true;
-                b.phase = BatchPhase::Done;
+            if let Some(t) = state.tasks.active.as_mut() {
+                t.records = records;
+                t.finished = true;
+                t.phase = BatchPhase::Done;
             }
             state.progress.clear();
         }
         Msg::Lib(Event::BatchCancelled { completed, total }) => {
-            if let Some(b) = state.batch.as_mut() {
-                b.cancelled = true;
-                b.finished = true;
-                b.phase = BatchPhase::Done;
+            if let Some(t) = state.tasks.active.as_mut() {
+                t.cancelled = true;
+                t.finished = true;
+                t.phase = BatchPhase::Done;
             }
             state.last_error = Some(format!("cancelled after {completed}/{total}"));
         }
@@ -2191,17 +2231,17 @@ fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>, config: &App
             // During Encoding: transition to Done so dir picker
             // re-enables. During Analyzing: the optimistic phase
             // transition is wrong if lib rejected the DryRun
-            // dispatch (busy-gate failed). Clear state.batch so
+            // dispatch (busy-gate failed). Clear tasks.active so
             // user can retry. During AwaitingConfirm: no-op (lib
             // hasn't been asked to do anything yet).
-            if let Some(b) = state.batch.as_mut() {
-                match b.phase {
+            if let Some(t) = state.tasks.active.as_mut() {
+                match t.phase {
                     BatchPhase::Encoding => {
-                        b.phase = BatchPhase::Done;
-                        b.finished = true;
+                        t.phase = BatchPhase::Done;
+                        t.finished = true;
                     }
                     BatchPhase::Analyzing => {
-                        state.batch = None;
+                        state.tasks.active = None;
                     }
                     _ => {}
                 }
@@ -2259,6 +2299,8 @@ fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>, config: &App
 | `Done` | `BatchCompleted` / `BatchCancelled` / `Error` | **enabled** | "Start ▸" (re-arms, transitions back to `Analyzing`) | hidden | "BATCH #1 · N encoded / M skipped / 0 failed" |
 
 **No auto-switch**:用户在 `[SETUP]` 页面点 Start 后,**UI 不自动切换**到 `[TASK]` 页(per §3.8.7.1 product-lens review 反馈——之前的 auto-switch 会把误选目录的用户困在 TASK 页,recovery 需要等分析结束 + 取消 + 切回 SETUP)。Batch 在后台跑,UI 停留在 `[SETUP]`;用户看到 SettingsPanel 下方的 phase 状态变化或自己点 `[TASK]` tab 看进度。Dir picker 锁仍然生效(per `None / AwaitingConfirm` 的 phase 规则)。
+
+**TaskQueue capacity** (v1: 1, v1.1: N):guard 走 `tasks.active.is_some() || tasks.pending.len() >= tasks.capacity`,**不**走 batch id 比较(per review 反馈 ——task 是 gating unit,batch id 只是映射字段)。v1 capacity = 1 意味着最多一个 active task——空 queue 时 `UserClickedStart` 派 DryRun(填 `tasks.active`);active 非空 + phase != Done 时,start 被拒(reducer 设 `last_error`)。v1.1 提升 capacity 到 N 后,多余的 task push 进 `tasks.pending`(FIFO),active 完成时 promote。详见 §3.8.7 `TaskQueue` 结构。
 
 **Cancel during Analyzing** 是 v1 限制(`§3.8.7.4`):lib 的 `Command::Analyze` handler 跑 `analyze_records_with_probe_and_progress_parallel` 全程不轮询 cancel_token,所以 UI 派 `Command::Cancel` 时 lib 不真正中断分析。`Event::AnalyzeFinished` 仍会到达,UI 把它当正常结果处理(显示完整 records)。v1.1 在 analyze handler 里加 cancel_token 轮询。
 
@@ -2320,7 +2362,7 @@ fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>, config: &App
 | `[SETUP]` | `SettingsPanel` | `config` | 只读 `[encode]` key/value list |
 | `[TASK]` | `BatchStatus` | `state` | BATCH #N + phase badge + 12 files / 10 encode / 2 skipped 列表 |
 | `[TASK]` | `ProgressPanel` | `state` | 进度条 + per-file table(Encoding 时) |
-| `[TASK]` | `TaskPlanPanel` (NEW,替换 `DryRunPanel`) | `state.batch.dry_run_records` | post-DryRun 的 file list,per-file outcome 标签(ENCODE / SKIP / FAIL) |
+| `[TASK]` | `TaskPlanPanel` (NEW,替换 `DryRunPanel`) | `tasks.active.dry_run_records` | post-DryRun 的 file list,per-file outcome 标签(ENCODE / SKIP / FAIL) |
 | `[HISTORY]` | `HistoryPanel` | `state.history` | history records 表 |
 | `[LOG]` | `LogPanel` (full version) | `state.log` | 全 1000 行 scrollback |
 
@@ -2396,7 +2438,6 @@ fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>, config: &App
 |----|------|------|
 | Dir picker 锁 during whole batch lifecycle | v1:dir picker 在 `Analyzing` / `AwaitingConfirm` / `Encoding` 期间都被 disable(per §3.8.7.1),防止用户对 in-flight task 换目录 | v1.1 解锁 Encoding 期间的 picker(per spec point 6)——允许选下一个目录排队 |
 | Cancel during Analyzing 是 best-effort | lib 的 `Command::Analyze` handler 不轮询 cancel_token,UI 发 `Command::Cancel` 时 lib 不真正中断。`Event::AnalyzeFinished` 仍到达并被 reducer 当正常结果处理 | v1.1 在 analyze handler 里加 cancel_token 轮询 |
-| Batch id 永远是 1(v1) | `BatchInfo.id` 是 lib `Event::BatchStarted.id` 的镜像,但 v1 只有单 batch(no counter),所以一直是 1 | v1.1 真正启用 counter,允许多 batch 并存 |
 | `state.analyze_progress` / `state.analyze_results` 字段保留但未 populate | workflow 改造后 Start 自动调 `Command::DryRun`(不是 `Command::Analyze`),analyze state 字段未 populate。代码里还在(`#[allow(dead_code)]`),变成 dead field——AppState 代码块里保留定义以备 v1.1 / U22 重启用 | v1.1 移除 dead 字段 + 删除对应 `Event::Analyze*` reducer arm |
 | `UserClickedLoadHistory` 自动派 on app start | app 启动时 `use_hook` 派一次(per §3.8.7.2 history page);但目前没有显式 init code,history 是空直到用户手动 reload | v1.1 在 `use_hook` 里加 `cmd_tx.send(Command::LoadHistory { limit: Some(100), after: None })` |
 | Settings 只读 | `[SETUP]` 页 settings 只显示 `[encode]` 当前值;不支持 inline edit | v1.2 加 inline edit 模式(`<input type="number">` for crf 等)+ dispatch `Command::SaveConfig` |
@@ -2627,7 +2668,7 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 35 | §3.8 GUI 范围 Unix-only（matches §1.3）；wry/Dioxus 非 Unix 支持 deferred | ✅ |
 | 36 | `ErrorCategory` 加 `#[non_exhaustive]`（U21，对齐 `Command` / `Event`）；`Event::Error` 故意只带 `(category, message)` 不带 stderr_tail | ✅ |
 | 37 | `ErrorContext` 加 `#[non_exhaustive]`（U21，对齐 `ErrorCategory`）；外部 crate 不可构造,字段读取仍可 | ✅ |
-| 38 | §3.8.7 定义 `BatchInfo` / `ProgressInfo` / `LogLine` 三个 UI state struct,让 reducer 可独立 unit-test | ✅ |
+| 38 | §3.8.7 定义 `TaskInfo` / `TaskQueue` / `TaskId` / `ProgressInfo` / `LogLine` UI state struct,让 reducer 可独立 unit-test | ✅ |
 | 39 | `Command::LoadHistory` 不带 path 字段；controller 用 `config::path::resolve_data_dir()` 自解析（honors `$RENENCODER_DATA_DIR`,v1.1 启用） | ✅ |
 | 40 | Partial-output 检测(U21)：output duration < source - 1s → partial → 删 + 重转；probe 失败视作 partial；删除失败 → `Skipped(PartialOutput)` | ✅ |
 | 41 | CLI encode summary 增加 `PartialSkip` 独立分类(`PartialOutput` 不计入 `Skipped` 也不计入 `Failed`) | ✅ |
