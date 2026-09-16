@@ -2522,6 +2522,84 @@ CLI 和 GUI 共享同一份 `rencoder.toml`（§1.2）和同一份 lib 实现：
 - **GUI 路径**：发 `Command` → 收 `Event` → reducer → 渲染。
 - 两条路径都触发 Parquet 写入；GUI 加载历史 = 读 Parquet（同一文件路径）。
 
+#### 3.8.7.5 Unified log pipeline (UI side)
+
+> **TL;DR** — lib 用 `log` facade 发事件;两个 binary 各自 init
+> `tracing-log::LogTracer` + 自己的 tracing subscriber。CLI 写到
+> stderr + 文件;UI 写到 `crossbeam_channel::Sender<LogLine>` → 专用
+> drain thread → `state.log`,footer / `[LOG]` 页统一显示。
+
+**Why this architecture**: lib 不知道也不该知道是哪个 binary 在消费
+log——`log` facade 是标准做法,`tracing-log` 是 bridge。两个 binary
+各装各的 subscriber,各自的 sink。Lib 一行代码不改。
+
+**Flow**:
+
+```
+         lib (log::info! / log::warn!)
+                  │
+                  ▼ tracing-log::LogTracer::init() (per-binary)
+                  │
+                  ▼
+       ┌──────────┴──────────┐
+       ▼                     ▼
+   CLI subscriber        UI subscriber
+       │                     │
+ ┌─────┴─────┐                ▼
+ stderr  file sink    MakeWriter (custom)
+                         │
+                         ▼ crossbeam_channel::Sender<LogLine>
+                                  │
+                                  ▼
+                         dedicated log drain thread
+                                  │
+                                  ▼
+                         state.with_mut(|s| {
+                             s.log.push_back(LogLine { ... })
+                         })
+                                  │
+                                  ▼
+                     footer log (last 5) + [LOG] page (last 1000)
+                     (also receives Event::LogLine from ffmpeg stderr
+                      via the lib's main event channel)
+```
+
+**Two sources, one VecDeque**:
+
+- `Event::LogLine { file_index, line }` = ffmpeg stderr per file
+  (per-batch context, 1 line per stderr chunk)
+- tracing events from lib = lib internal logging
+  ("task skipped: source codec matches target",
+  "nvidia-smi unavailable", "processing task N/M" etc.)
+  - 这些**没有 file context** —— `LogLine.file_index` 用 `usize::MAX` sentinel
+  - 渲染时显示 `(global)` 而不是 `[N]`
+
+`LogSource` enum 区分这两类,方便后续 v1.2 给 lib events 加视觉
+区分(颜色 / icon),不影响 log panel 的合并显示。
+
+**Threading model**:
+
+- Lib 的 log 事件从 lib 内部线程发出(actor thread + rayon worker threads)
+- `crossbeam_channel` 是 MPMC,任意线程可 send
+- UI 端一个专用 drain thread 阻塞 `recv()`,push 到 state.log
+- state.log 的 `VecDeque<LogLine>` 用 `with_mut` 写,触发 Dioxus 响应式 re-render
+
+**v1 不做的**:
+
+- Visual 区分 ffmpeg stderr vs lib internal(都用同一灰底色)
+  —— v1.2 加 color / icon
+- Filter controls(hide lib events / only show errors)—— v1.2
+- Persist log to disk on UI side(CLI 的 file sink 不覆盖 UI;
+  UI session 退出即丢;CLI 不受影响)—— v1.2 if needed
+
+**Why not just write tracing events to stderr from the UI?** —
+stderr 不适合 desktop app(GUI 程序没控制台)。Sink 必须接到 UI
+state,才能在 footer / `[LOG]` 页显示。custom `MakeWriter` 把
+`tracing_subscriber::fmt::Layer` 接到 `crossbeam_channel` 是最小
+开销的方案。
+
+#### 3.8.8 与 §3.4 CLI 前端的关系
+
 ### 3.9 UI 运行时 / Dioxus 适配
 
 > **TL;DR** — 禁用 `use_coroutine` 消费 `crossbeam` 事件(阻塞 `recv()` 会
