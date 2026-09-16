@@ -1861,9 +1861,16 @@ struct AppState {
     /// Session 内已完成任务的索引(newest-first)。Done transition 时
     /// reducer 从 `tasks.active` 取出 task,**保留 TaskId**,insert
     /// 到这里——queue 和 history 共享同一 ID 空间,跨两者的查找用
-    /// 同一 TaskId 即可。**进程退出时丢失**(纯内存)。
-    /// `state.history: Vec<EncodingRecord>` 是不同概念——从 Parquet
-    /// 读的历史记录,cross-session 持久化;v1.1 启用。
+    /// 同一 TaskId 即可。
+    ///
+    /// **重要**: `task_history` 是 session 内 UX 缓存,**不是**记录
+    /// 的 primary store。Per-file 的 EncodingRecord 已经由 lib 在
+    /// `BatchCompleted` 时写入 Parquet(`encoding-*.parquet`),v1.1
+    /// `Command::LoadHistory` 启动时 reload 到 `state.history`。
+    /// 所以 v1 "进程退出时 task_history 丢失" 不是数据丢失——
+    /// records 在 Parquet 里,只是 session 内 task 维度的导航 cache
+    /// 没了。v1.1 加 cross-session task 导航(把 Parquet records
+    /// group by batch_id 渲染成 TaskInfo 形态)即可。
     task_history: Vec<TaskInfo>,
     /// 当前 active page tab(`§3.8.7.2`)。`Setup` 是 app 启动默认值;
     /// 4 个 page 之间不自动切换(用户手动点 tab)。在 `[SETUP]` 点
@@ -1995,6 +2002,14 @@ struct TaskInfo {
 /// Start 后 Cancel 又 Start)用 `-N` 后缀区分——`20260916142301`,
 /// `20260916142301-1`, `20260916142301-2`。reducer 维护一个
 /// `current_second_counts: HashMap<String, usize>` 来分配后缀。
+///
+/// **Scope**: `TaskId` 只在 session 内唯一。Cross-session 不需要
+/// 唯一——`state.history` 通过 Parquet reload 拿到 EncodingRecord
+/// 列表,每条 record 带 `batch_id`(lib-side 计数,重启清零),v1.1
+/// 按 batch_id group by 渲染成 TaskInfo 视图。所以**不**需要
+/// 跨进程跨重启的 TaskId 全局唯一,也不需要把 task_history 写到
+/// 另一个 SQLite / JSONL store——现有的 Parquet 已经是数据后端
+/// (per review 反馈,避免引入新 store 类型)。
 ///
 /// **Why not u64 counter**: u64 counter 也行(单调递增,简单),但
 /// timestamp 形式对用户可读(看 TaskId 就知道任务大概什么时候开始),
@@ -2487,7 +2502,7 @@ fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>, config: &App
 | Cancel during Analyzing 是 best-effort | lib 的 `Command::Analyze` handler 不轮询 cancel_token,UI 发 `Command::Cancel` 时 lib 不真正中断。`Event::AnalyzeFinished` 仍到达并被 reducer 当正常结果处理 | v1.1 在 analyze handler 里加 cancel_token 轮询 |
 | `state.analyze_progress` / `state.analyze_results` 字段保留但未 populate | workflow 改造后 Start 自动调 `Command::DryRun`(不是 `Command::Analyze`),analyze state 字段未 populate。代码里还在(`#[allow(dead_code)]`),变成 dead field——AppState 代码块里保留定义以备 v1.1 / U22 重启用 | v1.1 移除 dead 字段 + 删除对应 `Event::Analyze*` reducer arm |
 | `UserClickedLoadHistory` 自动派 on app start | app 启动时 `use_hook` 派一次(per §3.8.7.2 history page);但目前没有显式 init code,history 是空直到用户手动 reload | v1.1 在 `use_hook` 里加 `cmd_tx.send(Command::LoadHistory { limit: Some(100), after: None })` |
-| `task_history` 进程退出即丢失 | `task_history: Vec<TaskInfo>` 只在内存里——session 结束(关 GUI / 进程 crash)后所有 Done 任务都没了。`state.history` (Parquet) 是不同概念,cross-session 持久化 | v1.1 把 task_history 通过 SQLite/JSONL 持久化到 `<app_dir>/data/task-history.jsonl`,启动时 reload |
+| Cross-session task 导航缺失 | `task_history` 是 session 内 cache(进程退出即丢);`state.history` 是 cross-session 但以 per-file EncodingRecord 为单位。**没有** task 维度的 cross-session 视图——v1 看不到昨天跑的 batch 用了哪个 dir / 多少文件 | v1.1 启动时 load Parquet records → group by batch_id → 渲染成 TaskInfo 列表。数据后端已经是 Parquet(`encoding-*.parquet`),不引新 store |
 | Settings 只读 | `[SETUP]` 页 settings 只显示 `[encode]` 当前值;不支持 inline edit | v1.2 加 inline edit 模式(`<input type="number">` for crf 等)+ dispatch `Command::SaveConfig` |
 
 **v1 安全保证**(从 v1.1 deferred 提前到 v1 实现,per §3.8.7 product-lens / scope-guardian review 反馈):
