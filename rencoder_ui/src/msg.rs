@@ -308,11 +308,6 @@ pub enum Msg {
     /// start deferred.
     #[allow(dead_code)]
     UserClickedLoadHistory,
-    /// Save the loaded AppConfig back to its original path.
-    /// Wired by Save button (v1: removed — see §3.8.7.2; kept
-    /// for v1.1).
-    #[allow(dead_code)]
-    UserClickedSaveSettings,
     /// User clicked a top-bar tab. Reducer writes
     /// `state.active_page`. No lib command.
     UserClickedTab(Page),
@@ -353,9 +348,15 @@ pub fn reduce(
         Msg::UserSelectedDir(path) => {
             if let Some(t) = &state.tasks.active {
                 if !matches!(t.phase, BatchPhase::Done) {
+                    // P2.5 fix: silently rejected (active task).
+                    // Don't keep a stale last_error on screen —
+                    // clear it so the user isn't misled by an
+                    // error from an earlier action.
+                    state.last_error = None;
                     return;
                 }
             }
+            state.last_error = None;
             state.input_dir = Some(path);
         }
         Msg::UserClickedStart => {
@@ -384,10 +385,37 @@ pub fn reduce(
                     dispatch_dry_run_for_new_task(state, cmd_tx, config);
                 }
                 Some(BatchPhase::AwaitingConfirm) => {
-                    let params = build_encode_params_from_config(config);
-                    let Some(files) = collect_input_files(state, config) else {
-                        return;
+                    // Validate the directory is still readable and
+                    // non-empty before dispatching StartBatch. The
+                    // user might have emptied/deleted the dir
+                    // between DryRun and Confirm — the original
+                    // code dispatched StartBatch with 0 files, which
+                    // the lib would error on with no UI feedback.
+                    let files = match collect_input_files(state, config) {
+                        Ok(files) => files,
+                        Err(CollectError::NoInputDir) => {
+                            // No dir anymore (shouldn't happen —
+                            // the active task's dir is still set).
+                            return;
+                        }
+                        Err(CollectError::UnreadableDir) => {
+                            let dir = state.tasks.active.as_ref().unwrap().dir.display();
+                            state.last_error = Some(format!(
+                                "cannot read {} (permission denied or path missing)",
+                                dir
+                            ));
+                            return;
+                        }
                     };
+                    if files.is_empty() {
+                        let dir = state.tasks.active.as_ref().unwrap().dir.display();
+                        state.last_error = Some(format!(
+                            "no files in {} (file list changed since DryRun)",
+                            dir
+                        ));
+                        return;
+                    }
+                    let params = build_encode_params_from_config(config);
                     if let Some(t) = state.tasks.active.as_mut() {
                         t.phase = BatchPhase::Encoding;
                         t.records.clear();
@@ -409,7 +437,22 @@ pub fn reduce(
                     let _ = cmd_tx.send(Command::Cancel);
                 }
                 Some(BatchPhase::AwaitingConfirm) => {
-                    state.tasks.active = None;
+                    // P2.7 fix: keep the cancelled plan in history
+                    // (with `cancelled = true`) so the user has a
+                    // record of "I planned X but cancelled". Without
+                    // this, cancelling a plan silently vanishes with
+                    // no audit trail.
+                    if let Some(mut t) = state.tasks.active.take() {
+                        t.cancelled = true;
+                        // `finished` stays false — that flag is
+                        // reserved for tasks that actually ran.
+                        // Phase stays at AwaitingConfirm so the user
+                        // can see "this was a cancelled plan" vs
+                        // "this finished encoding". History renderer
+                        // can colour-code based on phase if needed.
+                        state.task_history.insert(0, t);
+                    }
+                    state.viewing_task = None;
                 }
                 None | Some(BatchPhase::Done) => {}
             }
@@ -419,9 +462,6 @@ pub fn reduce(
                 limit: Some(100),
                 after: None,
             });
-        }
-        Msg::UserClickedSaveSettings => {
-            let _ = cmd_tx.send(Command::SaveConfig);
         }
         Msg::UserClickedTab(page) => {
             state.active_page = page;
@@ -522,8 +562,12 @@ fn apply_event(state: &mut AppState, evt: Event) {
             // U22 standalone Analyze no longer used by the UI
             // (Start auto-DryRun subsumes it). Silently drop.
         }
-        Event::ConfigSaved { path } => {
-            state.last_error = Some(format!("saved to {}", path.display()));
+        Event::ConfigSaved { .. } => {
+            // Save button was removed in the §3.8.7.2 redesign;
+            // if the lib ever emits this event (e.g., a future
+            // SaveConfig dispatch), we ignore it. v1.2 will wire
+            // this to a dedicated `state.last_success` field or a
+            // success banner UI element.
         }
         Event::FileCompleted { record, .. } => {
             if let Some(t) = state.tasks.active.as_mut() {
@@ -541,6 +585,10 @@ fn apply_event(state: &mut AppState, evt: Event) {
                 t.phase = BatchPhase::Done;
                 state.task_history.insert(0, t);
             }
+            // P2.4 fix: clear viewing_task so the TaskPage falls
+            // back to history.first() instead of pointing at a
+            // task that's no longer in active.
+            state.viewing_task = None;
             state.progress.clear();
         }
         Event::BatchCancelled { completed, total } => {
@@ -551,6 +599,7 @@ fn apply_event(state: &mut AppState, evt: Event) {
                 t.phase = BatchPhase::Done;
                 state.task_history.insert(0, t);
             }
+            state.viewing_task = None;
             state.last_error = Some(format!("cancelled after {completed}/{total}"));
         }
         Event::LogLine { file_index, line } => {
@@ -580,9 +629,11 @@ fn apply_event(state: &mut AppState, evt: Event) {
                     t.finished = true;
                     t.phase = BatchPhase::Done;
                     state.task_history.insert(0, t);
+                    state.viewing_task = None;
                 }
                 Some(t) if matches!(t.phase, BatchPhase::Analyzing) => {
                     drop(t);
+                    state.viewing_task = None;
                 }
                 Some(t) => {
                     state.tasks.active = Some(t);
@@ -606,33 +657,54 @@ fn build_encode_params_from_config(
     rencoder_lib::types::EncodeParams::from_encode_config(config.encode.as_ref())
 }
 
+/// Errors that `collect_input_files` can return. Distinguishes
+/// "user hasn't picked a directory" from "directory is unreadable"
+/// (permission denied / path doesn't exist / filesystem error)
+/// from "directory is empty / no files match extensions". The old
+/// `Option<Vec<PathBuf>>` API conflated "None" with all of these,
+/// leading to generic "no files in X" errors even when the real
+/// issue was I/O.
+#[derive(Debug)]
+enum CollectError {
+    /// `state.input_dir` is None. User hasn't picked a directory.
+    NoInputDir,
+    /// `std::fs::read_dir` failed (permission denied, not found,
+    /// or other I/O error). The user gets a distinct error message
+    /// so they can fix permissions / path.
+    UnreadableDir,
+}
+
 /// Collect input files from `state.input_dir`, filtered by the
 /// configured extensions from `config.encode.extensions`
 /// (empty = all).
 ///
-/// Returns `None` if no input dir is selected; otherwise returns
-/// the file list (possibly empty). Caller decides action-specific
-/// empty-dir error message.
+/// Returns `Err(NoInputDir)` if no directory is selected;
+/// `Err(UnreadableDir)` on I/O error; `Ok(vec)` otherwise (the
+/// vec may be empty if the directory has no matching files —
+/// callers handle that as a distinct "no files" condition).
 fn collect_input_files(
     state: &AppState,
     config: &rencoder_lib::config::app::AppConfig,
-) -> Option<Vec<PathBuf>> {
-    let dir = state.input_dir.as_ref()?;
+) -> Result<Vec<PathBuf>, CollectError> {
+    let Some(dir) = state.input_dir.as_ref() else {
+        return Err(CollectError::NoInputDir);
+    };
     let extensions = config
         .encode
         .as_ref()
         .and_then(|e| e.extensions.clone())
         .unwrap_or_default();
-    let files: Vec<_> = std::fs::read_dir(dir)
-        .map(|rd| {
-            rd.flatten()
-                .map(|e| e.path())
-                .filter(|p| p.is_file())
-                .filter(|p| extension_matches(p, &extensions))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    Some(files)
+    let read_dir = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return Err(CollectError::UnreadableDir),
+    };
+    let files: Vec<_> = read_dir
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .filter(|p| extension_matches(p, &extensions))
+        .collect();
+    Ok(files)
 }
 
 /// Check whether a path's extension matches any of the user's
@@ -669,14 +741,20 @@ fn dispatch_dry_run_for_new_task(
     cmd_tx: &crossbeam_channel::Sender<Command>,
     config: &rencoder_lib::config::app::AppConfig,
 ) {
-    if state.input_dir.is_none() {
-        state.last_error = Some("no input dir selected".into());
-        return;
-    }
-    let params = build_encode_params_from_config(config);
-    let Some(files) = collect_input_files(state, config) else {
-        state.last_error = Some("no input dir selected".into());
-        return;
+    let files = match collect_input_files(state, config) {
+        Ok(files) => files,
+        Err(CollectError::NoInputDir) => {
+            state.last_error = Some("no input dir selected".into());
+            return;
+        }
+        Err(CollectError::UnreadableDir) => {
+            let dir = state.input_dir.as_deref().unwrap_or(Path::new("?"));
+            state.last_error = Some(format!(
+                "cannot read {} (permission denied or path missing)",
+                dir.display()
+            ));
+            return;
+        }
     };
     if files.is_empty() {
         let extensions = config
@@ -699,6 +777,7 @@ fn dispatch_dry_run_for_new_task(
         state.last_error = Some(detail);
         return;
     }
+    let params = build_encode_params_from_config(config);
     state.last_error = None;
     state.progress.clear();
     state.log.clear();
@@ -915,6 +994,144 @@ mod tests {
                 "re-arm must not trigger spurious 'task queue full'"
             );
         }
+    }
+
+    #[test]
+    fn awaiting_confirm_with_empty_dir_records_error_no_dispatch() {
+        // P1.2 fix: between DryRun and Confirm, the user could
+        // empty/delete the directory. The old code dispatched
+        // StartBatch with 0 files, which the lib would error on
+        // with no UI feedback. Now the reducer validates the dir
+        // is still readable + non-empty before dispatching.
+        let mut state = fresh_state();
+        let tx = cmd_tx();
+        state.tasks.active = Some(TaskInfo {
+            task_id: TaskId("20260101000000".into()),
+            batch_id: None,
+            phase: BatchPhase::AwaitingConfirm,
+            dir: PathBuf::from("/y"), // dir doesn't exist (read_dir errors)
+            total_files: 1,
+            to_encode: 1,
+            to_skip: 0,
+            encoded: 0,
+            cancelled: false,
+            finished: false,
+            records: vec![],
+            dry_run_records: vec![],
+        });
+        state.input_dir = Some(PathBuf::from("/y"));
+        reduce(&mut state, Msg::UserClickedStart, &tx, &default_config());
+        // Phase should still be AwaitingConfirm — Confirm was rejected.
+        assert_eq!(
+            state.tasks.active.as_ref().unwrap().phase,
+            BatchPhase::AwaitingConfirm
+        );
+        // last_error should mention the unreadable dir.
+        let err = state.last_error.expect("expected last_error to be set");
+        assert!(
+            err.contains("cannot read") || err.contains("no files"),
+            "unexpected last_error: {err}"
+        );
+    }
+
+    #[test]
+    fn cancel_during_awaiting_confirm_keeps_plan_in_history() {
+        // P2.7 fix: cancelling a plan should leave an audit trail
+        // in task_history (with `cancelled = true`) instead of
+        // silently vanishing.
+        let mut state = fresh_state();
+        let tx = cmd_tx();
+        let task_id = TaskId("20260101000000".into());
+        state.tasks.active = Some(TaskInfo {
+            task_id: task_id.clone(),
+            batch_id: None,
+            phase: BatchPhase::AwaitingConfirm,
+            dir: PathBuf::from("/x"),
+            total_files: 3,
+            to_encode: 2,
+            to_skip: 1,
+            encoded: 0,
+            cancelled: false,
+            finished: false,
+            records: vec![],
+            dry_run_records: vec![],
+        });
+        reduce(&mut state, Msg::UserClickedCancel, &tx, &default_config());
+        assert!(state.tasks.active.is_none());
+        assert_eq!(state.task_history.len(), 1);
+        let h = &state.task_history[0];
+        assert_eq!(h.task_id, task_id);
+        assert!(h.cancelled);
+        assert!(!h.finished); // finished reserved for actually-completed tasks
+        assert_eq!(state.viewing_task, None);
+    }
+
+    #[test]
+    fn user_selected_dir_rejected_clears_stale_error() {
+        // P2.5 fix: when picker is rejected (active task in
+        // Analyzing/Encoding), clear any stale last_error so the
+        // user doesn't see an error from an earlier action.
+        let mut state = fresh_state();
+        let tx = cmd_tx();
+        state.tasks.active = Some(TaskInfo {
+            task_id: TaskId("20260101000000".into()),
+            batch_id: None,
+            phase: BatchPhase::Encoding,
+            dir: PathBuf::from("/x"),
+            total_files: 5,
+            to_encode: 5,
+            to_skip: 0,
+            encoded: 0,
+            cancelled: false,
+            finished: false,
+            records: vec![],
+            dry_run_records: vec![],
+        });
+        state.last_error = Some("previous unrelated error".into());
+        reduce(
+            &mut state,
+            Msg::UserSelectedDir(PathBuf::from("/y")),
+            &tx,
+            &default_config(),
+        );
+        // Picker was rejected; stale error should be cleared.
+        assert!(state.last_error.is_none());
+        assert_eq!(state.input_dir, None);
+    }
+
+    #[test]
+    fn batch_completed_clears_viewing_task() {
+        // P2.4 fix: after Done transition, viewing_task should
+        // not point to the (now-history) task. TaskPage falls
+        // back to history.first() instead.
+        let mut state = fresh_state();
+        let tx = cmd_tx();
+        let task_id = TaskId("20260101000000".into());
+        state.tasks.active = Some(TaskInfo {
+            task_id: task_id.clone(),
+            batch_id: Some(1),
+            phase: BatchPhase::Encoding,
+            dir: PathBuf::from("/x"),
+            total_files: 2,
+            to_encode: 2,
+            to_skip: 0,
+            encoded: 2,
+            cancelled: false,
+            finished: false,
+            records: vec![],
+            dry_run_records: vec![],
+        });
+        state.viewing_task = Some(task_id.clone());
+        reduce(
+            &mut state,
+            Msg::Lib(Event::BatchCompleted { records: vec![] }),
+            &tx,
+            &default_config(),
+        );
+        assert!(state.tasks.active.is_none());
+        assert_eq!(state.viewing_task, None);
+        assert_eq!(state.task_history.len(), 1);
+        assert_eq!(state.task_history[0].task_id, task_id);
     }
 
     #[test]
