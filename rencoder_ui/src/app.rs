@@ -41,9 +41,7 @@ use crossbeam_channel::Sender;
 use rencoder_lib::config::app::AppConfig;
 use rencoder_lib::job::{start_controller, Command};
 
-use crate::msg::{
-    reduce, AppState, BatchPhase, Msg, Page, TaskId, TaskQueue,
-};
+use crate::msg::{reduce, AppState, BatchPhase, Msg, Page, TaskId, TaskQueue};
 use crate::tracing_init;
 
 /// CSS inlined as a `<style>` child of the root div via Dioxus's
@@ -99,9 +97,7 @@ pub fn App() -> Element {
                     while let Ok(line) = log_rx.recv() {
                         let cfg = config_for_log.read().clone();
                         if let Some(tx) = cmd_tx_for_log.read().clone() {
-                            state_for_log.with_mut(|s| {
-                                reduce(s, Msg::LibLogLine(line), &tx, &cfg)
-                            });
+                            state_for_log.with_mut(|s| reduce(s, Msg::LibLogLine(line), &tx, &cfg));
                         }
                     }
                 })

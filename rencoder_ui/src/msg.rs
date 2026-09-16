@@ -177,6 +177,13 @@ impl TaskQueue {
 
     /// True iff a new task can be started (capacity has room).
     /// v1 with capacity=1: returns true only when `active` is None.
+    ///
+    /// **Not** currently called by the reducer — the `None` arm of
+    /// `UserClickedStart` knows `active` is `None` (so trivially
+    /// has room) and the `Some(Done)` re-arm arm overwrites
+    /// `active` after taking. v1.1 multi-task will need this
+    /// check back (when capacity > 1 and pending exists).
+    #[allow(dead_code)]
     pub fn has_room(&self) -> bool {
         let total = (self.active.is_some() as usize) + self.pending.len();
         total < self.capacity
@@ -251,7 +258,7 @@ pub struct LogLine {
     /// - `LibInternal`: lib's `log::info!` / `log::warn!` events,
     ///   bridged to tracing and pushed to the UI
     #[allow(dead_code)] // populated but v1 doesn't differentiate visually;
-                        // v1.2 will use this for color coding
+    // v1.2 will use this for color coding
     pub source: LogSource,
     pub line: String,
     pub at: DateTime<Utc>,
@@ -265,7 +272,7 @@ pub const NO_FILE_INDEX: usize = usize::MAX;
 
 /// Origin of a `LogLine` (§3.8.7.5 unified log pipeline).
 #[allow(dead_code)] // v1: visually treated the same as ffmpeg stderr;
-                    // v1.2 will use this to color-code the log line
+// v1.2 will use this to color-code the log line
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogSource {
     /// Per-file ffmpeg stderr line (`Event::LogLine`). Has a
@@ -354,66 +361,27 @@ pub fn reduce(
         Msg::UserClickedStart => {
             let phase = state.tasks.active.as_ref().map(|t| t.phase);
             match phase {
-                None | Some(BatchPhase::Done) => {
-                    // Capacity check (v1: capacity=1, only fires
-                    // when active is None, so always true here).
-                    if !state.tasks.has_room() {
-                        state.last_error = Some("task queue full".into());
-                        return;
+                None => {
+                    // No active task. Start fresh.
+                    dispatch_dry_run_for_new_task(state, cmd_tx, config);
+                }
+                Some(BatchPhase::Done) => {
+                    // Active task is Done — user is re-arming.
+                    // Take the previous task out (it should already
+                    // be in task_history from apply_event, but the
+                    // take is defensive in case Some(Done) ever
+                    // surfaces without a prior move). Then start
+                    // fresh.
+                    //
+                    // **Do not** call `tasks.has_room()` here —
+                    // v1 capacity=1 means has_room returns false
+                    // whenever active.is_some() = true, which would
+                    // wrongly block re-arming with a "task queue
+                    // full" error.
+                    if let Some(prev) = state.tasks.active.take() {
+                        state.task_history.insert(0, prev);
                     }
-                    if state.input_dir.is_none() {
-                        state.last_error = Some("no input dir selected".into());
-                        return;
-                    }
-                    let params = build_encode_params_from_config(config);
-                    let Some(files) = collect_input_files(state, config) else {
-                        state.last_error = Some("no input dir selected".into());
-                        return;
-                    };
-                    if files.is_empty() {
-                        let extensions = config
-                            .encode
-                            .as_ref()
-                            .and_then(|e| e.extensions.clone())
-                            .unwrap_or_default();
-                        let detail = if extensions.is_empty() {
-                            format!(
-                                "no files in {}",
-                                state.input_dir.as_ref().unwrap().display()
-                            )
-                        } else {
-                            format!(
-                                "no files in {} matching extensions {:?}",
-                                state.input_dir.as_ref().unwrap().display(),
-                                extensions
-                            )
-                        };
-                        state.last_error = Some(detail);
-                        return;
-                    }
-                    state.last_error = None;
-                    state.progress.clear();
-                    state.log.clear();
-
-                    let task_id = state.tasks.next_task_id();
-                    let dir = state.input_dir.clone().unwrap();
-                    let total_files = files.len();
-                    state.tasks.active = Some(TaskInfo {
-                        task_id: task_id.clone(),
-                        batch_id: None,
-                        phase: BatchPhase::Analyzing,
-                        dir,
-                        total_files,
-                        to_encode: 0,
-                        to_skip: 0,
-                        encoded: 0,
-                        cancelled: false,
-                        finished: false,
-                        records: Vec::new(),
-                        dry_run_records: Vec::new(),
-                    });
-                    state.viewing_task = Some(task_id);
-                    let _ = cmd_tx.send(Command::DryRun { params, files });
+                    dispatch_dry_run_for_new_task(state, cmd_tx, config);
                 }
                 Some(BatchPhase::AwaitingConfirm) => {
                     let params = build_encode_params_from_config(config);
@@ -684,6 +652,78 @@ fn extension_matches(path: &Path, extensions: &[String]) -> bool {
     })
 }
 
+/// Dispatch a `Command::DryRun` for a freshly-created task (None or
+/// Done re-arm). Caller is responsible for ensuring `tasks.active`
+/// is `None` before calling (the reducer's `Some(Done)` arm does
+/// `tasks.active.take()` first).
+///
+/// Sets `state.last_error` and returns early on:
+/// - no input dir selected
+/// - empty file list (with extension-aware hint)
+///
+/// On success: creates a new `TaskInfo` with phase=Analyzing,
+/// pushes to `tasks.active`, sets `viewing_task`, clears
+/// `progress`/`log`, dispatches `Command::DryRun`.
+fn dispatch_dry_run_for_new_task(
+    state: &mut AppState,
+    cmd_tx: &crossbeam_channel::Sender<Command>,
+    config: &rencoder_lib::config::app::AppConfig,
+) {
+    if state.input_dir.is_none() {
+        state.last_error = Some("no input dir selected".into());
+        return;
+    }
+    let params = build_encode_params_from_config(config);
+    let Some(files) = collect_input_files(state, config) else {
+        state.last_error = Some("no input dir selected".into());
+        return;
+    };
+    if files.is_empty() {
+        let extensions = config
+            .encode
+            .as_ref()
+            .and_then(|e| e.extensions.clone())
+            .unwrap_or_default();
+        let detail = if extensions.is_empty() {
+            format!(
+                "no files in {}",
+                state.input_dir.as_ref().unwrap().display()
+            )
+        } else {
+            format!(
+                "no files in {} matching extensions {:?}",
+                state.input_dir.as_ref().unwrap().display(),
+                extensions
+            )
+        };
+        state.last_error = Some(detail);
+        return;
+    }
+    state.last_error = None;
+    state.progress.clear();
+    state.log.clear();
+
+    let task_id = state.tasks.next_task_id();
+    let dir = state.input_dir.clone().unwrap();
+    let total_files = files.len();
+    state.tasks.active = Some(TaskInfo {
+        task_id: task_id.clone(),
+        batch_id: None,
+        phase: BatchPhase::Analyzing,
+        dir,
+        total_files,
+        to_encode: 0,
+        to_skip: 0,
+        encoded: 0,
+        cancelled: false,
+        finished: false,
+        records: Vec::new(),
+        dry_run_records: Vec::new(),
+    });
+    state.viewing_task = Some(task_id);
+    let _ = cmd_tx.send(Command::DryRun { params, files });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -818,6 +858,63 @@ mod tests {
             Some("task in progress"),
             "second Start click during Analyzing should be rejected"
         );
+    }
+
+    #[test]
+    fn user_clicked_start_rearms_after_done() {
+        // Per review feedback: when the previous task is Done,
+        // clicking Start should NOT trigger a spurious "task queue
+        // full" error. The fix: take the done task out of active
+        // (push to history as a defensive fallback) and start
+        // fresh. The has_room() check inside the Some(Done) arm
+        // was the bug — it returned false because active.is_some()
+        // was true (capacity=1, no pending), even though the task
+        // was done and we wanted to overwrite it.
+        //
+        // Use /tmp as input_dir (real dir that should exist on
+        // Unix-like test envs). Even if /tmp is empty, the test
+        // still verifies the *re-arm path* doesn't trigger
+        // "task queue full" — last_error will be the empty-file
+        // warning instead.
+        let mut state = fresh_state();
+        let tx = cmd_tx();
+        let prev_id = TaskId("20260101000000".into());
+        state.tasks.active = Some(TaskInfo {
+            task_id: prev_id.clone(),
+            batch_id: Some(1),
+            phase: BatchPhase::Done,
+            dir: PathBuf::from("/x"),
+            total_files: 5,
+            to_encode: 5,
+            to_skip: 0,
+            encoded: 5,
+            cancelled: false,
+            finished: true,
+            records: vec![],
+            dry_run_records: vec![],
+        });
+        state.input_dir = Some(std::path::PathBuf::from("/tmp"));
+        reduce(&mut state, Msg::UserClickedStart, &tx, &default_config());
+        // Previous done task moved to history (newest-first).
+        assert_eq!(state.task_history.len(), 1);
+        assert_eq!(state.task_history[0].task_id, prev_id);
+        // Active is now the new analyzing task (different task_id).
+        assert!(state.tasks.active.is_some());
+        let active_id = state.tasks.active.as_ref().unwrap().task_id.clone();
+        assert_ne!(active_id, prev_id);
+        assert_eq!(
+            state.tasks.active.as_ref().unwrap().phase,
+            BatchPhase::Analyzing
+        );
+        // No spurious "task queue full" error. May be None (if
+        // /tmp has files matching extensions) or the empty-file
+        // warning — but never "task queue full".
+        if let Some(err) = state.last_error.as_deref() {
+            assert_ne!(
+                err, "task queue full",
+                "re-arm must not trigger spurious 'task queue full'"
+            );
+        }
     }
 
     #[test]
