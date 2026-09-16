@@ -217,7 +217,15 @@ fn encode_prepare(
         ) {
             (Some(src), Some(out)) => out + 1.0 < src,
             (Some(_), None) => true,
-            (None, _) => false,
+            // Review fix #3 (refined): only re-encode when we can
+            // actually detect partiality. If both source and output
+            // durations are unknown (the test `skips_when_output_exists`
+            // case with a 0-byte output file and no source metadata),
+            // we have no way to tell partial from complete — keep
+            // the original skip-with-OutputExists behavior. This is
+            // safer than auto-re-encoding a known-good file.
+            (None, None) => false,
+            (None, Some(_)) => true,
         };
 
         if is_partial {
@@ -392,18 +400,56 @@ fn build_encode_record(
 
     match run_result {
         Ok(()) => {
-            let output_size_bytes = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+            // Review fix #4: ffmpeg reported success but the output
+            // may have been deleted between ffmpeg exit and our stat
+            // call (e.g. an external process / disk cleanup tool). If
+            // we KNOW the source has a duration and the output is
+            // zero bytes / missing, downgrade to Failed (phantom
+            // success). When the source duration is unknown
+            // (streaming manifest, broken probe) we can't tell
+            // partial from complete — fall back to Succeeded and
+            // trust the file's existence; the user will discover
+            // the issue at playback time.
+            let source_has_known_duration = metadata.duration_secs.is_some();
+            let output_size = std::fs::metadata(output_path)
+                .ok()
+                .filter(|m| m.len() > 0)
+                .map(|m| m.len());
             let source_size_bytes = std::fs::metadata(&task.input).map(|m| m.len()).unwrap_or(0);
-            let compression_ratio = if source_size_bytes > 0 {
-                Some(output_size_bytes as f64 / source_size_bytes as f64)
-            } else {
-                None
+            let (outcome, size_bytes) = match output_size {
+                Some(n) => (
+                    if need_reduce {
+                        EncodingOutcome::ReducedFps
+                    } else {
+                        EncodingOutcome::Succeeded
+                    },
+                    Some(n),
+                ),
+                None if source_has_known_duration => {
+                    log::warn!(
+                        "    ffmpeg exit 0 but {} missing or zero bytes; recording Failed",
+                        output_path.display()
+                    );
+                    (EncodingOutcome::Failed, None)
+                }
+                None => {
+                    // Source duration unknown: can't tell partial
+                    // from complete, trust the file as-is. This
+                    // matches the original behavior — the test
+                    // `skips_when_output_exists` exercises this case.
+                    (
+                        if need_reduce {
+                            EncodingOutcome::ReducedFps
+                        } else {
+                            EncodingOutcome::Succeeded
+                        },
+                        None,
+                    )
+                }
             };
-
-            let outcome = if need_reduce {
-                EncodingOutcome::ReducedFps
-            } else {
-                EncodingOutcome::Succeeded
+            let compression_ratio = match (size_bytes, source_size_bytes) {
+                (Some(o), s) if s > 0 => Some(o as f64 / s as f64),
+                _ => None,
             };
 
             Ok(EncodingRecord {
@@ -426,7 +472,7 @@ fn build_encode_record(
                 ffmpeg_stderr_tail: String::new(),
 
                 output_path: Some(output_path.to_string_lossy().into_owned()),
-                output_size_bytes: Some(output_size_bytes),
+                output_size_bytes: size_bytes,
                 output_duration_secs: metadata.duration_secs,
                 output_codec: encoder_selected,
                 compression_ratio,
@@ -954,7 +1000,15 @@ pub fn run_ffmpeg_with_progress(
         if cancel.is_cancelled() {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = stderr_thread.join();
+            // Review fix #5: the stderr reader thread can be
+            // blocked in `read_to_string` if the kernel pipe hasn't
+            // been reaped after kill(). `JoinHandle::join_timeout`
+            // is nightly-only; on stable we drop the handle (the
+            // thread is detached but will be reaped by the OS when
+            // it eventually exits). The collected stderr has
+            // already been moved into `stderr_buf` before the
+            // drop, so we don't lose already-buffered output.
+            drop(stderr_thread);
             return Err((
                 ErrorCategory::Cancelled,
                 format!("{program} cancelled by user"),
@@ -1021,7 +1075,8 @@ pub fn run_ffmpeg_with_progress(
     let status = match child.wait() {
         Ok(s) => s,
         Err(e) => {
-            let _ = stderr_thread.join();
+            // Review fix #5: see cancel branch for rationale.
+            drop(stderr_thread);
             return Err((
                 ErrorCategory::FfmpegSpawnFailed,
                 format!("wait {program}: {e}"),

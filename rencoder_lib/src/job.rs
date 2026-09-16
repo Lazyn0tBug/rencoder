@@ -367,10 +367,20 @@ mod tests {
 /// failure (the closure error) and event-send failure (UI dropped,
 /// batch must abort). Tests that don't care about event-send
 /// failure can `.unwrap()` the encode variant.
+///
+/// Review fix #6: `EventSend` now carries the in-flight `EncodingRecord`
+/// when the failure happens on `FileCompleted` (file was successfully
+/// encoded but the result couldn't be delivered to the UI). The
+/// caller can log it / surface it in `BatchCancelled` handling so
+/// the file isn't silently "in flight" forever. On `FileStarted`
+/// failure the record is `None` (encode hadn't started yet).
+#[allow(clippy::large_enum_variant)] // EventSend variant carries EncodingRecord for post-mortem logging
 #[derive(Debug)]
 enum ProcessError {
     Encode(EncodeError),
-    EventSend,
+    EventSend {
+        partial_record: Option<EncodingRecord>,
+    },
 }
 
 /// Per-file orchestration extracted from the StartBatch loop so
@@ -415,6 +425,7 @@ pub(crate) fn encode_error_category(e: &EncodeError) -> ErrorCategory {
 /// `Err(ProcessError::EventSend)` if `emit` has been disconnected
 /// (caller should abort the batch — UI dropped the receiver).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::result_large_err)] // EventSend variant carries EncodingRecord for post-mortem logging
 fn process_one_file<F>(
     task: &TranscodeTask,
     params: &EncodeParams,
@@ -444,7 +455,9 @@ where
         })
         .is_err()
     {
-        return Err(ProcessError::EventSend);
+        return Err(ProcessError::EventSend {
+            partial_record: None,
+        });
     }
 
     let progress_emit = emit.clone();
@@ -470,7 +483,9 @@ where
         })
         .is_err()
     {
-        return Err(ProcessError::EventSend);
+        return Err(ProcessError::EventSend {
+            partial_record: Some(record),
+        });
     }
 
     Ok(record)
@@ -748,8 +763,21 @@ fn run_actor(
                                 message: format!("encode error: {e}"),
                             });
                         }
-                        Err(ProcessError::EventSend) => {
+                        Err(ProcessError::EventSend { partial_record }) => {
                             // evt_tx disconnected (UI dropped). Stop the batch.
+                            // Review fix #6: if the failure was on
+                            // FileCompleted, the in-flight file was
+                            // successfully encoded — log the partial
+                            // record for post-mortem visibility. The UI
+                            // is gone so it won't see anything; we
+                            // just avoid silent data loss on the lib side.
+                            if let Some(r) = partial_record {
+                                log::warn!(
+                                    "    FileCompleted for {} lost to disconnected UI (source_path={})",
+                                    index,
+                                    r.source_path
+                                );
+                            }
                             cancelled = true;
                             break;
                         }
@@ -1071,7 +1099,7 @@ mod mock_tests {
                                         message: format!("encode error: {e}"),
                                     });
                                 }
-                                Err(super::ProcessError::EventSend) => {}
+                                Err(super::ProcessError::EventSend { .. }) => {}
                             }
                         }
                         busy.store(false, AtomicOrdering::SeqCst);

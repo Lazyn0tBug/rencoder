@@ -266,19 +266,61 @@ fn columns_to_records(df: &DataFrame) -> PolarsResult<Vec<EncodingRecord>> {
     // original read_records_round_trip test didn't check started_at
     // so this went undetected until the mock_load_history filter
     // tests surfaced it).
-    let started_at_casted = df.column("started_at")?.cast(&DataType::Int64)?;
-    let started_at_us = started_at_casted.i64()?;
-    let started_at: Vec<Option<DateTime<Utc>>> = started_at_us
-        .into_iter()
-        .map(|o| o.and_then(DateTime::<Utc>::from_timestamp_micros))
-        .collect();
+    //
+    // Review fix #7: validate the column dtype before casting.
+    // A newer Polars version may write the column as `Datetime(Ns)`
+    // or with a non-UTC timezone; the cast to Int64 would then
+    // either yield raw i64 nanoseconds (overflows i64 micros by
+    // 1000x, from_timestamp_micros returns None) or produce a
+    // timezone-shifted value. In both cases, the previous code
+    // silently substituted Utc::now() across all records, which
+    // broke the newest-first sort. Detect the mismatch and
+    // return an error instead of corrupting the data.
+    fn read_timestamp_column(
+        df: polars::prelude::DataFrame,
+        name: &str,
+    ) -> Result<Vec<Option<DateTime<Utc>>>, PolarsError> {
+        let col = df.column(name)?;
+        let dt = col.dtype();
+        // Acceptable: Datetime(Us, UTC) or Datetime(Ms, UTC) or
+        // anything where the cast to Int64 gives us microseconds.
+        // Unacceptable: timezones, nanoseconds, physical types.
+        if !matches!(
+            dt,
+            DataType::Datetime(polars::prelude::TimeUnit::Microseconds, _)
+                | DataType::Datetime(polars::prelude::TimeUnit::Milliseconds, _)
+        ) {
+            return Err(PolarsError::ComputeError(
+                format!(
+                    "Parquet column '{}' has dtype {:?}; expected Datetime(Us/Ms, _). \
+                     Refusing to silently corrupt timestamps.",
+                    name, dt
+                )
+                .into(),
+            ));
+        }
+        let casted = col.cast(&DataType::Int64)?;
+        let i64_col = casted.i64()?;
+        let is_micros = matches!(
+            dt,
+            DataType::Datetime(polars::prelude::TimeUnit::Microseconds, _)
+        );
+        Ok(i64_col
+            .into_iter()
+            .map(|o| {
+                o.and_then(|v| {
+                    if is_micros {
+                        DateTime::<Utc>::from_timestamp_micros(v)
+                    } else {
+                        DateTime::<Utc>::from_timestamp_millis(v)
+                    }
+                })
+            })
+            .collect())
+    }
+    let started_at = read_timestamp_column(df.clone(), "started_at")?;
     // ended_at has the same schema.
-    let ended_at_casted = df.column("ended_at")?.cast(&DataType::Int64)?;
-    let ended_at_us = ended_at_casted.i64()?;
-    let ended_at: Vec<Option<DateTime<Utc>>> = ended_at_us
-        .into_iter()
-        .map(|o| o.and_then(DateTime::<Utc>::from_timestamp_micros))
-        .collect();
+    let ended_at = read_timestamp_column(df.clone(), "ended_at")?;
 
     let encoding_duration_secs = f64_col("encoding_duration_secs")?;
     let encoder_selected = str_col("encoder_selected")?;
