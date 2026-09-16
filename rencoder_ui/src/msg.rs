@@ -445,7 +445,7 @@ pub fn reduce(
                     // record of "I planned X but cancelled". Without
                     // this, cancelling a plan silently vanishes with
                     // no audit trail.
-                    if let Some(mut t) = state.tasks.active.take() {
+                    finalize(state, |t| {
                         t.cancelled = true;
                         // `finished` stays false — that flag is
                         // reserved for tasks that actually ran.
@@ -453,9 +453,7 @@ pub fn reduce(
                         // can see "this was a cancelled plan" vs
                         // "this finished encoding". History renderer
                         // can colour-code based on phase if needed.
-                        state.task_history.insert(0, t);
-                    }
-                    state.viewing_task = None;
+                    });
                 }
                 None | Some(BatchPhase::Done) => {}
             }
@@ -587,30 +585,19 @@ fn apply_event(state: &mut AppState, evt: Event) {
             state.progress.clear();
         }
         Event::BatchCompleted { records } => {
-            // Move-to-history (per §3.8.7.1): tasks.active.take()
-            // -> set phase = Done -> task_history.insert(0, t).
-            let done = state.tasks.active.take();
-            if let Some(mut t) = done {
+            finalize(state, |t| {
                 t.records = records;
                 t.finished = true;
                 t.phase = BatchPhase::Done;
-                state.task_history.insert(0, t);
-            }
-            // P2.4 fix: clear viewing_task so the TaskPage falls
-            // back to history.first() instead of pointing at a
-            // task that's no longer in active.
-            state.viewing_task = None;
+            });
             state.progress.clear();
         }
         Event::BatchCancelled { completed, total } => {
-            let done = state.tasks.active.take();
-            if let Some(mut t) = done {
+            finalize(state, |t| {
                 t.cancelled = true;
                 t.finished = true;
                 t.phase = BatchPhase::Done;
-                state.task_history.insert(0, t);
-            }
-            state.viewing_task = None;
+            });
             state.last_error = Some(format!("cancelled after {completed}/{total}"));
         }
         Event::LogLine { file_index, line } => {
@@ -634,22 +621,23 @@ fn apply_event(state: &mut AppState, evt: Event) {
             // Analyzing, drop without history (task never
             // started); AwaitingConfirm is no-op (lib hasn't
             // been asked to do anything yet).
-            let active = state.tasks.active.take();
-            match active {
-                Some(mut t) if matches!(t.phase, BatchPhase::Encoding) => {
-                    t.finished = true;
-                    t.phase = BatchPhase::Done;
-                    state.task_history.insert(0, t);
-                    state.viewing_task = None;
+            let phase = state.tasks.active.as_ref().map(|t| t.phase);
+            match phase {
+                Some(BatchPhase::Encoding) => {
+                    finalize(state, |t| {
+                        t.finished = true;
+                        t.phase = BatchPhase::Done;
+                    });
                 }
-                Some(t) if matches!(t.phase, BatchPhase::Analyzing) => {
-                    drop(t);
-                    state.viewing_task = None;
+                Some(BatchPhase::Analyzing) => {
+                    drop_active(state);
                 }
-                Some(t) => {
-                    state.tasks.active = Some(t);
+                _ => {
+                    // AwaitingConfirm (or other): restore to active.
+                    if let Some(t) = state.tasks.active.take() {
+                        state.tasks.active = Some(t);
+                    }
                 }
-                None => {}
             }
         }
         // #[non_exhaustive] future variants — silently drop.
@@ -716,6 +704,32 @@ fn collect_input_files(
         .filter(|p| extension_matches(p, &extensions))
         .collect();
     Ok(files)
+}
+
+/// Move the active task to history, applying `mutate` to it first.
+/// Centralizes the take + insert + viewing_task clear used by
+/// 4 call sites (BatchCompleted, BatchCancelled, Error-Encoding,
+/// Cancel-AwaitingConfirm). Also handles the Some(Done) re-arm
+/// pre-move (no flag changes needed — just move).
+fn finalize<F>(state: &mut AppState, mutate: F)
+where
+    F: FnOnce(&mut TaskInfo),
+{
+    let done = state.tasks.active.take();
+    if let Some(mut t) = done {
+        mutate(&mut t);
+        state.task_history.insert(0, t);
+    }
+    state.viewing_task = None;
+}
+
+/// Drop the active task without history (e.g., Analyzing-phase
+/// Error where the task never started). Used by `Event::Error` to
+/// clear the slot without polluting history with a never-encoded
+/// task.
+fn drop_active(state: &mut AppState) {
+    let _ = state.tasks.active.take();
+    state.viewing_task = None;
 }
 
 /// Check whether a path's extension matches any of the user's

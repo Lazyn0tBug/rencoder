@@ -66,16 +66,19 @@ pub fn App() -> Element {
         cmd_tx.set(Some(tx.clone()));
 
         let mut state_thread = state;
-        let config_thread = config;
-        let cmd_tx_thread = cmd_tx;
+        // Per the /code-review medium perf finding: hoist the
+        // .read().clone() out of the event loop. config and
+        // cmd_tx are set once at startup (v1: no Save button, no
+        // runtime config reload) so caching is safe. Saves one
+        // SyncStorage read-lock + Arc clone per lib event.
+        let cfg_cached = config.read().clone();
+        let cmd_tx_cached = cmd_tx.read().clone();
         std::thread::Builder::new()
             .name("rencoder-ui-drain".to_string())
             .spawn(move || {
-                while let Ok(evt) = evt_rx.recv() {
-                    let cfg = config_thread.read().clone();
-                    let tx_for_reduce = cmd_tx_thread.read().clone();
-                    if let Some(tx) = tx_for_reduce {
-                        state_thread.with_mut(|s| reduce(s, Msg::Lib(evt), &tx, &cfg));
+                if let Some(tx) = cmd_tx_cached.as_ref() {
+                    while let Ok(evt) = evt_rx.recv() {
+                        state_thread.with_mut(|s| reduce(s, Msg::Lib(evt), tx, &cfg_cached));
                     }
                 }
             })
@@ -86,19 +89,31 @@ pub fn App() -> Element {
         // out of LOG_RECEIVER and capture state for `with_mut`.
         // Each line goes through Msg::LibLogLine -> reducer, which
         // pushes to state.log with source = LogSource::LibInternal.
+        // Note: Msg::LibLogLine doesn't dispatch to cmd_tx or use
+        // config, but the reducer signature requires both for
+        // symmetry with other arms. We pass the cached values
+        // (no per-line read) — they're cheap borrows.
         if let Some(rx_ref) = tracing_init::LOG_RECEIVER.get() {
             let log_rx = rx_ref.clone();
             let mut state_for_log = state;
-            let cmd_tx_for_log = cmd_tx;
-            let config_for_log = config;
+            // Re-read the signals for the log drain thread. The
+            // cached values above were moved into the event drain
+            // thread, so we re-read once (cheap — single read +
+            // Arc clone). This is the only re-read; the log drain
+            // thread itself caches these values for its loop.
+            let cfg_for_log = config.read().clone();
+            let cmd_tx_for_log = cmd_tx.read().clone();
             std::thread::Builder::new()
                 .name("rencoder-ui-log-drain".to_string())
                 .spawn(move || {
+                    // LibLogLine never dispatches; Sender is only
+                    // here to satisfy the reducer signature.
+                    let tx = cmd_tx_for_log
+                        .as_ref()
+                        .expect("cmd_tx must be set by use_hook before log drain runs");
                     while let Ok(line) = log_rx.recv() {
-                        let cfg = config_for_log.read().clone();
-                        if let Some(tx) = cmd_tx_for_log.read().clone() {
-                            state_for_log.with_mut(|s| reduce(s, Msg::LibLogLine(line), &tx, &cfg));
-                        }
+                        state_for_log
+                            .with_mut(|s| reduce(s, Msg::LibLogLine(line), tx, &cfg_for_log));
                     }
                 })
                 .expect("rencoder-ui-log-drain: failed to spawn log drain thread");
