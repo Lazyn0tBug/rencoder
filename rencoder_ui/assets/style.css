@@ -1,173 +1,612 @@
-/* Rencoder UI — basic layout.
+/* Rencoder UI — Mission Control Terminal aesthetic
+ * (§3.8.7.3 Visual design tokens)
  *
- * Without this file, Dioxus 0.6 default rendering is a single
- * vertical column where every panel stacks below the previous one.
- * On a typical screen the h1 + controls fit on screen but every
- * panel (Progress, Log, History, DryRun, Settings, Analyze)
- * renders below the fold. This CSS gives the layout:
+ * Light theme + warm off-white background, JetBrains Mono throughout,
+ * bracketed section labels ([SETUP], [TASK], etc.), colored status
+ * badges. Anti-slop: no Inter/Roboto, no purple gradient, no
+ * glassmorphism, no emoji icons, no centered card layouts.
  *
- *   +-------------------------------+
- *   | h1 "Rencoder" + subtitle       |   fixed top
- *   +-------------------------------+
- *   |                               |
- *   | <scrollable main>              |
- *   |  DirPicker                     |
- *   |  BatchInfo                     |
- *   |  ProgressPanel                 |
- *   |  LogPanel                      |
- *   |  HistoryPanel                  |
- *   |  DryRunPanel                   |
- *   |  SettingsPanel                 |
- *   |  AnalyzePanel                  |
- *   |  <error banner>                |
- *   |                               |
- *   +-------------------------------+
- *   | [Start][Cancel][Save][Hist..] |   sticky bottom
- *   +-------------------------------+
- *
- * No theming, no design system. Just enough CSS to make the
- * panels readable. Replace later when a real design lands.
+ *   +-------------------------------------------------------+
+ *   | RENENCODER   [SETUP][TASK][HISTORY][LOG]   [Exit]     |
+ *   +-------------------------------------------------------+
+ *   | --[ SETUP ]-------------------------------- [Start >]  |
+ *   | INPUT DIRECTORY                                      |
+ *   | /Users/.../blender/                                  |
+ *   | [ pick directory ]                                   |
+ *   |                                                      |
+ *   | SETTINGS                                             |
+ *   | codec    av1                                         |
+ *   | crf      45                                          |
+ *   | ...                                                  |
+ *   +-------------------------------------------------------+
+ *   | LOG - last 5 lines                                   |
+ *   | 14:23:01 [0] probing file 1/12                       |
+ *   +-------------------------------------------------------+
  */
 
-* { box-sizing: border-box; }
+/* ============================================================
+ * Design tokens (§3.8.7.3)
+ * ============================================================ */
+
+:root {
+    /* Backgrounds — warm near-black (light theme variant) */
+    --bg-app: #fafaf9;
+    --bg-surface: #ffffff;
+    --bg-elev: #f4f4f3;
+    --bg-input: #ffffff;
+
+    /* Borders */
+    --border: #d4d4d2;
+    --border-strong: #a3a3a0;
+    --border-active: #6b6b68;
+
+    /* Text */
+    --text: #1c1c1a;
+    --text-dim: #6b6b68;
+    --text-mute: #9a9a97;
+
+    /* Status */
+    --status-idle: #9a9a97;     /* gray dot */
+    --status-active: #16a34a;   /* green — ANALYZING/AWAITING/ENCODING */
+    --status-done: #2563eb;     /* blue — DONE */
+    --status-warning: #d97706;  /* amber — empty / partial */
+    --status-error: #dc2626;    /* red — errors */
+
+    /* Accent */
+    --accent: #16a34a;
+    --accent-dim: #dcfce7;
+
+    /* Spacing rhythm: 4 / 8 / 12 / 16 / 24 */
+    --space-1: 4px;
+    --space-2: 8px;
+    --space-3: 12px;
+    --space-4: 16px;
+    --space-6: 24px;
+
+    /* Typography */
+    --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo,
+                 "Cascadia Mono", Consolas, monospace;
+    --font-size-base: 13px;
+    --line-height: 1.5;
+}
+
+/* ============================================================
+ * Reset / base
+ * ============================================================ */
+
+* {
+    box-sizing: border-box;
+}
 
 html, body {
     margin: 0;
     padding: 0;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-    font-size: 14px;
-    color: #222;
-    background: #f7f7f7;
+    font-family: var(--font-mono);
+    font-size: var(--font-size-base);
+    line-height: var(--line-height);
+    color: var(--text);
+    background: var(--bg-app);
     height: 100%;
     width: 100%;
+    -webkit-font-smoothing: antialiased;
 }
 
-#main, .app {
+/* ============================================================
+ * App layout
+ * ============================================================ */
+
+.app {
     display: flex;
     flex-direction: column;
-    height: 100vh;
-    width: 100%;
+    min-height: 100vh;
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 0 var(--space-4);
 }
 
-h1 {
-    font-size: 18px;
-    font-weight: 600;
-    margin: 0;
-    padding: 12px 16px;
-    background: #1f2937;
-    color: #f5f5f5;
-    border-bottom: 1px solid #111827;
-    flex: 0 0 auto;
+.app-header {
+    padding: var(--space-3) 0;
+    border-bottom: 1px solid var(--border);
 }
 
-h3 {
-    font-size: 14px;
-    font-weight: 600;
-    margin: 0 0 8px 0;
-    color: #1f2937;
+.brand {
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--text);
 }
 
-h4 {
+.global-error {
+    padding: var(--space-2) var(--space-3);
+    margin: var(--space-2) 0;
+    background: #fef2f2;
+    border-left: 3px solid var(--status-error);
+    color: var(--status-error);
     font-size: 12px;
-    font-weight: 600;
-    margin: 8px 0 4px 0;
-    color: #991b1b;
 }
 
-p { margin: 4px 0; }
-
-.muted { color: #6b7280; font-style: italic; font-size: 12px; }
-.error { color: #b91c1c; font-weight: 500; }
-
-/* The scrollable main area. Place EVERY panel inside this so
- * overflow scrolls instead of pushing controls off-screen. */
-main {
+.page {
     flex: 1 1 auto;
-    overflow-y: auto;
-    padding: 12px 16px;
+    padding: var(--space-4) 0;
+}
+
+/* ============================================================
+ * TopBar (4 tabs + Exit)
+ * ============================================================ */
+
+.top-bar {
+    display: flex;
+    align-items: center;
+    gap: var(--space-4);
+    padding: var(--space-3) 0;
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    background: var(--bg-app);
+    z-index: 10;
+}
+
+.tabs {
+    display: flex;
+    gap: var(--space-1);
+    flex: 1 1 auto;
+}
+
+.tab {
+    background: transparent;
+    border: none;
+    padding: var(--space-2) var(--space-3);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--text-mute);
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    transition: color 120ms ease, border-color 120ms ease;
+}
+
+.tab:hover {
+    color: var(--text-dim);
+}
+
+.tab-active {
+    color: var(--text);
+    border-bottom-color: var(--accent);
+}
+
+.top-bar-right {
+    display: flex;
+    gap: var(--space-2);
+}
+
+.exit-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    padding: var(--space-1) var(--space-3);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    cursor: pointer;
+    transition: background 120ms ease, border-color 120ms ease;
+}
+
+.exit-btn:hover {
+    background: var(--bg-elev);
+    border-color: var(--border-active);
+}
+
+/* ============================================================
+ * Common: section labels, buttons, badges, helpers
+ * ============================================================ */
+
+.section-label {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--text-mute);
+    display: block;
+    margin-bottom: var(--space-2);
+}
+
+.page-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    margin-bottom: var(--space-3);
+    padding-bottom: var(--space-2);
+    border-bottom: 1px solid var(--border);
+}
+
+.page-header-right {
+    display: flex;
+    gap: var(--space-2);
+}
+
+.primary-btn {
+    background: var(--accent);
+    border: 1px solid var(--accent);
+    color: white;
+    padding: var(--space-2) var(--space-4);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+    transition: background 120ms ease, border-color 120ms ease;
+}
+
+.primary-btn:hover:not(:disabled) {
+    background: #15803d;
+    border-color: #15803d;
+}
+
+.primary-btn:disabled {
+    background: var(--bg-elev);
+    border-color: var(--border);
+    color: var(--text-mute);
+    cursor: not-allowed;
+}
+
+.secondary-btn {
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: var(--space-2) var(--space-3);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 120ms ease, border-color 120ms ease;
+}
+
+.secondary-btn:hover:not(:disabled) {
+    background: var(--bg-elev);
+    border-color: var(--border-active);
+}
+
+.secondary-btn:disabled {
+    color: var(--text-mute);
+    cursor: not-allowed;
+}
+
+.muted {
+    color: var(--text-mute);
+    font-size: 12px;
+    font-style: italic;
+    margin: 0;
+}
+
+.code {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+}
+
+.path {
+    font-size: 13px;
+    color: var(--text-dim);
+    word-break: break-all;
+}
+
+.badge {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    padding: 2px var(--space-2);
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    display: inline-block;
+}
+
+.badge-active {
+    border-color: var(--status-active);
+    color: var(--status-active);
+    animation: pulse 2s ease-in-out infinite;
+}
+
+.badge-done {
+    border-color: var(--status-done);
+    color: var(--status-done);
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+}
+
+/* ============================================================
+ * SetupPage: DirPicker + Settings + Start button
+ * ============================================================ */
+
+.setup-page {
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: var(--space-4);
 }
 
-/* Card-like styling for every panel so they're visually distinct. */
-.dir-picker, .batch, .progress-panel, .log-window,
-.history-table, .dryrun-table, .settings-panel,
-.analyze-panel, .history {
-    background: white;
-    border: 1px solid #e5e7eb;
-    border-radius: 6px;
-    padding: 10px 12px;
+.dir-picker {
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    padding: var(--space-3) var(--space-4);
 }
 
-/* Empty-state hint gets a distinct, less-prominent style. */
-.empty-hint {
-    background: white;
-    border: 1px dashed #d1d5db;
-    border-radius: 6px;
-    padding: 24px 16px;
-    text-align: center;
-    color: #6b7280;
-    font-size: 13px;
-    line-height: 1.6;
+.dir-display {
+    padding: var(--space-2) 0;
+    min-height: 24px;
 }
 
-.empty-hint strong { color: #1f2937; }
+.dir-picker button {
+    margin-top: var(--space-2);
+}
 
-/* Tables: compact rows. */
-table {
-    border-collapse: collapse;
-    width: 100%;
+.settings-panel {
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    padding: var(--space-3) var(--space-4);
+}
+
+.kv-list {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    column-gap: var(--space-4);
+    row-gap: var(--space-1);
+    margin: 0;
+}
+
+.kv-list dt {
+    color: var(--text-mute);
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.kv-list dd {
+    margin: 0;
+    color: var(--text);
     font-size: 12px;
 }
 
-th, td {
-    text-align: left;
-    padding: 4px 8px;
-    border-bottom: 1px solid #f3f4f6;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    max-width: 320px;
+.settings-panel .muted {
+    margin-top: var(--space-3);
+    padding-top: var(--space-2);
+    border-top: 1px dashed var(--border);
 }
 
-th {
-    background: #f9fafb;
-    font-weight: 600;
-    color: #374151;
-}
+/* ============================================================
+ * TaskPage: BatchStatus + TaskPlan + Progress + button
+ * ============================================================ */
 
-/* Input field in DirPicker. */
-input[type="text"] {
-    width: 100%;
-    padding: 6px 8px;
-    border: 1px solid #d1d5db;
-    border-radius: 4px;
-    font-size: 13px;
-    margin-top: 4px;
-}
-
-/* Controls: sticky bottom bar. */
-.controls {
+.task-page {
     display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+}
+
+.batch-status {
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    padding: var(--space-3) var(--space-4);
+}
+
+.batch-status-row {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-3);
     flex-wrap: wrap;
-    gap: 8px;
-    padding: 10px 16px;
-    background: #1f2937;
-    border-top: 1px solid #111827;
-    flex: 0 0 auto;
 }
 
-button {
-    padding: 6px 12px;
-    border: 1px solid #4b5563;
-    border-radius: 4px;
-    background: #374151;
-    color: #f5f5f5;
-    font-size: 13px;
-    cursor: pointer;
-    font-family: inherit;
+.batch-status-row + .batch-status-row {
+    margin-top: var(--space-2);
+    padding-top: var(--space-2);
+    border-top: 1px dashed var(--border);
 }
 
-button:hover { background: #4b5563; }
-button:active { background: #1f2937; }
+.task-id {
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--text);
+}
+
+.task-plan-panel {
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    padding: var(--space-3) var(--space-4);
+}
+
+.plan-table-wrap {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    margin-top: var(--space-2);
+    max-height: 400px;
+    overflow-y: auto;
+}
+
+.plan-row {
+    display: flex;
+    gap: var(--space-3);
+    padding: var(--space-1) 0;
+    border-bottom: 1px solid var(--border);
+}
+
+.plan-row:last-child {
+    border-bottom: none;
+}
+
+.outcome-encode {
+    color: var(--status-active);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    min-width: 60px;
+}
+
+.outcome-skip {
+    color: var(--status-warning);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    min-width: 60px;
+}
+
+.outcome-fail {
+    color: var(--status-error);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    min-width: 60px;
+}
+
+.progress-panel {
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    padding: var(--space-3) var(--space-4);
+}
+
+.progress-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: var(--space-2);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+}
+
+.progress-table th,
+.progress-table td {
+    text-align: left;
+    padding: var(--space-1) var(--space-2);
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+}
+
+.progress-table th {
+    color: var(--text-mute);
+    font-weight: 600;
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+/* ============================================================
+ * HistoryPage: HistoryPanel + Refresh
+ * ============================================================ */
+
+.history-page {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+}
+
+.history-panel {
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    padding: var(--space-3) var(--space-4);
+}
+
+.history-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+}
+
+.history-table th,
+.history-table td {
+    text-align: left;
+    padding: var(--space-1) var(--space-2);
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+}
+
+.history-table th {
+    color: var(--text-mute);
+    font-weight: 600;
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+/* ============================================================
+ * LogPage: full log scrollback
+ * ============================================================ */
+
+.log-page {
+    display: flex;
+    flex-direction: column;
+}
+
+.log-window {
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    padding: var(--space-3) var(--space-4);
+    max-height: 70vh;
+    overflow-y: auto;
+    font-size: 12px;
+}
+
+.log-line {
+    display: flex;
+    gap: var(--space-2);
+    padding: 2px 0;
+    border-bottom: 1px solid var(--bg-elev);
+    font-variant-numeric: tabular-nums;
+}
+
+.log-line:last-child {
+    border-bottom: none;
+}
+
+.log-line .time {
+    color: var(--text-mute);
+    min-width: 64px;
+}
+
+.log-line .file {
+    color: var(--text-dim);
+    min-width: 40px;
+}
+
+.log-line .msg {
+    color: var(--text);
+    flex: 1 1 auto;
+    word-break: break-word;
+    white-space: pre-wrap;
+}
+
+/* ============================================================
+ * FooterLog: last 5 lines on every page
+ * ============================================================ */
+
+.log-footer {
+    border-top: 1px solid var(--border);
+    padding: var(--space-2) 0;
+    margin-top: var(--space-3);
+}
+
+.log-footer .section-label {
+    margin-bottom: var(--space-1);
+}
+
+.log-footer-lines {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    font-size: 11px;
+    max-height: 100px;
+    overflow-y: auto;
+}
+
+.log-footer .log-line {
+    border-bottom: none;
+    padding: 1px 0;
+}
+
+.log-footer .log-line .time,
+.log-footer .log-line .file {
+    font-size: 11px;
+}
