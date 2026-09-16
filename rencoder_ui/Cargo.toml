@@ -11,6 +11,11 @@ rencoder_lib = { path = "../rencoder_lib" }
 dioxus = { version = "0.6", features = ["desktop"] }
 dioxus-hooks = "0.6"
 crossbeam-channel = "0.5"
+# `futures` provides an async-channel used to bridge the
+# blocking crossbeam recv (which can't be awaited) into a
+# future that Dioxus's executor can poll without blocking
+# (Tiers follow-up fix).
+futures = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [[bin]]
