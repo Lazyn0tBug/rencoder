@@ -1687,30 +1687,19 @@ Topic 设计意图：dispatch 由 UI 端 reducer 用 `match` 完成，路由成�
 #### 3.8.4 Controller
 
 ```rust
-pub struct ControllerHandle {
-    cmd_tx: Sender<Command>,           // crossbeam unbounded
-    evt_rx: Receiver<Event>,
-}
+/// 控制器句柄:同时持有 lib 端的"actor 入参"(cmd_tx 给 UI 发命令)
+/// 和"actor 出参"(evt_rx 让 UI 收事件),以及一次性 `start_controller`
+/// 加载完的 `AppConfig` + 路径(给 SettingsPanel 显示 + Save 回写用)。
+/// 字段类型与每个 accessor 的签名见 `rencoder_lib::job::ControllerHandle` 的 rustdoc。
+pub struct ControllerHandle { /* 见 rustdoc */ }
 
 pub fn start_controller() -> ControllerHandle;
-
-impl ControllerHandle {
-    /// Cloneable handle for sending Commands. UI typically clones
-    /// this once per component that needs to dispatch (Start /
-    /// Cancel / Load History buttons).
-    pub fn command_sender(&self) -> Sender<Command>;
-
-    /// Destructures into the raw pair. Single-use — once the
-    /// receiver is taken, the handle is consumed. Preferred pattern:
-    /// `let ControllerHandle { cmd_tx, evt_rx } = handle.into_split();`
-    pub fn into_split(self) -> (Sender<Command>, Receiver<Event>);
-}
 ```
 
-UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `into_split()` 把两端分给不同持有者:cmd_tx 给多个 UI 组件(可克隆),evt_rx 给顶层 coroutine(独占消费)。
+UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `into_split()` 把两端分给不同持有者:cmd_tx 给多个 UI 组件(可克隆),evt_rx 给 UI 顶层的事件消费线程(独占消费,见 §3.9 "UI 运行时 / Dioxus 适配")。
 
 - `cmd_tx`：可克隆,供多个 UI 组件使用(开始按钮、取消按钮、历史按钮)。
-- `evt_rx`：由顶层 `use_coroutine` 独占消费;不广播、不多订阅者——保证单消费者的因果序。`crossbeam_channel::Receiver` 是 single-consumer,无法 clone——这正是我们想要的(避免事件分发歧义)。
+- `evt_rx`：由 UI 顶层**专用 OS 线程**独占消费;不广播、不多订阅者——保证单消费者的因果序。`crossbeam_channel::Receiver` 是 single-consumer,无法 clone——这正是我们想要的(避免事件分发歧义)。具体 UI 端如何消费(为何不用 `use_coroutine` + async 块)见 §3.9。
 - Channel 策略:`crossbeam unbounded`(`std::sync::mpsc` 无 unbounded 变体)。单 batch 下每秒最多 ~50 个事件,UI 永远消费得过来;如未来有背压风险再换 `bounded + DropOldest`。
 - Actor 线程命名:`rencoder-controller`,便于 thread 列表里识别。
 
@@ -1726,6 +1715,7 @@ UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `int
 - 批结束：lib 写 Parquet + 发 `Event::BatchCompleted`。
 - **History 回读（v1.1 启用）**:UI 启动时发 `Command::LoadHistory { limit, after }` → lib 读 Parquet → 发 `Event::HistoryLoaded` 填充历史视图。v1 不展示历史(见 §3.8.7 limitations),但 Parquet 仍在写,数据可用。
 - 这是 event sourcing 的两面：state 是 event log 的 fold，event log 是 append-only 真相源。
+- **Realtime 通道的消费方**:UI 端的具体消费机制——`crossbeam_channel::unbounded` 在专用 OS 线程里阻塞 recv,然后通过 `use_signal_sync` 的 `SyncSignal` 改 Dioxus state——见 §3.9 "UI 运行时 / Dioxus 适配"。Channel 策略:UI 侧用 `Arc<Mutex<>>` 共享给子组件;lib 侧不感知。背压:两侧都是 unbounded;send 永不 block。
 
 #### 3.8.6 lib 内部实现要点
 
@@ -1869,14 +1859,6 @@ struct AppState {
     input_dir: Option<PathBuf>,
     /// 最近一次 fatal 错误(由 `Event::Error` 设置;UI 在 header 顶部展示)
     last_error: Option<String>,
-    /// Whether the lib actor thread is still alive. Set false on
-    /// `Event::ActorExited`; the coroutine exits naturally after
-    /// that since the sender side has dropped. UI can offer
-    /// "Restart Controller" if `controller_alive == false`.
-    controller_alive: bool,
-    /// Reason the actor thread exited. `Some` after `ActorExited`;
-    /// `None` while alive or before any exit has happened.
-    last_exit: Option<ExitReason>,
     /// 当前 analyze 批的进度(U22 / Tier 3 #9)。`None` = 没在跑或还没
     /// 收到 `AnalyzeStarted`。`done` / `total` / `failed` 单调递增——
     /// reducer 不去重,完全信任 lib 推上来的 event sequence。
@@ -1963,13 +1945,15 @@ fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>) {
             while state.log.len() > 1000 { state.log.pop_front(); }
         }
         Msg::Lib(Event::HistoryLoaded { records }) => { state.history = records; }
-        Msg::Lib(Event::ActorExited { reason }) => {
-            // Last event before the channel closes. The coroutine
-            // will exit naturally on the next recv(); UI keeps the
-            // last_exit reason visible until a restart.
-            state.controller_alive = false;
-            state.last_exit = Some(reason);
-        }
+        // Msg::Lib(Event::ActorExited { reason }) handler was removed
+        // when the event pump switched to use_signal_sync + std::thread
+        // (see §3.9). The lib's `Event::ActorExited` is still emitted,
+        // but the UI drain thread exits naturally on the next recv()
+        // when the lib drops its sender — no controller_alive flag
+        // needed in the UI. If we add a v2 UI-side restart button,
+        // the actor's contact channel is `ControllerHandle::restart()`
+        // (not yet implemented), not a `Msg::Lib(Event::ActorExited)`
+        // reducer arm.
         // ...
     }
 }
@@ -2006,6 +1990,7 @@ fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>) {
 | Preview / Dry Run | **未实现**——user 无法预览编码结果 | v1.1 加 `Command::DryRun` + `Event::DryRunFinished` |
 | Analyze + progress reporting | **未实现**——UI 不能跑 analyze | v1.1 加 `Command::Analyze` + `Event::AnalyzeProgress` + `AnalyzePanel`;**v1.1 也**不支持 `Command::Cancel` abort analyze 批(见 §3.4 "分析进度上报" v1 限制) |
 | Native 文件选择对话框 | **无**——v1 用 `<input type="text">` | v1.2 调研 `rfd` 或 Dioxus 内建 |
+| UI drain thread panic recovery | **未实现**——v1 不包裹 `use_hook` 里 `std::thread::spawn` 的循环 in `catch_unwind`。如果 `state.with_mut(\|s\| reduce(...))` panic(reducer bug、SIGPIPE 等),所有后续事件被静默吞掉,UI 不响应但 lib 仍在写 channel | v1.1 `use_hook` 里 `std::panic::catch_unwind` 包裹循环 + 暴露 `controller_alive: false` + `last_error`;详见 §3.9.4 |
 
 这些限制不影响协议契约（Command/Event 已端到端测试通过 mock_tests），只是 UI 渲染层不完整。
 
@@ -2017,7 +2002,60 @@ CLI 和 GUI 共享同一份 `rencoder.toml`（§1.2）和同一份 lib 实现：
 - **GUI 路径**：发 `Command` → 收 `Event` → reducer → 渲染。
 - 两条路径都触发 Parquet 写入；GUI 加载历史 = 读 Parquet（同一文件路径）。
 
+### 3.9 UI 运行时 / Dioxus 适配
+
+> **TL;DR** — 禁用 `use_coroutine` 消费 `crossbeam` 事件(阻塞 `recv()` 会
+> block Dioxus runtime,首帧不渲染);改用 `use_signal_sync` + 专用 OS 线程 +
+> 直接 `with_mut()`。完整 bisect 历史见 `docs/debug-journal/event-pump-blocking.md`。
+
+#### 3.9.1 架构总览
+
+```text
+[rayon/polars worker thread]    (lib 内)
+        │ crossbeam_tx.send
+        ▼
+[rencoder-controller thread]    (lib 启,管 1;持有 evt_tx)
+        │ 写入 crossbeam
+        ▼
+[crossbeam evt_rx]              (lib boundary,unbounded)
+        │
+        │ UI App() use_hook: std::thread::spawn 一个专用 OS 线程
+        ▼
+[rencoder-ui-drain thread]      (UI 启;阻塞 rx.recv() 循环)
+        │ read cfg / read cmd_tx (SyncSignal,跨线程 OK)
+        │ state.with_mut(|s| reduce(...))
+        ▼
+[SyncSignal state storage]      (Dioxus 0.6,parking_lot RwLock 后端)
+        │ 触发 reactive re-render
+        ▼
+[App() next render]
+```
+
+线程命名: `rencoder-controller`(lib)+ `rencoder-ui-drain`(UI)。其余(rayon workers, ffmpeg stdio reader)未命名。
+
+#### 3.9.2 关键决策
+
+- **std::thread,不用 `use_coroutine`** — `crossbeam_channel::Receiver::recv()` 是阻塞调用,放进 `async move` 块会 block Dioxus runtime 的 task poller,首帧永远不渲染。
+- **`use_signal_sync` 不用 `use_signal`** — 默认 `use_signal` 返回 `Signal<T, UnsyncStorage>`(`RefCell` 后端,`!Send`),`std::thread::spawn` 编译报错 `E0277`。`use_signal_sync` 返回 `Signal<T, SyncStorage>`(`parking_lot::RwLock` 后端),`Send + Sync`。
+- **不桥接到 `futures::channel::mpsc`** — 多一个桥接线程、一个中间队列、`futures` 依赖。阻塞 recv 跑在专用线程上就够。
+- **Lib API 不动** — `start_controller()` 还是返回 crossbeam `ControllerHandle + into_split()`。Lib 仍是 100% sync/runtime-agnostic(CLI 路径走 `transcode_batch` 同步)。
+
+#### 3.9.3 Alternatives considered
+
+| 策略 | 结论 |
+|---|---|
+| A. `use_signal` + `use_coroutine` + `async { recv() }` | 阻塞 recv() block executor — 同 §3.9.2 第 1 项。|
+| B. bridge `crossbeam` → `futures::mpsc` via std::thread + `use_coroutine` | 功能 OK,架构冗余(多 1 线程 + 1 队列 + 1 依赖)。|
+| C. Lib 改用 `async-channel::Sender<Event>` | 拒绝 — Lib 保持 100% sync 是项目约束;CLI 已用 `transcode_batch` 同步路径,actor 内部从 sync 漂到 async 友好会扩大差异面。|
+| D. 默认 `use_signal` + `Sender<Event>` 直接给 actor | 拒绝 — `use_signal` 所有权从 `App()` 移到 actor 闭包意味着 state 不再是 Dioxus state;buttons 改 state 必须经 `cmd_tx` 绕一圈,增加间接层。|
+
+#### 3.9.4 v1 限制
+
+见 §3.8.7 "UI drain thread panic recovery"行。完整 bisect 与"为什么不桥接 futures"等决策历史在 `docs/debug-journal/event-pump-blocking.md`,本节不复述。
+
 ---
+
+
 
 
 
@@ -2183,10 +2221,11 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 45 | `process_one_file` 抽出 `encode_fn: &mut F` 闭包参数让 mock 测试注入；`ProcessError` enum 区分 Encode vs EventSend(后者表示 UI dropped receiver,batch 应 abort) | ✅ |
 | 46 | `load_history(data_dir, limit, after)` 显式接受 data_dir 参数(不读 env var)——让 mock 测试 parallel-safe,env vars 是 process-global 会 race（v1.1 启用） | ✅ |
 | 47 | `rencoder_lib::job::EncodingRecord` 重新导出——UI 需要命名 `Event::FileCompleted` / `BatchCompleted` 携带的 record 类型 | ✅ |
-| 48 | `rencoder_ui` crate bootstrap(Dioxus desktop 0.6)：reducer + 9 个 unit test;App 组件 wire ControllerHandle via `use_coroutine` + `use_signal`;v1 三按钮 (Start/Cancel)+ 极简状态显示;Load History 按钮存在但 v1 不显示历史(v1.1 启用 HistoryPanel) | ✅ |
-| 49 | Actor 退出显式信号：`Event::ActorExited { reason: ExitReason }` 作为最后一个 event 在 lib drop `evt_tx` 前发出；UI reducer 设 `controller_alive = false` + `last_exit = Some(reason)`。Lifecycle 对称：start = 构造,exit = 显式消息,中间交互 = Command/Event | ✅ |
+| 48 | `rencoder_ui` crate bootstrap(Dioxus desktop 0.6)：reducer + 9 个 unit test;App 在 `use_hook` 里 `std::thread::spawn` 做阻塞 `crossbeam::recv()` 循环,通过 `use_signal_sync` 的 SyncSignal 直接改 Dioxus state(详见 §3.9,不用 `use_coroutine` 因阻塞 recv 会 block executor);v1 三按钮 (Start/Cancel)+ 极简状态显示;Load History 按钮存在但 v1 不显示历史(v1.1 启用 HistoryPanel) | ✅ |
+| 49 | Actor 退出显式信号:`Event::ActorExited { reason: ExitReason }` 作为最后一个 event 在 lib drop `evt_tx` 前发出;UI drain thread 收到后下一次 `rx.recv()` 自然返回 `Err` 退出(v1 不维护 `controller_alive`,这是 §3.9.4 v1 限制)。Lifecycle 对称:start = 构造,exit = 显式消息,中间交互 = Command/Event | ✅ |
 | 50 | Preview / Dry Run (Tier 2 #6):`Command::DryRun { params, files }` 跑 `encode_prepare` 但**不调 ffmpeg**,emit `Event::DryRunFinished { records }`;`dry_run_batch` lib helper 复用 probe + partial + skip 逻辑。UI `Preview` 按钮 → reducer arm → DryRunPanel 渲染 planned outcomes。`encode.nv` 故意忽略——dry-run 不知道也不关心 GPU 是否启用 | ✅ |
 | 51 | Parallel analyze progress (Tier 3 #9):`Command::Analyze { files }` 走 `analyze_records_with_probe_and_progress_parallel` 闭包注入层(不是 c-probe FFI 回调层),emit `Event::AnalyzeStarted { total }` + N × `Event::AnalyzeProgress { done, total, failed, last: Option<AnalyzedFile> }` + `Event::AnalyzeFinished { records, failed_count }`;复合 A+B 显示(进度计数 + per-file log)、failure-only log、AnalyzedFile 新 type(不复用 AnalysisRecord 避免污染 success path)、v1 不响应 `Command::Cancel` 和 SIGINT、v1 走 busy-gate 不与 encode 并发。why 详见 §3.4 "分析进度上报" | ✅ |
+| 52 | UI 事件泵架构:UI 在 `use_hook` 里 `std::thread::spawn` 一个专用 OS 线程做阻塞 `crossbeam::Receiver::recv()`,通过 `use_signal_sync` 暴露的 `SyncSignal` 直接 `state.with_mut()` 改 Dioxus state。不用 `use_coroutine`(阻塞 recv() 会 block Dioxus executor,首帧不渲染);不桥接 `futures::mpsc`(冗余);lib API(`start_controller` 返回 crossbeam ControllerHandle)不动。详见 §3.9;bisect 历史见 `docs/debug-journal/event-pump-blocking.md` | ✅ |
 
 ---
 
