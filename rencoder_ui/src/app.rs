@@ -1,23 +1,37 @@
 //! Dioxus App component (U21 §3.8.7).
 //!
-//! Tiers follow-up fix (see git log): the event pump used to
-//! block the Dioxus executor (crossbeam_channel::Receiver::recv()
-//! is blocking, not a real future). Fix: bridge through a
-//! futures::channel::mpsc so the executor can poll without
-//! blocking. This file is the full restored App() — all
-//! panels + buttons + the original CSS via `include_str!`.
+//! Tiers follow-up refactor (Strategy 2 per the architectural
+//! review): keep the lib's `crossbeam-channel` boundary intact
+//! and drain events on a dedicated `std::thread`. The thread
+//! mutates Dioxus `Signal`s directly via `with_mut` / `set`,
+//! which Dioxus 0.6 supports across thread boundaries (the
+//! signal's underlying storage is `Send + Sync`).
+//!
+//!   [Polars/Rayon worker thread] ---send--->  crossbeam evt_tx
+//!                                                    |
+//!                                                    v
+//!                                            crossbeam evt_rx
+//!                                                    |
+//!                                                    v
+//!                                          [std::thread::spawn]
+//!                                          blocks on rx.recv()
+//!                                          calls state.with_mut
+//!                                          (triggers Dioxus re-render)
+//!
+//! No `use_coroutine`, no `async`, no `futures` crate, no
+//! intermediate mpsc bridge. The executor is never blocked
+//! because the blocking recv runs on a dedicated OS thread,
+//! not in Dioxus's task scheduler.
 
 use dioxus::prelude::*;
 
 use std::sync::Arc;
 
 use crossbeam_channel::Sender;
-use futures::channel::mpsc;
-use futures::StreamExt;
 
 use rencoder_lib::analyzer::records::AnalysisRecord;
 use rencoder_lib::config::app::AppConfig;
-use rencoder_lib::job::{start_controller, Command, Event};
+use rencoder_lib::job::{start_controller, Command};
 
 use crate::msg::{reduce, AppState, Msg};
 
@@ -29,40 +43,67 @@ const CSS: &str = include_str!("../assets/style.css");
 
 #[component]
 pub fn App() -> Element {
-    let mut state = use_signal(AppState::default);
-    let mut cmd_tx: Signal<Option<Sender<Command>>> = use_signal(|| None);
-    let mut config: Signal<Arc<AppConfig>> = use_signal(|| Arc::new(AppConfig::default()));
+    // Signals live in the component body so the buttons and the
+    // background thread can both read/copy them. `Signal<T>` is
+    // `Copy` in Dioxus 0.6, so the thread closure can capture
+    // a copy and the buttons capture another copy of the same
+    // underlying storage.
+    // Strategy 2 (design §3.9.2): `use_signal_sync` returns
+    // `Signal<T, SyncStorage>` (parking_lot RwLock backend, Send +
+    // Sync). Required because the background drain thread captures
+    // copies of these signals and mutates them across thread
+    // boundaries. Default `use_signal` is `Signal<T, UnsyncStorage>`
+    // (RefCell backend, !Send) — E0277 on `std::thread::spawn`.
+    // `state` is read/copied into the buttons and panels below; only
+    // `config` and `cmd_tx` are directly `.set(...)` here. Marking
+    // `state` non-`mut` keeps the warning clean.
+    let state: Signal<AppState, SyncStorage> = use_signal_sync(AppState::default);
+    let mut config: Signal<Arc<AppConfig>, SyncStorage> =
+        use_signal_sync(|| Arc::new(AppConfig::default()));
+    let mut cmd_tx: Signal<Option<Sender<Command>>, SyncStorage> = use_signal_sync(|| None);
 
-    let mut state_for_coro = state;
-    let mut config_for_coro = config;
-
-    use_coroutine(move |_rx: UnboundedReceiver<()>| {
+    // One-shot setup: start the controller, wire the channels
+    // into the signals, spawn the event-drain thread. Runs once
+    // per App() mount (Dioxus calls use_hook on the first render
+    // and skips it on re-renders). The thread lives as long as
+    // the component (until the App() unmounts, which for the
+    // desktop main view is the process lifetime).
+    use_hook(|| {
         let handle = start_controller();
         let cfg = handle.config();
-        config_for_coro.set(cfg);
         let (tx, evt_rx) = handle.into_split();
-        let tx_for_loop = tx.clone();
-        cmd_tx.set(Some(tx));
+        config.set(cfg);
+        cmd_tx.set(Some(tx.clone()));
 
-        // Bridge: blocking crossbeam -> futures::mpsc.
-        let (mut tx_async, rx_async) = mpsc::unbounded::<Event>();
-        std::thread::spawn(move || {
-            while let Ok(evt) = evt_rx.recv() {
-                if tx_async.unbounded_send(evt).is_err() {
-                    break;
+        // Capture signal copies for the thread closure. These
+        // are the same underlying storage the App() body uses
+        // for `state.read()` and the buttons' `state.with_mut()`.
+        let mut state_thread = state;
+        let config_thread = config;
+        let cmd_tx_thread = cmd_tx;
+        // Thread name per design §3.9.5 (`rencoder-ui-drain`) so
+        // the OS thread list and crash dumps identify the UI's
+        // event-pump worker. `Builder::spawn` returns
+        // `io::Result<JoinHandle>` — the thread is started in
+        // `use_hook` which only runs once per App mount, so a
+        // spawn failure here is unrecoverable and we panic with
+        // context.
+        std::thread::Builder::new()
+            .name("rencoder-ui-drain".to_string())
+            .spawn(move || {
+                while let Ok(evt) = evt_rx.recv() {
+                    let cfg = config_thread.read().clone();
+                    // cmd_tx is needed by reduce() for any
+                    // user-input events that the reducer decides
+                    // to re-dispatch. We read it fresh each time
+                    // because it's set by use_hook above.
+                    let tx_for_reduce = cmd_tx_thread.read().clone();
+                    if let Some(tx) = tx_for_reduce {
+                        state_thread.with_mut(|s| reduce(s, Msg::Lib(evt), &tx, &cfg));
+                    }
                 }
-            }
-        });
-
-        async move {
-            let mut stream = rx_async;
-            while let Some(evt) = stream.next().await {
-                let cfg = config_for_coro.read().clone();
-                state_for_coro.with_mut(|s| {
-                    reduce(s, Msg::Lib(evt), &tx_for_loop, &cfg)
-                });
-            }
-        }
+            })
+            .expect("rencoder-ui-drain: failed to spawn event-pump thread");
     });
 
     let s = state.read();
@@ -169,9 +210,9 @@ pub fn App() -> Element {
 
 #[component]
 fn DirPicker(
-    state: Signal<AppState>,
-    cmd_tx: Signal<Option<Sender<Command>>>,
-    config: Signal<std::sync::Arc<AppConfig>>,
+    state: Signal<AppState, SyncStorage>,
+    cmd_tx: Signal<Option<Sender<Command>>, SyncStorage>,
+    config: Signal<std::sync::Arc<AppConfig>, SyncStorage>,
 ) -> Element {
     let mut local = use_signal(|| {
         state
@@ -222,7 +263,7 @@ fn DirPicker(
 }
 
 #[component]
-fn ProgressPanel(state: Signal<AppState>) -> Element {
+fn ProgressPanel(state: Signal<AppState, SyncStorage>) -> Element {
     let progress = state.read().progress.clone();
     if progress.is_empty() {
         return rsx! { p { class: "muted", "(no active progress)" } };
@@ -256,7 +297,7 @@ fn ProgressPanel(state: Signal<AppState>) -> Element {
 }
 
 #[component]
-fn HistoryPanel(state: Signal<AppState>) -> Element {
+fn HistoryPanel(state: Signal<AppState, SyncStorage>) -> Element {
     let history = state.read().history.clone();
     if history.is_empty() {
         return rsx! { p { class: "muted", "(no history loaded)" } };
@@ -286,7 +327,7 @@ fn HistoryPanel(state: Signal<AppState>) -> Element {
 }
 
 #[component]
-fn DryRunPanel(state: Signal<AppState>) -> Element {
+fn DryRunPanel(state: Signal<AppState, SyncStorage>) -> Element {
     let results = state.read().dry_run_results.clone();
     if results.is_empty() {
         return rsx! { p { class: "muted", "(no dry-run results yet — click Preview)" } };
@@ -312,7 +353,7 @@ fn DryRunPanel(state: Signal<AppState>) -> Element {
 }
 
 #[component]
-fn SettingsPanel(config: Signal<std::sync::Arc<AppConfig>>) -> Element {
+fn SettingsPanel(config: Signal<std::sync::Arc<AppConfig>, SyncStorage>) -> Element {
     let cfg = config.read().clone();
     let enc = cfg.encode.clone().unwrap_or_default();
     rsx! {
@@ -331,7 +372,7 @@ fn SettingsPanel(config: Signal<std::sync::Arc<AppConfig>>) -> Element {
 }
 
 #[component]
-fn AnalyzePanel(state: Signal<AppState>) -> Element {
+fn AnalyzePanel(state: Signal<AppState, SyncStorage>) -> Element {
     let s = state.read();
     let progress_text = s.analyze_progress.as_ref().map(|p| {
         let last_hint = match &p.last {
@@ -403,7 +444,7 @@ fn AnalyzePanel(state: Signal<AppState>) -> Element {
 }
 
 #[component]
-fn LogPanel(state: Signal<AppState>) -> Element {
+fn LogPanel(state: Signal<AppState, SyncStorage>) -> Element {
     let log = state.read().log.clone();
     if log.is_empty() {
         return rsx! { p { class: "muted", "(no log output)" } };
