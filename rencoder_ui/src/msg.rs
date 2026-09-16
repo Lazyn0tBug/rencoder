@@ -394,8 +394,11 @@ pub fn reduce(
                     let files = match collect_input_files(state, config) {
                         Ok(files) => files,
                         Err(CollectError::NoInputDir) => {
-                            // No dir anymore (shouldn't happen —
-                            // the active task's dir is still set).
+                            // Defensive: input_dir is None while an
+                            // active task exists. Should be impossible
+                            // (the dir picker is gated), but show
+                            // an error rather than silent failure.
+                            state.last_error = Some("input dir missing (re-pick)".into());
                             return;
                         }
                         Err(CollectError::UnreadableDir) => {
@@ -574,6 +577,14 @@ fn apply_event(state: &mut AppState, evt: Event) {
                 t.records.push(record);
                 t.encoded += 1;
             }
+            // Per-file progress is a snapshot of the LAST file
+            // ffmpeg reported on; clear it so the ProgressPanel
+            // shows the next in-flight file's metrics, not the
+            // finished file's stale ones. (Restored from
+            // pre-redesign behavior; the redesign accidentally
+            // dropped this and the panel kept the last row's
+            // stale fps/eta until next Event::Progress.)
+            state.progress.clear();
         }
         Event::BatchCompleted { records } => {
             // Move-to-history (per §3.8.7.1): tasks.active.take()
@@ -748,7 +759,13 @@ fn dispatch_dry_run_for_new_task(
             return;
         }
         Err(CollectError::UnreadableDir) => {
-            let dir = state.input_dir.as_deref().unwrap_or(Path::new("?"));
+            // `UnreadableDir` only fires when `read_dir(state.input_dir)`
+            // was attempted, which requires `state.input_dir` to be
+            // `Some` (NoInputDir short-circuits before read_dir).
+            // So `unwrap()` is safe here — the alternative would be
+            // to thread the failing path back through CollectError,
+            // but it's a marginal ergonomic win.
+            let dir = state.input_dir.as_ref().unwrap();
             state.last_error = Some(format!(
                 "cannot read {} (permission denied or path missing)",
                 dir.display()

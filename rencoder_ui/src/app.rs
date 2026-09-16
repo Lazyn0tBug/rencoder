@@ -690,25 +690,8 @@ fn LogPanel(state: Signal<AppState, SyncStorage>) -> Element {
         return rsx! { p { class: "muted", "(no log output)" } };
     }
     let lines: Vec<crate::msg::LogLine> = log.iter().rev().take(1000).cloned().collect();
-    let rendered: Vec<(String, String, String)> = lines
-        .iter()
-        .rev()
-        .map(|l| {
-            // LibInternal lines use file_index = usize::MAX
-            // (sentinel). Render as "(global)" instead of a huge
-            // number; per-file ffmpeg stderr keeps "[N]".
-            let file_label = if l.file_index == crate::msg::NO_FILE_INDEX {
-                "global".to_string()
-            } else {
-                format!("{}", l.file_index)
-            };
-            (
-                l.at.format("%H:%M:%S").to_string(),
-                file_label,
-                l.line.clone(),
-            )
-        })
-        .collect();
+    let rendered: Vec<(String, String, String)> =
+        lines.iter().rev().map(format_log_entry).collect();
     rsx! {
         div { class: "log-window",
             for (time, file, msg) in rendered {
@@ -730,22 +713,8 @@ fn LogPanel(state: Signal<AppState, SyncStorage>) -> Element {
 fn FooterLog(state: Signal<AppState, SyncStorage>) -> Element {
     let log = state.read().log.clone();
     let lines: Vec<_> = log.iter().rev().take(5).cloned().collect();
-    let rendered: Vec<(String, String, String)> = lines
-        .iter()
-        .rev()
-        .map(|l| {
-            let file_label = if l.file_index == crate::msg::NO_FILE_INDEX {
-                "global".to_string()
-            } else {
-                format!("{}", l.file_index)
-            };
-            (
-                l.at.format("%H:%M:%S").to_string(),
-                file_label,
-                l.line.clone(),
-            )
-        })
-        .collect();
+    let rendered: Vec<(String, String, String)> =
+        lines.iter().rev().map(format_log_entry).collect();
     let empty = rendered.is_empty();
     rsx! {
         footer { class: "log-footer",
@@ -772,3 +741,24 @@ fn FooterLog(state: Signal<AppState, SyncStorage>) -> Element {
 // ============================================================================
 #[allow(dead_code)]
 fn _unused_field_type_hints(_: TaskQueue, _: TaskId) {}
+
+/// Format a `LogLine` for display in `LogPanel` and `FooterLog`.
+/// Returns `(time, file_label, message)`:
+/// - `time`: HH:MM:SS format of when the line landed in `state.log`
+/// - `file_label`: the file index (per-file ffmpeg stderr) or
+///   `"global"` (lib-internal tracing events with `NO_FILE_INDEX`)
+/// - `message`: the raw line text (already formatted by
+///   `tracing-subscriber` for lib events; raw ffmpeg text for
+///   `Event::LogLine`).
+fn format_log_entry(l: &crate::msg::LogLine) -> (String, String, String) {
+    let file_label = if l.file_index == crate::msg::NO_FILE_INDEX {
+        "global".to_string()
+    } else {
+        format!("{}", l.file_index)
+    };
+    (
+        l.at.format("%H:%M:%S").to_string(),
+        file_label,
+        l.line.clone(),
+    )
+}

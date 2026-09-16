@@ -1892,40 +1892,36 @@ struct AppState {
     input_dir: Option<PathBuf>,
     /// 最近一次 fatal 错误(由 `Event::Error` 设置;UI 在 header 顶部展示)
     last_error: Option<String>,
-    /// 当前 analyze 批的进度(U22 / Tier 3 #9)。`None` = 没在跑或还没
-    /// 收到 `AnalyzeStarted`。`done` / `total` / `failed` 单调递增——
-    /// reducer 不去重,完全信任 lib 推上来的 event sequence。
-    #[allow(dead_code)]
-    analyze_progress: Option<AnalyzeProgressInfo>,
-    /// 上一次 analyze 批的结果(U22)。`AnalyzeFinished` 触发时**覆盖**
-    /// 而不是 append——下一次 analyze 自然取代上一次,跟 history 行为
-    /// 一致;用户点别的按钮不清空。
-    #[allow(dead_code)]
-    analyze_results: Vec<AnalysisRecord>,
-}
+    // NOTE: v1 之前有两个 analyze-related 字段(`analyze_progress`,
+    // `analyze_results`)和对应的 `AnalyzeProgressInfo` struct。
+    // §3.8.7.2 redesign 把 `Command::Analyze` 路径删了(Start
+    // 自动 DryRun + Confirm 已经能完成同样的用户意图),这俩字段
+    // 同步移除;U22 analyze state 假设作废。
 
-/// 4 个 page tab 的枚举(§3.8.7.2)。`Setup` 是初始值。Tab 切换
-/// 通过 `Msg::UserClickedTab(Page)` 走 reducer;reducer 直接写
-/// `state.active_page`,App() 通过 `use_signal_sync` 镜像此字段给
-/// Dioxus 渲染层(reducer 不持有 Dioxus signal,保持测试无 runtime
-/// 依赖)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum Page {
-    #[default]
-    Setup,
-    Task,
-    History,
-    Log,
-}
-
-/// 当前 analyze 批的进度(§3.8.3 `Event::AnalyzeProgress` 的 UI 镜像)。
-#[allow(dead_code)]
-struct AnalyzeProgressInfo {
-    done: usize,
-    total: usize,
-    failed: usize,
-    /// 最近完成的一个文件 path + outcome(结果流 A 模式——LogPanel 用)。
-    last: Option<AnalyzedFile>,
+    /// 当前 active page tab。`Setup` 是初始值;4 个 page 之间
+    /// 不自动切换(用户手动点 tab)。Reducer 的 `UserClickedTab`
+    /// 直接写这个字段(可测试)。
+    pub active_page: Page,
+    /// 当前 Task 页展示哪个 task(v1: 总是 `tasks.active`,因为只有
+    /// 一个 slot)。v1.1:用户可在多 active 间切换。
+    pub viewing_task: Option<TaskId>,
+    /// per-file 进度,key 是 file_index(§3.8.3 `Progress.file_index`)。
+    /// v1: 单一 active task 的进度;v1.1: `HashMap<TaskId, HashMap<...>>`。
+    pub progress: HashMap<usize, ProgressInfo>,
+    /// stderr log ring buffer(newest last)。混合 ffmpeg stderr
+    /// (`Event::LogLine` → `LogSource::FfmpegStderr`)和 lib 内部
+    /// tracing 事件(`Msg::LibLogLine` → `LogSource::LibInternal`),
+    /// 上限 `LOG_RING_CAP = 1000`。
+    pub log: VecDeque<LogLine>,
+    /// Parquet-loaded history(per-file EncodingRecord)。和
+    /// `task_history` 概念不同:这个是 cross-session 的 Parquet
+    /// reload 结果(`Command::LoadHistory`),v1.1 启用。
+    pub history: Vec<EncodingRecord>,
+    /// 当前选中的输入目录(DirPicker 设置)。
+    pub input_dir: Option<PathBuf>,
+    /// 最近一次 fatal error(任何来源)。UI 在 header 下方展示
+    /// 红色 banner。
+    pub last_error: Option<String>,
 }
 
 /// 当前批的元信息;由 `Event::BatchStarted` 写入、`Event::BatchCompleted`/`BatchCancelled` 关闭。
@@ -2112,10 +2108,6 @@ enum Msg {
     /// app start is deferred to v1.1 (§3.8.7.4 limitations).
     #[allow(dead_code)]
     UserClickedLoadHistory,
-    /// 触发 AppConfig 写回原路径(U21 / Tier 2 #8)——Save 按钮
-    /// 走这条,发 `Command::SaveConfig`。
-    #[allow(dead_code)]
-    UserClickedSaveSettings,
     /// User clicked a top-bar tab(§3.8.7.2 Page structure).
     /// Reducer writes `state.active_page`. No lib command; purely
     /// UI-side routing.
@@ -2203,9 +2195,6 @@ fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>, config: &App
         }
         Msg::UserClickedLoadHistory => {
             let _ = cmd_tx.send(Command::LoadHistory { limit: Some(100), after: None });
-        }
-        Msg::UserClickedSaveSettings => {
-            let _ = cmd_tx.send(Command::SaveConfig);
         }
         Msg::UserClickedTab(page) => {
             // No lib command; pure UI routing.
