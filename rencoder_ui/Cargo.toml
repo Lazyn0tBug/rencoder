@@ -11,6 +11,14 @@ rencoder_lib = { path = "../rencoder_lib" }
 dioxus = { version = "0.6", features = ["desktop"] }
 dioxus-hooks = "0.6"
 crossbeam-channel = "0.5"
+# `rfd` (Rusty File Dialog) drives the native folder picker behind
+# `DirPicker` (§3.8.7). Default features pull in the platform backend
+# (rfd uses NSOpenPanel on macOS, IFileDialog on Windows, zenity /
+# kdialog / xdg-desktop-portal on Linux). Sync API (`pick_folder`)
+# is what we want — the onclick handler is on the main thread, so a
+# blocking dialog call there is fine and simpler than wrapping
+# `AsyncFileDialog` in a use_future.
+rfd = "0.14"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [[bin]]

@@ -23,6 +23,7 @@
 //! because the blocking recv runs on a dedicated OS thread,
 //! not in Dioxus's task scheduler.
 
+use dioxus::desktop;
 use dioxus::prelude::*;
 
 use std::sync::Arc;
@@ -203,6 +204,7 @@ pub fn App() -> Element {
                     },
                     "Analyze"
                 }
+                ExitButton {}
             }
         }
     }
@@ -214,24 +216,6 @@ fn DirPicker(
     cmd_tx: Signal<Option<Sender<Command>>, SyncStorage>,
     config: Signal<std::sync::Arc<AppConfig>, SyncStorage>,
 ) -> Element {
-    let mut local = use_signal(|| {
-        state
-            .read()
-            .input_dir
-            .clone()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    });
-    let state_value = state
-        .read()
-        .input_dir
-        .clone()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    if local.read().as_str() != state_value.as_str() {
-        local.set(state_value);
-    }
-
     rsx! {
         div { class: "dir-picker",
             label { "Input directory: " }
@@ -241,23 +225,48 @@ fn DirPicker(
             } else {
                 span { class: "muted", "(none)" }
             }
-            input {
-                r#type: "text",
-                placeholder: "/path/to/videos",
-                value: "{local}",
-                oninput: move |e| {
-                    let s = e.value();
-                    local.set(s.clone());
-                    if s.is_empty() { return; }
-                    let path = std::path::PathBuf::from(&s);
-                    if let Some(tx) = cmd_tx.read().clone() {
-                        let cfg = config.read().clone();
-                        state.with_mut(|st| {
-                            reduce(st, Msg::UserSelectedDir(path), &tx, &cfg)
-                        });
+            button {
+                // rfd::FileDialog::pick_folder blocks until the user
+                // closes the dialog. Runs on the Dioxus main thread
+                // (onclick handler) — required on macOS where
+                // NSOpenPanel must run on the main thread. Sync API
+                // is the right fit: no need to wire a use_future
+                // around AsyncFileDialog for a one-shot pick.
+                onclick: move |_| {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_title("Choose input directory")
+                        .pick_folder()
+                    {
+                        if let Some(tx) = cmd_tx.read().clone() {
+                            let cfg = config.read().clone();
+                            state.with_mut(|st| {
+                                reduce(st, Msg::UserSelectedDir(path), &tx, &cfg)
+                            });
+                        }
                     }
                 },
+                "Pick directory..."
             }
+        }
+    }
+}
+
+#[component]
+fn ExitButton() -> Element {
+    rsx! {
+        button {
+            // v1: just close the window — no Command::Cancel sent
+            // to the lib actor (limitation documented in design
+            // §3.8.7 v1 limitations). When Dioxus's runtime
+            // exits after the last window closes, the OS reaps
+            // the lib actor + drain thread. If a batch was in
+            // flight, partial output is cleaned up on the next
+            // start by encode_prepare's existing partial
+            // detection — no new work added.
+            onclick: move |_| {
+                desktop::window().close();
+            },
+            "Exit"
         }
     }
 }

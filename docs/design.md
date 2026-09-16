@@ -1968,13 +1968,14 @@ fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>) {
 
 | 组件 | 输入 | 渲染什么 |
 |------|------|----------|
-| `DirPicker` | `state: Signal<AppState>`, `cmd_tx: Signal<Option<Sender<Command>>>` | 目录输入框 + 当前选择 path;on change 派 `UserSelectedDir` |
+| `DirPicker` | `state: Signal<AppState>`, `cmd_tx: Signal<Option<Sender<Command>>>` | **Pick button + native folder dialog** (`rfd::FileDialog::pick_folder`)+ 当前选择 path 显示;on pick 派 `UserSelectedDir`(v1.1 早期版本用 `<input type="text">`,v1.1+ 换成 native dialog——见 v1 limitations 表的更新) |
 | `ProgressPanel` | `state: Signal<AppState>` | `state.progress` HashMap → per-file 表格(fps/speed/ETA);空时显示"(no active progress)" |
 | `LogPanel` | `state: Signal<AppState>` | `state.log` 末 100 行 newest-first,带时间戳;空时显示"(no log output)" |
 | `HistoryPanel` | `state: Signal<AppState>` | `state.history` 表(source / outcome / output / duration / size);空时显示"(no history loaded)" |
 | `DryRunPanel` | `state: Signal<AppState>` | `state.dry_run_results` 表(source / planned outcome / output);空时显示"(no dry-run results yet — click Preview)" |
 | `SettingsPanel` | `config: Signal<Arc<AppConfig>>` | 只读展示 `[encode]` 当前值(format / crf / bitrate / extensions / max_fps / nv);text-only 字段编辑留 v1.2 |
 | `AnalyzePanel` (U22) | `state: Signal<AppState>` | analyze 进度文本 `"X/Y (Z failed)"` + `last` 字段(刚完成文件);v1 不带视觉进度条。`state.analyze_results` 末 batch 完成时在下面渲染 records 表(类似 DryRunPanel)**按 outcome 分区显示:failed 在上 succeeded 在下,中间 muted 分隔行**(`Vec::partition` by `r.fps.is_none()`,stable partition 保持组内输入序)。lib 不抽 `partition_by_outcome` helper——单 consumer 且 inline 1 行,等 CLI 也要用时再抽 |
+| `ExitButton` | — | 单 `<button>`,onclick 调 `dioxus::desktop::window().close()`。v1 不主动停 lib actor——关窗后 Dioxus 退 runtime,进程退出时 OS 回收 actor / drain 线程。若有批在跑,partial output 由 `encode_prepare` partial detection 下次启动自动清(无新增 work)。无 `controller_alive` 字段(同 §3.9 v1 一致) |
 
 **v1 已知 limitations**(rencoder_ui 当前 bootstrap 状态):
 
@@ -1989,8 +1990,8 @@ fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>) {
 | `EncoderSettings.preset` / `max_fps_target` | **未传给 ffmpeg** | v1.1 build_ffmpeg_command 接 `EncodeParams` |
 | Preview / Dry Run | **未实现**——user 无法预览编码结果 | v1.1 加 `Command::DryRun` + `Event::DryRunFinished` |
 | Analyze + progress reporting | **未实现**——UI 不能跑 analyze | v1.1 加 `Command::Analyze` + `Event::AnalyzeProgress` + `AnalyzePanel`;**v1.1 也**不支持 `Command::Cancel` abort analyze 批(见 §3.4 "分析进度上报" v1 限制) |
-| Native 文件选择对话框 | **无**——v1 用 `<input type="text">` | v1.2 调研 `rfd` 或 Dioxus 内建 |
 | UI drain thread panic recovery | **未实现**——v1 不包裹 `use_hook` 里 `std::thread::spawn` 的循环 in `catch_unwind`。如果 `state.with_mut(\|s\| reduce(...))` panic(reducer bug、SIGPIPE 等),所有后续事件被静默吞掉,UI 不响应但 lib 仍在写 channel | v1.1 `use_hook` 里 `std::panic::catch_unwind` 包裹循环 + 暴露 `controller_alive: false` + `last_error`;详见 §3.9.4 |
+| Exit button 不发 Cancel | v1 Exit 只 `window().close()`,不向 lib actor 发 `Command::Cancel`。若用户在批运行中点 Exit,ffmpeg 子进程随进程退出被杀,partial output 由 `encode_prepare` partial detection 下次启动清(同 §3.8.2 partial 处理路径) | v1.1 Exit 先 `Command::Cancel` + 等 `BatchCancelled` event,再 `window().close()`,避免依赖 partial-detection 兜底 |
 
 这些限制不影响协议契约（Command/Event 已端到端测试通过 mock_tests），只是 UI 渲染层不完整。
 
