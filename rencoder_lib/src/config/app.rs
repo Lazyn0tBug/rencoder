@@ -155,6 +155,55 @@ pub struct EncodeConfig {
     pub extensions: Option<Vec<String>>,
     pub output_dir: Option<PathBuf>,
     pub encoders: Option<EncodersConfig>,
+    /// ffmpeg argv construction knobs. Most of the previously hardcoded
+    /// flags move here so users can override the encoder/preset chain
+    /// without forking the binary. `build_ffmpeg_command` interpolates
+    /// only `ffmpeg`, `-y`, `-i`, the input path, and the output path;
+    /// everything else comes from these lists. (See review fix #1:
+    /// the path-injection surface is now the *only* Rust-concatenated
+    /// raw string in the argv.)
+    #[serde(default)]
+    pub ffmpeg_args: FfmpegArgsConfig,
+}
+
+/// Ffmpeg argv construction knobs (Tiers follow-up review). All four
+/// lists are interpolated verbatim by `build_ffmpeg_command`; flags
+/// must already be valid for the chosen encoder.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FfmpegArgsConfig {
+    /// Flags before `-i <input>`. Default: `["-y", "-hide_banner",
+    /// "-loglevel", "info", "-nostats"]`.
+    pub pre_input: Vec<String>,
+    /// Flags after `-i <input>` and before any rate-control flags.
+    /// Default: `[]` (caller appends `-c:v`, `-crf`, audio, etc. via
+    /// their own knobs below).
+    pub post_input: Vec<String>,
+    /// `-preset` value when the libsvtav1 fallback is taken. Default:
+    /// `None` — the lib falls back to `"6"` (libsvtav1 medium).
+    pub default_preset: Option<String>,
+    /// Audio codec passed to `-c:a <codec>`. Default: `Some("libopus")`.
+    pub default_audio_codec: Option<String>,
+    /// Audio bitrate passed to `-b:a <bitrate>`. Default: `Some("32k")`.
+    pub default_audio_bitrate: Option<String>,
+}
+
+impl Default for FfmpegArgsConfig {
+    fn default() -> Self {
+        Self {
+            pre_input: vec![
+                "-y".into(),
+                "-hide_banner".into(),
+                "-loglevel".into(),
+                "info".into(),
+                "-nostats".into(),
+            ],
+            post_input: vec![],
+            default_preset: None,
+            default_audio_codec: Some("libopus".into()),
+            default_audio_bitrate: Some("32k".into()),
+        }
+    }
 }
 
 // Manual `Default` so the in-memory default matches the TOML
@@ -172,6 +221,7 @@ impl Default for EncodeConfig {
             extensions: None,
             output_dir: None,
             encoders: None,
+            ffmpeg_args: FfmpegArgsConfig::default(),
         }
     }
 }
@@ -624,6 +674,7 @@ mod tests {
                     extensions: None,
                     output_dir: None,
                     encoders: None,
+                    ffmpeg_args: FfmpegArgsConfig::default(),
                 }),
                 analyze: None,
             };
@@ -651,6 +702,7 @@ mod tests {
                     extensions: None,
                     output_dir: None,
                     encoders: None,
+                    ffmpeg_args: FfmpegArgsConfig::default(),
                 }),
                 analyze: None,
             };
@@ -673,6 +725,7 @@ mod tests {
                 extensions: None,
                 output_dir: None,
                 encoders: None,
+                ffmpeg_args: FfmpegArgsConfig::default(),
             }),
             analyze: None,
         };
@@ -695,6 +748,7 @@ mod tests {
                 extensions: None,
                 output_dir: None,
                 encoders: None,
+                ffmpeg_args: FfmpegArgsConfig::default(),
             }),
             analyze: None,
         };

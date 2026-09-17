@@ -692,7 +692,7 @@ fn build_argv(
     }
     let encoder = select_encoder(params.format, cache, config)
         .expect("select_encoder in build_argv should have been filtered");
-    build_ffmpeg_command(task, params, &encoder, src_fps)
+    build_ffmpeg_command(task, params, &encoder, src_fps, &config.ffmpeg_args)
 }
 
 /// Build the skipped-record skeleton (used for OutputExists and

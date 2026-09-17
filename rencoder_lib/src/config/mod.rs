@@ -29,6 +29,10 @@ pub struct Config {
     pub max_fps_eps: f64,
     /// Per-format encoder overrides. `None` means "use built-in default".
     pub encoders: EncoderConfig,
+    /// ffmpeg argv construction knobs (Tiers follow-up review). Mirrors
+    /// `EncodeConfig.ffmpeg_args` in the user-facing AppConfig; defaults
+    /// are populated by `Config::from_encode_config`.
+    pub ffmpeg_args: crate::config::app::FfmpegArgsConfig,
 }
 
 impl Default for Config {
@@ -37,6 +41,7 @@ impl Default for Config {
             max_fps: 0.0,
             max_fps_eps: 0.05,
             encoders: EncoderConfig::default(),
+            ffmpeg_args: crate::config::app::FfmpegArgsConfig::default(),
         }
     }
 }
@@ -97,6 +102,7 @@ impl Config {
                 .get("max_fps_eps")
                 .and_then(Value::as_f64)
                 .unwrap_or(defaults.max_fps_eps),
+            ffmpeg_args: defaults.ffmpeg_args,
             encoders: parse_encoders(v.get("encoders")),
         }
     }
@@ -159,6 +165,7 @@ impl Config {
                 .as_ref()
                 .map(EncoderConfig::from)
                 .unwrap_or_default(),
+            ffmpeg_args: enc.ffmpeg_args.clone(),
         }
     }
 }

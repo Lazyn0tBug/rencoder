@@ -45,6 +45,31 @@ fn collect_dir(root: &Path, extensions: &[String]) -> Result<Vec<PathBuf>, Encod
         // follow_links(false) walkdir reports symlinks with is_file()=false,
         // is_symlink()=true -- exactly what we want.
         if entry.file_type().is_file() && matches_extension(path, extensions) {
+            // Review fix #1 (partial): reject filenames beginning with
+            // `-` so they can't be parsed as ffmpeg options when
+            // passed as `argv[i]` after the libsvtav1 argv shift
+            // (review fix: most flags now come from `EncodeConfig.
+            // ffmpeg_args.{pre_input, post_input}` instead of Rust
+            // concatenation, but the input path is still passed
+            // positionally). POSIX-flavoured ffmpeg accepts `-vf`,
+            // `-ss`, etc. as positional options; rejecting the
+            // filename at the source is the simplest, library-level
+            // fix that doesn't depend on ffmpeg honoring `--`.
+            //
+            // Allowlist: filenames whose first component does not
+            // start with `-` (including the leading dot files like
+            // `.bashrc`, which start with `.` not `-`).
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with('-'))
+            {
+                log::warn!(
+                    "    skipping file with leading-dash name (would be parsed as ffmpeg flag): {}",
+                    path.display()
+                );
+                continue;
+            }
             results.push(path.to_path_buf());
         }
     }
@@ -116,6 +141,20 @@ mod tests {
         let f = touch(&dir, "anything.xyz");
         let files = collect_files(&Target::File(f.clone()), &[]).unwrap();
         assert_eq!(files, vec![f]);
+    }
+
+    #[test]
+    fn dir_target_skips_files_with_dash_prefixed_names() {
+        // Review fix #1 (partial): filenames starting with `-` would
+        // be parsed as ffmpeg argv options when passed positionally
+        // after `-i`. The lib's collect_dir skips them with a warning
+        // rather than passing them through.
+        let dir = fixture_dir("dir_dash");
+        let good = touch(&dir, "movie.mp4");
+        let bad = touch(&dir, "-vf_negate.mp4");
+        let files = collect_files(&Target::Dir(dir), &["mp4".into()]).unwrap();
+        assert_eq!(files, vec![good]);
+        assert!(!files.contains(&bad));
     }
 
     #[test]
