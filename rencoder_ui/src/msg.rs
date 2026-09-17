@@ -423,7 +423,12 @@ pub fn reduce(
                         t.phase = BatchPhase::Encoding;
                         t.records.clear();
                     }
-                    let _ = cmd_tx.send(Command::StartBatch { params, files });
+                    // Review #111: cmd_tx is bounded (capacity 16). `try_send` is
+                    // non-blocking; on Full or Disconnected the
+                    // command is dropped. A dropped Cmd is equivalent
+                    // to a no-op (the user sees no BatchStarted
+                    // response and can retry).
+                    let _ = cmd_tx.try_send(Command::StartBatch { params, files });
                 }
                 Some(BatchPhase::Analyzing) | Some(BatchPhase::Encoding) => {
                     state.last_error = Some("task in progress".into());
@@ -437,7 +442,7 @@ pub fn reduce(
                     if let Some(t) = state.tasks.active.as_mut() {
                         t.cancelled = true;
                     }
-                    let _ = cmd_tx.send(Command::Cancel);
+                    let _ = cmd_tx.try_send(Command::Cancel);
                 }
                 Some(BatchPhase::AwaitingConfirm) => {
                     // P2.7 fix: keep the cancelled plan in history
@@ -459,7 +464,7 @@ pub fn reduce(
             }
         }
         Msg::UserClickedLoadHistory => {
-            let _ = cmd_tx.send(Command::LoadHistory {
+            let _ = cmd_tx.try_send(Command::LoadHistory {
                 limit: Some(100),
                 after: None,
             });
@@ -843,7 +848,7 @@ fn dispatch_dry_run_for_new_task(
         dry_run_records: Vec::new(),
     });
     state.viewing_task = Some(task_id);
-    let _ = cmd_tx.send(Command::DryRun { params, files });
+    let _ = cmd_tx.try_send(Command::DryRun { params, files });
 }
 
 #[cfg(test)]

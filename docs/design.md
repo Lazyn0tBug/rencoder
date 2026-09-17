@@ -1686,6 +1686,17 @@ UI actor (Dioxus)  ──Command──►  lib actor (BatchController bg thread)
 - ffmpeg 子进程、`PartialOutputHandle`、`Child` handle、SIGINT 全部封装在 lib actor 内部。
 - 这把 lib 内部的复杂性收敛到一处，UI 端只看到消息流。
 
+**Channel 上限（review #111）**:两个 actor 之间的 mpsc 是有界的。
+- `cmd_tx` (UI → lib):容量 16,`try_send` 语义。人类节奏下足够,
+  满了就丢——重复的 `StartBatch` 本来就会被 busy-gate 拒绝。
+- `evt_tx` (lib → UI):容量 1024,按 variant 分流:结构性事件
+  (`BatchStarted` / `FileCompleted` / `BatchCompleted` / `Error`)
+  满了就 block(不丢,准确性优先);进度类事件(`Progress` /
+  `AnalyzeProgress` / `LogLine`)满了就丢 + 计数(`#[non_exhaustive]`
+  让未来新增 variant 默认走"结构性"安全路径)。
+- 公共 API (`ControllerHandle.command_sender()`) 类型不变,
+  `Sender<Command>` 的内部容量是构造细节。
+
 #### 3.8.3 消息协议
 
 **Command（UI → lib）**

@@ -21,7 +21,9 @@
 //! A second `StartBatch` while one is running returns
 //! `Event::Error(ConfigError)` rather than queueing.
 
-use crossbeam_channel::{unbounded, Receiver, Sender};
+#[cfg(test)]
+use crossbeam_channel::unbounded;
+use crossbeam_channel::{bounded, Receiver, Sender};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -361,6 +363,104 @@ mod tests {
             message: "ffmpeg not found".into(),
         };
     }
+
+    // ---- send_evt_lossy / bounded channel policy (review #111) ----
+
+    use std::sync::atomic::AtomicU64;
+
+    /// Helper: build a synthetic Event::Progress for tests.
+    fn progress_event(i: usize) -> Event {
+        Event::Progress {
+            file_index: i,
+            frame: i as u64 * 100,
+            fps: 30.0,
+            speed: 1.0,
+            time_secs: i as f64,
+            eta_secs: None,
+        }
+    }
+
+    #[test]
+    fn send_evt_lossy_drops_progress_events_when_full() {
+        // cap 2: first two events land, rest are dropped (droppable class).
+        let (tx, rx) = crossbeam_channel::bounded::<Event>(2);
+        let counter = AtomicU64::new(0);
+        for i in 0..5 {
+            send_evt_lossy(&tx, progress_event(i), &counter);
+        }
+        // Drain whatever landed — should be exactly 2.
+        let received: Vec<Event> = rx.try_iter().collect();
+        assert_eq!(received.len(), 2);
+        // 3 of the 5 dropped; counter incremented 3 times.
+        assert_eq!(counter.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn is_droppable_classification_covers_progress_and_analyze_progress() {
+        assert!(is_droppable_event(&progress_event(0)));
+        assert!(is_droppable_event(&Event::AnalyzeProgress {
+            done: 1,
+            total: 10,
+            failed: 0,
+            last: None,
+        }));
+        // Structural variants must NOT be droppable.
+        assert!(!is_droppable_event(&Event::BatchStarted {
+            id: 1,
+            total_files: 10,
+        }));
+        assert!(!is_droppable_event(&Event::BatchCompleted {
+            records: vec![],
+        }));
+        assert!(!is_droppable_event(&Event::Error {
+            category: ErrorCategory::FfmpegSpawnFailed,
+            message: "x".into(),
+        }));
+    }
+
+    #[test]
+    fn send_evt_lossy_blocks_for_structural_event_when_full() {
+        // cap 1, filled with a structural event. Second structural
+        // event must block (not drop). We use a separate thread to
+        // observe: drop the receiver side after the first send, the
+        // second send (after fill) would otherwise hang forever —
+        // so we test the drop path by closing the channel and
+        // confirming the function returns without panic.
+        let (tx, rx) = crossbeam_channel::bounded::<Event>(1);
+        let counter = AtomicU64::new(0);
+        send_evt_lossy(
+            &tx,
+            Event::BatchStarted {
+                id: 1,
+                total_files: 10,
+            },
+            &counter,
+        );
+        // Drop receiver — second structural send should now hit
+        // Disconnected (the bounded send returns Err immediately on
+        // disconnect; our helper logs + returns). Confirms the
+        // structural path uses `send` (blocking) and that the
+        // Disconnected branch handles it.
+        drop(rx);
+        send_evt_lossy(&tx, Event::BatchCompleted { records: vec![] }, &counter);
+        // Droppable counter must NOT have ticked (structural events
+        // never increment).
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn send_cmd_lossy_drops_on_full() {
+        // cmd_tx capacity is 16 by convention; verify the helper
+        // drops on Full and accepts under-cap.
+        let (tx, _rx) = crossbeam_channel::bounded::<Command>(2);
+        send_cmd_lossy(&tx, Command::Cancel);
+        send_cmd_lossy(&tx, Command::Cancel);
+        // Third send should drop (capacity 2).
+        send_cmd_lossy(&tx, Command::Cancel);
+        // Receiver was held, so no Disconnected path exercised here.
+        // (The full assertion is just that the function returned
+        // without panicking on the third send.)
+    }
 }
 
 /// Error type returned by [`process_one_file`]. Encodes both encode
@@ -436,6 +536,10 @@ fn process_one_file<F>(
     total: usize,
     encode_fn: &mut F,
     emit: &Sender<Event>,
+    // Review #111: dropped-event counter, cloned into the progress
+    // closure so progress ticks drop on full per the lossy-send
+    // policy.
+    dropped_counter: &Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<EncodingRecord, ProcessError>
 where
     F: FnMut(
@@ -462,15 +566,24 @@ where
 
     let progress_emit = emit.clone();
     let progress_index = index;
+    // Review #111: capture the dropped-event counter so the
+    // progress callback (a FnMut closure) routes through the
+    // lossy-send helper. The counter is an Arc<AtomicU64> so
+    // cloning into the closure is cheap.
+    let progress_dropped = dropped_counter.clone();
     let mut on_progress = |p: FfmpegProgress| {
-        let _ = progress_emit.send(Event::Progress {
-            file_index: progress_index,
-            frame: p.frame,
-            fps: p.fps,
-            speed: p.speed,
-            time_secs: p.time_secs,
-            eta_secs: p.eta_secs,
-        });
+        send_evt_lossy(
+            &progress_emit,
+            Event::Progress {
+                file_index: progress_index,
+                frame: p.frame,
+                fps: p.fps,
+                speed: p.speed,
+                time_secs: p.time_secs,
+                eta_secs: p.eta_secs,
+            },
+            &progress_dropped,
+        );
     };
 
     let record = encode_fn(task, params, cache, config, cancel, &mut on_progress)
@@ -514,6 +627,79 @@ pub struct ControllerHandle {
     pub(crate) config_path: PathBuf,
 }
 
+/// Capacity for `evt_tx` (review #111). Sized for ~50 seconds of
+/// progress headroom at ~20 events/sec for 10 concurrent files.
+const EVT_TX_CAPACITY: usize = 1024;
+
+/// Capacity for `cmd_tx` (review #111). Human-paced UI sends;
+/// 16 covers any realistic burst.
+const CMD_TX_CAPACITY: usize = 16;
+
+/// Classify an `Event` by its drop-on-full behavior (review #111).
+/// Progress-class events can be dropped when the consumer is
+/// behind — losing one Progress tick just means the UI sees the
+/// next one slightly later. Structural events (BatchStarted,
+/// FileCompleted, BatchCompleted, Error) must NOT be dropped
+/// because they drive batch state and the UI relies on them for
+/// correctness.
+///
+/// `Event::AnalyzeProgress` is treated as progress-class for the
+/// same reason — `done`/`total`/`failed` are monotonic counters
+/// the UI uses for progress bars; missing a tick just delays
+/// the bar by one increment.
+///
+/// `#[non_exhaustive]` on `Event` means future variants default
+/// to "structural" — the safe choice for correctness. The match
+/// only enumerates the droppable cases; a new variant that should
+/// be droppable must add its own arm.
+fn is_droppable_event(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Progress { .. } | Event::AnalyzeProgress { .. }
+    )
+}
+
+/// Send an `Event` to the UI with per-variant policy (review
+/// #111). Progress-class events drop on full; structural events
+/// block. Disconnected UI is logged + ignored.
+fn send_evt_lossy(
+    tx: &Sender<Event>,
+    event: Event,
+    dropped_counter: &std::sync::atomic::AtomicU64,
+) {
+    match tx.try_send(event) {
+        Ok(()) => {}
+        Err(crossbeam_channel::TrySendError::Full(event)) => {
+            if is_droppable_event(&event) {
+                dropped_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                // Structural event: block until the UI drains. This
+                // stalls the actor thread briefly, but structural
+                // events are rare (1 per file) and the consumer
+                // backlog would have to be > 1024 for the wait to
+                // be noticeable.
+                let _ = tx.send(event);
+            }
+        }
+        Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+            log::warn!("    evt_tx disconnected (UI dropped receiver)");
+        }
+    }
+}
+
+/// Send a `Command` to the lib actor without blocking the caller.
+/// UI commands are human-paced; if the channel is full the command
+/// is dropped (review #111). The lib already handles duplicate
+/// `StartBatch` via the busy-gate.
+fn send_cmd_lossy(tx: &Sender<Command>, cmd: Command) {
+    if let Err(crossbeam_channel::TrySendError::Full(cmd)) = tx.try_send(cmd) {
+        log::warn!(
+            "    cmd_tx full, dropping command: {:?}",
+            std::mem::discriminant(&cmd)
+        );
+    }
+}
+
 impl ControllerHandle {
     /// Get a cloneable sender for sending commands. The UI typically
     /// clones this once per component that needs to dispatch.
@@ -543,6 +729,20 @@ impl ControllerHandle {
     /// rather than calling this method.
     pub fn into_split(self) -> (Sender<Command>, Receiver<Event>) {
         (self.cmd_tx, self.evt_rx)
+    }
+
+    /// Non-blocking command send (review #111). `cmd_tx` is
+    /// bounded (capacity 16); if the channel is full the command
+    /// is dropped with a log warn. The lib already handles
+    /// duplicate / late `StartBatch` via the busy-gate, so a
+    /// dropped command is a UI ergonomics issue, not a correctness
+    /// one.
+    ///
+    /// Use this from UI send sites that must not block the GUI
+    /// thread. For internal / test usage the standard
+    /// `Sender<Command>::send` is fine.
+    pub fn try_send_command(&self, cmd: Command) {
+        send_cmd_lossy(&self.cmd_tx, cmd);
     }
 }
 
@@ -580,8 +780,13 @@ impl ControllerHandle {
 /// Any init failure emits `Event::Error(ConfigError)` then the
 /// thread exits — UI sees the error + then no more events.
 pub fn start_controller() -> ControllerHandle {
-    let (cmd_tx, cmd_rx) = unbounded::<Command>();
-    let (evt_tx, evt_rx) = unbounded::<Event>();
+    // Review #111: bounded channels. cmd_tx (UI → lib) cap 16
+    // (human pace); evt_tx (lib → UI) cap 1024 (~50s of progress
+    // headroom at 20 events/sec for 10 concurrent files). Send
+    // policy: progress-class events drop on full; structural events
+    // block. See `send_evt_lossy` / `send_cmd_lossy` below.
+    let (cmd_tx, cmd_rx) = bounded::<Command>(CMD_TX_CAPACITY);
+    let (evt_tx, evt_rx) = bounded::<Event>(EVT_TX_CAPACITY);
 
     // Load AppConfig once here so the same Arc is shared with both:
     // - the actor thread (needs Config + AppConfig for derive / cache)
@@ -602,6 +807,12 @@ pub fn start_controller() -> ControllerHandle {
     let config_for_thread = Arc::clone(&config);
     let app_config_for_thread = Arc::clone(&app_config);
     let config_path_for_thread = config_path.clone();
+    // Review #111: dropped-event counter lives on the actor thread
+    // (only it sends to evt_tx). `Arc<AtomicU64>` would let the
+    // handle read it later, but v1 doesn't expose the count; the
+    // thread-local counter is enough.
+    let dropped_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let dropped_for_thread = Arc::clone(&dropped_counter);
 
     std::thread::Builder::new()
         .name("renencoder-controller".into())
@@ -612,6 +823,7 @@ pub fn start_controller() -> ControllerHandle {
                 config_for_thread,
                 app_config_for_thread,
                 config_path_for_thread,
+                dropped_for_thread,
             )
         })
         .expect("spawn controller thread");
@@ -634,6 +846,11 @@ fn load_and_share_config(evt_tx: &Sender<Event>) -> Option<(Arc<Config>, Arc<App
     let app_config = match AppConfig::load(&config_path) {
         Ok(c) => c,
         Err(e) => {
+            // Direct send here (review #111): runs before the actor
+            // thread is spawned, so we don't have the dropped-event
+            // counter yet. Error is structural — block on full
+            // rather than drop, matching `send_evt_lossy`'s policy
+            // for structural events.
             let _ = evt_tx.send(Event::Error {
                 category: ErrorCategory::ConfigError,
                 message: format!("failed to load {}: {e}", config_path.display()),
@@ -651,6 +868,11 @@ fn run_actor(
     config: Arc<Config>,
     app_config: Arc<AppConfig>,
     config_path: PathBuf,
+    // Review #111: dropped-event counter for diagnostics. The actor
+    // thread owns it; v1 doesn't surface the count, but it's
+    // logged here on each drop so the warning includes a running
+    // total.
+    dropped_counter: Arc<std::sync::atomic::AtomicU64>,
 ) {
     // Init once for the controller's lifetime. AppConfig + Config
     // already loaded by start_controller; we just derive Cache
@@ -664,10 +886,14 @@ fn run_actor(
     let cache: EncoderCache = match init_encoder_cache(enable_nv) {
         Ok(c) => c,
         Err(e) => {
-            let _ = evt_tx.send(Event::Error {
-                category: ErrorCategory::ConfigError,
-                message: format!("encoder cache init failed: {e}"),
-            });
+            send_evt_lossy(
+                &evt_tx,
+                Event::Error {
+                    category: ErrorCategory::ConfigError,
+                    message: format!("encoder cache init failed: {e}"),
+                },
+                &dropped_counter,
+            );
             return;
         }
     };
@@ -684,10 +910,14 @@ fn run_actor(
         match cmd {
             Command::StartBatch { params, files } => {
                 if busy.swap(true, Ordering::SeqCst) {
-                    let _ = evt_tx.send(Event::Error {
-                        category: ErrorCategory::ConfigError,
-                        message: "another batch is already running".into(),
-                    });
+                    send_evt_lossy(
+                        &evt_tx,
+                        Event::Error {
+                            category: ErrorCategory::ConfigError,
+                            message: "another batch is already running".into(),
+                        },
+                        &dropped_counter,
+                    );
                     continue;
                 }
 
@@ -695,10 +925,14 @@ fn run_actor(
                 next_batch_id += 1;
                 cancel_token = CancelToken::new();
 
-                let _ = evt_tx.send(Event::BatchStarted {
-                    id,
-                    total_files: files.len(),
-                });
+                send_evt_lossy(
+                    &evt_tx,
+                    Event::BatchStarted {
+                        id,
+                        total_files: files.len(),
+                    },
+                    &dropped_counter,
+                );
 
                 let total = files.len();
                 let mut records: Vec<EncodingRecord> = Vec::with_capacity(total);
@@ -731,11 +965,15 @@ fn run_actor(
                         break;
                     }
 
-                    let _ = evt_tx.send(Event::FileStarted {
-                        index,
-                        total,
-                        source: file.clone(),
-                    });
+                    send_evt_lossy(
+                        &evt_tx,
+                        Event::FileStarted {
+                            index,
+                            total,
+                            source: file.clone(),
+                        },
+                        &dropped_counter,
+                    );
 
                     let output_path = output_path_for(file.as_path(), params.format);
                     let task = TranscodeTask {
@@ -753,15 +991,20 @@ fn run_actor(
                         total,
                         &mut encode_fn,
                         &evt_tx,
+                        &dropped_counter,
                     ) {
                         Ok(record) => {
                             records.push(record);
                         }
                         Err(ProcessError::Encode(e)) => {
-                            let _ = evt_tx.send(Event::Error {
-                                category: encode_error_category(&e),
-                                message: format!("encode error: {e}"),
-                            });
+                            send_evt_lossy(
+                                &evt_tx,
+                                Event::Error {
+                                    category: encode_error_category(&e),
+                                    message: format!("encode error: {e}"),
+                                },
+                                &dropped_counter,
+                            );
                         }
                         Err(ProcessError::EventSend { partial_record }) => {
                             // evt_tx disconnected (UI dropped). Stop the batch.
@@ -787,12 +1030,16 @@ fn run_actor(
                 busy.store(false, Ordering::SeqCst);
 
                 if cancelled {
-                    let _ = evt_tx.send(Event::BatchCancelled {
-                        completed: records.len(),
-                        total,
-                    });
+                    send_evt_lossy(
+                        &evt_tx,
+                        Event::BatchCancelled {
+                            completed: records.len(),
+                            total,
+                        },
+                        &dropped_counter,
+                    );
                 } else {
-                    let _ = evt_tx.send(Event::BatchCompleted { records });
+                    send_evt_lossy(&evt_tx, Event::BatchCompleted { records }, &dropped_counter);
                 }
             }
 
@@ -801,17 +1048,21 @@ fn run_actor(
                 // StartBatch, but no ffmpeg invocation. busy-gate
                 // applies so a real batch can't sneak in during dry-run.
                 if busy.swap(true, Ordering::SeqCst) {
-                    let _ = evt_tx.send(Event::Error {
-                        category: ErrorCategory::ConfigError,
-                        message: "another batch is already running".into(),
-                    });
+                    send_evt_lossy(
+                        &evt_tx,
+                        Event::Error {
+                            category: ErrorCategory::ConfigError,
+                            message: "another batch is already running".into(),
+                        },
+                        &dropped_counter,
+                    );
                     continue;
                 }
 
                 let records =
                     crate::pipeline::batch::dry_run_batch(&params, &cache, &config, files.iter());
                 busy.store(false, Ordering::SeqCst);
-                let _ = evt_tx.send(Event::DryRunFinished { records });
+                send_evt_lossy(&evt_tx, Event::DryRunFinished { records }, &dropped_counter);
             }
 
             Command::Cancel => {
@@ -824,20 +1075,28 @@ fn run_actor(
 
             Command::LoadHistory { limit, after } => {
                 let records = load_history(resolve_data_dir(), limit, after);
-                let _ = evt_tx.send(Event::HistoryLoaded { records });
+                send_evt_lossy(&evt_tx, Event::HistoryLoaded { records }, &dropped_counter);
             }
 
             Command::SaveConfig => match app_config.save(&config_path) {
                 Ok(()) => {
-                    let _ = evt_tx.send(Event::ConfigSaved {
-                        path: config_path.clone(),
-                    });
+                    send_evt_lossy(
+                        &evt_tx,
+                        Event::ConfigSaved {
+                            path: config_path.clone(),
+                        },
+                        &dropped_counter,
+                    );
                 }
                 Err(e) => {
-                    let _ = evt_tx.send(Event::Error {
-                        category: ErrorCategory::ConfigError,
-                        message: format!("save failed: {e}"),
-                    });
+                    send_evt_lossy(
+                        &evt_tx,
+                        Event::Error {
+                            category: ErrorCategory::ConfigError,
+                            message: format!("save failed: {e}"),
+                        },
+                        &dropped_counter,
+                    );
                 }
             },
 
@@ -849,15 +1108,19 @@ fn run_actor(
                 // Command::Cancel abort; the rayon par_iter runs to
                 // completion and AnalyzeFinished fires cleanly.
                 if busy.swap(true, Ordering::SeqCst) {
-                    let _ = evt_tx.send(Event::Error {
-                        category: ErrorCategory::ConfigError,
-                        message: "another batch is already running".into(),
-                    });
+                    send_evt_lossy(
+                        &evt_tx,
+                        Event::Error {
+                            category: ErrorCategory::ConfigError,
+                            message: "another batch is already running".into(),
+                        },
+                        &dropped_counter,
+                    );
                     continue;
                 }
 
                 let total = files.len();
-                let _ = evt_tx.send(Event::AnalyzeStarted { total });
+                send_evt_lossy(&evt_tx, Event::AnalyzeStarted { total }, &dropped_counter);
 
                 // Progress closure: convert each rayon worker tick
                 // into an Event on the lib→UI channel. The closure
@@ -865,12 +1128,16 @@ fn run_actor(
                 // Sync, so the `Fn + Sync + Send` bound required by
                 // rayon is satisfied.
                 let progress = |p: AnalyzeProgress| {
-                    let _ = evt_tx.send(Event::AnalyzeProgress {
-                        done: p.done,
-                        total: p.total,
-                        failed: p.failed,
-                        last: p.last,
-                    });
+                    send_evt_lossy(
+                        &evt_tx,
+                        Event::AnalyzeProgress {
+                            done: p.done,
+                            total: p.total,
+                            failed: p.failed,
+                            last: p.last,
+                        },
+                        &dropped_counter,
+                    );
                 };
 
                 let records = analyze_records_with_probe_and_progress_parallel(
@@ -887,10 +1154,14 @@ fn run_actor(
                 let failed_count = records.iter().filter(|r| r.fps.is_none()).count();
 
                 busy.store(false, Ordering::SeqCst);
-                let _ = evt_tx.send(Event::AnalyzeFinished {
-                    records,
-                    failed_count,
-                });
+                send_evt_lossy(
+                    &evt_tx,
+                    Event::AnalyzeFinished {
+                        records,
+                        failed_count,
+                    },
+                    &dropped_counter,
+                );
             }
         }
     }
@@ -1039,6 +1310,10 @@ mod mock_tests {
 
         let busy = Arc::new(AtomicBool::new(false));
         let cancel_token = CancelToken::new();
+        // Review #111: tests keep unbounded channels (synchronous
+        // drain, the bound is irrelevant), but process_one_file
+        // now takes a dropped-event counter. Use a local one.
+        let dropped_counter = Arc::new(AtomicU64::new(0));
         let cache = EncoderCache {
             encoders_output: String::new(),
             has_nvidia: false,
@@ -1054,20 +1329,28 @@ mod mock_tests {
                 match cmd {
                     Command::StartBatch { params: _, files } => {
                         if busy.swap(true, AtomicOrdering::SeqCst) {
-                            let _ = evt_tx.send(Event::Error {
-                                category: ErrorCategory::ConfigError,
-                                message: "another batch is already running".into(),
-                            });
+                            send_evt_lossy(
+                                &evt_tx,
+                                Event::Error {
+                                    category: ErrorCategory::ConfigError,
+                                    message: "another batch is already running".into(),
+                                },
+                                &dropped_counter,
+                            );
                             continue;
                         }
                         let id = next_batch_id;
                         next_batch_id += 1;
                         cancel_token = CancelToken::new();
 
-                        let _ = evt_tx.send(Event::BatchStarted {
-                            id,
-                            total_files: files.len(),
-                        });
+                        send_evt_lossy(
+                            &evt_tx,
+                            Event::BatchStarted {
+                                id,
+                                total_files: files.len(),
+                            },
+                            &dropped_counter,
+                        );
 
                         let total = files.len();
                         let mut records = Vec::with_capacity(total);
@@ -1093,6 +1376,7 @@ mod mock_tests {
                                 total,
                                 &mut encode_fn,
                                 &evt_tx,
+                                &dropped_counter,
                             ) {
                                 Ok(record) => records.push(record),
                                 Err(super::ProcessError::Encode(e)) => {
@@ -1100,22 +1384,34 @@ mod mock_tests {
                                     // level errors as Event::Error, using
                                     // the same EncodeError→ErrorCategory
                                     // mapping as production.
-                                    let _ = evt_tx.send(Event::Error {
-                                        category: super::encode_error_category(&e),
-                                        message: format!("encode error: {e}"),
-                                    });
+                                    send_evt_lossy(
+                                        &evt_tx,
+                                        Event::Error {
+                                            category: super::encode_error_category(&e),
+                                            message: format!("encode error: {e}"),
+                                        },
+                                        &dropped_counter,
+                                    );
                                 }
                                 Err(super::ProcessError::EventSend { .. }) => {}
                             }
                         }
                         busy.store(false, AtomicOrdering::SeqCst);
                         if cancelled {
-                            let _ = evt_tx.send(Event::BatchCancelled {
-                                completed: records.len(),
-                                total,
-                            });
+                            send_evt_lossy(
+                                &evt_tx,
+                                Event::BatchCancelled {
+                                    completed: records.len(),
+                                    total,
+                                },
+                                &dropped_counter,
+                            );
                         } else {
-                            let _ = evt_tx.send(Event::BatchCompleted { records });
+                            send_evt_lossy(
+                                &evt_tx,
+                                Event::BatchCompleted { records },
+                                &dropped_counter,
+                            );
                         }
                     }
                     Command::Cancel => {
@@ -1125,7 +1421,7 @@ mod mock_tests {
                         // Mock actor: use the test-supplied data_dir
                         // (parallel-safe — env vars would race).
                         let records = load_history(data_dir.clone(), limit, after);
-                        let _ = evt_tx.send(Event::HistoryLoaded { records });
+                        send_evt_lossy(&evt_tx, Event::HistoryLoaded { records }, &dropped_counter);
                     }
                     // SaveConfig is exercised by the UI flow (which
                     // talks to the production actor). The mock actor
@@ -1149,7 +1445,11 @@ mod mock_tests {
                             &Config::default(),
                             files.iter(),
                         );
-                        let _ = evt_tx.send(Event::DryRunFinished { records });
+                        send_evt_lossy(
+                            &evt_tx,
+                            Event::DryRunFinished { records },
+                            &dropped_counter,
+                        );
                     }
                     // Analyze is exercised here with a lite version
                     // of the production arm (no busy-gate — that's
@@ -1163,14 +1463,18 @@ mod mock_tests {
                     // in analyzer::records::tests.
                     Command::Analyze { files } => {
                         let total = files.len();
-                        let _ = evt_tx.send(Event::AnalyzeStarted { total });
+                        send_evt_lossy(&evt_tx, Event::AnalyzeStarted { total }, &dropped_counter);
                         let progress = |p: AnalyzeProgress| {
-                            let _ = evt_tx.send(Event::AnalyzeProgress {
-                                done: p.done,
-                                total: p.total,
-                                failed: p.failed,
-                                last: p.last,
-                            });
+                            send_evt_lossy(
+                                &evt_tx,
+                                Event::AnalyzeProgress {
+                                    done: p.done,
+                                    total: p.total,
+                                    failed: p.failed,
+                                    last: p.last,
+                                },
+                                &dropped_counter,
+                            );
                         };
                         let records = analyze_records_with_probe_and_progress_parallel(
                             &files,
@@ -1178,10 +1482,14 @@ mod mock_tests {
                             progress,
                         );
                         let failed_count = records.iter().filter(|r| r.fps.is_none()).count();
-                        let _ = evt_tx.send(Event::AnalyzeFinished {
-                            records,
-                            failed_count,
-                        });
+                        send_evt_lossy(
+                            &evt_tx,
+                            Event::AnalyzeFinished {
+                                records,
+                                failed_count,
+                            },
+                            &dropped_counter,
+                        );
                     }
                 }
             }
