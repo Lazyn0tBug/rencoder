@@ -147,6 +147,29 @@ pub struct EncodeParams {
 }
 
 impl EncodeParams {
+    /// Validate the `extra_args` field against the ffmpeg-argv
+    /// safety allowlist (review fix #15). Each entry must start
+    /// with `-` and contain only ASCII alphanumeric + `= . : / - _ @`
+    /// characters. Rejects:
+    ///   - filenames starting with `-` (would re-inject ffmpeg flags)
+    ///   - long options like `--preset` (too varied for allowlist)
+    ///   - shell metachars (whitespace, `;`, `&`, `|`, quotes, etc.)
+    ///   - bare positionals without leading `-`
+    ///
+    /// Returns the index of the first invalid entry, or `None` if
+    /// all are safe. Empty list is trivially safe.
+    ///
+    /// Callers that build `EncodeParams` from untrusted input (CLI
+    /// passthrough, future config field, tests) should run this
+    /// before pushing `extra_args` into the ffmpeg argv.
+    pub fn validate_extra_args(&self) -> Result<(), usize> {
+        use crate::encoder::command::first_unsafe_extra_arg;
+        if let Some(idx) = first_unsafe_extra_arg(&self.extra_args) {
+            return Err(idx);
+        }
+        Ok(())
+    }
+
     /// Build a full `EncodeParams` from the loaded `AppConfig`'s
     /// `encode` section. Missing fields fall back to defaults.
     ///
@@ -741,5 +764,60 @@ mod tests {
         // This is the property the parser filters against, not has_encoder
         // itself.
         assert!(empty.has_encoder(""));
+    }
+
+    // ---- EncodeParams::validate_extra_args (review fix #15) ----
+
+    fn params_with_extra(extra: Vec<String>) -> EncodeParams {
+        EncodeParams {
+            extra_args: extra,
+            ..EncodeParams::from_encode_config(None)
+        }
+    }
+
+    #[test]
+    fn validate_extra_args_passes_for_standard_user_tweaks() {
+        let p = params_with_extra(vec![
+            "-ss=5".into(),
+            "-metadata".into(),
+            "title=foo".into(),
+            "-vf".into(),
+            "scale=720:-1".into(),
+        ]);
+        let bad = crate::encoder::command::first_unsafe_extra_arg(&p.extra_args);
+        assert!(
+            bad.is_none(),
+            "unexpectedly rejected at index {bad:?}: {0:?}",
+            p.extra_args
+        );
+        assert!(p.validate_extra_args().is_ok());
+    }
+
+    #[test]
+    fn validate_extra_args_rejects_path_injection_variants() {
+        for evil in [
+            vec!["-i".into(), "/etc/passwd".into()],  // -i on deny list
+            vec!["-c:v".into(), "rawvideo".into()],   // -c:v on deny list
+            vec!["-o".into(), "/tmp/out.mkv".into()], // -o on deny list
+            vec!["-y".into()],                        // -y is hardcoded
+            vec!["--preset".into(), "5".into()],      // long opt
+            vec!["-vf_negate.mp4".into()],            // flag-with-value as one token
+            vec!["-vf scale=720:foo bar".into()],     // whitespace in value
+            vec!["-vf scale=720:foo;rm".into()],      // shell metachar
+            vec!["preset".into()],                    // missing leading dash
+            vec!["".into()],                          // empty
+            vec!["-".into()],                         // bare dash
+            vec!["-; rm -rf /".into()],               // shell metachar prefix
+        ] {
+            let p = EncodeParams {
+                extra_args: evil,
+                ..EncodeParams::from_encode_config(None)
+            };
+            assert!(
+                p.validate_extra_args().is_err(),
+                "expected validate_extra_args to reject: {:?}",
+                p.extra_args
+            );
+        }
     }
 }
