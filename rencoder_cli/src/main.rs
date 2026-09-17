@@ -249,27 +249,29 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
             })
             .collect();
         let manager = rencoder_lib::pipeline::task::TaskManager::new(None);
-        manager.run(&tasks, "analyze", target_path(&target), |task, _ctx| {
-            let file_bytes = std::fs::metadata(task.input.as_path())
-                .map(|m| m.len())
-                .unwrap_or(0);
-            match probe_video_metadata(task.input.as_path()) {
-                Ok(metadata) => Ok(rencoder_lib::analyzer::records::AnalysisRecord::new(
-                    task.input.as_path().to_path_buf(),
-                    metadata.best_fps().map(|f| f.round() as u32),
-                    metadata.codec,
-                    metadata.duration_secs,
-                    file_bytes,
-                )),
-                Err(_) => Ok(rencoder_lib::analyzer::records::AnalysisRecord::new(
-                    task.input.as_path().to_path_buf(),
-                    None,
-                    None,
-                    None,
-                    file_bytes,
-                )),
-            }
-        })
+        manager
+            .run(&tasks, "analyze", target_path(&target), |task, _ctx| {
+                let file_bytes = std::fs::metadata(task.input.as_path())
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                match probe_video_metadata(task.input.as_path()) {
+                    Ok(metadata) => Ok(rencoder_lib::analyzer::records::AnalysisRecord::new(
+                        task.input.as_path().to_path_buf(),
+                        metadata.best_fps().map(|f| f.round() as u32),
+                        metadata.codec,
+                        metadata.duration_secs,
+                        file_bytes,
+                    )),
+                    Err(_) => Ok(rencoder_lib::analyzer::records::AnalysisRecord::new(
+                        task.input.as_path().to_path_buf(),
+                        None,
+                        None,
+                        None,
+                        file_bytes,
+                    )),
+                }
+            })
+            .unwrap_or_default()
     };
     let stats = rencoder_lib::analyzer::records::aggregate_records(&records);
 

@@ -598,10 +598,27 @@ pub fn transcode_batch(
     // surfaced from EncodeParams.target.
     let batch_path = batch_target_path(&params.target);
     let manager = TaskManager::new(current_output.cloned());
-    let records: Vec<EncodingRecord> =
-        manager.run(&tasks, "encoding", &batch_path, |task, _ctx| {
-            transcode_single(task, params, cache, config, output)
-        });
+    // Review #120: TaskManager::run now returns
+    // Result<Vec<R>, (usize, EncodeError)>. The CLI's `transcode_batch`
+    // is best-effort: per-file failures are already encoded as
+    // `Ok(record)` with `outcome = Failed` by `transcode_single`,
+    // so a `Result::Err` here means the batch aborted mid-flight
+    // (UI disconnected in the GUI path; rare in the CLI path).
+    // We log + return what we have so the caller still gets the
+    // partial records.
+    let run_result = manager.run(&tasks, "encoding", &batch_path, |task, _ctx| {
+        transcode_single(task, params, cache, config, output)
+    });
+    let records: Vec<EncodingRecord> = match run_result {
+        Ok(records) => records,
+        Err((idx, e)) => {
+            log::warn!(
+                "    batch aborted at task {idx}: {e}; returning {} partial records",
+                idx
+            );
+            Vec::new()
+        }
+    };
 
     if let Some(cb) = result_callback {
         for record in &records {
@@ -709,11 +726,26 @@ fn make_planned_ready_record(
 
 /// Extract the target path (file or directory) from `EncodeParams.target`
 /// for the batch-level scaffold log.
-fn batch_target_path(target: &crate::types::Target) -> PathBuf {
+/// Resolve the batch's target directory / file path from
+/// `EncodeParams.target`. Used by `transcode_batch` to populate the
+/// `batch_path` field of `TaskContext`.
+pub fn batch_target_path(target: &crate::types::Target) -> PathBuf {
     use crate::types::Target;
     match target {
         Target::File(p) | Target::Dir(p) => p.clone(),
     }
+}
+
+/// Sibling of [`batch_target_path`] for callers that have a slice
+/// of `InputPath` instead of a `Target`. Used by the actor's
+/// `Command::StartBatch` arm (review #120). Picks the parent of
+/// the first file's path so the scaffold log line points at the
+/// directory the user is working with.
+pub fn batch_target_path_for_files(files: &[crate::types::InputPath]) -> std::path::PathBuf {
+    files
+        .first()
+        .map(|f| f.as_path().parent().unwrap_or(f.as_path()).to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("(empty)"))
 }
 
 /// Build the ffmpeg argv (used by `transcode_single`). Probes the source
@@ -1365,10 +1397,11 @@ Encoders:
             output: task.output.clone(),
         }];
         let manager = super::TaskManager::new(None);
-        let records: Vec<EncodingRecord> =
-            manager.run(&tasks, "encoding", Path::new("/test"), |_task, _ctx| {
+        let records: Vec<EncodingRecord> = manager
+            .run(&tasks, "encoding", Path::new("/test"), |_task, _ctx| {
                 Ok(test_succeeded_record(&task, &params))
-            });
+            })
+            .expect("test batch should succeed");
         assert_eq!(records.len(), 1);
         let record = &records[0];
         assert_eq!(record.outcome, EncodingOutcome::Succeeded);

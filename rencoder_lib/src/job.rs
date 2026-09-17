@@ -39,6 +39,7 @@ use crate::error::EncodeError;
 use crate::pipeline::batch::{transcode_single_with_progress, FfmpegProgress};
 use crate::pipeline::cache::init_encoder_cache;
 use crate::pipeline::cancel::CancelToken;
+use crate::pipeline::task::TaskManager;
 use crate::types::{EncodeParams, EncoderCache, ErrorCategory, TranscodeTask};
 use crate::utils::fs::output_path_for;
 
@@ -463,34 +464,6 @@ mod tests {
     }
 }
 
-/// Error type returned by [`process_one_file`]. Encodes both encode
-/// failure (the closure error) and event-send failure (UI dropped,
-/// batch must abort). Tests that don't care about event-send
-/// failure can `.unwrap()` the encode variant.
-///
-/// Review fix #6: `EventSend` now carries the in-flight `EncodingRecord`
-/// when the failure happens on `FileCompleted` (file was successfully
-/// encoded but the result couldn't be delivered to the UI). The
-/// caller can log it / surface it in `BatchCancelled` handling so
-/// the file isn't silently "in flight" forever. On `FileStarted`
-/// failure the record is `None` (encode hadn't started yet).
-#[allow(clippy::large_enum_variant)] // EventSend variant carries EncodingRecord for post-mortem logging
-#[derive(Debug)]
-enum ProcessError {
-    Encode(EncodeError),
-    EventSend {
-        partial_record: Option<EncodingRecord>,
-    },
-}
-
-/// Per-file orchestration extracted from the StartBatch loop so
-/// tests can inject a mock encode function (no ffmpeg required).
-///
-/// Emits the following events on `emit`:
-/// - `Event::FileStarted { index, total, source }` (before encode)
-/// - `Event::Progress { ... }` per FfmpegProgress callback (during)
-/// - `Event::FileCompleted { index, record }` (on Ok return)
-///
 /// Map an [`EncodeError`] (from the encode closure) to the appropriate
 /// [`ErrorCategory`] for [`Event::Error`]. See design §3.8.6 for the
 /// full mapping table:
@@ -506,8 +479,9 @@ enum ProcessError {
 /// | `UserCancel`        | `Cancelled`             |
 ///
 /// `Event::Error` is fatal-only; per-file encode failures travel
-/// through `EncodingRecord.error` instead. This function is only
-/// called on the rare setup-level error path in `process_one_file`.
+/// through `EncodingRecord.error` instead. Called by the
+/// `Command::StartBatch` processor closure to surface a setup-
+/// level error to the UI.
 pub(crate) fn encode_error_category(e: &EncodeError) -> ErrorCategory {
     match e {
         EncodeError::Io(_) => ErrorCategory::IoError,
@@ -518,90 +492,6 @@ pub(crate) fn encode_error_category(e: &EncodeError) -> ErrorCategory {
         EncodeError::FpsParse(_) => ErrorCategory::ConfigError,
         EncodeError::UserCancel => ErrorCategory::Cancelled,
     }
-}
-
-/// Returns `Err(ProcessError::Encode)` if the encode closure errors
-/// (caller emits `Event::Error`). Returns
-/// `Err(ProcessError::EventSend)` if `emit` has been disconnected
-/// (caller should abort the batch — UI dropped the receiver).
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::result_large_err)] // EventSend variant carries EncodingRecord for post-mortem logging
-fn process_one_file<F>(
-    task: &TranscodeTask,
-    params: &EncodeParams,
-    cache: &EncoderCache,
-    config: &Config,
-    cancel: &CancelToken,
-    index: usize,
-    total: usize,
-    encode_fn: &mut F,
-    emit: &Sender<Event>,
-    // Review #111: dropped-event counter, cloned into the progress
-    // closure so progress ticks drop on full per the lossy-send
-    // policy.
-    dropped_counter: &Arc<std::sync::atomic::AtomicU64>,
-) -> Result<EncodingRecord, ProcessError>
-where
-    F: FnMut(
-        &TranscodeTask,
-        &EncodeParams,
-        &EncoderCache,
-        &Config,
-        &CancelToken,
-        &mut dyn FnMut(FfmpegProgress),
-    ) -> Result<EncodingRecord, EncodeError>,
-{
-    if emit
-        .send(Event::FileStarted {
-            index,
-            total,
-            source: task.input.clone(),
-        })
-        .is_err()
-    {
-        return Err(ProcessError::EventSend {
-            partial_record: None,
-        });
-    }
-
-    let progress_emit = emit.clone();
-    let progress_index = index;
-    // Review #111: capture the dropped-event counter so the
-    // progress callback (a FnMut closure) routes through the
-    // lossy-send helper. The counter is an Arc<AtomicU64> so
-    // cloning into the closure is cheap.
-    let progress_dropped = dropped_counter.clone();
-    let mut on_progress = |p: FfmpegProgress| {
-        send_evt_lossy(
-            &progress_emit,
-            Event::Progress {
-                file_index: progress_index,
-                frame: p.frame,
-                fps: p.fps,
-                speed: p.speed,
-                time_secs: p.time_secs,
-                eta_secs: p.eta_secs,
-            },
-            &progress_dropped,
-        );
-    };
-
-    let record = encode_fn(task, params, cache, config, cancel, &mut on_progress)
-        .map_err(ProcessError::Encode)?;
-
-    if emit
-        .send(Event::FileCompleted {
-            index,
-            record: record.clone(),
-        })
-        .is_err()
-    {
-        return Err(ProcessError::EventSend {
-            partial_record: Some(record),
-        });
-    }
-
-    Ok(record)
 }
 
 // =====================================================================
@@ -909,6 +799,11 @@ fn run_actor(
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
             Command::StartBatch { params, files } => {
+                // Review #120: delegate per-file iteration to
+                // TaskManager::run. The processor closure owns the UI
+                // protocol (FileStarted / FileCompleted / Progress /
+                // Error); TaskManager owns batch/task scaffold logs +
+                // partial_output::Guard registration.
                 if busy.swap(true, Ordering::SeqCst) {
                     send_evt_lossy(
                         &evt_tx,
@@ -934,112 +829,136 @@ fn run_actor(
                     &dropped_counter,
                 );
 
-                let total = files.len();
-                let mut records: Vec<EncodingRecord> = Vec::with_capacity(total);
-                let mut cancelled = false;
+                let tasks: Vec<TranscodeTask> = files
+                    .iter()
+                    .map(|file| TranscodeTask {
+                        input: file.clone(),
+                        output: Some(output_path_for(file.as_path(), params.format)),
+                    })
+                    .collect();
 
-                // Real encoder closure: invokes
-                // transcode_single_with_progress (which actually runs
-                // ffmpeg). Mock tests use a different closure that
-                // returns predetermined records without ffmpeg.
-                let mut encode_fn = |task: &TranscodeTask,
-                                     params: &EncodeParams,
-                                     _cache: &EncoderCache,
-                                     _config: &Config,
-                                     cancel: &CancelToken,
-                                     on_progress: &mut dyn FnMut(FfmpegProgress)|
+                let batch_path = crate::pipeline::batch::batch_target_path_for_files(&files);
+
+                // Capture for the processor closure (FnMut needs
+                // owned captures — Send + Sync not required because
+                // run() is fully sync on this thread). The closure
+                // borrows `cache` / `config` for its lifetime — both
+                // outlive the closure because they live for the
+                // entire `run_actor` body.
+                let evt_tx_for_closure = evt_tx.clone();
+                let dropped_for_closure = dropped_counter.clone();
+                let cancel_for_closure = cancel_token.clone();
+                let evt_tx_progress = evt_tx_for_closure.clone();
+                let dropped_progress = dropped_for_closure.clone();
+
+                let processor = |task: &TranscodeTask,
+                                 ctx: &crate::pipeline::task::TaskContext|
                  -> Result<EncodingRecord, EncodeError> {
-                    transcode_single_with_progress(
-                        task,
-                        params,
-                        _cache,
-                        _config,
-                        cancel,
-                        on_progress,
-                    )
-                };
-
-                for (index, file) in files.iter().enumerate() {
-                    if cancel_token.is_cancelled() {
-                        cancelled = true;
-                        break;
-                    }
+                    // FileStarted uses 0-indexed (matches v1 UI
+                    // contract). TaskManager passes 1-indexed in
+                    // `ctx.index`; convert.
+                    let idx = ctx.index - 1;
 
                     send_evt_lossy(
-                        &evt_tx,
+                        &evt_tx_for_closure,
                         Event::FileStarted {
-                            index,
-                            total,
-                            source: file.clone(),
+                            index: idx,
+                            total: ctx.total,
+                            source: task.input.clone(),
                         },
-                        &dropped_counter,
+                        &dropped_for_closure,
                     );
 
-                    let output_path = output_path_for(file.as_path(), params.format);
-                    let task = TranscodeTask {
-                        input: file.clone(),
-                        output: Some(output_path),
+                    // Honor cancel between files (cancel-for-loop
+                    // removed in #120; this is the only check).
+                    if cancel_for_closure.is_cancelled() {
+                        return Err(EncodeError::UserCancel);
+                    }
+
+                    let mut on_progress = |p: FfmpegProgress| {
+                        send_evt_lossy(
+                            &evt_tx_progress,
+                            Event::Progress {
+                                file_index: idx,
+                                frame: p.frame,
+                                fps: p.fps,
+                                speed: p.speed,
+                                time_secs: p.time_secs,
+                                eta_secs: p.eta_secs,
+                            },
+                            &dropped_progress,
+                        );
                     };
 
-                    match process_one_file(
-                        &task,
+                    let res = transcode_single_with_progress(
+                        task,
                         &params,
                         &cache,
                         &config,
-                        &cancel_token,
-                        index,
-                        total,
-                        &mut encode_fn,
-                        &evt_tx,
-                        &dropped_counter,
-                    ) {
+                        &cancel_for_closure,
+                        &mut on_progress,
+                    );
+
+                    match res {
                         Ok(record) => {
-                            records.push(record);
-                        }
-                        Err(ProcessError::Encode(e)) => {
                             send_evt_lossy(
-                                &evt_tx,
+                                &evt_tx_for_closure,
+                                Event::FileCompleted {
+                                    index: idx,
+                                    record: record.clone(),
+                                },
+                                &dropped_for_closure,
+                            );
+                            Ok(record)
+                        }
+                        Err(e) => {
+                            send_evt_lossy(
+                                &evt_tx_for_closure,
                                 Event::Error {
                                     category: encode_error_category(&e),
                                     message: format!("encode error: {e}"),
                                 },
-                                &dropped_counter,
+                                &dropped_for_closure,
                             );
-                        }
-                        Err(ProcessError::EventSend { partial_record }) => {
-                            // evt_tx disconnected (UI dropped). Stop the batch.
-                            // Review fix #6: if the failure was on
-                            // FileCompleted, the in-flight file was
-                            // successfully encoded — log the partial
-                            // record for post-mortem visibility. The UI
-                            // is gone so it won't see anything; we
-                            // just avoid silent data loss on the lib side.
-                            if let Some(r) = partial_record {
-                                log::warn!(
-                                    "    FileCompleted for {} lost to disconnected UI (source_path={})",
-                                    index,
-                                    r.source_path
-                                );
-                            }
-                            cancelled = true;
-                            break;
+                            // Map per-file failure to Ok(Failed
+                            // record) so TaskManager doesn't abort
+                            // the batch on the first failure —
+                            // matches v1 inline behavior.
+                            Ok(crate::pipeline::task::build_failed_record(task, e))
                         }
                     }
-                }
+                };
+
+                let run_result =
+                    TaskManager::new(None).run(&tasks, "encoding", &batch_path, processor);
 
                 busy.store(false, Ordering::SeqCst);
 
-                if cancelled {
-                    send_evt_lossy(
-                        &evt_tx,
-                        Event::BatchCancelled {
-                            completed: records.len(),
-                            total,
-                        },
-                        &dropped_counter,
-                    );
-                } else {
-                    send_evt_lossy(&evt_tx, Event::BatchCompleted { records }, &dropped_counter);
+                match run_result {
+                    Ok(records) => {
+                        send_evt_lossy(
+                            &evt_tx,
+                            Event::BatchCompleted { records },
+                            &dropped_counter,
+                        );
+                    }
+                    Err((idx, _e)) => {
+                        // Review #120: TaskManager aborts when the
+                        // processor returns Err. The only Err the
+                        // closure produces is `EncodeError::Cancelled`
+                        // (cancel poll at the top). Map to
+                        // BatchCancelled with the correct completed
+                        // count (idx = 0-based task index where the
+                        // batch stopped).
+                        send_evt_lossy(
+                            &evt_tx,
+                            Event::BatchCancelled {
+                                completed: idx,
+                                total: tasks.len(),
+                            },
+                            &dropped_counter,
+                        );
+                    }
                 }
             }
 
@@ -1352,66 +1271,104 @@ mod mock_tests {
                             &dropped_counter,
                         );
 
-                        let total = files.len();
-                        let mut records = Vec::with_capacity(total);
-                        let mut cancelled = false;
-
-                        for (index, file) in files.iter().enumerate() {
-                            if cancel_token.is_cancelled() {
-                                cancelled = true;
-                                break;
-                            }
-                            let output_path = output_path_for(file.as_path(), params.format);
-                            let task = TranscodeTask {
+                        let _total = files.len();
+                        let tasks: Vec<TranscodeTask> = files
+                            .iter()
+                            .map(|file| TranscodeTask {
                                 input: file.clone(),
-                                output: Some(output_path),
-                            };
-                            match process_one_file(
-                                &task,
-                                &params,
-                                &cache,
-                                &config,
-                                &cancel_token,
-                                index,
-                                total,
-                                &mut encode_fn,
-                                &evt_tx,
-                                &dropped_counter,
-                            ) {
-                                Ok(record) => records.push(record),
-                                Err(super::ProcessError::Encode(e)) => {
-                                    // Mirror production: surface setup-
-                                    // level errors as Event::Error, using
-                                    // the same EncodeError→ErrorCategory
-                                    // mapping as production.
-                                    send_evt_lossy(
-                                        &evt_tx,
-                                        Event::Error {
-                                            category: super::encode_error_category(&e),
-                                            message: format!("encode error: {e}"),
-                                        },
-                                        &dropped_counter,
-                                    );
+                                output: Some(output_path_for(file.as_path(), params.format)),
+                            })
+                            .collect();
+                        let batch_path =
+                            crate::pipeline::batch::batch_target_path_for_files(&files);
+
+                        let evt_tx_for_closure = evt_tx.clone();
+                        let dropped_for_closure = dropped_counter.clone();
+                        let cancel_for_closure = cancel_token.clone();
+                        let evt_tx_progress = evt_tx_for_closure.clone();
+                        let dropped_progress = dropped_for_closure.clone();
+
+                        let processor =
+                            |task: &TranscodeTask,
+                             ctx: &crate::pipeline::task::TaskContext|
+                             -> Result<EncodingRecord, EncodeError> {
+                                let idx = ctx.index - 1;
+                                send_evt_lossy(
+                                    &evt_tx_for_closure,
+                                    Event::FileStarted {
+                                        index: idx,
+                                        total: ctx.total,
+                                        source: task.input.clone(),
+                                    },
+                                    &dropped_for_closure,
+                                );
+                                if cancel_for_closure.is_cancelled() {
+                                    return Err(EncodeError::UserCancel);
                                 }
-                                Err(super::ProcessError::EventSend { .. }) => {}
-                            }
-                        }
+                                let mut on_progress = |p: FfmpegProgress| {
+                                    send_evt_lossy(
+                                        &evt_tx_progress,
+                                        Event::Progress {
+                                            file_index: idx,
+                                            frame: p.frame,
+                                            fps: p.fps,
+                                            speed: p.speed,
+                                            time_secs: p.time_secs,
+                                            eta_secs: p.eta_secs,
+                                        },
+                                        &dropped_progress,
+                                    );
+                                };
+                                let res = encode_fn(
+                                    task,
+                                    &params,
+                                    &cache,
+                                    &config,
+                                    &cancel_for_closure,
+                                    &mut on_progress,
+                                );
+                                match res {
+                                    Ok(record) => {
+                                        send_evt_lossy(
+                                            &evt_tx_for_closure,
+                                            Event::FileCompleted {
+                                                index: idx,
+                                                record: record.clone(),
+                                            },
+                                            &dropped_for_closure,
+                                        );
+                                        Ok(record)
+                                    }
+                                    Err(e) => {
+                                        send_evt_lossy(
+                                            &evt_tx_for_closure,
+                                            Event::Error {
+                                                category: super::encode_error_category(&e),
+                                                message: format!("encode error: {e}"),
+                                            },
+                                            &dropped_for_closure,
+                                        );
+                                        Ok(crate::pipeline::task::build_failed_record(task, e))
+                                    }
+                                }
+                            };
+                        let run_result =
+                            TaskManager::new(None).run(&tasks, "encoding", &batch_path, processor);
                         busy.store(false, AtomicOrdering::SeqCst);
-                        if cancelled {
-                            send_evt_lossy(
-                                &evt_tx,
-                                Event::BatchCancelled {
-                                    completed: records.len(),
-                                    total,
-                                },
-                                &dropped_counter,
-                            );
-                        } else {
-                            send_evt_lossy(
+                        match run_result {
+                            Ok(records) => send_evt_lossy(
                                 &evt_tx,
                                 Event::BatchCompleted { records },
                                 &dropped_counter,
-                            );
+                            ),
+                            Err((idx, _)) => send_evt_lossy(
+                                &evt_tx,
+                                Event::BatchCancelled {
+                                    completed: idx,
+                                    total: tasks.len(),
+                                },
+                                &dropped_counter,
+                            ),
                         }
                     }
                     Command::Cancel => {
@@ -2107,9 +2064,14 @@ mod mock_tests {
             }
             _ => unreachable!(),
         }
+        // Review #120: failed records ARE included in the final
+        // BatchCompleted list (the per-file failure is now mapped to
+        // Ok(Failed record) inside the processor closure, not to
+        // an aborted batch).
         assert!(matches!(
             events.last().unwrap(),
-            Event::BatchCompleted { records } if records.is_empty()
+            Event::BatchCompleted { records } if records.len() == 1
+                && matches!(records[0].outcome, EncodingOutcome::Failed)
         ));
     }
 

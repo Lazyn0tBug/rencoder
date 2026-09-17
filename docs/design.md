@@ -1397,6 +1397,15 @@ completed，不需要跨线程共享 counter。完整示例见 §3.4.5。
 - `transcode_single` / `analyze_records_with_probe` 回归"输入 → 输出"的纯函数测试
 - 信号 handler 不影响 `transcode_single` 测试（无 mock signal handler）
 
+**GUI actor 也走 TaskManager**（review #120）：`Command::StartBatch` 在
+`run_actor` 里的内联 per-file 循环被替换成 `TaskManager::new(None).run(...)`
+调用。processor closure 负责 UI 协议（`Event::FileStarted` /
+`FileCompleted` / `Progress` / `Error`），TaskManager 负责 batch/task
+lifecycle log + `partial_output::Guard` 注册。返回类型从 `Vec<R>` 改成
+`Result<Vec<R>, (usize, EncodeError)>`（abort-mid-batch 不再 panic）。
+`DryRun` / `Analyze` arm 不动——前者走 `dry_run_batch`，后者走 rayon
+并行 helper，两者都不需要 TaskManager 的 lifecycle log 编排。
+
 ---
 
 ### 3.5 数据流
