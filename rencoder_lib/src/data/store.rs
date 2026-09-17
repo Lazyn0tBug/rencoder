@@ -150,49 +150,59 @@ pub fn records_to_dataframe(records: &[EncodingRecord]) -> PolarsResult<DataFram
 
 /// Render the DataFrame as CSV (header + rows). Empty DataFrame → just
 /// the header.
-pub fn dataframe_to_csv(df: &DataFrame) -> String {
+///
+/// Review #125: takes `&mut DataFrame` so the underlying polars
+/// writer can move out columns in place — the previous `&DataFrame`
+/// signature forced a full `df.clone()` (memory cost scales with
+/// record count; for a large batch this was a significant peak).
+pub fn dataframe_to_csv(df: &mut DataFrame) -> String {
     let mut buf = Vec::new();
     polars::prelude::CsvWriter::new(&mut buf)
-        .finish(&mut df.clone())
+        .finish(df)
         .expect("CsvWriter::finish");
     String::from_utf8(buf).unwrap_or_default()
 }
 
 /// Render the DataFrame as JSON Lines (one object per line).
-pub fn dataframe_to_jsonl(df: &DataFrame) -> String {
+/// Review #125: see `dataframe_to_csv` for the `&mut` rationale.
+pub fn dataframe_to_jsonl(df: &mut DataFrame) -> String {
     let mut buf = Vec::new();
     let _ = polars::io::json::JsonWriter::new(&mut buf)
         .with_json_format(polars::io::json::JsonFormat::JsonLines)
-        .finish(&mut df.clone());
+        .finish(df);
     String::from_utf8(buf).unwrap_or_default()
 }
 
 /// Render the DataFrame as Parquet bytes (Snappy compression; schema
 /// embedded; columnar).
-pub fn dataframe_to_parquet(df: &DataFrame) -> PolarsResult<Vec<u8>> {
+/// Review #125: see `dataframe_to_csv` for the `&mut` rationale.
+pub fn dataframe_to_parquet(df: &mut DataFrame) -> PolarsResult<Vec<u8>> {
     let mut buf = Vec::new();
     polars::prelude::ParquetWriter::new(&mut buf)
         .with_compression(polars::prelude::ParquetCompression::Snappy)
-        .finish(&mut df.clone())?;
+        .finish(df)?;
     Ok(buf)
 }
 
 /// One-shot helper: records → CSV string.
+/// Review #125: passes `&mut` to avoid cloning the DataFrame.
 pub fn records_to_csv(records: &[EncodingRecord]) -> String {
-    let df = records_to_dataframe(records).expect("records_to_dataframe");
-    dataframe_to_csv(&df)
+    let mut df = records_to_dataframe(records).expect("records_to_dataframe");
+    dataframe_to_csv(&mut df)
 }
 
 /// One-shot helper: records → JSONL string.
+/// Review #125: see `records_to_csv`.
 pub fn records_to_jsonl(records: &[EncodingRecord]) -> String {
-    let df = records_to_dataframe(records).expect("records_to_dataframe");
-    dataframe_to_jsonl(&df)
+    let mut df = records_to_dataframe(records).expect("records_to_dataframe");
+    dataframe_to_jsonl(&mut df)
 }
 
 /// One-shot helper: records → Parquet bytes.
+/// Review #125: see `records_to_csv`.
 pub fn records_to_parquet(records: &[EncodingRecord]) -> PolarsResult<Vec<u8>> {
-    let df = records_to_dataframe(records)?;
-    dataframe_to_parquet(&df)
+    let mut df = records_to_dataframe(records)?;
+    dataframe_to_parquet(&mut df)
 }
 
 /// Read records back from a single Parquet file. Inverse of

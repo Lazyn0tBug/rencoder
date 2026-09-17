@@ -18,6 +18,37 @@ pub fn init_encoder_cache(enable_nv: bool) -> Result<EncoderCache, EncodeError> 
     init_encoder_cache_impl(enable_nv, run_subprocess)
 }
 
+/// Build an `EncoderCache` on a background thread; return a receiver
+/// the caller can poll/await (review #126).
+///
+/// `ffmpeg -encoders` takes ~50-200ms on a cold start; `nvidia-smi -L`
+/// adds another 50-100ms. Blocking the actor thread for this duration
+/// delays `Command::StartBatch` processing. By spawning the init on a
+/// background thread and returning a one-shot receiver, the actor can
+/// drain the `cmd_rx` loop while the cache is being built.
+///
+/// The receiver delivers the final `Result<EncoderCache, EncodeError>`
+/// exactly once. A failed init returns `Err(EncodeError::Probe(...))`;
+/// consumers should map that to `Event::Error` like the sync variant.
+pub fn init_encoder_cache_async(
+    enable_nv: bool,
+) -> std::sync::mpsc::Receiver<Result<EncoderCache, EncodeError>> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("rencoder-cache-init".into())
+        .spawn(move || {
+            let result = init_encoder_cache(enable_nv);
+            // Block on the send until the consumer picks up. With
+            // sync_channel(1), the first send succeeds (buffer slot
+            // empty); subsequent sends would fail because the
+            // consumer has already received. We only call once so
+            // this is fine.
+            let _ = tx.send(result);
+        })
+        .expect("spawn cache-init thread");
+    rx
+}
+
 /// Test seam: same as `init_encoder_cache` but with an injectable runner.
 /// Production calls `init_encoder_cache` (which passes `run_subprocess`).
 fn init_encoder_cache_impl<F>(enable_nv: bool, runner: F) -> Result<EncoderCache, EncodeError>

@@ -26,7 +26,7 @@ use crossbeam_channel::unbounded;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Utc};
 
@@ -37,7 +37,6 @@ use crate::config::{path::resolve_config, Config};
 use crate::data::extract::probe_video_metadata_auto;
 use crate::error::EncodeError;
 use crate::pipeline::batch::{transcode_single_with_progress, FfmpegProgress};
-use crate::pipeline::cache::init_encoder_cache;
 use crate::pipeline::cancel::CancelToken;
 use crate::pipeline::task::TaskManager;
 use crate::types::{EncodeParams, EncoderCache, ErrorCategory, TranscodeTask};
@@ -678,6 +677,18 @@ pub fn start_controller() -> ControllerHandle {
     let dropped_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let dropped_for_thread = Arc::clone(&dropped_counter);
 
+    // Review #126: async cache init. The cache init spawns its own
+    // thread and returns a one-shot receiver; the actor can drain
+    // cmd_rx while init runs in the background. StartBatch
+    // handlers block on the receiver only when a batch actually
+    // starts.
+    let enable_nv = app_config
+        .encode
+        .as_ref()
+        .and_then(|e| e.nv)
+        .unwrap_or(false);
+    let cache_rx = crate::pipeline::cache::init_encoder_cache_async(enable_nv);
+
     std::thread::Builder::new()
         .name("renencoder-controller".into())
         .spawn(move || {
@@ -688,6 +699,7 @@ pub fn start_controller() -> ControllerHandle {
                 app_config_for_thread,
                 config_path_for_thread,
                 dropped_for_thread,
+                cache_rx,
             )
         })
         .expect("spawn controller thread");
@@ -737,30 +749,56 @@ fn run_actor(
     // logged here on each drop so the warning includes a running
     // total.
     dropped_counter: Arc<std::sync::atomic::AtomicU64>,
+    // Review #126: cache init runs on a background thread; this
+    // receiver yields the result when ready. The cmd_rx loop can
+    // process other commands (Cancel / LoadHistory / SaveConfig)
+    // while init runs. StartBatch handlers block on this when a
+    // batch actually starts.
+    cache_rx: std::sync::mpsc::Receiver<Result<EncoderCache, crate::error::EncodeError>>,
 ) {
-    // Init once for the controller's lifetime. AppConfig + Config
-    // already loaded by start_controller; we just derive Cache
-    // from `encode.nv`.
-
-    let enable_nv = app_config
-        .encode
-        .as_ref()
-        .and_then(|e| e.nv)
-        .unwrap_or(false);
-    let cache: EncoderCache = match init_encoder_cache(enable_nv) {
-        Ok(c) => c,
-        Err(e) => {
-            send_evt_lossy(
-                &evt_tx,
-                Event::Error {
-                    category: ErrorCategory::ConfigError,
-                    message: format!("encoder cache init failed: {e}"),
-                },
-                &dropped_counter,
-            );
-            return;
+    // Review #126: cache init is now async — see
+    // `init_encoder_cache_async`. The cmd_rx loop below runs
+    // immediately; the cache receiver is consumed lazily by
+    // StartBatch handlers.
+    //
+    // We use `Arc<OnceLock<EncoderCache>>` so the StartBatch
+    // processor closure can clone the Arc cheaply per task and
+    // get a guaranteed-initialized `&EncoderCache` on first
+    // access. The OnceLock blocks the first caller until the
+    // background init thread finishes.
+    let cache_cell: Arc<OnceLock<EncoderCache>> = Arc::new(OnceLock::new());
+    let cache_cell_for_closure = Arc::clone(&cache_cell);
+    let cache_cell_for_dry_run = Arc::clone(&cache_cell);
+    // Drive the OnceLock from the background init thread. The
+    // thread takes the receiver (single-use), blocks until the
+    // result is ready, and stores it. StartBatch handlers call
+    // `get_or_init` which blocks on the same result.
+    let cache_cell_for_thread = Arc::clone(&cache_cell);
+    let evt_tx_for_init = evt_tx.clone();
+    let dropped_for_init = Arc::clone(&dropped_counter);
+    std::thread::spawn(move || {
+        match cache_rx.recv() {
+            Ok(Ok(c)) => {
+                cache_cell_for_thread.set(c).ok();
+            }
+            Ok(Err(e)) => {
+                send_evt_lossy(
+                    &evt_tx_for_init,
+                    Event::Error {
+                        category: e.category(),
+                        message: format!("encoder cache init failed: {e}"),
+                    },
+                    &dropped_for_init,
+                );
+                // Leave the OnceLock unset; StartBatch handlers
+                // will surface a "cache init failed" error if they
+                // try to use it.
+            }
+            Err(_) => {
+                log::warn!("    cache init channel closed unexpectedly");
+            }
         }
-    };
+    });
     // `app_config` is still held (referenced by `config_path`
     // for the SaveConfig handler). Don't drop yet.
 
@@ -874,10 +912,38 @@ fn run_actor(
                         );
                     };
 
+                    // Review #126: wait for the cache-init thread to populate the
+                    // OnceLock. First StartBatch after startup blocks
+                    // here; subsequent batches see a populated cell
+                    // and return immediately. If init failed the
+                    // cell stays unset — we surface the error as
+                    // an Event::Error + a synthetic Failed record.
+                    let cache = match cache_cell_for_closure.get() {
+                        Some(c) => c,
+                        None => {
+                            send_evt_lossy(
+                                &evt_tx_for_closure,
+                                Event::Error {
+                                    category: EncodeError::Probe(
+                                        "encoder cache init failed".into(),
+                                    )
+                                    .category(),
+                                    message: "encoder cache not available".into(),
+                                },
+                                &dropped_for_closure,
+                            );
+                            return Ok(crate::pipeline::task::build_failed_record(
+                                task,
+                                crate::error::EncodeError::Probe(
+                                    "encoder cache init failed".into(),
+                                ),
+                            ));
+                        }
+                    };
                     let res = transcode_single_with_progress(
                         task,
                         &params,
-                        &cache,
+                        cache,
                         &config,
                         &cancel_for_closure,
                         &mut on_progress,
@@ -962,8 +1028,30 @@ fn run_actor(
                     continue;
                 }
 
-                let records =
-                    crate::pipeline::batch::dry_run_batch(&params, &cache, &config, files.iter());
+                // Review #126: wait for the cache-init thread to populate the
+                // OnceLock before dry-run.
+                let cache_ref = match cache_cell_for_dry_run.get() {
+                    Some(c) => c,
+                    None => {
+                        send_evt_lossy(
+                            &evt_tx,
+                            Event::Error {
+                                category: EncodeError::Probe("encoder cache init failed".into())
+                                    .category(),
+                                message: "encoder cache not available".into(),
+                            },
+                            &dropped_counter,
+                        );
+                        busy.store(false, Ordering::SeqCst);
+                        continue;
+                    }
+                };
+                let records = crate::pipeline::batch::dry_run_batch(
+                    &params,
+                    cache_ref,
+                    &config,
+                    files.iter(),
+                );
                 busy.store(false, Ordering::SeqCst);
                 send_evt_lossy(&evt_tx, Event::DryRunFinished { records }, &dropped_counter);
             }
@@ -1217,10 +1305,17 @@ mod mock_tests {
         // drain, the bound is irrelevant), but process_one_file
         // now takes a dropped-event counter. Use a local one.
         let dropped_counter = Arc::new(AtomicU64::new(0));
-        let cache = EncoderCache {
-            encoders_output: String::new(),
-            has_nvidia: false,
-        };
+        // Review #126: pre-populate the cache cell synchronously
+        // so the mock processor closure can read it without an
+        // init thread. Production wires this through the async
+        // init (see `init_encoder_cache_async`).
+        let cache_cell: Arc<OnceLock<EncoderCache>> = Arc::new(OnceLock::new());
+        cache_cell
+            .set(EncoderCache {
+                encoders_output: String::new(),
+                has_nvidia: false,
+            })
+            .expect("fresh OnceLock");
         let config = Config::default();
         let params = EncodeParams::default();
 
@@ -1282,6 +1377,10 @@ mod mock_tests {
                         let cancel_for_closure = cancel_token.clone();
                         let evt_tx_progress = evt_tx_for_closure.clone();
                         let dropped_progress = dropped_for_closure.clone();
+                        // Review #126: clone the cache cell for the
+                        // mock processor. Mock tests pre-populate it
+                        // synchronously, so .get() always succeeds.
+                        let cache_cell_for_mock = Arc::clone(&cache_cell);
 
                         let processor =
                             |task: &TranscodeTask,
@@ -1314,10 +1413,18 @@ mod mock_tests {
                                         &dropped_progress,
                                     );
                                 };
+                                // Review #126: mock tests pre-populate the cache_cell, so
+                                // .get().unwrap() is the correct shape
+                                // here. In production this is the
+                                // .get().unwrap() pattern; the
+                                // production path uses the explicit
+                                // match-and-fallback form.
+                                let cache =
+                                    cache_cell_for_mock.get().expect("mock cache pre-populated");
                                 let res = encode_fn(
                                     task,
                                     &params,
-                                    &cache,
+                                    cache,
                                     &config,
                                     &cancel_for_closure,
                                     &mut on_progress,
