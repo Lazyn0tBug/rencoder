@@ -761,42 +761,46 @@ fn run_actor(
     // immediately; the cache receiver is consumed lazily by
     // StartBatch handlers.
     //
-    // We use `Arc<OnceLock<EncoderCache>>` so the StartBatch
-    // processor closure can clone the Arc cheaply per task and
-    // get a guaranteed-initialized `&EncoderCache` on first
-    // access. The OnceLock blocks the first caller until the
-    // background init thread finishes.
-    let cache_cell: Arc<OnceLock<EncoderCache>> = Arc::new(OnceLock::new());
+    // We store `Result<EncoderCache, EncodeError>` in the
+    // OnceLock so a FAILED init stays observable: subsequent
+    // StartBatch handlers see `Err(...)` and can surface a
+    // meaningful "encoder cache init failed" error rather than a
+    // generic "cache not available" fallback. (`OnceLock::get`
+    // returns None only if NO `set` has happened yet, not on
+    // Err — so storing `Result` directly is what makes the
+    // failure visible.)
+    let cache_cell: Arc<OnceLock<Result<EncoderCache, EncodeError>>> = Arc::new(OnceLock::new());
     let cache_cell_for_closure = Arc::clone(&cache_cell);
     let cache_cell_for_dry_run = Arc::clone(&cache_cell);
-    // Drive the OnceLock from the background init thread. The
-    // thread takes the receiver (single-use), blocks until the
-    // result is ready, and stores it. StartBatch handlers call
-    // `get_or_init` which blocks on the same result.
+    // Drive the OnceLock from the background init thread.
     let cache_cell_for_thread = Arc::clone(&cache_cell);
     let evt_tx_for_init = evt_tx.clone();
     let dropped_for_init = Arc::clone(&dropped_counter);
     std::thread::spawn(move || {
-        match cache_rx.recv() {
-            Ok(Ok(c)) => {
-                cache_cell_for_thread.set(c).ok();
-            }
-            Ok(Err(e)) => {
-                send_evt_lossy(
-                    &evt_tx_for_init,
-                    Event::Error {
-                        category: e.category(),
-                        message: format!("encoder cache init failed: {e}"),
-                    },
-                    &dropped_for_init,
-                );
-                // Leave the OnceLock unset; StartBatch handlers
-                // will surface a "cache init failed" error if they
-                // try to use it.
-            }
-            Err(_) => {
-                log::warn!("    cache init channel closed unexpectedly");
-            }
+        // The receiver delivers exactly one `Result`. Use
+        // `unwrap_or_else` to surface a channel-disconnect as
+        // a sentinel error so the OnceLock always gets set.
+        let result = cache_rx.recv().unwrap_or_else(|_| {
+            Err(EncodeError::Probe(
+                "encoder cache init channel closed".into(),
+            ))
+        });
+        // EncoderCache + EncodeError both impl Clone (small values),
+        // so we clone before moving into OnceLock::set and the
+        // error log path.
+        // Peek at the result so we can emit an error event with the
+        // correct category before moving into the OnceLock.
+        let err_event = match &result {
+            Err(e) => Some((e.category(), format!("encoder cache init failed: {e}"))),
+            Ok(_) => None,
+        };
+        let _ = cache_cell_for_thread.set(result);
+        if let Some((category, message)) = err_event {
+            send_evt_lossy(
+                &evt_tx_for_init,
+                Event::Error { category, message },
+                &dropped_for_init,
+            );
         }
     });
     // `app_config` is still held (referenced by `config_path`
@@ -912,31 +916,49 @@ fn run_actor(
                         );
                     };
 
-                    // Review #126: wait for the cache-init thread to populate the
-                    // OnceLock. First StartBatch after startup blocks
-                    // here; subsequent batches see a populated cell
-                    // and return immediately. If init failed the
-                    // cell stays unset — we surface the error as
-                    // an Event::Error + a synthetic Failed record.
+                    // Review #126 (delta-review fix): wait for the
+                    // cache-init thread. The cell stores
+                    // `Result<EncoderCache, EncodeError>` so a
+                    // FAILED init surfaces the underlying error each
+                    // time, not a generic fallback.
                     let cache = match cache_cell_for_closure.get() {
-                        Some(c) => c,
-                        None => {
+                        Some(Ok(c)) => c,
+                        Some(Err(e)) => {
                             send_evt_lossy(
                                 &evt_tx_for_closure,
                                 Event::Error {
-                                    category: EncodeError::Probe(
-                                        "encoder cache init failed".into(),
-                                    )
-                                    .category(),
-                                    message: "encoder cache not available".into(),
+                                    category: e.category(),
+                                    message: format!("{e}"),
+                                },
+                                &dropped_for_closure,
+                            );
+                            return Ok(crate::pipeline::task::build_failed_record(
+                                task,
+                                crate::error::EncodeError::Probe(format!(
+                                    "encoder cache init failed: {e}"
+                                )),
+                                &params,
+                            ));
+                        }
+                        None => {
+                            // Init thread hasn't finished yet (race
+                            // unlikely since we spawned it before
+                            // entering the cmd_rx loop). Surface as
+                            // a transient error and skip this task.
+                            send_evt_lossy(
+                                &evt_tx_for_closure,
+                                Event::Error {
+                                    category: ErrorCategory::ConfigError,
+                                    message: "encoder cache init in progress".into(),
                                 },
                                 &dropped_for_closure,
                             );
                             return Ok(crate::pipeline::task::build_failed_record(
                                 task,
                                 crate::error::EncodeError::Probe(
-                                    "encoder cache init failed".into(),
+                                    "encoder cache init not yet complete".into(),
                                 ),
+                                &params,
                             ));
                         }
                     };
@@ -974,7 +996,7 @@ fn run_actor(
                             // record) so TaskManager doesn't abort
                             // the batch on the first failure —
                             // matches v1 inline behavior.
-                            Ok(crate::pipeline::task::build_failed_record(task, e))
+                            Ok(crate::pipeline::task::build_failed_record(task, e, &params))
                         }
                     }
                 };
@@ -1028,17 +1050,30 @@ fn run_actor(
                     continue;
                 }
 
-                // Review #126: wait for the cache-init thread to populate the
-                // OnceLock before dry-run.
+                // Review #126 (delta-review fix): same Result shape as
+                // StartBatch. A failed cache init surfaces the error
+                // and skips the dry run; an unset cell means the
+                // init thread hasn't finished yet.
                 let cache_ref = match cache_cell_for_dry_run.get() {
-                    Some(c) => c,
+                    Some(Ok(c)) => c,
+                    Some(Err(e)) => {
+                        send_evt_lossy(
+                            &evt_tx,
+                            Event::Error {
+                                category: e.category(),
+                                message: format!("{e}"),
+                            },
+                            &dropped_counter,
+                        );
+                        busy.store(false, Ordering::SeqCst);
+                        continue;
+                    }
                     None => {
                         send_evt_lossy(
                             &evt_tx,
                             Event::Error {
-                                category: EncodeError::Probe("encoder cache init failed".into())
-                                    .category(),
-                                message: "encoder cache not available".into(),
+                                category: ErrorCategory::ConfigError,
+                                message: "encoder cache init in progress".into(),
                             },
                             &dropped_counter,
                         );
@@ -1450,7 +1485,9 @@ mod mock_tests {
                                             },
                                             &dropped_for_closure,
                                         );
-                                        Ok(crate::pipeline::task::build_failed_record(task, e))
+                                        Ok(crate::pipeline::task::build_failed_record(
+                                            task, e, &params,
+                                        ))
                                     }
                                 }
                             };

@@ -226,4 +226,25 @@ Encoders:
         let result = init_encoder_cache_impl(false, runner);
         assert!(matches!(result, Err(EncodeError::Probe(_))));
     }
+
+    // Review delta #8 (delta-review): regression coverage for
+    // init_encoder_cache_async. The async path was previously
+    // untested; this test exercises the thread spawn + receiver
+    // round-trip. A failure to populate the channel would hang
+    // here (timeout).
+    #[test]
+    fn init_encoder_cache_async_delivers_result() {
+        // Use a custom runner via init_encoder_cache_impl would
+        // require re-plumbing; instead we exercise the real path
+        // but tolerate the ffmpeg binary missing on the test host.
+        let rx = init_encoder_cache_async(false);
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("init_encoder_cache_async channel closed without result");
+        // Either Ok (ffmpeg present) or Err (ffmpeg missing) is
+        // acceptable — what we're testing is that the channel
+        // delivers a result within the timeout. The exact
+        // variant depends on the host.
+        let _ = result; // suppress unused warning
+    }
 }

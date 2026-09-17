@@ -114,7 +114,7 @@ pub enum ProcessOutput {
 
 // ===== Encoder cache =====
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct EncoderCache {
     pub encoders_output: String,
     pub has_nvidia: bool,
@@ -573,6 +573,46 @@ mod tests {
         assert_eq!(VideoFormat::Hevc.default_extension(), "mp4");
         assert_eq!(VideoFormat::Vp9.default_extension(), "webm");
         assert_eq!(VideoFormat::Av1.default_extension(), "mkv");
+    }
+
+    // Review delta #6 (delta-review): regression coverage for
+    // EncodeParams::from_app_config (renamed in review #123).
+    // Without this test the rename + downstream callers could
+    // silently regress.
+    #[test]
+    fn from_app_config_uses_defaults_when_no_encode_section() {
+        let params = EncodeParams::from_app_config(None);
+        assert!(matches!(params.target, Target::File(p) if p.as_os_str().is_empty()));
+        assert_eq!(params.extensions, Vec::<String>::new());
+        assert!(params.extra_args.is_empty());
+        // EncodeConfig::default() sets crf = 45 (libsvtav1 medium),
+        // so is_crf is true and bitrate_or_crf carries the CRF value.
+        // (crf == 0 is the bitrate-mode sentinel.)
+        assert!(params.is_crf);
+        assert_eq!(params.bitrate_or_crf, 45);
+        assert_eq!(params.max_fps.max_fps, 0.0);
+        assert!(matches!(params.format, VideoFormat::Av1));
+    }
+
+    #[test]
+    fn from_app_config_picks_up_max_fps_and_format() {
+        let enc = crate::config::app::EncodeConfig {
+            format: Some(crate::config::app::FormatArg::Hevc),
+            max_fps: Some(30),
+            crf: 28,
+            bitrate: Some(5000),
+            nv: Some(false),
+            extensions: Some(vec!["mov".into()]),
+            output_dir: None,
+            encoders: None,
+            ffmpeg_args: Default::default(),
+        };
+        let params = EncodeParams::from_app_config(Some(&enc));
+        assert!(matches!(params.format, VideoFormat::Hevc));
+        assert_eq!(params.max_fps.max_fps, 30.0);
+        assert!(params.is_crf);
+        assert_eq!(params.bitrate_or_crf, 28);
+        assert_eq!(params.extensions, vec!["mov"]);
     }
 
     #[test]

@@ -223,13 +223,22 @@ impl TaskManager {
 /// knew before the encode started. `EncodingRecord::source_path`
 /// is `task.input.to_string()`; `started_at` / `ended_at` are
 /// `Utc::now()`; `encoding_duration_secs = None`.
-pub fn build_failed_record(task: &TranscodeTask, err: EncodeError) -> crate::types::EncodingRecord {
+///
+/// Review delta #5 (delta-review fix): `encoder_settings` is now
+/// derived from `params` (via `encoder_settings_from_params`) so
+/// downstream Parquet analysis can correlate failed encodes with
+/// their target config (CRF / bitrate / max-fps). Previously this
+/// defaulted to all-zeros, which made Failed records invisible
+/// to config-based queries.
+pub fn build_failed_record(
+    task: &TranscodeTask,
+    err: EncodeError,
+    params: &crate::types::EncodeParams,
+) -> crate::types::EncodingRecord {
+    use crate::data::record::encoder_settings_from_params;
     use crate::types::{EncodingOutcome, EncodingRecord, ErrorContext};
     use chrono::Utc;
 
-    // map EncodeError -> ErrorCategory via the lib's
-    // EncodeError::category method (review #121: was previously
-    // a pub(crate) fn in job.rs, which inverted the dependency).
     let category = err.category();
     let now = Utc::now();
     EncodingRecord {
@@ -246,7 +255,7 @@ pub fn build_failed_record(task: &TranscodeTask, err: EncodeError) -> crate::typ
         ended_at: Some(now),
         encoding_duration_secs: None,
         encoder_selected: None,
-        encoder_settings: Default::default(),
+        encoder_settings: encoder_settings_from_params(params),
         ffmpeg_argv: vec![],
         ffmpeg_stderr_tail: String::new(),
         output_path: task
