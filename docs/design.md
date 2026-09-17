@@ -765,6 +765,15 @@ pub fn transcode_single(
   这是合理的:video 输出一定有 duration;没有 = 文件损坏。
 - **删除失败 fallback**:`fs::remove_file` 失败（如权限拒绝）→
   `Skipped(PartialOutput)`,encode 不继续（output 在那挡着）。
+- **Post-run 0 字节清理**:ffmpeg exit 0 但 output 缺失 / 0 字节,且
+  source 有 known duration → 立即 `remove_file` 并记录 `Failed`。
+  不留 0 字节 ghost 等下次 partial detector 兜底（review #114）。
+- **stderr 内存上限**:ffmpeg verbose 跑可能喷出数百 MiB
+  stderr,`run_ffmpeg_with_progress` 的 reader 线程有 256 KiB
+  上限（`STDERR_READER_MAX_BYTES`）,超出部分丢入
+  `[stderr truncated; N bytes dropped]` 注解。reader 持续 drain
+  pipe 到 EOF,因此 `stderr_thread.join()` 不会卡住（review
+  #112 + #116）。
 - **代价**:每个 skipped file 多一次 ffprobe 调用（~10ms）。
   1000-file 二次跑额外 ~10s,可接受。
 

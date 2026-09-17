@@ -36,6 +36,18 @@ use crate::types::{
 };
 use crate::utils::fs::output_path_for;
 
+/// Maximum bytes the stderr reader thread will keep in memory for the
+/// `ErrorContext.ffmpeg_stderr_tail` payload (review fix #112). 256 KiB
+/// is comfortably more than ffmpeg ever writes for a single-file
+/// failure — even at `-loglevel debug` the last-20-lines tail fits in
+/// ~4 KiB. Anything larger is dumped and counted so the user sees a
+/// "[stderr truncated; N bytes dropped]" annotation. The cap also
+/// bounds `stderr_thread.join()` wait time: once the cap is hit the
+/// thread keeps draining the pipe to EOF but never grows memory, so
+/// the subsequent join cannot wedge the calling task indefinitely
+/// (review fix #116).
+const STDERR_READER_MAX_BYTES: usize = 256 * 1024;
+
 /// Per-file callback fired after the record is built.
 type ResultCallback = dyn Fn(&EncodingRecord);
 
@@ -416,6 +428,16 @@ fn build_encode_record(
                 .filter(|m| m.len() > 0)
                 .map(|m| m.len());
             let source_size_bytes = std::fs::metadata(&task.input).map(|m| m.len()).unwrap_or(0);
+            // Review fix #114 (partial-output detection fall-through):
+            // when ffmpeg exits 0 but the output is missing or
+            // zero-byte, the encode produced nothing useful. If the
+            // source has a known duration we can confidently call this
+            // `Failed`; if a zero-byte file is left behind, remove it
+            // in the same run so the next invocation's partial-output
+            // detector doesn't have to clean it up. Without this the
+            // zero-byte ghost would linger on disk until the next
+            // run — and could be mistaken for a real output by other
+            // tools that just check `path.exists()`.
             let (outcome, size_bytes) = match output_size {
                 Some(n) => (
                     if need_reduce {
@@ -426,10 +448,29 @@ fn build_encode_record(
                     Some(n),
                 ),
                 None if source_has_known_duration => {
-                    log::warn!(
-                        "    ffmpeg exit 0 but {} missing or zero bytes; recording Failed",
-                        output_path.display()
-                    );
+                    // Best-effort cleanup of any zero-byte file left
+                    // by ffmpeg before it gave up. We tolerate a
+                    // remove failure (e.g. file vanished between
+                    // `metadata()` and `remove_file`) since the next
+                    // run's partial detector will retry.
+                    if output_path.exists() {
+                        match std::fs::remove_file(output_path) {
+                            Ok(()) => log::warn!(
+                                "    ffmpeg exit 0 but {} was zero bytes; removed, recording Failed",
+                                output_path.display()
+                            ),
+                            Err(e) => log::warn!(
+                                "    ffmpeg exit 0 but {} was zero bytes and remove failed: {}; recording Failed",
+                                output_path.display(),
+                                e
+                            ),
+                        }
+                    } else {
+                        log::warn!(
+                            "    ffmpeg exit 0 but {} missing; recording Failed",
+                            output_path.display()
+                        );
+                    }
                     (EncodingOutcome::Failed, None)
                 }
                 None => {
@@ -853,6 +894,67 @@ fn stderr_tail(stderr: &str, n: usize) -> String {
         .join("\n")
 }
 
+/// Read stderr from a child process into a bounded buffer (review fix
+/// #112). Caps memory at `max_bytes`; once hit, drains the rest of
+/// the pipe and counts discarded bytes. The returned tail is
+/// annotated with a "[stderr truncated; N bytes dropped]" prefix
+/// when anything was discarded, so the user sees that the upstream
+/// prefix was elided.
+///
+/// Lossy UTF-8 conversion is used because ffmpeg stderr is normally
+/// UTF-8 but a chunk boundary could split a multi-byte sequence —
+/// replacing the bad tail with `U+FFFD` is acceptable for a log tail.
+///
+/// Note: `Read::read` is allowed to return short reads (any value
+/// from 1 to `buf.len()`), so the cap must be re-checked *after* each
+/// append, not just at the start of the loop iteration.
+fn read_bounded_stderr<R: std::io::Read>(reader: R, max_bytes: usize) -> String {
+    use std::io::Read;
+    let mut buf = std::io::BufReader::new(reader);
+    let mut kept = String::with_capacity(max_bytes.min(8192));
+    let mut chunk = vec![0u8; 8192];
+    let mut discarded = 0u64;
+    let mut cap_hit = false;
+    loop {
+        match buf.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                if cap_hit {
+                    discarded += n as u64;
+                    continue;
+                }
+                let room = max_bytes.saturating_sub(kept.len());
+                if room == 0 {
+                    cap_hit = true;
+                    discarded += n as u64;
+                    continue;
+                }
+                let take = n.min(room);
+                kept.push_str(&String::from_utf8_lossy(&chunk[..take]));
+                if take < n {
+                    cap_hit = true;
+                    discarded += (n - take) as u64;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    if cap_hit {
+        // Take the tail FIRST, then prepend the annotation. If we
+        // appended the annotation to `kept` and *then* took the
+        // tail, the annotation would be at the front and
+        // `stderr_tail` would drop it (it only keeps the last 20
+        // non-empty lines).
+        let tail = stderr_tail(&kept, 20);
+        let prefix = format!("[stderr truncated; {discarded} bytes dropped]\n");
+        let mut annotated = String::with_capacity(prefix.len() + tail.len());
+        annotated.push_str(&prefix);
+        annotated.push_str(&tail);
+        return annotated;
+    }
+    stderr_tail(&kept, 20)
+}
+
 /// Structured progress snapshot from ffmpeg's `-progress pipe:1`
 /// output (U21, §3.8.3 `Event::Progress`). Built incrementally as we
 /// parse key=value lines, then emitted once per `progress=continue`
@@ -981,12 +1083,20 @@ pub fn run_ffmpeg_with_progress(
     // Stderr reader thread: collects tail for ErrorContext.ffmpeg_stderr_tail
     // on failure. We don't surface stderr live in this path (CLI path
     // inherits stderr to the terminal instead).
-    let stderr_thread = std::thread::spawn(move || {
-        use std::io::Read;
-        let mut buf = String::new();
-        let _ = std::io::BufReader::new(stderr).read_to_string(&mut buf);
-        stderr_tail(&buf, 20)
-    });
+    //
+    // Review fix #112 (stderr reader memory cap): ffmpeg can emit
+    // unbounded stderr on verbose runs (e.g. `-loglevel debug` with a
+    // long source) or pathological encoder paths. `read_to_string`
+    // would let that grow without bound and OOM the worker. The
+    // read loop caps at [`STDERR_READER_MAX_BYTES`] (256 KiB); once
+    // reached, drain the rest of the pipe and discard — the 20-line
+    // tail we keep comes from the *end* of stderr (where ffmpeg
+    // writes the failure cause), so dropping the prefix is acceptable
+    // for the ErrorContext payload. After the cap is hit the thread
+    // terminates promptly so the subsequent `join()` cannot wedge
+    // (review fix #116, bounded stderr_thread.join()).
+    let stderr_thread =
+        std::thread::spawn(move || read_bounded_stderr(stderr, STDERR_READER_MAX_BYTES));
 
     // Stdout reader: ffmpeg writes key=value lines, with blocks
     // separated by `progress=continue` / `progress=end`.
@@ -1372,4 +1482,57 @@ Encoders:
     // Guard per task -- the new contract routes that wiring through
     // `TaskManager::run` (U19 step 4). The replacement TaskManager
     // unit tests land in U19 step 7.
+
+    // ---- read_bounded_stderr (review fix #112 + #116) ----
+
+    #[test]
+    fn read_bounded_stderr_under_cap_keeps_full_tail() {
+        let input = b"frame= 1\nframe= 2\nConversion failed!\n";
+        let tail = read_bounded_stderr(&input[..], 1024);
+        assert_eq!(tail, "frame= 1\nframe= 2\nConversion failed!");
+    }
+
+    #[test]
+    fn read_bounded_stderr_over_cap_annotates_truncation() {
+        // ~10 KiB of input, 1 KiB cap. The reader keeps the LAST 1 KiB
+        // (where ffmpeg's failure cause normally lives) and discards
+        // the prefix.
+        let mut input = Vec::new();
+        let line = b"frame= XXXX line padding padding padding padding\n";
+        for _ in 0..(10 * 1024 / line.len() + 1) {
+            input.extend_from_slice(line);
+        }
+        assert!(input.len() > 10 * 1024, "input was {}", input.len());
+        let tail = read_bounded_stderr(&input[..], 1024);
+        assert!(
+            tail.starts_with("[stderr truncated;"),
+            "expected truncation annotation, got: {tail:?}"
+        );
+        assert!(tail.contains("bytes dropped]"));
+        // The tail should keep the SUFFIX of the input (proves we
+        // didn't keep the prefix instead). The annotation prefix
+        // displaces the very first line, so we check for one of the
+        // mid-input lines that survives.
+        assert!(
+            tail.contains("padding padding padding padding"),
+            "tail should retain suffix lines; got: {tail:?}"
+        );
+    }
+
+    #[test]
+    fn read_bounded_stderr_empty_input_returns_empty() {
+        let tail = read_bounded_stderr(&[][..], 1024);
+        assert_eq!(tail, "");
+    }
+
+    #[test]
+    fn read_bounded_stderr_handles_invalid_utf8_lossy() {
+        // 0xFF is not valid UTF-8; must not panic. The lossy
+        // replacement is U+FFFD (\u{FFFD}).
+        let input: Vec<u8> = vec![b'x', 0xFF, 0xFE, b'y'];
+        let tail = read_bounded_stderr(&input[..], 1024);
+        assert!(tail.contains('\u{FFFD}'));
+        assert!(tail.contains('x'));
+        assert!(tail.contains('y'));
+    }
 }
