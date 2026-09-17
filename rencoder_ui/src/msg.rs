@@ -4,21 +4,20 @@
 //! only via `reduce(state, msg, cmd_tx)` which also dispatches
 //! Commands back to the lib actor as needed.
 //!
-//! **Workflow state machine** (§3.8.7.1):
+//! **Workflow state machine** (§3.8.7.1, v1.2 redesign — review #133):
 //!
 //! ```text
-//! [None]  --UserClickedStart-->  [Analyzing]
-//!                                     |
-//!                                     v
-//!                              [AwaitingConfirm]
-//!                                     |
-//!                                     +-- UserClickedStart (dispatches Command::StartBatch)
-//!                                     v
-//!                                [Encoding]
-//!                                     |
-//!                  +-- BatchCompleted ---+
-//!                  +-- BatchCancelled ---+--> [Done] (moves to task_history)
-//!                  +-- Error (Encoding) -+
+//! [None]
+//!   |  (UserClickedStart or UserSelectedDir)
+//!   |  when to_encode=0 -> [Analyzing]
+//!   |  when to_encode>0 -> [Encoding] (auto-dispatch via
+//!   |                       Event::DryRunFinished with to_encode>0)
+//!   v
+//! [Analyzing] --Event::DryRunFinished--> [Encoding] (auto) | (no
+//!   auto-encode, leaves button disabled: "Encode (no encodable
+//!   files)" stays on the page)
+//! [Encoding] --BatchCompleted/BatchCancelled/Error--> [Done]
+//! [Done]    --UserClickedStart (re-arm)--> [Analyzing]
 //! ```
 //!
 //! v1 invariant: TaskQueue capacity = 1. Gating unit is task
@@ -41,22 +40,20 @@ const LOG_RING_CAP: usize = 1000;
 /// Lifecycle phase of a task. Drives the Task page header badge,
 /// the contextual button label, and the dir picker's enabled state
 /// (§3.8.7.1 state machine).
+/// Lifecycle phase of a task (review #133: AwaitingConfirm removed
+/// for 1-click workflow).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchPhase {
     /// `Command::DryRun` dispatched; awaiting `Event::DryRunFinished`.
-    /// Dir picker disabled. Cancel button shown (best-effort).
+    /// Dir picker disabled. Start button disabled (analyze in flight).
     Analyzing,
-    /// DryRun done; user must explicitly confirm before encoding
-    /// begins. Start button label flips to "encode N files".
-    /// Dir picker disabled.
-    AwaitingConfirm,
     /// `Command::StartBatch` dispatched; awaiting `BatchCompleted`
     /// / `BatchCancelled` / `Event::Error`. Progress bar active.
-    /// Dir picker disabled. Cancel button shown.
+    /// Dir picker disabled. Start button shows "Cancel ✕".
     Encoding,
     /// Final state after the batch lifecycle ends. Dir picker
-    /// re-enables. Start button re-arms (clicking it transitions
-    /// back to `Analyzing` for a new cycle).
+    /// re-enables. Start button shows "Re-run ▸" (clicking
+    /// transitions back to `Analyzing` for a new cycle).
     Done,
 }
 
