@@ -212,10 +212,81 @@ impl Default for Target {
     }
 }
 
+// ===== Input path safety boundary (review #109) =====
+//
+// Type-level guarantee that the input path passed to ffmpeg can't
+// start with `-` (which ffmpeg would parse as an option). Pairs
+// with `ExtraArg` (§3.3.7) on the argv side: both push the
+// validation to the type system so a runtime check can't be
+// forgotten.
+//
+// Status: TYPE DEFINED BUT NOT YET WIRED THROUGH. The migration
+// from `TranscodeTask.input: PathBuf` to `InputPath` is a cross-
+// cutting change touching collect.rs, encoder/command.rs,
+// pipeline/batch.rs, pipeline/task.rs, job.rs (Command variants
+// + all test fixtures), and rencoder_cli/src/main.rs. The doc
+// section §3.3.8 + §3.8.6 row + this type are staged in advance
+// so the wire-through PR is a mechanical replace + new tests.
+//
+// Rejected forms (once wired through):
+//   - empty path
+//   - any path whose final component starts with `-` — covers the
+//     classic `-vf_negate.mp4` case AND any sub-path with a
+//     dash-prefixed leaf (`/tmp/-secret`). POSIX-style paths are
+//     always relative-or-absolute + components; we only need to
+//     inspect the filename.
+#[allow(dead_code)] // staged for review #109 wire-through
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct InputPath(String);
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum InputPathError {
+    #[error("empty input path")]
+    Empty,
+    #[error("input path filename starts with `-` (would be parsed by ffmpeg as an option): {0:?}")]
+    DashPrefixed(String),
+}
+
+impl InputPath {
+    /// Validate + wrap a path. Returns `Err` for the rejected forms
+    /// listed in the type-level docs above.
+    pub fn new(p: &std::path::Path) -> Result<Self, InputPathError> {
+        let s = p.to_string_lossy();
+        if s.is_empty() {
+            return Err(InputPathError::Empty);
+        }
+        // Path::file_name() returns None for paths ending in `..`
+        // or `/`, but those are pathological for ffmpeg input anyway.
+        // Reject via filename = None (also caught by dash check on
+        // the full string, but explicit is clearer).
+        let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or(&s);
+        if fname.starts_with('-') {
+            return Err(InputPathError::DashPrefixed(s.into_owned()));
+        }
+        Ok(Self(s.into_owned()))
+    }
+
+    /// Borrow the underlying path string.
+    pub fn as_path(&self) -> &std::path::Path {
+        std::path::Path::new(&self.0)
+    }
+
+    /// Consume and return the owned `String` (lossy round-trip via
+    /// `PathBuf::display()`).
+    pub fn display(&self) -> std::path::Display<'_> {
+        std::path::Path::new(&self.0).display()
+    }
+}
+
 // ===== Single transcode task =====
 
 #[derive(Clone, Debug)]
 pub struct TranscodeTask {
+    /// Source path the task reads. Currently `PathBuf`; planned
+    /// migration to [`InputPath`] (review #109) is in progress but
+    /// not yet wired through. The runtime dash-prefix check in
+    /// `collect::collect_dir` is the interim guard.
     pub input: PathBuf,
     /// Output path the task writes to. `Some` for encode (ffmpeg
     /// output), `None` for analyze (read-only). The signal handler

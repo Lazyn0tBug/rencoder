@@ -492,7 +492,9 @@ pub enum Target {
 // ===== 单个转码任务 =====
 #[derive(Clone, Debug)]
 pub struct TranscodeTask {
-    pub input: PathBuf,
+    /// 输入路径,经过 [`InputPath`](§3.3.8) 验证——dash 前缀文件名在
+    /// 构造时就被拒,ffmpeg 不会把它当 option 解析
+    pub input: InputPath,
     pub output: PathBuf,
 }
 
@@ -798,6 +800,51 @@ for arg in &params.extra_args {
   错误消息直接 surface 给用户
 - 未来的 TOML `[encode] extra_args` 字段用 `Vec<ExtraArg>`
   反序列化,serde 自动跑 parse,非法 config 在 load 阶段就 fail
+
+#### 输入路径安全边界（类型级,review #109 收尾）
+
+跟 `ExtraArg` 同样的策略——把路径合法性提到类型层。
+
+**问题**:ffmpeg 把 argv 当作选项解析。如果 input 路径以
+`-` 开头（例如 `-vf_negate.mp4`、`.config/-secret`）,
+ffmpeg 可能解释成选项（`-vf negate.mp4`）或报错。`collect.rs`
+已经在收集阶段过滤掉 dash 前缀的文件（review #1 partial）,
+但**边界是 collect_dir 内部**,`TranscodeTask.input: PathBuf`
+仍然是 raw 类型——任何未来 caller（CLI 直接 `-f`、测试、
+其他 source）只要绕过 collect 就能塞 unsafe 路径。
+
+**新做法**:`TranscodeTask.input: InputPath`,`InputPath` 是
+newtype + validated factory,只有 `InputPath::new(&Path)`
+能构造,工厂里 reject dash 前缀 / 空字符串。
+
+```rust
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct InputPath(String);
+
+impl InputPath {
+    /// Validate + wrap. Rejects:
+    ///   - empty path
+    ///   - filename starting with `-` (ffmpeg would parse as option)
+    ///   - any other form that `build_ffmpeg_command` could mis-parse
+    pub fn new(p: &Path) -> Result<Self, InputPathError>;
+    pub fn as_path(&self) -> &Path;
+}
+```
+
+**配套改动**:
+
+- `collect_files` 返回 `Vec<Result<InputPath, InputPathError>>` 或
+  `Vec<InputPath>`（前者把校验错误传给 caller 决定 surface 方式;
+  v1 用后者,先 warn + skip 跟现有行为对齐）
+- CLI `-f` 路径走 `InputPath::new` 校验,失败时 bail
+- `build_ffmpeg_command` 拿 `&InputPath`,转成 `&Path` 拼 argv
+- 删除 `collect_dir` 里的 dash-prefix 检查分支(类型层已经兜底)
+
+**为什么不让 OutputPath 也走同样路径**:`output` 是 wrapper 写
+出去的目标,ffmpeg 不会把它当 option 解析(它在 argv 末尾,位置
+上是 output file)。加同款保护只是过度防御;保留 `Option<PathBuf>`
+就够了。
 
 #### 转码跳过判断
 
@@ -1846,6 +1893,7 @@ UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `int
 | `job.rs` | `Event::AnalyzeStarted` / `Event::AnalyzeProgress` / `Event::AnalyzeFinished` | U22：见 §3.8.3。`Event::AnalyzeProgress` 在 mock actor 里是 no-op（test seam，ref-count 即可）|
 | `data/store.rs` | `read_records(path)` | 单 Parquet 文件回读(v1 不使用,v1.1 启用) |
 | `encoder/ffmpeg_arg.rs` | `ExtraArg` enum + `ExtraArg::parse` factory + char-class 模块 | 类型级 ffmpeg argv 安全边界(§3.3.7)——非法 argv 在 parse 阶段被拒,运行时无法塞 unsafe 值。替换 v1 的 runtime `validate_extra_args` |
+| `types.rs` | `InputPath` newtype + `InputPath::new(&Path)` factory + `InputPathError` | 输入路径类型级安全边界(§3.3.8)——dash 前缀文件名在构造时就被拒,`build_ffmpeg_command` 不可能拿到 `-vf_negate.mp4`。替换 `collect_dir` 里的运行时 dash-prefix 检查(review #109 收尾) |
 
 **`process_one_file` testability surface**(§8 item 43)——这是 §3.8 唯一保留的函数签名,因为它**解释了为何要抽出这个 helper**(测试性):
 
