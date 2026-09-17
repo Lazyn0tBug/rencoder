@@ -227,9 +227,10 @@ pub fn build_failed_record(task: &TranscodeTask, err: EncodeError) -> crate::typ
     use crate::types::{EncodingOutcome, EncodingRecord, ErrorContext};
     use chrono::Utc;
 
-    // map EncodeError -> ErrorCategory via the lib's existing
-    // helper.
-    let category = crate::job::encode_error_category(&err);
+    // map EncodeError -> ErrorCategory via the lib's
+    // EncodeError::category method (review #121: was previously
+    // a pub(crate) fn in job.rs, which inverted the dependency).
+    let category = err.category();
     let now = Utc::now();
     EncodingRecord {
         source_path: task.input.to_string(),

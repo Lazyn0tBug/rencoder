@@ -162,6 +162,13 @@ impl EncodeParams {
     /// Build a full `EncodeParams` from the loaded `AppConfig`'s
     /// `encode` section. Missing fields fall back to defaults.
     ///
+    /// Review #123: renamed from `from_encode_config` to
+    /// `from_app_config` to disambiguate from
+    /// [`crate::config::Config::from_encode_config`], which has the
+    /// same name but a different job (sub-config extraction).
+    /// Both existed side by side; the disambiguation makes it
+    /// clear at the call site which layer is being constructed.
+    ///
     /// This is the single source of truth for "how a TOML `[encode]`
     /// block becomes an `EncodeParams`". Both the CLI and the GUI
     /// (`rencoder_ui::msg::build_encode_params_from_config`) call this
@@ -172,7 +179,7 @@ impl EncodeParams {
     /// `[encode] target` is parsed but not consumed by
     /// `transcode_single`. If/when target becomes per-batch
     /// controllable, this function picks it up automatically.
-    pub fn from_encode_config(encode: Option<&crate::config::app::EncodeConfig>) -> Self {
+    pub fn from_app_config(encode: Option<&crate::config::app::EncodeConfig>) -> Self {
         use crate::config::app::EncodeConfig;
         let default_enc = EncodeConfig::default();
         let enc: &EncodeConfig = encode.unwrap_or(&default_enc);
@@ -411,6 +418,53 @@ pub struct EncodingRecord {
     // === 4. Status (independent monitoring) ===
     pub outcome: EncodingOutcome,
     pub error: Option<ErrorContext>,
+}
+
+impl EncodingRecord {
+    /// Build a record populated from `metadata` + `input_path` +
+    /// `source_size_bytes`. The 7 `source_*` fields (codec / container /
+    /// width / height / fps / duration / bit_rate) are filled from
+    /// `metadata`; the rest of the record is left at defaults that the
+    /// caller fills in per outcome (process / result / status).
+    ///
+    /// Review #124: this deduplicates the source-field assignment
+    /// that was repeated in `make_planned_ready_record`,
+    /// `make_skipped_record`, `make_failed_probe_record`, and
+    /// `build_encode_record`'s success arm — four sites building
+    /// the same 7-field block from the same `&VideoMetadata`.
+    pub fn from_metadata(
+        input_path: &crate::types::InputPath,
+        source_size_bytes: u64,
+        metadata: Option<&VideoMetadata>,
+    ) -> Self {
+        use chrono::Utc;
+        Self {
+            source_path: input_path.to_string(),
+            source_size_bytes,
+            source_codec: metadata.and_then(|m| m.codec.clone()),
+            source_container: metadata.and_then(|m| m.container.clone()),
+            source_width: metadata.and_then(|m| m.width),
+            source_height: metadata.and_then(|m| m.height),
+            source_fps: metadata.and_then(|m| m.best_fps()),
+            source_duration_secs: metadata.and_then(|m| m.duration_secs),
+            source_bit_rate_bps: metadata.and_then(|m| m.bit_rate),
+            // Caller fills in the process / result / status fields.
+            started_at: Utc::now(),
+            ended_at: None,
+            encoding_duration_secs: None,
+            encoder_selected: None,
+            encoder_settings: EncoderSettings::default(),
+            ffmpeg_argv: Vec::new(),
+            ffmpeg_stderr_tail: String::new(),
+            output_path: None,
+            output_size_bytes: None,
+            output_duration_secs: None,
+            output_codec: None,
+            compression_ratio: None,
+            outcome: EncodingOutcome::Succeeded,
+            error: None,
+        }
+    }
 }
 
 // Re-export for backwards compat with existing call sites (the encode
@@ -842,7 +896,7 @@ mod tests {
     fn params_with_extra(extra: Vec<crate::encoder::ffmpeg_arg::ExtraArg>) -> EncodeParams {
         EncodeParams {
             extra_args: extra,
-            ..EncodeParams::from_encode_config(None)
+            ..EncodeParams::from_app_config(None)
         }
     }
 

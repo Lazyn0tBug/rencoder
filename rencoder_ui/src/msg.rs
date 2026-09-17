@@ -658,7 +658,7 @@ fn apply_event(state: &mut AppState, evt: Event) {
 fn build_encode_params_from_config(
     config: &rencoder_lib::config::app::AppConfig,
 ) -> rencoder_lib::types::EncodeParams {
-    rencoder_lib::types::EncodeParams::from_encode_config(config.encode.as_ref())
+    rencoder_lib::types::EncodeParams::from_app_config(config.encode.as_ref())
 }
 
 /// Errors that `collect_input_files` can return. Distinguishes

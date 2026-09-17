@@ -34,7 +34,6 @@ use crate::types::{
     EncodeParams, EncoderCache, EncoderSettings, EncodingOutcome, EncodingRecord, ErrorCategory,
     ErrorContext, ProcessOutput, SkippedReason, TranscodeTask, VideoMetadata,
 };
-use crate::utils::fs::output_path_for;
 
 /// Maximum bytes the stderr reader thread will keep in memory for the
 /// `ErrorContext.ffmpeg_stderr_tail` payload (review fix #112). 256 KiB
@@ -582,14 +581,24 @@ pub fn transcode_batch(
     result_callback: Option<&ResultCallback>,
 ) -> Vec<EncodingRecord> {
     // U19 step 4: route the batch through `TaskManager::run`. The
-    // manager owns the iteration, scaffold logs, and signal-handler
-    // Guard wiring. The `current_output` handle is cloned into the
-    // manager so per-task Guards register the in-flight output path.
+    // Review #122: hoist `format.default_extension()` out of the
+    // per-task loop. The extension doesn't change across tasks;
+    // computing it once saves one match per file. For a 1000-file
+    // batch this is 1000 saved lookups.
+    let ext = params.format.default_extension();
     let tasks: Vec<TranscodeTask> = files
         .iter()
-        .map(|input| TranscodeTask {
-            input: input.clone(),
-            output: Some(output_path_for(input.as_path(), params.format)),
+        .map(|input| {
+            let stem = input
+                .as_path()
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("output");
+            let parent = input.as_path().parent().unwrap_or_else(|| Path::new(""));
+            TranscodeTask {
+                input: input.clone(),
+                output: Some(parent.join(format!("{stem}.{ext}"))),
+            }
         })
         .collect();
 
@@ -651,9 +660,17 @@ pub fn dry_run_batch<'a, I>(
 where
     I: IntoIterator<Item = &'a crate::types::InputPath>,
 {
+    // Review #122: hoist extension out of the per-file loop.
+    let ext = params.format.default_extension();
     let mut records = Vec::new();
     for file in files {
-        let output_path = output_path_for(file.as_path(), params.format);
+        let stem = file
+            .as_path()
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("output");
+        let parent = file.as_path().parent().unwrap_or_else(|| Path::new(""));
+        let output_path = parent.join(format!("{stem}.{ext}"));
         let task = TranscodeTask {
             input: file.clone(),
             output: Some(output_path),
@@ -679,6 +696,10 @@ where
 /// Build a "dry-run planned success" record: same metadata fields as
 /// `make_skipped_record` (probe + source info populated) but outcome
 /// is `Succeeded` and `ended_at` is `None` (no actual run yet).
+///
+/// Review #124: source fields via `EncodingRecord::from_metadata`;
+/// override only the bits this helper cares about (encoder_settings
+/// from `params`, planned output path).
 fn make_planned_ready_record(
     task: &TranscodeTask,
     params: &EncodeParams,
@@ -688,40 +709,15 @@ fn make_planned_ready_record(
         .map(|m| m.len())
         .unwrap_or(0);
     let source_meta = probe_video_metadata_quick(task);
-    EncodingRecord {
-        source_path: task.input.to_string(),
-        source_size_bytes,
-        source_codec: source_meta.as_ref().and_then(|m| m.codec.clone()),
-        source_container: source_meta.as_ref().and_then(|m| m.container.clone()),
-        source_width: source_meta.as_ref().and_then(|m| m.width),
-        source_height: source_meta.as_ref().and_then(|m| m.height),
-        source_fps: source_meta.as_ref().and_then(|m| m.best_fps()),
-        source_duration_secs: source_meta.as_ref().and_then(|m| m.duration_secs),
-        source_bit_rate_bps: source_meta.as_ref().and_then(|m| m.bit_rate),
-
-        started_at,
-        // No actual end time — this is a plan, not a run record.
-        ended_at: None,
-        encoding_duration_secs: None,
-        encoder_selected: None,
-        encoder_settings: encoder_settings_from_params(params),
-        ffmpeg_argv: Vec::new(),
-        ffmpeg_stderr_tail: String::new(),
-
-        // The planned output path (ffmpeg hasn't run, but we know
-        // what it WOULD produce).
-        output_path: task
-            .output
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned()),
-        output_size_bytes: None,
-        output_duration_secs: None,
-        output_codec: None,
-        compression_ratio: None,
-
-        outcome: EncodingOutcome::Succeeded,
-        error: None,
-    }
+    let mut record =
+        EncodingRecord::from_metadata(&task.input, source_size_bytes, source_meta.as_ref());
+    record.started_at = started_at;
+    record.encoder_settings = encoder_settings_from_params(params);
+    record.output_path = task
+        .output
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned());
+    record
 }
 
 /// Extract the target path (file or directory) from `EncodeParams.target`

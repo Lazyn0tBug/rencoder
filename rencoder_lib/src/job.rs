@@ -24,7 +24,7 @@
 #[cfg(test)]
 use crossbeam_channel::unbounded;
 use crossbeam_channel::{bounded, Receiver, Sender};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -41,7 +41,6 @@ use crate::pipeline::cache::init_encoder_cache;
 use crate::pipeline::cancel::CancelToken;
 use crate::pipeline::task::TaskManager;
 use crate::types::{EncodeParams, EncoderCache, ErrorCategory, TranscodeTask};
-use crate::utils::fs::output_path_for;
 
 // Re-export for UI consumers — `Event::FileCompleted` and
 // `Event::BatchCompleted` carry `EncodingRecord`, so consumers
@@ -464,35 +463,10 @@ mod tests {
     }
 }
 
-/// Map an [`EncodeError`] (from the encode closure) to the appropriate
-/// [`ErrorCategory`] for [`Event::Error`]. See design §3.8.6 for the
-/// full mapping table:
-///
-/// | `EncodeError`       | `ErrorCategory`         |
-/// |---------------------|-------------------------|
-/// | `Io(_)`             | `IoError`               |
-/// | `Ffmpeg(_)`         | `FfmpegSpawnFailed`    |
-/// | `Probe(_)`          | `ProbeFailed`           |
-/// | `InvalidParam(_)`   | `ConfigError`           |
-/// | `EncoderNotFound(_)`| `EncoderSelectionFailed`|
-/// | `FpsParse(_)`       | `ConfigError`           |
-/// | `UserCancel`        | `Cancelled`             |
-///
-/// `Event::Error` is fatal-only; per-file encode failures travel
-/// through `EncodingRecord.error` instead. Called by the
-/// `Command::StartBatch` processor closure to surface a setup-
-/// level error to the UI.
-pub(crate) fn encode_error_category(e: &EncodeError) -> ErrorCategory {
-    match e {
-        EncodeError::Io(_) => ErrorCategory::IoError,
-        EncodeError::Ffmpeg(_) => ErrorCategory::FfmpegSpawnFailed,
-        EncodeError::Probe(_) => ErrorCategory::ProbeFailed,
-        EncodeError::InvalidParam(_) => ErrorCategory::ConfigError,
-        EncodeError::EncoderNotFound(_) => ErrorCategory::EncoderSelectionFailed,
-        EncodeError::FpsParse(_) => ErrorCategory::ConfigError,
-        EncodeError::UserCancel => ErrorCategory::Cancelled,
-    }
-}
+// Review #121: EncodeError::category() (in error.rs) replaces
+// the previous `encode_error_category` helper. The mapping lives
+// on the error type itself so the dependency direction stays
+// correct (pipeline::task uses it without depending on job).
 
 // =====================================================================
 // Controller — §3.8.4
@@ -829,11 +803,21 @@ fn run_actor(
                     &dropped_counter,
                 );
 
+                // Review #122: hoist extension out of the per-task loop.
+                let ext = params.format.default_extension();
                 let tasks: Vec<TranscodeTask> = files
                     .iter()
-                    .map(|file| TranscodeTask {
-                        input: file.clone(),
-                        output: Some(output_path_for(file.as_path(), params.format)),
+                    .map(|file| {
+                        let stem = file
+                            .as_path()
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("output");
+                        let parent = file.as_path().parent().unwrap_or_else(|| Path::new(""));
+                        TranscodeTask {
+                            input: file.clone(),
+                            output: Some(parent.join(format!("{stem}.{ext}"))),
+                        }
                     })
                     .collect();
 
@@ -915,7 +899,7 @@ fn run_actor(
                             send_evt_lossy(
                                 &evt_tx_for_closure,
                                 Event::Error {
-                                    category: encode_error_category(&e),
+                                    category: e.category(),
                                     message: format!("encode error: {e}"),
                                 },
                                 &dropped_for_closure,
@@ -1272,11 +1256,22 @@ mod mock_tests {
                         );
 
                         let _total = files.len();
+                        // Review #122: hoist extension out of the per-task loop.
+                        let ext = params.format.default_extension();
                         let tasks: Vec<TranscodeTask> = files
                             .iter()
-                            .map(|file| TranscodeTask {
-                                input: file.clone(),
-                                output: Some(output_path_for(file.as_path(), params.format)),
+                            .map(|file| {
+                                let stem = file
+                                    .as_path()
+                                    .file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("output");
+                                let parent =
+                                    file.as_path().parent().unwrap_or_else(|| Path::new(""));
+                                TranscodeTask {
+                                    input: file.clone(),
+                                    output: Some(parent.join(format!("{stem}.{ext}"))),
+                                }
                             })
                             .collect();
                         let batch_path =
@@ -1343,7 +1338,7 @@ mod mock_tests {
                                         send_evt_lossy(
                                             &evt_tx_for_closure,
                                             Event::Error {
-                                                category: super::encode_error_category(&e),
+                                                category: e.category(),
                                                 message: format!("encode error: {e}"),
                                             },
                                             &dropped_for_closure,
@@ -2103,11 +2098,7 @@ mod mock_tests {
             (EncodeError::UserCancel, ErrorCategory::Cancelled),
         ];
         for (err, expected) in cases {
-            assert_eq!(
-                encode_error_category(&err),
-                expected,
-                "mapping wrong for {err:?}",
-            );
+            assert_eq!(err.category(), expected, "mapping wrong for {err:?}",);
         }
     }
 }

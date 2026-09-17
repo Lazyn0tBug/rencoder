@@ -1,5 +1,7 @@
 //! Library error type. CLI maps these to user-facing messages via `anyhow`.
 
+use crate::types::ErrorCategory;
+
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
 pub enum EncodeError {
@@ -23,6 +25,36 @@ pub enum EncodeError {
 
     #[error("User cancelled")]
     UserCancel,
+}
+
+impl EncodeError {
+    /// Map to the [`ErrorCategory`] the UI displays. Review #121:
+    /// the mapping was previously a `pub(crate) fn encode_error_category`
+    /// in `job.rs`, which forced `pipeline::task` (a lower layer)
+    /// to depend on `job` (a higher layer). Moving it onto
+    /// `EncodeError` itself keeps the dependency direction correct:
+    /// `pipeline::*` depends on `error`, not the other way around.
+    ///
+    /// | `EncodeError`       | `ErrorCategory`         |
+    /// |---------------------|-------------------------|
+    /// | `Io(_)`             | `IoError`               |
+    /// | `Ffmpeg(_)`         | `FfmpegSpawnFailed`    |
+    /// | `Probe(_)`          | `ProbeFailed`           |
+    /// | `InvalidParam(_)`   | `ConfigError`           |
+    /// | `EncoderNotFound(_)`| `EncoderSelectionFailed`|
+    /// | `FpsParse(_)`       | `ConfigError`           |
+    /// | `UserCancel`        | `Cancelled`             |
+    pub fn category(&self) -> ErrorCategory {
+        match self {
+            EncodeError::Io(_) => ErrorCategory::IoError,
+            EncodeError::Ffmpeg(_) => ErrorCategory::FfmpegSpawnFailed,
+            EncodeError::Probe(_) => ErrorCategory::ProbeFailed,
+            EncodeError::InvalidParam(_) => ErrorCategory::ConfigError,
+            EncodeError::EncoderNotFound(_) => ErrorCategory::EncoderSelectionFailed,
+            EncodeError::FpsParse(_) => ErrorCategory::ConfigError,
+            EncodeError::UserCancel => ErrorCategory::Cancelled,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -71,5 +103,38 @@ mod tests {
     fn user_cancel_display() {
         let err = EncodeError::UserCancel;
         assert_eq!(err.to_string(), "User cancelled");
+    }
+
+    // Review #121: category mapping table.
+    #[test]
+    fn category_mapping_covers_all_variants() {
+        use crate::types::ErrorCategory;
+        let cases: Vec<(EncodeError, ErrorCategory)> = vec![
+            (
+                EncodeError::Io(std::io::Error::other("x")),
+                ErrorCategory::IoError,
+            ),
+            (
+                EncodeError::Ffmpeg("x".into()),
+                ErrorCategory::FfmpegSpawnFailed,
+            ),
+            (EncodeError::Probe("x".into()), ErrorCategory::ProbeFailed),
+            (
+                EncodeError::InvalidParam("x".into()),
+                ErrorCategory::ConfigError,
+            ),
+            (
+                EncodeError::EncoderNotFound("x".into()),
+                ErrorCategory::EncoderSelectionFailed,
+            ),
+            (
+                EncodeError::FpsParse("x".into()),
+                ErrorCategory::ConfigError,
+            ),
+            (EncodeError::UserCancel, ErrorCategory::Cancelled),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(err.category(), expected, "wrong category for {err:?}");
+        }
     }
 }
