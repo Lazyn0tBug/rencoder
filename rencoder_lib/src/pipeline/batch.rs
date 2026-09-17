@@ -288,12 +288,24 @@ fn encode_prepare(
     }
 }
 
-/// Inner helper for [`transcode_single`] (CLI path). Invokes ffmpeg
-/// with stderr-capture via [`run_ffmpeg_with_stderr`] and blocks until
-/// exit. Then calls [`build_encode_record`] to construct the final
-/// `EncodingRecord` from ffmpeg's exit result.
+/// Shared body for the CLI + GUI transcode inner helpers (review #119).
+///
+/// Both `transcode_with_argv` (CLI, sync) and `transcode_with_progress`
+/// (GUI, cancellable) used to repeat the same 10-line skip-check +
+/// run-then-build-record boilerplate. This helper extracts the common
+/// shape:
+///
+/// 1. Compute `need_reduce` from `metadata.best_fps()`.
+/// 2. If `should_skip_encoding`, return a `Skipped(SameCodec)` record.
+/// 3. Call the caller-provided `run_ffmpeg` (sync vs cancellable
+///    variant) to get a `Result<(), (ErrorCategory, String, String)>`.
+/// 4. Delegate to [`build_encode_record`] for the final record.
+///
+/// Caller-specific behavior (sync ffmpeg.run vs cancellable
+/// ffmpeg.run + on_progress streaming) lives in the `run_ffmpeg`
+/// closure. The shared record construction + skip policy live here.
 #[allow(clippy::too_many_arguments)]
-fn transcode_with_argv(
+fn transcode_inner<F>(
     task: &TranscodeTask,
     params: &EncodeParams,
     metadata: &VideoMetadata,
@@ -301,12 +313,11 @@ fn transcode_with_argv(
     output_path: &Path,
     started_at_meta: chrono::DateTime<chrono::Utc>,
     started_at_instant: Instant,
-    output: ProcessOutput,
-) -> Result<EncodingRecord, EncodeError> {
-    // (kept structurally identical to the original transcode_with_argv
-    // but now reads output_path from the explicit parameter instead
-    // of recomputing it from task.output.)
-    let _ = output_path; // currently unused inside; reserved for symmetry with progress variant
+    run_ffmpeg: F,
+) -> Result<EncodingRecord, EncodeError>
+where
+    F: FnOnce(Vec<String>) -> Result<(), (ErrorCategory, String, String)>,
+{
     let src_fps = metadata.best_fps();
     let codec = metadata.codec.as_deref().unwrap_or("");
     let need_reduce = src_fps
@@ -324,7 +335,10 @@ fn transcode_with_argv(
         ));
     }
 
-    let run_result = run_ffmpeg_with_stderr(&argv, output);
+    // Clone argv for the closure — build_encode_record needs it too.
+    // Per-batch this is one ~20-element Vec<String> clone; trivial.
+    let argv_for_run = argv.clone();
+    let run_result = run_ffmpeg(argv_for_run);
     build_encode_record(
         task,
         params,
@@ -337,6 +351,40 @@ fn transcode_with_argv(
     )
 }
 
+/// Inner helper for [`transcode_single`] (CLI path). Invokes ffmpeg
+/// with stderr-capture via [`run_ffmpeg_with_stderr`] and blocks until
+/// exit. Then calls [`build_encode_record`] to construct the final
+/// `EncodingRecord` from ffmpeg's exit result.
+///
+/// Review #119: thin wrapper around `transcode_inner` that supplies
+/// the sync ffmpeg runner.
+#[allow(clippy::too_many_arguments)]
+fn transcode_with_argv(
+    task: &TranscodeTask,
+    params: &EncodeParams,
+    metadata: &VideoMetadata,
+    argv: Vec<String>,
+    output_path: &Path,
+    started_at_meta: chrono::DateTime<chrono::Utc>,
+    started_at_instant: Instant,
+    output: ProcessOutput,
+) -> Result<EncodingRecord, EncodeError> {
+    let _ = output_path; // currently unused inside; reserved for symmetry with progress variant
+    transcode_inner(
+        task,
+        params,
+        metadata,
+        argv,
+        output_path,
+        started_at_meta,
+        started_at_instant,
+        |argv| run_ffmpeg_with_stderr(&argv, output),
+    )
+}
+// ^ argv moves into the closure; build_encode_record uses a fresh
+// argv passed by the caller. The closure's FnOnce captures argv
+// exactly once.
+
 /// Inner helper for [`transcode_single_with_progress`] (GUI path).
 /// Invokes ffmpeg via [`run_ffmpeg_with_progress`] which:
 /// - Uses `cmd.spawn()` (not `cmd.output()`) — we hold a `Child`
@@ -345,6 +393,9 @@ fn transcode_with_argv(
 ///   kills the child and returns `Err((Cancelled, ...))`.
 /// - Streams progress snapshots to `on_progress` (one per ffmpeg
 ///   progress block, ~2/sec per active file).
+///
+/// Review #119: thin wrapper around `transcode_inner` that supplies
+/// the cancellable ffmpeg runner with on_progress streaming.
 #[allow(clippy::too_many_arguments)]
 fn transcode_with_progress(
     task: &TranscodeTask,
@@ -357,25 +408,7 @@ fn transcode_with_progress(
     cancel: &CancelToken,
     on_progress: &mut dyn FnMut(FfmpegProgress),
 ) -> Result<EncodingRecord, EncodeError> {
-    let src_fps = metadata.best_fps();
-    let codec = metadata.codec.as_deref().unwrap_or("");
-    let need_reduce = src_fps
-        .map(|s| params.max_fps.enabled() && params.max_fps.need_reduce(s))
-        .unwrap_or(false);
-
-    if should_skip_encoding(codec, params.format, need_reduce) {
-        log::info!("    task skipped: source codec matches target ({})", codec);
-        return Ok(make_skipped_record(
-            task,
-            params,
-            started_at_meta,
-            Some(started_at_instant.elapsed().as_secs_f64()),
-            SkippedReason::SameCodec,
-        ));
-    }
-
-    let run_result = run_ffmpeg_with_progress(&argv, cancel, metadata.duration_secs, on_progress);
-    build_encode_record(
+    transcode_inner(
         task,
         params,
         metadata,
@@ -383,7 +416,7 @@ fn transcode_with_progress(
         output_path,
         started_at_meta,
         started_at_instant,
-        run_result,
+        |argv| run_ffmpeg_with_progress(&argv, cancel, metadata.duration_secs, on_progress),
     )
 }
 
