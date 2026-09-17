@@ -139,7 +139,13 @@ pub struct EncodeParams {
     pub is_crf: bool,
     pub target: Target,
     pub extensions: Vec<String>,
-    pub extra_args: Vec<String>,
+    /// User-controlled extra ffmpeg argv entries (CLI `--` passthrough,
+    /// future `rencoder.toml [encode] extra_args`). Type-level boundary
+    /// via [`crate::encoder::ffmpeg_arg::ExtraArg`]: every entry has
+    /// been validated by `ExtraArg::parse` at construction, so
+    /// `build_ffmpeg_command` can splice them into the argv without
+    /// any runtime check.
+    pub extra_args: Vec<crate::encoder::ffmpeg_arg::ExtraArg>,
     pub max_fps: MaxFpsConfig,
     // Note: NVIDIA enablement lives on `EncoderCache.has_nvidia` after
     // `init_encoder_cache(enable_nv)` consumes the `--nv` flag. Keeping a
@@ -147,28 +153,11 @@ pub struct EncodeParams {
 }
 
 impl EncodeParams {
-    /// Validate the `extra_args` field against the ffmpeg-argv
-    /// safety allowlist (review fix #15). Each entry must start
-    /// with `-` and contain only ASCII alphanumeric + `= . : / - _ @`
-    /// characters. Rejects:
-    ///   - filenames starting with `-` (would re-inject ffmpeg flags)
-    ///   - long options like `--preset` (too varied for allowlist)
-    ///   - shell metachars (whitespace, `;`, `&`, `|`, quotes, etc.)
-    ///   - bare positionals without leading `-`
-    ///
-    /// Returns the index of the first invalid entry, or `None` if
-    /// all are safe. Empty list is trivially safe.
-    ///
-    /// Callers that build `EncodeParams` from untrusted input (CLI
-    /// passthrough, future config field, tests) should run this
-    /// before pushing `extra_args` into the ffmpeg argv.
-    pub fn validate_extra_args(&self) -> Result<(), usize> {
-        use crate::encoder::command::first_unsafe_extra_arg;
-        if let Some(idx) = first_unsafe_extra_arg(&self.extra_args) {
-            return Err(idx);
-        }
-        Ok(())
-    }
+    // No `validate_extra_args` method: the type-level boundary via
+    // `Vec<ExtraArg>` makes it impossible to construct an
+    // `EncodeParams` containing an unvalidated entry. CLI / TOML
+    // parsing must call `ExtraArg::parse` per element; failing entries
+    // surface as `ExtraArgParseError` and never reach this struct.
 
     /// Build a full `EncodeParams` from the loaded `AppConfig`'s
     /// `encode` section. Missing fields fall back to defaults.
@@ -766,57 +755,67 @@ mod tests {
         assert!(empty.has_encoder(""));
     }
 
-    // ---- EncodeParams::validate_extra_args (review fix #15) ----
+    // ---- EncodeParams + ExtraArg boundary (review #15 → Option B) ----
+    //
+    // The runtime `validate_extra_args` method was removed because
+    // the type-level boundary (`Vec<ExtraArg>`) makes it impossible
+    // to construct an unvalidated entry. These tests now exercise
+    // the boundary via `ExtraArg::parse`: the standard-user-tweaks
+    // inputs all parse successfully, the injection variants all
+    // fail at parse time.
 
-    fn params_with_extra(extra: Vec<String>) -> EncodeParams {
+    fn params_with_extra(extra: Vec<crate::encoder::ffmpeg_arg::ExtraArg>) -> EncodeParams {
         EncodeParams {
             extra_args: extra,
             ..EncodeParams::from_encode_config(None)
         }
     }
 
-    #[test]
-    fn validate_extra_args_passes_for_standard_user_tweaks() {
-        let p = params_with_extra(vec![
-            "-ss=5".into(),
-            "-metadata".into(),
-            "title=foo".into(),
-            "-vf".into(),
-            "scale=720:-1".into(),
-        ]);
-        let bad = crate::encoder::command::first_unsafe_extra_arg(&p.extra_args);
-        assert!(
-            bad.is_none(),
-            "unexpectedly rejected at index {bad:?}: {0:?}",
-            p.extra_args
-        );
-        assert!(p.validate_extra_args().is_ok());
+    fn parse_all(inputs: &[&str]) -> Vec<crate::encoder::ffmpeg_arg::ExtraArg> {
+        inputs
+            .iter()
+            .map(|s| {
+                crate::encoder::ffmpeg_arg::ExtraArg::parse(s)
+                    .unwrap_or_else(|e| panic!("expected {s:?} to parse, got: {e:?}"))
+            })
+            .collect()
     }
 
     #[test]
-    fn validate_extra_args_rejects_path_injection_variants() {
+    fn standard_user_tweaks_parse_into_extra_args() {
+        let p = params_with_extra(parse_all(&[
+            "-ss=5",
+            "-metadata",
+            "title=foo",
+            "-vf",
+            "scale=720:-1",
+        ]));
+        assert_eq!(p.extra_args.len(), 5);
+    }
+
+    #[test]
+    fn path_injection_variants_fail_at_parse() {
+        // Each of these MUST be rejected by `ExtraArg::parse`. If
+        // any slips through, the type-level boundary has a hole.
         for evil in [
-            vec!["-i".into(), "/etc/passwd".into()],  // -i on deny list
-            vec!["-c:v".into(), "rawvideo".into()],   // -c:v on deny list
-            vec!["-o".into(), "/tmp/out.mkv".into()], // -o on deny list
-            vec!["-y".into()],                        // -y is hardcoded
-            vec!["--preset".into(), "5".into()],      // long opt
-            vec!["-vf_negate.mp4".into()],            // flag-with-value as one token
-            vec!["-vf scale=720:foo bar".into()],     // whitespace in value
-            vec!["-vf scale=720:foo;rm".into()],      // shell metachar
-            vec!["preset".into()],                    // missing leading dash
-            vec!["".into()],                          // empty
-            vec!["-".into()],                         // bare dash
-            vec!["-; rm -rf /".into()],               // shell metachar prefix
+            "-i",                    // -i on deny list
+            "-c:v",                  // -c:v on deny list
+            "-c:a",                  // -c:a on deny list
+            "-o",                    // -o on deny list
+            "-y",                    // -y is hardcoded
+            "--preset",              // long opt
+            "-vf_negate.mp4",        // flag-with-path-char as one token
+            "-vf scale=720:foo bar", // whitespace in value
+            "-vf=scale=720:foo;rm",  // shell metachar
+            "preset",                // missing leading dash, no `=`
+            "5",                     // bare value with no `=`
+            "",                      // empty
+            "-",                     // bare dash
+            "-; rm -rf /",           // shell metachar prefix
         ] {
-            let p = EncodeParams {
-                extra_args: evil,
-                ..EncodeParams::from_encode_config(None)
-            };
             assert!(
-                p.validate_extra_args().is_err(),
-                "expected validate_extra_args to reject: {:?}",
-                p.extra_args
+                crate::encoder::ffmpeg_arg::ExtraArg::parse(evil).is_err(),
+                "expected ExtraArg::parse to reject {evil:?}"
             );
         }
     }

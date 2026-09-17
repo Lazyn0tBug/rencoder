@@ -89,13 +89,26 @@ fn encode_cmd(args: args::EncodeArgs) -> Result<()> {
 
     let config = Config::from_encode_config(app_config.encode.as_ref());
 
+    // Parse each `--` passthrough entry through the type-level safety
+    // boundary. A bad entry fails fast here with a precise error
+    // pointing at the offending argv token — `EncodeParams` itself
+    // can only be constructed with a validated `Vec<ExtraArg>`.
+    let extra_args: Vec<_> = args
+        .extra_args
+        .iter()
+        .map(|s| {
+            rencoder_lib::encoder::ffmpeg_arg::ExtraArg::parse(s)
+                .map_err(|e| anyhow::anyhow!("invalid ffmpeg passthrough argument {s:?}: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+
     let params = EncodeParams {
         format,
         bitrate_or_crf,
         is_crf,
         target: target.clone(),
         extensions: extensions.clone(),
-        extra_args: args.extra_args.clone(),
+        extra_args,
         max_fps: config.max_fps_config(),
     };
 

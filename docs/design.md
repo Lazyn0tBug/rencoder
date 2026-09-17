@@ -280,6 +280,7 @@ rencoder_lib/
 ├── encoder/
 │   ├── mod.rs
 │   ├── command.rs               # build_ffmpeg_command（参数映射，含 -r 输出选项位置）
+│   ├── ffmpeg_arg.rs            # 类型级 ffmpeg argv 安全边界（§3.x.y）
 │   └── select.rs                # select_encoder（cache + Config → 编码器名）
 ├── error.rs                     # EncodeError（thiserror）
 ├── job.rs                       # GUI actor 入口（§3.8）：Command/Event + start_controller()
@@ -473,7 +474,10 @@ pub struct EncodeParams {
     pub is_crf: bool,
     pub target: Target,
     pub extensions: Vec<String>,
-    pub extra_args: Vec<String>,
+    /// 用户通过 CLI `--` 后的额外 ffmpeg 参数,或 config `[encode] extra_args`。
+    /// 元素类型 [`ExtraArg`](§3.x.y) 是 parser 校验过的:非法值
+    /// 在 parse 阶段就被拒,运行时无法塞进未校验的 raw `String`。
+    pub extra_args: Vec<ExtraArg>,
     pub max_fps: MaxFpsConfig,
     /// 用户是否传了 --nv
     pub enable_nv: bool,
@@ -711,6 +715,89 @@ pub fn build_ffmpeg_command(
     src_fps: Option<f64>,
 ) -> Vec<String>;
 ```
+
+#### ffmpeg argv 安全边界（类型级）
+
+`EncodeParams.extra_args` 接收用户控制值（CLI `--` 后的 passthrough、
+`rencoder.toml` `[encode] extra_args`、未来其他来源），由
+`build_ffmpeg_command` 拼到 argv 末尾——这给了用户一个**任意字符串插入
+ffmpeg argv 的口子**,必须严格守边界。
+
+**以前的做法**:运行期 `is_safe_extra_arg` 跑 `chars()` 检查 + 一个
+`validate_extra_args()` 包装器。问题是**runtime check 可被遗忘**:
+任何忘了调 `validate_extra_args()` 的代码路径都能塞 unsafe 值进去,
+仅靠 lint / 测试兜底。
+
+**新做法（类型级边界,review #15 升级 + Option B 落地）**:
+`extra_args: Vec<ExtraArg>`,`ExtraArg` 是带 `#[non_exhaustive]` 的
+enum + validated factory,只有 `ExtraArg::parse(&str)` 能构造。
+`String` 无法直接 push 进去——编译器拒绝非法构造。
+
+```rust
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ExtraArg {
+    /// 纯 flag,例 `-y`、`-vf`、`-metadata`、`-ss`
+    Flag(String),
+    /// `flag=value` 形式,flag 和 value 都过 char-class 校验
+    FlagEqValue { flag: String, value: String },
+    /// 裸 value(前一 flag 的参数),例 `-metadata` 后的 `title=foo`
+    BareValue(String),
+}
+
+impl ExtraArg {
+    /// Parse + validate 一条 argv 字符串。失败原因(空、长选项、
+    /// 非法字符、shell 元字符、命中 deny-list)通过错误消息返回,
+    /// 调用方(CLI 解析、TOML 反序列化)决定怎么 surface 给上游。
+    pub fn parse(s: &str) -> Result<Self, ExtraArgParseError>;
+}
+```
+
+**字符类**(集中放 `ffmpeg_arg::chars`,validator 和未来其他
+argv 处理代码共用):
+
+- `is_flag_char(c)`:`ASCII alphanumeric + '_'`
+- `is_value_char(c)`:`is_flag_char` + `. : / - _ @ =`
+- **隐式禁止**:空格、`;`、`&`、`|`、`>`、`<`、`"`、`'`、`$`、
+  `` ` ``、`\n`、`\t`——任一出现 → parse 失败。
+
+**Deny-list**(`ExtraArg::parse` 强制):
+
+- `i` — 重新注入输入
+- `y` — `build_ffmpeg_command` 永远硬编码,不允许用户关
+- `c` — 与硬编码 codec 冲突(`-c:v` / `-c:a` 也命中)
+- `o` — 重新注入输出路径
+- `vn` / `hide_banner` — 与硬编码选项冲突
+
+**拒绝的形态**(同 review #15 的具体规则):
+
+- 长选项 `--foo`——allowlist 太散
+- `flag=value` 里 value 含 shell 元字符 / 路径里的 `;`
+- flag 后面跟路径字符但没 `=`(例 `-vf_negate.mp4`,可能
+  被 ffmpeg 解析成 `-vf negate.mp4`)
+- 裸 value 不含 `=`(例 `preset`、`5`)——ffmpeg 可能当 input
+  path 或 filter arg,意图在 wrapper 层不可判定
+
+**与 `build_ffmpeg_command` 的接口**:
+消费者按 enum 分支展开成 `String`,无需再做运行时校验:
+
+```rust
+for arg in &params.extra_args {
+    match arg {
+        ExtraArg::Flag(f)         => argv.push(f.clone()),
+        ExtraArg::FlagEqValue{flag,value} => argv.push(format!("{flag}={value}")),
+        ExtraArg::BareValue(v)    => argv.push(v.clone()),
+    }
+}
+```
+
+**配套改动**:
+
+- `EncodeParams::validate_extra_args` **删除**;parse 阶段已经守边界
+- CLI 解析阶段(`rencoder_cli::args`)调 `ExtraArg::parse`,
+  错误消息直接 surface 给用户
+- 未来的 TOML `[encode] extra_args` 字段用 `Vec<ExtraArg>`
+  反序列化,serde 自动跑 parse,非法 config 在 load 阶段就 fail
 
 #### 转码跳过判断
 
@@ -1758,6 +1845,7 @@ UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `int
 | `job.rs` | `Command::Analyze { files }` arm | U22：调用 `analyze_records_with_probe_and_progress_parallel` with `probe = probe_video_metadata_auto`，`progress = |p| evt_tx.send(Event::AnalyzeProgress { ... })`。先发 `AnalyzeStarted { total }`，批结束发 `AnalyzeFinished`。**走** busy-gate（v1 限制——UI 不能同时跑 analyze + encode；analyze 是 read-only，理论上可与 encode 并存，但 v1 简化起见跟 DryRun 一致复用 busy-gate）|
 | `job.rs` | `Event::AnalyzeStarted` / `Event::AnalyzeProgress` / `Event::AnalyzeFinished` | U22：见 §3.8.3。`Event::AnalyzeProgress` 在 mock actor 里是 no-op（test seam，ref-count 即可）|
 | `data/store.rs` | `read_records(path)` | 单 Parquet 文件回读(v1 不使用,v1.1 启用) |
+| `encoder/ffmpeg_arg.rs` | `ExtraArg` enum + `ExtraArg::parse` factory + char-class 模块 | 类型级 ffmpeg argv 安全边界(§3.3.7)——非法 argv 在 parse 阶段被拒,运行时无法塞 unsafe 值。替换 v1 的 runtime `validate_extra_args` |
 
 **`process_one_file` testability surface**(§8 item 43)——这是 §3.8 唯一保留的函数签名,因为它**解释了为何要抽出这个 helper**(测试性):
 

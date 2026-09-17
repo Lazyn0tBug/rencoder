@@ -5,4 +5,5 @@
 //! pieces the pipeline layer needs to actually run ffmpeg.
 
 pub mod command;
+pub mod ffmpeg_arg;
 pub mod select;

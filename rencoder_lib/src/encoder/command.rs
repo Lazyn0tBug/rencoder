@@ -15,6 +15,9 @@
 use crate::config::app::FfmpegArgsConfig;
 use crate::types::{EncodeParams, TranscodeTask, VideoFormat};
 
+#[cfg(test)]
+use crate::encoder::ffmpeg_arg::ExtraArg;
+
 /// Decide whether the source already matches the target encoding and
 /// no fps reduction is needed, in which case the file can be skipped.
 ///
@@ -40,93 +43,6 @@ fn codec_matches_format(codec: &str, format: VideoFormat) -> bool {
         VideoFormat::Vp9 => c.contains("vp9"),
         VideoFormat::Av1 => c.contains("av1"),
     }
-}
-
-/// Check that an `extra_args` entry is safe to pass verbatim to ffmpeg
-/// argv. The user-controlled value (from `rencoder.toml` `[encode]
-/// extra_args` or future CLI passthrough) is interpolated by
-/// `build_ffmpeg_command` into the argv AFTER our own hardcoded
-/// flags, so a malicious value could re-inject an ffmpeg option
-/// (`-i /etc/passwd`, `-vf scale=720:foo bar` with whitespace,
-/// `; rm -rf /` for a shell-style argument, etc.).
-///
-/// Each entry must be one of:
-///   1. A pure flag — `-` + ASCII alphanumeric (e.g., `-y`, `-vf`,
-///      `-metadata`, `-ss`).
-///   2. A flag with `=value` — flag + `=` + value where value is
-///      ASCII alphanumeric + `. : / - _ @` (rules out shell
-///      metachars, whitespace, quotes, semicolons, etc.).
-///   3. A bare value passed to a preceding flag. Same value
-///      charset as (2), but no `-` prefix, AND containing `=`
-///      (the canonical `key=value` form ffmpeg uses for metadata
-///      and filter options). Covers entries like the value half
-///      of `-metadata title=foo`. Bare values without `=` such
-///      as `preset` or `5` are rejected because they could be
-///      parsed by ffmpeg as input paths or filter args depending
-///      on context.
-///
-/// Rejected:
-///   - long options like `--foo` (too varied for a simple allowlist)
-///   - flag-without-`=` followed by path-like chars (e.g.,
-///     `-vf_negate.mp4` could be parsed by lenient ffmpeg as
-///     `-vf negate.mp4` — ambiguous; reject)
-///   - flag on the explicit deny-list: `-i` (re-inject input),
-///     `-c:v` / `-c:a` (duplicate our hardcoded codec), `-o`
-///     (re-inject output), `-y` (our hardcoded overwrite)
-pub fn is_safe_extra_arg(arg: &str) -> bool {
-    if let Some(rest) = arg.strip_prefix('-') {
-        if rest.is_empty() || rest.starts_with('-') {
-            return false; // "--foo" disallowed; we don't allow long opts
-        }
-        let mut chars = rest.chars();
-        let first = chars.next().expect("non-empty by guard above");
-        if !first.is_ascii_alphanumeric() {
-            return false; // "-;" "-)" etc.
-        }
-        // Split on the first `=`: flag-name (must be alphanumeric) and
-        // value (must be safe if present). This rejects `-vf_negate.mp4`
-        // (no `=`, so the path chars become part of the value-less form
-        // which the allowlist forbids) while still allowing `-vf` and
-        // `-vf=scale=720:-1`.
-        let (flag, value) = match rest.find('=') {
-            Some(i) => (&rest[..i], &rest[i + 1..]),
-            None => (rest, ""),
-        };
-        if !flag.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            return false;
-        }
-        if !value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '/' | '-' | '_' | '@'))
-        {
-            return false;
-        }
-        // Deny-list: these flags would re-inject paths or duplicate
-        // hardcoded wrappers. A user wanting to override them should
-        // edit the lib's source (which is the design intent — the
-        // `extra_args` field is for *additional* ffmpeg knobs, not
-        // for re-overriding our wrapper-level decisions).
-        return !matches!(flag, "i" | "y" | "o" | "c" | "vn" | "hide_banner");
-    }
-    // Bare value: the value half of a preceding flag like
-    // `-metadata title=foo` or `-vf scale=720:-1`. Must contain
-    // `=` (the canonical `key=value` form ffmpeg uses for
-    // metadata + filter options) and otherwise stick to a safe
-    // charset. Bare values without `=` (`preset`, `5`) are
-    // rejected: they could be parsed by ffmpeg as input paths or
-    // filter args depending on context, and the user's intent
-    // is ambiguous at the wrapper level.
-    if arg.is_empty() || !arg.contains('=') {
-        return false;
-    }
-    arg.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '/' | '-' | '_' | '@' | '='))
-}
-
-/// Validate a full `extra_args` slice. Returns the index of the
-/// first invalid entry, or `None` if all are safe.
-pub fn first_unsafe_extra_arg(args: &[String]) -> Option<usize> {
-    args.iter().position(|a| !is_safe_extra_arg(a))
 }
 
 /// Build the argv for an `ffmpeg` invocation.
@@ -214,7 +130,12 @@ pub fn build_ffmpeg_command(
     }
 
     // User passthrough args.
-    argv.extend(params.extra_args.iter().cloned());
+    // User-supplied extra flags. Each `ExtraArg` has already been
+    // validated by `ExtraArg::parse` at the boundary (CLI parse or
+    // future TOML deserialize) — no runtime check needed here.
+    for arg in &params.extra_args {
+        argv.push(arg.as_argv());
+    }
 
     // Output path always last.
     argv.push(
@@ -529,7 +450,13 @@ mod tests {
     #[test]
     fn extra_args_passed_through_before_output() {
         let mut params = params_disabled();
-        params.extra_args = vec!["-ss".to_string(), "10".to_string(), "-metadata".to_string()];
+        // Build via ExtraArg::parse so the test exercises the
+        // type-level boundary (Vec<ExtraArg>, not Vec<String>).
+        params.extra_args = vec![
+            ExtraArg::parse("-ss").unwrap(),
+            ExtraArg::parse("scale=720:-1").unwrap(), // bare value form
+            ExtraArg::parse("-metadata").unwrap(),
+        ];
         let argv = build_ffmpeg_command(
             &task("/in.mp4", "/out.mkv"),
             &params,
@@ -538,7 +465,7 @@ mod tests {
             &FfmpegArgsConfig::default(),
         );
         let ss_pos = argv.iter().position(|s| s == "-ss").expect("-ss present");
-        assert_eq!(argv[ss_pos + 1], "10");
+        assert_eq!(argv[ss_pos + 1], "scale=720:-1");
         let out_pos = argv.len() - 1;
         // -ss should be before output (passed through near the end)
         assert!(ss_pos < out_pos);
@@ -553,7 +480,10 @@ mod tests {
             max_fps: 30.0,
             eps: 0.05,
         };
-        params.extra_args = vec!["-metadata".to_string(), "title=foo".to_string()];
+        params.extra_args = vec![
+            ExtraArg::parse("-metadata").unwrap(),
+            ExtraArg::parse("title=foo").unwrap(),
+        ];
         let argv = build_ffmpeg_command(
             &task("/in.mp4", "/out.mkv"),
             &params,
@@ -566,64 +496,5 @@ mod tests {
         let out_pos = argv.len() - 1;
         assert!(r_pos < meta_pos);
         assert!(meta_pos < out_pos);
-    }
-
-    // ---- is_safe_extra_arg (review fix #15) ----
-
-    #[test]
-    fn safe_extra_arg_accepts_standard_ffmpeg_flags() {
-        // The allowlist covers typical user tweaks. Note: -y is
-        // hardcoded by build_ffmpeg_command and is on the deny
-        // list, so it's NOT safe to override here.
-        for arg in [
-            "-n",        // no-overwrite
-            "-ss",       // start time
-            "-ss",       // (re-listed; the validator checks each entry)
-            "-metadata", // metadata key=val
-            "-metadata",
-            "-vf",          // video filter
-            "-vf",          // (re-listed; same as above)
-            "-af",          // audio filter
-            "-t",           // duration limit
-            "-to",          // stop time
-            "-pass",        // two-pass encoding
-            "-passlogfile", // two-pass log path
-        ] {
-            assert!(is_safe_extra_arg(arg), "expected safe: {arg:?}");
-        }
-    }
-
-    #[test]
-    fn safe_extra_arg_rejects_dash_prefixed_values() {
-        // Filename starting with `-` would be parsed by ffmpeg
-        // as another option. The `is_file` in the wrapper is the
-        // user-controlled side; `extra_args` is also user-controlled
-        // (config / future CLI passthrough). Both need the same
-        // allowlist discipline.
-        for arg in [
-            "-i",                    // bare -i on the deny list (re-injects input)
-            "-c:v",                  // redundant with our hardcoded -c:v; deny-listed
-            "-c:a",                  // would override our audio codec; deny-listed
-            "-o",                    // would re-inject output; deny-listed
-            "-y",                    // -y is hardcoded; deny-listed
-            "-i /etc/passwd",        // shell-style value with whitespace
-            "-vf scale=720:foo bar", // whitespace inside value
-            "-vf scale=720:foo;rm",  // shell metachar
-            "--preset",              // long option (ambiguous; reject for safety)
-            "preset",                // missing leading dash
-            "",                      // empty
-            "-",                     // bare dash
-            "-; rm -rf /",           // shell metachar prefix
-        ] {
-            assert!(!is_safe_extra_arg(arg), "expected UNSAFE: {arg:?}");
-        }
-    }
-
-    #[test]
-    fn first_unsafe_extra_arg_returns_position() {
-        // Bare positional ("10") has no leading dash, so the
-        // validator rejects it at index 2.
-        let args = vec!["-vf".to_string(), "-ss".to_string(), "10".to_string()];
-        assert_eq!(first_unsafe_extra_arg(&args), Some(2));
     }
 }
