@@ -59,7 +59,7 @@ pub struct TaskContext {
     /// processing. Appears in batch-level scaffold lines.
     pub batch_path: PathBuf,
     /// Source (input) file path -- what the operator cares about.
-    pub source: PathBuf,
+    pub source: crate::types::InputPath,
     /// Output file path -- what the signal handler removes on SIGINT.
     /// `None` for read-only tasks (analyze); the signal handler sees
     /// `None` and skips the removal.
@@ -197,7 +197,8 @@ mod tests {
     fn make_tasks(n: usize) -> Vec<TranscodeTask> {
         (0..n)
             .map(|i| TranscodeTask {
-                input: PathBuf::from(format!("/in/{i}.mp4")),
+                input: crate::types::InputPath::new(&PathBuf::from(format!("/in/{i}.mp4")))
+                    .unwrap(),
                 output: Some(PathBuf::from(format!("/out/{i}.mkv"))),
             })
             .collect()
@@ -227,10 +228,16 @@ mod tests {
         assert_eq!(seen[0].total, 2);
         assert_eq!(seen[0].batch_label, "probing");
         assert_eq!(seen[0].batch_path, PathBuf::from("/in"));
-        assert_eq!(seen[0].source, PathBuf::from("/in/0.mp4"));
+        assert_eq!(
+            seen[0].source,
+            crate::types::InputPath::new(&PathBuf::from("/in/0.mp4")).unwrap()
+        );
         assert_eq!(seen[0].output, Some(PathBuf::from("/out/0.mkv")));
         assert_eq!(seen[1].index, 2);
-        assert_eq!(seen[1].source, PathBuf::from("/in/1.mp4"));
+        assert_eq!(
+            seen[1].source,
+            crate::types::InputPath::new(&PathBuf::from("/in/1.mp4")).unwrap()
+        );
     }
 
     #[test]
@@ -255,7 +262,7 @@ mod tests {
         let tasks = make_tasks(3);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             mgr.run(&tasks, "encoding", Path::new("/in"), |task, _ctx| {
-                if task.input.to_string_lossy().ends_with("1.mp4") {
+                if task.input.to_string().ends_with("1.mp4") {
                     Err(EncodeError::Ffmpeg("boom".into()))
                 } else {
                     Ok::<(), EncodeError>(())

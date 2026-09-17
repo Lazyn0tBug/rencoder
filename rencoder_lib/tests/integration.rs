@@ -143,7 +143,10 @@ fn transcode_batch_end_to_end_produces_output_files() {
     let dir = fixture_dir("transcode_e2e");
     let input1 = make_video(&dir, "in1.mp4", 30, 1);
     let input2 = make_video(&dir, "in2.mp4", 30, 1);
-    let files = vec![input1.clone(), input2.clone()];
+    let files = vec![
+        rencoder_lib::types::InputPath::new(&input1).unwrap(),
+        rencoder_lib::types::InputPath::new(&input2).unwrap(),
+    ];
 
     // Build a minimal encoder cache. AV1 -> mkv container, so the
     // output filename (in1.mkv) differs from the input (in1.mp4) and
@@ -212,7 +215,7 @@ fn transcode_batch_skips_when_output_exists() {
     std::fs::write(&output, b"already there").unwrap();
 
     let task = TranscodeTask {
-        input: input.clone(),
+        input: rencoder_lib::types::InputPath::new(&input).unwrap(),
         output: Some(output.clone()),
     };
     let cache = EncoderCache {

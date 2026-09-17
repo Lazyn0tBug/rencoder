@@ -84,7 +84,10 @@ pub fn build_ffmpeg_command(
     argv.push("-y".to_string());
     argv.extend(ffmpeg_args.pre_input.iter().cloned());
     argv.push("-i".to_string());
-    argv.push(task.input.to_string_lossy().into_owned());
+    // `task.input` is an `InputPath`; the type system guarantees it
+    // doesn't start with `-` (review #109), so the lossy round-trip
+    // is safe to push verbatim.
+    argv.push(task.input.to_string());
     argv.extend(ffmpeg_args.post_input.iter().cloned());
 
     argv.push("-c:v".to_string());
@@ -159,7 +162,7 @@ mod tests {
 
     fn task(input: &str, output: &str) -> TranscodeTask {
         TranscodeTask {
-            input: PathBuf::from(input),
+            input: crate::types::InputPath::new(&PathBuf::from(input)).unwrap(),
             output: Some(PathBuf::from(output)),
         }
     }

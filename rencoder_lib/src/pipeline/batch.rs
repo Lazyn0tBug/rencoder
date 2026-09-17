@@ -208,7 +208,7 @@ fn encode_prepare(
     // partial-output detection (§3.3.6 + §8 item 40). SIGTERM/SIGHUP
     // can no longer clean up partial files (see §3.4.5 "注意"), so
     // re-runs must detect + auto-remove + reencode them.
-    let metadata = match probe_video_metadata_auto(&task.input) {
+    let metadata = match probe_video_metadata_auto(task.input.as_path()) {
         Ok(m) => m,
         Err(e) => {
             return EncodePrepareResult::FailedProbe(make_failed_probe_record(
@@ -427,7 +427,9 @@ fn build_encode_record(
                 .ok()
                 .filter(|m| m.len() > 0)
                 .map(|m| m.len());
-            let source_size_bytes = std::fs::metadata(&task.input).map(|m| m.len()).unwrap_or(0);
+            let source_size_bytes = std::fs::metadata(task.input.as_path())
+                .map(|m| m.len())
+                .unwrap_or(0);
             // Review fix #114 (partial-output detection fall-through):
             // when ffmpeg exits 0 but the output is missing or
             // zero-byte, the encode produced nothing useful. If the
@@ -494,7 +496,7 @@ fn build_encode_record(
             };
 
             Ok(EncodingRecord {
-                source_path: task.input.to_string_lossy().into_owned(),
+                source_path: task.input.to_string(),
                 source_size_bytes,
                 source_codec: metadata.codec.clone(),
                 source_container: metadata.container.clone(),
@@ -523,8 +525,10 @@ fn build_encode_record(
             })
         }
         Err((category, message, stderr_tail)) => Ok(EncodingRecord {
-            source_path: task.input.to_string_lossy().into_owned(),
-            source_size_bytes: std::fs::metadata(&task.input).map(|m| m.len()).unwrap_or(0),
+            source_path: task.input.to_string(),
+            source_size_bytes: std::fs::metadata(task.input.as_path())
+                .map(|m| m.len())
+                .unwrap_or(0),
             source_codec: metadata.codec.clone(),
             source_container: metadata.container.clone(),
             source_width: metadata.width,
@@ -570,7 +574,7 @@ fn build_encode_record(
 /// cell. One batch in flight at a time.
 pub fn transcode_batch(
     params: &EncodeParams,
-    files: &[PathBuf],
+    files: &[crate::types::InputPath],
     cache: &EncoderCache,
     config: &Config,
     output: ProcessOutput,
@@ -585,7 +589,7 @@ pub fn transcode_batch(
         .iter()
         .map(|input| TranscodeTask {
             input: input.clone(),
-            output: Some(output_path_for(input, params.format)),
+            output: Some(output_path_for(input.as_path(), params.format)),
         })
         .collect();
 
@@ -628,11 +632,11 @@ pub fn dry_run_batch<'a, I>(
     files: I,
 ) -> Vec<EncodingRecord>
 where
-    I: IntoIterator<Item = &'a PathBuf>,
+    I: IntoIterator<Item = &'a crate::types::InputPath>,
 {
     let mut records = Vec::new();
     for file in files {
-        let output_path = output_path_for(file, params.format);
+        let output_path = output_path_for(file.as_path(), params.format);
         let task = TranscodeTask {
             input: file.clone(),
             output: Some(output_path),
@@ -663,10 +667,12 @@ fn make_planned_ready_record(
     params: &EncodeParams,
     started_at: chrono::DateTime<chrono::Utc>,
 ) -> EncodingRecord {
-    let source_size_bytes = std::fs::metadata(&task.input).map(|m| m.len()).unwrap_or(0);
+    let source_size_bytes = std::fs::metadata(task.input.as_path())
+        .map(|m| m.len())
+        .unwrap_or(0);
     let source_meta = probe_video_metadata_quick(task);
     EncodingRecord {
-        source_path: task.input.to_string_lossy().into_owned(),
+        source_path: task.input.to_string(),
         source_size_bytes,
         source_codec: source_meta.as_ref().and_then(|m| m.codec.clone()),
         source_container: source_meta.as_ref().and_then(|m| m.container.clone()),
@@ -745,10 +751,12 @@ fn make_skipped_record(
     encoding_duration_secs: Option<f64>,
     reason: SkippedReason,
 ) -> EncodingRecord {
-    let source_size_bytes = std::fs::metadata(&task.input).map(|m| m.len()).unwrap_or(0);
+    let source_size_bytes = std::fs::metadata(task.input.as_path())
+        .map(|m| m.len())
+        .unwrap_or(0);
     let source_meta = probe_video_metadata_quick(task);
     EncodingRecord {
-        source_path: task.input.to_string_lossy().into_owned(),
+        source_path: task.input.to_string(),
         source_size_bytes,
         source_codec: source_meta.as_ref().and_then(|m| m.codec.clone()),
         source_container: source_meta.as_ref().and_then(|m| m.container.clone()),
@@ -786,9 +794,11 @@ fn make_failed_probe_record(
     encoding_duration_secs: Option<f64>,
     err: &EncodeError,
 ) -> EncodingRecord {
-    let source_size_bytes = std::fs::metadata(&task.input).map(|m| m.len()).unwrap_or(0);
+    let source_size_bytes = std::fs::metadata(task.input.as_path())
+        .map(|m| m.len())
+        .unwrap_or(0);
     EncodingRecord {
-        source_path: task.input.to_string_lossy().into_owned(),
+        source_path: task.input.to_string(),
         source_size_bytes,
         source_codec: None,
         source_container: None,
@@ -1238,7 +1248,7 @@ fn encoder_settings_from_params(params: &EncodeParams) -> EncoderSettings {
 /// the full VideoMetadata through the transcode_single early-return for
 /// skipped paths. Tolerates failure (returns None).
 fn probe_video_metadata_quick(task: &TranscodeTask) -> Option<VideoMetadata> {
-    probe_video_metadata_auto(&task.input).ok()
+    probe_video_metadata_auto(task.input.as_path()).ok()
 }
 
 /// Probe helper exposed for the batch caller (U7). Kept here so it lives
@@ -1253,6 +1263,15 @@ pub fn probe_input(path: &Path) -> Result<crate::types::VideoMetadata, EncodeErr
 mod tests {
     use super::*;
     use crate::types::VideoFormat;
+
+    /// Test helper: wrap a path literal in `InputPath`. Used at every
+    /// site that constructs a `TranscodeTask` literal in tests.
+    /// Production code goes through the boundary (`collect_files`),
+    /// so this `.expect` is safe.
+    fn ip(p: &Path) -> crate::types::InputPath {
+        crate::types::InputPath::new(p).expect("test fixture")
+    }
+
     fn cache_with_libx264_and_svtav1(has_nvidia: bool) -> EncoderCache {
         EncoderCache {
             encoders_output: "\
@@ -1327,7 +1346,7 @@ Encoders:
         std::fs::write(&input, b"fake webm").unwrap();
 
         let task = TranscodeTask {
-            input: input.clone(),
+            input: ip(&input),
             output: Some(output.clone()),
         };
         let params = params_x264_crf();
@@ -1365,7 +1384,7 @@ Encoders:
         use chrono::Utc;
         let now = Utc::now();
         EncodingRecord {
-            source_path: task.input.to_string_lossy().into_owned(),
+            source_path: task.input.to_string(),
             source_size_bytes: 1024,
             source_codec: Some("h264".into()),
             source_container: None,
@@ -1414,7 +1433,7 @@ Encoders:
         std::fs::write(&output, b"").unwrap();
 
         let task = TranscodeTask {
-            input: dir.join("input.mp4"),
+            input: ip(&dir.join("input.mp4")),
             output: Some(output),
         };
         let params = params_x264_crf();
@@ -1444,7 +1463,7 @@ Encoders:
         std::fs::write(&input, b"x").unwrap();
 
         let task = TranscodeTask {
-            input,
+            input: ip(&input),
             output: Some(output),
         };
         let params = params_x264_crf();

@@ -65,7 +65,7 @@ pub enum Command {
     /// Events to `evt_tx` instead of writing to a terminal.
     StartBatch {
         params: EncodeParams,
-        files: Vec<PathBuf>,
+        files: Vec<crate::types::InputPath>,
     },
     /// Dry-run: simulate a batch without invoking ffmpeg. Runs the
     /// same `encode_prepare` (probe + partial-output detection +
@@ -77,7 +77,7 @@ pub enum Command {
     /// commit (Tier 2, §3.8.7 v1 limitations item 1).
     DryRun {
         params: EncodeParams,
-        files: Vec<PathBuf>,
+        files: Vec<crate::types::InputPath>,
     },
     /// Abort the current batch (including any in-flight single file).
     /// Equivalent to SIGINT but triggered by the UI button. The
@@ -124,7 +124,7 @@ pub enum Command {
     ///   `AtomicBool` polling that doubles the test matrix.
     /// - SIGINT does not interrupt analyze: `Event::AnalyzeFinished`
     ///   fires cleanly, not `BatchCancelled`.
-    Analyze { files: Vec<PathBuf> },
+    Analyze { files: Vec<crate::types::InputPath> },
 }
 
 // =====================================================================
@@ -155,7 +155,7 @@ pub enum Event {
     FileStarted {
         index: usize,
         total: usize,
-        source: PathBuf,
+        source: crate::types::InputPath,
     },
     /// A single file finished encoding. The full record (including
     /// outcome, dimensions, sizes) is included for UI display.
@@ -309,7 +309,7 @@ mod tests {
         // Sanity: the variants the design promises are reachable.
         let _ = Command::StartBatch {
             params: EncodeParams::default(),
-            files: vec![PathBuf::from("/a.mp4")],
+            files: vec![crate::types::InputPath::new(std::path::Path::new("/a.mp4")).unwrap()],
         };
         let _ = Command::Cancel;
         let _ = Command::LoadHistory {
@@ -328,7 +328,7 @@ mod tests {
         let _ = Event::FileStarted {
             index: 0,
             total: 5,
-            source: PathBuf::from("/a.mp4"),
+            source: crate::types::InputPath::new(std::path::Path::new("/a.mp4")).unwrap(),
         };
         let _ = Event::FileCompleted {
             index: 0,
@@ -737,7 +737,7 @@ fn run_actor(
                         source: file.clone(),
                     });
 
-                    let output_path = output_path_for(file, params.format);
+                    let output_path = output_path_for(file.as_path(), params.format);
                     let task = TranscodeTask {
                         input: file.clone(),
                         output: Some(output_path),
@@ -1007,6 +1007,12 @@ mod mock_tests {
         std::env::temp_dir().join(format!("rencoder_mock_{label}_{}_{n}", std::process::id()))
     }
 
+    /// Test helper: wrap a path literal in `InputPath`. See the
+    /// equivalent in `mod tests` above for rationale.
+    fn input(p: &str) -> crate::types::InputPath {
+        crate::types::InputPath::new(std::path::Path::new(p)).expect("test fixture")
+    }
+
     /// Run the actor inline (no thread spawn) with a mock encoder.
     /// `mock_fn` is called once per file and returns the EncodingRecord
     /// for that file. `data_dir` is the path passed to `load_history`
@@ -1072,7 +1078,7 @@ mod mock_tests {
                                 cancelled = true;
                                 break;
                             }
-                            let output_path = output_path_for(file, params.format);
+                            let output_path = output_path_for(file.as_path(), params.format);
                             let task = TranscodeTask {
                                 input: file.clone(),
                                 output: Some(output_path),
@@ -1187,9 +1193,9 @@ mod mock_tests {
     /// Build a minimal EncodingRecord marked Succeeded with a given
     /// source path. Used by mock encoders to fabricate "completed"
     /// records without invoking ffmpeg.
-    fn fake_record(path: &std::path::Path) -> EncodingRecord {
+    fn fake_record(path: &crate::types::InputPath) -> EncodingRecord {
         EncodingRecord {
-            source_path: path.to_string_lossy().into_owned(),
+            source_path: path.to_string(),
             source_size_bytes: 0,
             source_codec: None,
             source_container: None,
@@ -1303,9 +1309,8 @@ mod mock_tests {
     #[test]
     fn start_batch_emits_expected_event_sequence() {
         let (cmd_tx, evt_rx) = run_actor_inline(make_succeeding_mock().0, None);
-        let files: Vec<PathBuf> = (0..3)
-            .map(|i| PathBuf::from(format!("/in/{i}.mp4")))
-            .collect();
+        let files: Vec<crate::types::InputPath> =
+            (0..3).map(|i| input(&format!("/in/{i}.mp4"))).collect();
         cmd_tx
             .send(Command::StartBatch {
                 params: EncodeParams::default(),
@@ -1356,7 +1361,7 @@ mod mock_tests {
             Event::BatchCompleted { records } => {
                 assert_eq!(records.len(), 3);
                 for (i, r) in records.iter().enumerate() {
-                    assert_eq!(r.source_path, files[i].to_string_lossy());
+                    assert_eq!(r.source_path, files[i].to_string());
                 }
             }
             _ => panic!("expected BatchCompleted as last event"),
@@ -1366,9 +1371,8 @@ mod mock_tests {
     #[test]
     fn start_batch_emits_progress_events_during_encode() {
         let (cmd_tx, evt_rx) = run_actor_inline(make_progress_mock(), None);
-        let files: Vec<PathBuf> = (0..2)
-            .map(|i| PathBuf::from(format!("/p/{i}.mp4")))
-            .collect();
+        let files: Vec<crate::types::InputPath> =
+            (0..2).map(|i| input(&format!("/p/{i}.mp4"))).collect();
         cmd_tx
             .send(Command::StartBatch {
                 params: EncodeParams::default(),
@@ -1391,7 +1395,7 @@ mod mock_tests {
     fn start_batch_rejects_second_batch_with_error() {
         let (mock_fn, call_count) = make_succeeding_mock();
         let (cmd_tx, evt_rx) = run_actor_inline(mock_fn, None);
-        let files: Vec<PathBuf> = vec![PathBuf::from("/a.mp4")];
+        let files: Vec<crate::types::InputPath> = vec![input("/a.mp4")];
         cmd_tx
             .send(Command::StartBatch {
                 params: EncodeParams::default(),
@@ -1429,9 +1433,8 @@ mod mock_tests {
             },
             None,
         );
-        let files: Vec<PathBuf> = (0..5)
-            .map(|i| PathBuf::from(format!("/c/{i}.mp4")))
-            .collect();
+        let files: Vec<crate::types::InputPath> =
+            (0..5).map(|i| input(&format!("/c/{i}.mp4"))).collect();
         cmd_tx
             .send(Command::StartBatch {
                 params: EncodeParams::default(),
@@ -1490,7 +1493,7 @@ mod mock_tests {
 
         let records: Vec<EncodingRecord> = (0..3)
             .map(|i| {
-                let mut r = fake_record(&PathBuf::from(format!("/lh/{i}.mp4")));
+                let mut r = fake_record(&input(&format!("/lh/{i}.mp4")));
                 r.started_at =
                     chrono::DateTime::<Utc>::from_timestamp(1_700_000_000 + i as i64 * 10, 0)
                         .unwrap();
@@ -1542,11 +1545,11 @@ mod mock_tests {
         // pins the actor's emit sequence.
         let tmp = unique_tmp("analyze");
         std::fs::create_dir_all(&tmp).unwrap();
-        let files: Vec<PathBuf> = (0..3)
+        let files: Vec<crate::types::InputPath> = (0..3)
             .map(|i| {
                 let p = tmp.join(format!("f{i}.mp4"));
                 std::fs::write(&p, b"not a real video").unwrap();
-                p
+                crate::types::InputPath::new(&p).unwrap()
             })
             .collect();
 
@@ -1587,7 +1590,7 @@ mod mock_tests {
                 assert_eq!(records.len(), 3);
                 // Input order: f0, f1, f2 (par_iter().collect() preserves).
                 for (i, r) in records.iter().enumerate() {
-                    assert_eq!(r.path, files[i]);
+                    assert_eq!(r.path, files[i].as_path());
                     assert!(r.fps.is_none(), "garbage file → fps = None");
                 }
             }
@@ -1615,11 +1618,11 @@ mod mock_tests {
         let (cmd_tx, evt_rx) = run_actor_inline(make_succeeding_mock().0, None);
         let tmp = unique_tmp("analyze-busy");
         std::fs::create_dir_all(&tmp).unwrap();
-        let files: Vec<PathBuf> = (0..3)
+        let files: Vec<crate::types::InputPath> = (0..3)
             .map(|i| {
                 let p = tmp.join(format!("f{i}.mp4"));
                 std::fs::write(&p, b"not a real video").unwrap();
-                p
+                crate::types::InputPath::new(&p).unwrap()
             })
             .collect();
         cmd_tx
@@ -1682,7 +1685,7 @@ mod mock_tests {
         let path = tmp.join("encoding-limit.parquet");
         let records: Vec<EncodingRecord> = (0..10)
             .map(|i| {
-                let mut r = fake_record(&PathBuf::from(format!("/lim/{i}.mp4")));
+                let mut r = fake_record(&input(&format!("/lim/{i}.mp4")));
                 r.started_at =
                     chrono::DateTime::<Utc>::from_timestamp(1_700_000_000 + i as i64, 0).unwrap();
                 r
@@ -1724,7 +1727,7 @@ mod mock_tests {
         let path = tmp.join("encoding-after.parquet");
         let records: Vec<EncodingRecord> = (0..5)
             .map(|i| {
-                let mut r = fake_record(&PathBuf::from(format!("/aft/{i}.mp4")));
+                let mut r = fake_record(&input(&format!("/aft/{i}.mp4")));
                 r.started_at =
                     chrono::DateTime::<Utc>::from_timestamp(1_700_000_000 + i as i64 * 100, 0)
                         .unwrap();
@@ -1773,7 +1776,7 @@ mod mock_tests {
             },
             None,
         );
-        let files = vec![PathBuf::from("/err.mp4")];
+        let files = vec![input("/err.mp4")];
         cmd_tx
             .send(Command::StartBatch {
                 params: EncodeParams::default(),

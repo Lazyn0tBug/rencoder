@@ -288,7 +288,7 @@ where
 /// non-deterministic.
 #[cfg(feature = "parallel-analyze")]
 pub fn analyze_records_with_probe_and_progress_parallel<F, P>(
-    files: &[PathBuf],
+    files: &[crate::types::InputPath],
     probe: F,
     progress: P,
 ) -> Vec<AnalysisRecord>
@@ -309,17 +309,19 @@ where
 
     files
         .par_iter()
-        .map(|path| {
+        .map(|input| {
+            let path = input.as_path();
+            let path_buf = path.to_path_buf();
             let file_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
             let (record, last) = match probe(path) {
                 Ok(metadata) => {
                     let last = AnalyzedFile {
-                        path: path.clone(),
+                        path: path_buf.clone(),
                         outcome: FileOutcome::Ok,
                     };
                     (
                         AnalysisRecord {
-                            path: path.clone(),
+                            path: path_buf,
                             fps: metadata.best_fps().map(|f| f.round() as u32),
                             codec: metadata.codec,
                             duration_secs: metadata.duration_secs,
@@ -334,12 +336,12 @@ where
                     // stderr; LogPanel surfaces it in the UI).
                     log::warn!("probe failed for {}: {e}", path.display());
                     let last = AnalyzedFile {
-                        path: path.clone(),
+                        path: path_buf.clone(),
                         outcome: FileOutcome::ProbeFailed(e),
                     };
                     (
                         AnalysisRecord {
-                            path: path.clone(),
+                            path: path_buf,
                             fps: None,
                             codec: None,
                             duration_secs: None,
@@ -820,8 +822,11 @@ mod tests {
     #[test]
     fn progress_called_once_per_file() {
         use std::sync::Mutex;
-        let files: Vec<PathBuf> = (0..100)
-            .map(|i| PathBuf::from(format!("/f/{i:03}.mp4")))
+        let files: Vec<crate::types::InputPath> = (0..100)
+            .map(|i| {
+                crate::types::InputPath::new(std::path::Path::new(&format!("/f/{i:03}.mp4")))
+                    .unwrap()
+            })
             .collect();
         let ticks: Mutex<Vec<AnalyzeProgress>> = Mutex::new(Vec::new());
         let probe = ok_probe;
@@ -848,8 +853,11 @@ mod tests {
     #[test]
     fn progress_failed_count_correct_for_mixed_input() {
         use std::sync::Mutex;
-        let files: Vec<PathBuf> = (0..10)
-            .map(|i| PathBuf::from(format!("/f/{i:02}.mp4")))
+        let files: Vec<crate::types::InputPath> = (0..10)
+            .map(|i| {
+                crate::types::InputPath::new(std::path::Path::new(&format!("/f/{i:02}.mp4")))
+                    .unwrap()
+            })
             .collect();
         // Fail on files whose name ends in "even" index (0, 2, 4, 6, 8).
         let probe = |path: &Path| -> Result<VideoMetadata, EncodeError> {
@@ -889,7 +897,8 @@ mod tests {
         // the input paths. Without this, a regression that
         // silently dropped the Err variant or pointed `last` at
         // the wrong file wouldn't be caught.
-        let input_paths: std::collections::HashSet<PathBuf> = files.iter().cloned().collect();
+        let input_paths: std::collections::HashSet<std::path::PathBuf> =
+            files.iter().map(|ip| ip.as_path().to_path_buf()).collect();
         for tick in &ticks {
             let last = tick.last.as_ref().expect("last is Some per tick");
             // The path is one of the input paths.
@@ -951,8 +960,11 @@ mod tests {
         use std::sync::Mutex;
         // 200 files to make sure rayon parallelizes (otherwise the
         // serial fallback path would trivially be monotonic).
-        let files: Vec<PathBuf> = (0..200)
-            .map(|i| PathBuf::from(format!("/f/{i:03}.mp4")))
+        let files: Vec<crate::types::InputPath> = (0..200)
+            .map(|i| {
+                crate::types::InputPath::new(std::path::Path::new(&format!("/f/{i:03}.mp4")))
+                    .unwrap()
+            })
             .collect();
         let ticks: Mutex<Vec<AnalyzeProgress>> = Mutex::new(Vec::new());
         let probe = ok_probe;

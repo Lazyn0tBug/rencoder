@@ -225,7 +225,13 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
     tracing::Span::current().record("parallel", parallel);
 
     let records = if parallel {
-        rencoder_lib::analyzer::records::analyze_records_parallel(&files)
+        // The parallel analyzer takes `&[PathBuf]` and bypasses the
+        // `InputPath` boundary (probe-only, no argv injection risk).
+        // Convert at the CLI boundary; the lib's signature stays
+        // untouched per the review #109 plan.
+        let paths: Vec<std::path::PathBuf> =
+            files.iter().map(|ip| ip.as_path().to_path_buf()).collect();
+        rencoder_lib::analyzer::records::analyze_records_parallel(&paths)
             .with_context(|| "fps analysis failed")?
     } else {
         // U19 step 5: serial analyze routes through TaskManager so the
@@ -244,17 +250,19 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
             .collect();
         let manager = rencoder_lib::pipeline::task::TaskManager::new(None);
         manager.run(&tasks, "analyze", target_path(&target), |task, _ctx| {
-            let file_bytes = std::fs::metadata(&task.input).map(|m| m.len()).unwrap_or(0);
-            match probe_video_metadata(&task.input) {
+            let file_bytes = std::fs::metadata(task.input.as_path())
+                .map(|m| m.len())
+                .unwrap_or(0);
+            match probe_video_metadata(task.input.as_path()) {
                 Ok(metadata) => Ok(rencoder_lib::analyzer::records::AnalysisRecord::new(
-                    task.input.clone(),
+                    task.input.as_path().to_path_buf(),
                     metadata.best_fps().map(|f| f.round() as u32),
                     metadata.codec,
                     metadata.duration_secs,
                     file_bytes,
                 )),
                 Err(_) => Ok(rencoder_lib::analyzer::records::AnalysisRecord::new(
-                    task.input.clone(),
+                    task.input.as_path().to_path_buf(),
                     None,
                     None,
                     None,

@@ -22,10 +22,12 @@ pub fn make_skipped_record(
     encoding_duration_secs: Option<f64>,
     reason: SkippedReason,
 ) -> EncodingRecord {
-    let source_size_bytes = std::fs::metadata(&task.input).map(|m| m.len()).unwrap_or(0);
-    let source_meta = probe_video_metadata_auto(&task.input).ok();
+    let source_size_bytes = std::fs::metadata(task.input.as_path())
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let source_meta = probe_video_metadata_auto(task.input.as_path()).ok();
     EncodingRecord {
-        source_path: task.input.to_string_lossy().into_owned(),
+        source_path: task.input.to_string(),
         source_size_bytes,
         source_codec: source_meta.as_ref().and_then(|m| m.codec.clone()),
         source_container: source_meta.as_ref().and_then(|m| m.container.clone()),
@@ -63,9 +65,11 @@ pub fn make_failed_probe_record(
     encoding_duration_secs: Option<f64>,
     err: &crate::error::EncodeError,
 ) -> EncodingRecord {
-    let source_size_bytes = std::fs::metadata(&task.input).map(|m| m.len()).unwrap_or(0);
+    let source_size_bytes = std::fs::metadata(task.input.as_path())
+        .map(|m| m.len())
+        .unwrap_or(0);
     EncodingRecord {
-        source_path: task.input.to_string_lossy().into_owned(),
+        source_path: task.input.to_string(),
         source_size_bytes,
         source_codec: None,
         source_container: None,

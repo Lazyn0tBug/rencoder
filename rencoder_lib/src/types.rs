@@ -220,22 +220,20 @@ impl Default for Target {
 // validation to the type system so a runtime check can't be
 // forgotten.
 //
-// Status: TYPE DEFINED BUT NOT YET WIRED THROUGH. The migration
-// from `TranscodeTask.input: PathBuf` to `InputPath` is a cross-
-// cutting change touching collect.rs, encoder/command.rs,
-// pipeline/batch.rs, pipeline/task.rs, job.rs (Command variants
-// + all test fixtures), and rencoder_cli/src/main.rs. The doc
-// section §3.3.8 + §3.8.6 row + this type are staged in advance
-// so the wire-through PR is a mechanical replace + new tests.
+// Status: WIRED THROUGH. `TranscodeTask.input`, `Command::*` file
+// vectors, and `Event::FileStarted.source` are all `InputPath` now.
+// The only raw `PathBuf` paths in ffmpeg-bound argv come from
+// `TranscodeTask.output` (the wrapper writes there; ffmpeg never
+// parses it as an option) and from `EncodingRecord.source_path`
+// (a serialised string for Parquet, not a runtime invariant).
 //
-// Rejected forms (once wired through):
+// Rejected forms:
 //   - empty path
 //   - any path whose final component starts with `-` — covers the
 //     classic `-vf_negate.mp4` case AND any sub-path with a
 //     dash-prefixed leaf (`/tmp/-secret`). POSIX-style paths are
 //     always relative-or-absolute + components; we only need to
 //     inspect the filename.
-#[allow(dead_code)] // staged for review #109 wire-through
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct InputPath(String);
@@ -279,15 +277,21 @@ impl InputPath {
     }
 }
 
+impl std::fmt::Display for InputPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.display().fmt(f)
+    }
+}
+
 // ===== Single transcode task =====
 
 #[derive(Clone, Debug)]
 pub struct TranscodeTask {
-    /// Source path the task reads. Currently `PathBuf`; planned
-    /// migration to [`InputPath`] (review #109) is in progress but
-    /// not yet wired through. The runtime dash-prefix check in
-    /// `collect::collect_dir` is the interim guard.
-    pub input: PathBuf,
+    /// Source path the task reads. Type-level safety boundary via
+    /// [`InputPath`] (review #109): dash-prefixed filenames are
+    /// rejected at construction, so `build_ffmpeg_command` can
+    /// pass this through to argv without any runtime check.
+    pub input: InputPath,
     /// Output path the task writes to. `Some` for encode (ffmpeg
     /// output), `None` for analyze (read-only). The signal handler
     /// removes the file at this path on SIGINT when `Some`.
@@ -889,5 +893,57 @@ mod tests {
                 "expected ExtraArg::parse to reject {evil:?}"
             );
         }
+    }
+
+    // ---- InputPath (review #109) ----
+    //
+    // The runtime tests cover the validated-factory reject cases that
+    // are the type-level guarantee's defense. A compile-fail test
+    // (trybuild) would also work but adds a build dependency for
+    // one newtype; not worth it here.
+
+    #[test]
+    fn input_path_accepts_normal_filename() {
+        let p = InputPath::new(std::path::Path::new("/in/movie.mp4")).unwrap();
+        assert_eq!(p.as_path(), std::path::Path::new("/in/movie.mp4"));
+        assert_eq!(p.to_string(), "/in/movie.mp4");
+    }
+
+    #[test]
+    fn input_path_accepts_dotfile() {
+        // Leading `.` (not `-`) is allowed — only dash-prefixed names
+        // are rejected, matching the v1 collect_dir behavior.
+        let p = InputPath::new(std::path::Path::new("/in/.bashrc")).unwrap();
+        assert_eq!(p.to_string(), "/in/.bashrc");
+    }
+
+    #[test]
+    fn input_path_accepts_relative_path() {
+        let p = InputPath::new(std::path::Path::new("in/movie.mp4")).unwrap();
+        assert_eq!(p.as_path(), std::path::Path::new("in/movie.mp4"));
+    }
+
+    #[test]
+    fn input_path_rejects_dash_prefixed_filename() {
+        // The classic review-#109 case: a filename whose first
+        // character is `-` would be parsed by ffmpeg as an option
+        // when passed positionally after `-i`.
+        let err = InputPath::new(std::path::Path::new("-vf_negate.mp4")).unwrap_err();
+        assert!(matches!(err, InputPathError::DashPrefixed(_)));
+    }
+
+    #[test]
+    fn input_path_rejects_dash_prefixed_subdirectory() {
+        // Cover the deeper case: a path with a dash-prefixed leaf
+        // (`/tmp/-secret`) should also be rejected, since ffmpeg
+        // receives the full path string.
+        let err = InputPath::new(std::path::Path::new("/tmp/-secret")).unwrap_err();
+        assert!(matches!(err, InputPathError::DashPrefixed(_)));
+    }
+
+    #[test]
+    fn input_path_rejects_empty_path() {
+        let err = InputPath::new(std::path::Path::new("")).unwrap_err();
+        assert!(matches!(err, InputPathError::Empty));
     }
 }

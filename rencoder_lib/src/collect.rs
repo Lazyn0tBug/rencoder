@@ -4,36 +4,51 @@
 //! the given extension allowlist. Symlinks are never followed (R10) so a
 //! loop in the filesystem doesn't recurse forever.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
 use crate::error::EncodeError;
-use crate::types::Target;
+use crate::types::{InputPath, Target};
 
-/// Collect input files for a transcode batch.
+/// Collect input files for a transcode batch, wrapped in [`InputPath`]
+/// (review #109 type-level boundary — dash-prefixed filenames are
+/// rejected at construction so ffmpeg can never parse them as options).
 ///
-/// - `Target::File(p)` returns `[p]` if `p` exists as a file and matches
-///   the extension filter (empty extensions = match all).
-/// - `Target::Dir(root)` walks the tree without following symlinks, returns
-///   every regular file that matches the filter.
+/// - `Target::File(p)` returns `[InputPath::new(p)]` if `p` exists as a
+///   file and matches the extension filter (empty extensions = match
+///   all). Bad paths are skipped with a warning.
+/// - `Target::Dir(root)` walks the tree without following symlinks,
+///   returns every regular file matching the filter, wrapped in
+///   `InputPath`. Dash-prefixed files are skipped with a warning.
 ///
-/// `extensions` is a case-insensitive allowlist; an empty slice means "all
-/// files".
-pub fn collect_files(target: &Target, extensions: &[String]) -> Result<Vec<PathBuf>, EncodeError> {
+/// `extensions` is a case-insensitive allowlist; an empty slice means
+/// "all files".
+pub fn collect_files(
+    target: &Target,
+    extensions: &[String],
+) -> Result<Vec<InputPath>, EncodeError> {
     match target {
         Target::File(p) => Ok(collect_single_file(p, extensions)),
         Target::Dir(root) => collect_dir(root, extensions),
     }
 }
 
-fn collect_single_file(p: &Path, extensions: &[String]) -> Vec<PathBuf> {
+fn collect_single_file(p: &Path, extensions: &[String]) -> Vec<InputPath> {
     if p.is_file() && matches_extension(p, extensions) {
-        vec![p.to_path_buf()]
+        match InputPath::new(p) {
+            Ok(ip) => vec![ip],
+            Err(e) => {
+                log::warn!("    skipping {}: {e}", p.display());
+                vec![]
+            }
+        }
     } else {
         vec![]
     }
 }
 
-fn collect_dir(root: &Path, extensions: &[String]) -> Result<Vec<PathBuf>, EncodeError> {
+fn collect_dir(root: &Path, extensions: &[String]) -> Result<Vec<InputPath>, EncodeError> {
     let mut results = Vec::new();
     let walker = walkdir::WalkDir::new(root).follow_links(false);
     for entry in walker {
@@ -45,32 +60,16 @@ fn collect_dir(root: &Path, extensions: &[String]) -> Result<Vec<PathBuf>, Encod
         // follow_links(false) walkdir reports symlinks with is_file()=false,
         // is_symlink()=true -- exactly what we want.
         if entry.file_type().is_file() && matches_extension(path, extensions) {
-            // Review fix #1 (partial): reject filenames beginning with
-            // `-` so they can't be parsed as ffmpeg options when
-            // passed as `argv[i]` after the libsvtav1 argv shift
-            // (review fix: most flags now come from `EncodeConfig.
-            // ffmpeg_args.{pre_input, post_input}` instead of Rust
-            // concatenation, but the input path is still passed
-            // positionally). POSIX-flavoured ffmpeg accepts `-vf`,
-            // `-ss`, etc. as positional options; rejecting the
-            // filename at the source is the simplest, library-level
-            // fix that doesn't depend on ffmpeg honoring `--`.
-            //
-            // Allowlist: filenames whose first component does not
-            // start with `-` (including the leading dot files like
-            // `.bashrc`, which start with `.` not `-`).
-            if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with('-'))
-            {
-                log::warn!(
-                    "    skipping file with leading-dash name (would be parsed as ffmpeg flag): {}",
-                    path.display()
-                );
-                continue;
+            // Review fix #109 (type-level boundary): the runtime
+            // dash-prefix check that used to live here is gone. Each
+            // entry goes through `InputPath::new`, which rejects
+            // dash-prefixed filenames at construction time. The
+            // rejection surfaces as a warn-and-skip, matching the
+            // v1 collect_dir behavior.
+            match InputPath::new(path) {
+                Ok(ip) => results.push(ip),
+                Err(e) => log::warn!("    skipping {}: {e}", path.display()),
             }
-            results.push(path.to_path_buf());
         }
     }
     Ok(results)
@@ -124,7 +123,8 @@ mod tests {
         let dir = fixture_dir("file_match");
         let f = touch(&dir, "movie.mp4");
         let files = collect_files(&Target::File(f.clone()), &["mp4".into()]).unwrap();
-        assert_eq!(files, vec![f]);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].as_path(), f);
     }
 
     #[test]
@@ -140,21 +140,24 @@ mod tests {
         let dir = fixture_dir("file_empty");
         let f = touch(&dir, "anything.xyz");
         let files = collect_files(&Target::File(f.clone()), &[]).unwrap();
-        assert_eq!(files, vec![f]);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].as_path(), f);
     }
 
     #[test]
     fn dir_target_skips_files_with_dash_prefixed_names() {
-        // Review fix #1 (partial): filenames starting with `-` would
-        // be parsed as ffmpeg argv options when passed positionally
-        // after `-i`. The lib's collect_dir skips them with a warning
-        // rather than passing them through.
+        // Review fix #109 (type-level boundary): filenames starting
+        // with `-` are rejected by `InputPath::new` at construction
+        // time. collect_dir sees the rejection and skips with a
+        // warning; the runtime dash-prefix check that used to live
+        // here is gone.
         let dir = fixture_dir("dir_dash");
         let good = touch(&dir, "movie.mp4");
         let bad = touch(&dir, "-vf_negate.mp4");
         let files = collect_files(&Target::Dir(dir), &["mp4".into()]).unwrap();
-        assert_eq!(files, vec![good]);
-        assert!(!files.contains(&bad));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].as_path(), good);
+        assert!(!files.iter().any(|ip| ip.as_path() == bad));
     }
 
     #[test]
@@ -172,7 +175,8 @@ mod tests {
         let dir = fixture_dir("file_case");
         let f = touch(&dir, "movie.MP4");
         let files = collect_files(&Target::File(f.clone()), &["mp4".into()]).unwrap();
-        assert_eq!(files, vec![f]);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].as_path(), f);
     }
 
     // ---- directory target ----
@@ -186,8 +190,9 @@ mod tests {
         let files =
             collect_files(&Target::Dir(dir.clone()), &["mp4".into(), "mkv".into()]).unwrap();
         assert_eq!(files.len(), 2);
-        assert!(files.iter().all(|p| {
-            p.extension()
+        assert!(files.iter().all(|ip| {
+            ip.as_path()
+                .extension()
                 .and_then(|e| e.to_str())
                 .is_some_and(|e| e == "mp4" || e == "mkv")
         }));
@@ -239,8 +244,8 @@ mod tests {
         }
         let files = collect_files(&Target::Dir(dir.clone()), &["mp4".into()]).unwrap();
         assert_eq!(files.len(), 1);
-        assert!(files.contains(&real));
-        assert!(!files.contains(&link));
+        assert!(files.iter().any(|ip| ip.as_path() == real));
+        assert!(!files.iter().any(|ip| ip.as_path() == link));
     }
 
     #[test]

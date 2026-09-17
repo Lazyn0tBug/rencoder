@@ -683,8 +683,8 @@ enum CollectError {
 /// callers handle that as a distinct "no files" condition).
 fn collect_input_files(
     state: &AppState,
-    config: &rencoder_lib::config::app::AppConfig,
-) -> Result<Vec<PathBuf>, CollectError> {
+    config: &rencoder_lib::config::AppConfig,
+) -> Result<Vec<rencoder_lib::types::InputPath>, CollectError> {
     let Some(dir) = state.input_dir.as_ref() else {
         return Err(CollectError::NoInputDir);
     };
@@ -702,6 +702,18 @@ fn collect_input_files(
         .map(|e| e.path())
         .filter(|p| p.is_file())
         .filter(|p| extension_matches(p, &extensions))
+        // Review #109: each entry must be wrapped in `InputPath::new`,
+        // which rejects dash-prefixed filenames (the lib's runtime
+        // warning already filtered these; this adds the type-level
+        // boundary on the UI side too). Skipped entries log a warning
+        // so the operator sees what was filtered.
+        .filter_map(|p| match rencoder_lib::types::InputPath::new(&p) {
+            Ok(ip) => Some(ip),
+            Err(e) => {
+                tracing::warn!(path = %p.display(), error = %e, "skipping UI file");
+                None
+            }
+        })
         .collect();
     Ok(files)
 }
