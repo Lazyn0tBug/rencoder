@@ -72,8 +72,8 @@ cargo build -p rencoder_lib --features parallel-analyze
 ## Test
 
 ```bash
-cargo test
 cargo clippy --all-targets -- -D warnings
+cargo test
 cargo fmt --check
 ```
 
@@ -125,8 +125,8 @@ call sites. Use this workflow instead:
 4. **Verify before each commit:**
    - `git status --short` — what actually changed?
    - `git diff <file> --` — what did the edit produce?
-   - `cargo test --workspace` — is the workspace green?
    - `cargo clippy --workspace --all-targets` — are there lints?
+   - `cargo test --workspace` — is the workspace green?
 
 5. **When stuck, diagnose the path first.** If a file edit fails because
    "file not found", `cat` the path or run `git ls-files | grep <name>`

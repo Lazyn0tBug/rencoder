@@ -2211,23 +2211,30 @@ struct TaskQueue {
 /// in the queue can be in different phases in v1.1). Drives the Task
 /// page header badge, the contextual button label, and the dir
 /// picker's enabled state (§3.8.7.1 state machine).
-#[allow(clippy::large_enum_variant)] // only Copy + 4 variants, no payload
+/// Picker's enabled state (§3.8.7.1 state machine).
+///
+/// v1.2 redesign: dropped `AwaitingConfirm` phase. The dry-run
+/// + encode flow is now 1-click:
+///   - Pick directory → auto-dispatch `Command::DryRun` (Analyzing).
+///   - On `Event::DryRunFinished` with `to_encode > 0`, auto-dispatch
+///     `Command::StartBatch` (Encoding). Button was already visible
+///     and clickable during the Analyzing→Encoding gap; the click
+///     is now a no-op because we're already Encoding.
+///   - On `to_encode == 0`, leave phase as Analyzing and surface
+///     the count summary; the button stays disabled.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BatchPhase {
     /// `Command::DryRun` dispatched; awaiting `Event::DryRunFinished`.
-    /// Dir picker disabled. Cancel button shown (best-effort).
+    /// Dir picker disabled. Start button disabled (analyze in flight).
     Analyzing,
-    /// DryRun done; user must explicitly confirm before encoding
-    /// begins. Start button label flips to "encode N files".
-    /// Dir picker disabled.
-    AwaitingConfirm,
     /// `Command::StartBatch` dispatched; awaiting `BatchCompleted` /
     /// `BatchCancelled` / `Event::Error`. Progress bar active.
-    /// Dir picker disabled. Cancel button shown.
+    /// Dir picker disabled. Start button shows "Cancel ✕".
     Encoding,
     /// Final state after the batch lifecycle ends. Dir picker
-    /// re-enables. Start button re-arms (clicking it transitions
-    /// back to `Analyzing` for a new cycle).
+    /// re-enables. Start button shows "Re-run ▸" (clicking
+    /// transitions back to Analyzing for a new cycle).
     Done,
 }
 
@@ -2284,31 +2291,52 @@ enum Msg {
 
 /// 唯一的状态变更入口。所有视图只读 state;所有写都走这里。
 ///
-/// **Phase-aware `UserClickedStart`** (§3.8.7.1):
+/// **Phase-aware `UserClickedStart`** (v1.2 — single Task-tab button):
 ///
 /// ```text
-///   ┌─ phase == None      → build params, collect files,
-///   │                       tasks.active = Some(Analyzing { .. }),
-///   │                       send Command::DryRun
-///   │
-///   ├─ phase == Done      → same as None (re-arm)
-///   │
-///   ├─ phase == AwaitingConfirm
-///   │                     → tasks.active.as_mut().unwrap().phase = Encoding,
-///   │                       tasks.active.as_mut().unwrap().records.clear(),
-///   │                       send Command::StartBatch
-///   │
+///   ┌─ phase == None + tasks.active.to_encode == 0
+///   │   → build params, collect files,
+///   │     tasks.active = Some(Analyzing { to_encode: 0, .. }),
+///   │     send Command::DryRun
+///   │   (typical "first pick" case: button shows "Analyze…" disabled)
+///
+///   ├─ phase == None + tasks.active.to_encode > 0
+///   │   → set phase = Encoding,
+///   │     tasks.active.records.clear(),
+///   │     send Command::StartBatch
+///   │   (typical "second pick" or post-DryRun case: button shows
+///   │   "Encode N files ▸"; user re-confirms the plan)
+///
+///   ├─ phase == Done      → same as None + to_encode == 0
+///   │                     (re-arm via "Re-run ▸" button)
+///
 ///   └─ phase == Analyzing | Encoding
 ///                         → set last_error "task in progress",
 ///                           return early (busy-gate)
 /// ```
 ///
-/// **Phase-aware `UserClickedCancel`**:
-///   - `Analyzing` / `Encoding`: send `Command::Cancel`. The lib
-///     respects cancel_token only during encoding (the analyze
-///     path doesn't poll cancel — best-effort; see §3.8.7.4).
-///   - `AwaitingConfirm`: clear `tasks.active` locally (no
-///     command needed — DryRun already finished, lib is idle).
+/// **Auto-dispatch on dir pick** (v1.2): `Msg::UserSelectedDir`
+/// triggers `Command::DryRun` immediately if no active task is
+/// in flight. This is what makes the "1 click" experience work —
+/// the user picks a dir, the dry-run starts, and the button
+/// transitions to "Encode N files ▸" without any further input.
+///
+/// **`Event::DryRunFinished` post-processing** (v1.2):
+/// 1. Compute `to_encode` / `to_skip` from the records.
+/// 2. **If `to_encode > 0`**: auto-dispatch `Command::StartBatch`,
+///    transition `phase = Encoding`, clear records. The UI button
+///    flips to "Cancel ✕".
+/// 3. **If `to_encode == 0`**: leave `phase = Analyzing` (no auto
+///    encode), surface the count summary on the Task page. The
+///    "Encode N files ▸" button stays disabled — this is the bug
+///    fix that makes "encode 0 files" structurally impossible.
+///
+/// **Phase-aware `UserClickedCancel`** (v1.2 — analyze stays
+/// non-cancellable per design decision):
+///   - `Encoding`: send `Command::Cancel`. The lib polls
+///     cancel_token between progress reads.
+///   - `Analyzing`: button is **disabled** during analyze (no
+///     review #100 implementation — best-effort only).
 ///   - `None` / `Done`: ignored (no-op).
 fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>, config: &AppConfig) {
     match msg {
@@ -2481,38 +2509,41 @@ fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>, config: &App
 > phase(Analyzing / AwaitingConfirm / Encoding)期间被锁;只有 `Done`
 > 之后才能再选目录。
 
-**State diagram**:
+**State diagram** (v1.2 — AwaitingConfirm dropped; auto-encode
+on positive dry-run count):
 
 ```text
-                UserClickedStart                          Event::DryRunFinished
-   [None] ─────────────────────────────> [Analyzing] ───────────────────> [AwaitingConfirm]
-      ▲                                     │                                       │
-      │                                     │ Cancel (best-effort)                  │ UserClickedStart
-      │                                     │                                       │  dispatches Command::StartBatch
-      │                                     ▼                                       ▼
-      │                                  [None] (local clear)                  [Encoding]
-      │                                                                         │
-      │                              ┌──────────────────────────────────────────┤
-      │                              │ Event::BatchCompleted                    │
-      │                              │ Event::BatchCancelled                    │
-      │                              │ Event::Error                             │
-      │                              ▼                                          │
-      │                          [Done] ◄────────────────────────────────────────┘
-      │                              │
-      └──────────────── UserClickedStart (re-arm) ─────────────────────────────────┘
+                UserSelectedDir / UserClickedStart (to_encode=0)
+   [None] ──────────────────────────────────────────────> [Analyzing]
+      ▲                                                          │
+      │                                                          │ Event::DryRunFinished
+      │                                                          │ (to_encode > 0)
+      │                                                          ▼  auto-dispatch
+      │                                                       [Encoding] ─────────────┐
+      │                                                          │                     │
+      │                                                          │ Event::BatchCompleted │
+      │                                                          │ Event::BatchCancelled │ Event::Error
+      │                                                          ▼                     │
+      └────────────────── UserClickedStart (re-arm) ───────> [Done] ◄─────────────────┘
+                                                              │
+                                                              └─ UserClickedStart → [Analyzing]
 ```
 
-**Per-phase semantics**:
+**Per-phase semantics** (v1.2 — single Start button):
 
-| Phase | 来源 | Dir picker | Start btn | Cancel btn | Task page 显示 |
-|-------|------|-----------|-----------|------------|---------------|
-| `None` | initial / post-Cancel | enabled | "Start ▸"(disabled if dir not picked) | hidden | "No task running. Pick a directory and click Start." |
-| `Analyzing` | reducer dispatch DryRun | **disabled** | "Analyzing…" (disabled) | "Cancel ✕" (best-effort — lib's Analyze handler 不轮询 cancel_token) | "probing N files…" + spinner |
-| `AwaitingConfirm` | `Event::DryRunFinished` | **disabled** | "encode N files ▸" (enabled) | "Cancel ✕" (best-effort local clear, no lib command — lib idle after DryRun) | `BATCH #1` + 12 files / 10 encode / 2 skipped breakdown + TASK PLAN 表 |
-| `Encoding` | `Event::BatchStarted` | **disabled** | "Encoding M/N" (disabled) | "Cancel ✕" (dispatches `Command::Cancel`, lib 终止 ffmpeg via cancel_token) | progress bar + per-file table + ETA |
-| `Done` | `BatchCompleted` / `BatchCancelled` / `Error` | **enabled** | "Start ▸" (re-arms, transitions back to `Analyzing`) | hidden | "BATCH #1 · N encoded / M skipped / 0 failed" |
+| Phase | 来源 | Dir picker | Start btn label | Start btn enabled | Task page 显示 |
+|-------|------|-----------|-----------------|------------------|---------------|
+| `None` + dir 未选 | initial | enabled | "Analyze…" | **disabled** (dir required) | "Pick a directory." |
+| `None` + dir 已选 + 正在 dry-run | `Msg::UserSelectedDir` auto-dispatch | enabled | "Analyze…" | **disabled** | spinner + "scanning N files…" |
+| `None` + dir 已选 + dry-run 完成 + `to_encode > 0` | `Event::DryRunFinished` auto-dispatch | enabled | "Encode N files ▸" | **enabled** | count summary + scrollable file list |
+| `None` + dir 已选 + dry-run 完成 + `to_encode == 0` | `Event::DryRunFinished` (no auto-encode) | enabled | "Encode (no encodable files)" | **disabled** (bug fix — was clickable before v1.2) | count summary + file list (all marked Skipped) |
+| `Analyzing` | dry-run in flight (UI button reflects "Analyze…" disabled) | **disabled** | "Analyze…" | **disabled** | spinner |
+| `Encoding` | `Event::BatchStarted` (lib accepted `Command::StartBatch`) | **disabled** | "Cancel ✕" | **enabled** (dispatches `Command::Cancel`) | progress bar + per-file table + ETA |
+| `Done` | `BatchCompleted` / `BatchCancelled` / `Error` | enabled | "Re-run ▸" | **enabled** (re-arms, transitions back to `Analyzing`) | summary: N encoded / M skipped / 0 failed |
 
-**No auto-switch**:用户在 `[SETUP]` 页面点 Start 后,**UI 不自动切换**到 `[TASK]` 页(per §3.8.7.1 product-lens review 反馈——之前的 auto-switch 会把误选目录的用户困在 TASK 页,recovery 需要等分析结束 + 取消 + 切回 SETUP)。Batch 在后台跑,UI 停留在 `[SETUP]`;用户看到 SettingsPanel 下方的 phase 状态变化或自己点 `[TASK]` tab 看进度。Dir picker 锁仍然生效(per `None / AwaitingConfirm` 的 phase 规则)。
+**Single-button UX**: v1.2 collapses the old 5-state machine (Start ▸ / Analyzing… / AwaitingConfirm + Cancel / Cancel / Re-arm) into a **3-state button** on the Task tab. State 1 (idle, dir not picked) and State 2 (analyze running) both show "Analyze…" disabled; State 3 (dry-run done) shows "Encode N files ▸" or "Encode (no encodable files)" depending on the count; State 4 (encoding) shows "Cancel ✕". The AwaitingConfirm phase is gone — auto-encode from positive dry-run count is the new "1 click" experience.
+
+**No auto-switch** (carried over from v1.1):用户在 `[SETUP]` 编辑配置后,UI **不自动切换**到 `[TASK]` 页——auto-switch 会把误改配置的用户困在 TASK 页。Setup 编辑是 real-time (每个字段的 `oninput` 直接调 `AppConfig::save`),所以切换到 Task 之前配置已落盘。Dir picker 锁仍然生效(per phase rules above)。
 
 **TaskQueue capacity** (v1: 1, v1.1: N):guard 走 `tasks.active.is_some() || tasks.pending.len() >= tasks.capacity`,**不**走 batch id 比较(per review 反馈 ——task 是 gating unit,batch id 只是映射字段)。v1 capacity = 1 意味着最多一个 active task——空 queue 时 `UserClickedStart` 派 DryRun(填 `tasks.active`);active 非空 + phase != Done 时,start 被拒(reducer 设 `last_error`)。v1.1 提升 capacity 到 N 后,多余的 task push 进 `tasks.pending`(FIFO),active 完成时 promote。详见 §3.8.7 `TaskQueue` 结构。
 
@@ -2652,12 +2683,14 @@ fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>, config: &App
 
 | 项 | 状态 | 后续 |
 |----|------|------|
-| Dir picker 锁 during whole batch lifecycle | v1:dir picker 在 `Analyzing` / `AwaitingConfirm` / `Encoding` 期间都被 disable(per §3.8.7.1),防止用户对 in-flight task 换目录 | v1.1 解锁 Encoding 期间的 picker(per spec point 6)——允许选下一个目录排队 |
-| Cancel during Analyzing 是 best-effort | lib 的 `Command::Analyze` handler 不轮询 cancel_token,UI 发 `Command::Cancel` 时 lib 不真正中断。`Event::AnalyzeFinished` 仍到达并被 reducer 当正常结果处理 | v1.1 在 analyze handler 里加 cancel_token 轮询 |
+| Dir picker 锁 during whole batch lifecycle | v1:dir picker 在 `Analyzing` / `Encoding` 期间都被 disable(per §3.8.7.1),防止用户对 in-flight task 换目录 | v1.1 解锁 Encoding 期间的 picker(per spec point 6)——允许选下一个目录排队 |
+| AwaitingConfirm phase (v1 2-click flow) | **v1.2 removed** — auto-encode on positive dry-run count. Start button no longer needs a second click to begin encoding | — |
+| Cancel during Analyzing 是 best-effort | v1.2 **decision**: button is **disabled** during Analyzing (no cancel during analyze). lib 的 `Command::Analyze` handler 不轮询 cancel_token,UI 发 `Command::Cancel` 时 lib 不真正中断。`Event::AnalyzeFinished` 仍到达并被 reducer 当正常结果处理 | v1.3 加 analyze cancel_token 轮询 |
+| "encode 0 files" 按钮可点击 | **v1.2 fixed**: Start button is **disabled** when `to_encode == 0`. `Event::DryRunFinished` only auto-dispatches `Command::StartBatch` when `to_encode > 0` | — |
 | `state.analyze_progress` / `state.analyze_results` 字段保留但未 populate | workflow 改造后 Start 自动调 `Command::DryRun`(不是 `Command::Analyze`),analyze state 字段未 populate。代码里还在(`#[allow(dead_code)]`),变成 dead field——AppState 代码块里保留定义以备 v1.1 / U22 重启用 | v1.1 移除 dead 字段 + 删除对应 `Event::Analyze*` reducer arm |
 | `UserClickedLoadHistory` 自动派 on app start | app 启动时 `use_hook` 派一次(per §3.8.7.2 history page);但目前没有显式 init code,history 是空直到用户手动 reload | v1.1 在 `use_hook` 里加 `cmd_tx.send(Command::LoadHistory { limit: Some(100), after: None })` |
 | Cross-session task 导航缺失 | `task_history` 是 session 内 cache(进程退出即丢);`state.history` 是 cross-session 但以 per-file EncodingRecord 为单位。**没有** task 维度的 cross-session 视图——v1 看不到昨天跑的 batch 用了哪个 dir / 多少文件 | v1.1 启动时 load Parquet records → group by batch_id → 渲染成 TaskInfo 列表。数据后端已经是 Parquet(`encoding-*.parquet`),不引新 store |
-| Settings 只读 | `[SETUP]` 页 settings 只显示 `[encode]` 当前值;不支持 inline edit | v1.2 加 inline edit 模式(`<input type="number">` for crf 等)+ dispatch `Command::SaveConfig` |
+| Settings inline edit | **v1.2 implemented**: `[SETUP]` 页每个字段 `<input>` `oninput` 直接调 `AppConfig::save` (real-time TOML atomic write via `write_atomic`). 没有 Save 按钮 | — |
 
 **v1 安全保证**(从 v1.1 deferred 提前到 v1 实现,per §3.8.7 product-lens / scope-guardian review 反馈):
 
