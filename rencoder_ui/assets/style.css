@@ -336,16 +336,44 @@ html, body {
 .dir-picker {
     background: var(--bg-surface);
     border: 1px solid var(--border);
-    padding: var(--space-3) var(--space-4);
+    padding: var(--space-2) var(--space-4);
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+}
+
+/* "DIR" label inline with the path + button (v1.2: dropped the
+ * 3-row layout — label + path + button stacked). Compact,
+ * saves ~50px vertical. */
+.dir-picker-label {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--text-mute);
+    flex-shrink: 0;
 }
 
 .dir-display {
-    padding: var(--space-2) 0;
-    min-height: 24px;
+    flex: 1 1 auto;
+    min-width: 0;       /* allow ellipsis truncation */
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 12px;
+}
+
+.dir-display .path {
+    color: var(--text);
+}
+
+.dir-display .muted {
+    color: var(--text-mute);
+    font-style: italic;
 }
 
 .dir-picker button {
-    margin-top: var(--space-2);
+    flex-shrink: 0;
 }
 
 .settings-panel {

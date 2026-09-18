@@ -594,13 +594,19 @@ fn DirPicker(
     let enabled = active_phase.is_none() || matches!(active_phase, Some(BatchPhase::Done));
 
     rsx! {
+        // v1.2 (review #133 follow-up): one-row layout — label
+        // + path + button on a single line. The label stays
+        // visible (so users know what this section is for)
+        // but the path truncates with ellipsis if too long.
+        // Saves ~50px vertical space vs the previous 3-row
+        // layout (label + path + button stacked).
         div { class: "dir-picker",
-            label { class: "section-label", "INPUT DIRECTORY" }
+            label { class: "dir-picker-label", "DIR" }
             div { class: "dir-display",
                 if let Some(ref d) = input_dir {
-                    span { class: "path", "{d.display()}" }
+                    span { class: "path", title: "{d.display()}", "{d.display()}" }
                 } else {
-                    span { class: "muted", "(none — click pick directory)" }
+                    span { class: "muted", "(not set)" }
                 }
             }
             button {
