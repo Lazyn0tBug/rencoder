@@ -400,7 +400,7 @@ pub struct LogLine {
     /// Origin of this log line (§3.8.7.5):
     /// - `FfmpegStderr`: ffmpeg's stderr per-file (via
     ///   `Event::LogLine`)
-    /// - `LibInternal`: lib's `log::info!` / `log::warn!` events,
+    /// - `LibInternal`: lib's `tracing::info!` / `tracing::warn!` events (v1.2 follow-up #4 — was `log::info!` bridged via `tracing-log`),
     ///   bridged to tracing and pushed to the UI
     #[allow(dead_code)] // populated but v1 doesn't differentiate visually;
     // v1.2 will use this for color coding
@@ -424,9 +424,8 @@ pub enum LogSource {
     /// meaningful `file_index`.
     FfmpegStderr,
     /// Lib-internal tracing event (v1.2 follow-up #4: no longer bridged
-    /// via `tracing-log::LogTracer` — lib emits `tracing` directly
-    /// and UI consumes via the same subscriber). No file context —
-    /// `file_index` is `NO_FILE_INDEX`.
+    /// lib emits `tracing` directly and UI consumes via the same
+    /// subscriber. No file context — `file_index` is `NO_FILE_INDEX`.
     LibInternal,
 }
 
@@ -472,9 +471,8 @@ pub enum Msg {
     /// through here; reducer routes them in `apply_event`.
     Lib(Event),
     /// Lib-internal tracing line (v1.2 follow-up #4: not bridged
-    /// via tracing-log; pushed through a crossbeam channel from the
-    /// log drain thread). Source field is fixed to
-    /// `LogSource::LibInternal`.
+    /// pushed through a crossbeam channel from the log drain
+    /// thread). Source field is fixed to `LogSource::LibInternal`.
     LibLogLine(String),
 }
 
