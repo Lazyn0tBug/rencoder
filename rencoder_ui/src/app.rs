@@ -38,10 +38,12 @@ use std::sync::Arc;
 
 use crossbeam_channel::Sender;
 
-use rencoder_lib::config::app::AppConfig;
+use rencoder_lib::config::app::{AppConfig, FormatArg};
 use rencoder_lib::job::{start_controller, Command};
 
-use crate::msg::{reduce, AppState, BatchPhase, Msg, Page, TaskId, TaskQueue};
+use crate::msg::{
+    reduce, AppState, BatchPhase, ConfigFieldKind, ConfigFieldValue, Msg, Page, TaskId, TaskQueue,
+};
 use crate::tracing_init;
 
 /// CSS inlined as a `<style>` child of the root div via Dioxus's
@@ -247,7 +249,15 @@ fn tab_button(
 }
 
 // ============================================================================
-// SetupPage — DirPicker + Settings + Start button (top-right)
+// SetupPage — pure config editor (review #133 part 3b).
+//
+// No [SETUP] header, no DirPicker, no Start button — those moved
+// to the Task tab. This page is a form that mirrors
+// `state.config_draft`; every input/radio change dispatches
+// `Msg::UserEditedConfigField`, which the reducer applies via
+// `apply_config_field_edit` + fires `Command::SaveConfig` for
+// atomic TOML write. The save status line reads
+// `state.config_save_status` ("Saving…" / "Saved at HH:MM:SS").
 // ============================================================================
 
 #[component]
@@ -256,102 +266,195 @@ fn SetupPage(
     cmd_tx: Signal<Option<Sender<Command>>, SyncStorage>,
     config: Signal<Arc<AppConfig>, SyncStorage>,
 ) -> Element {
-    let cfg = config.read().clone();
+    // Snapshot the values needed to render the form. The form
+    // is fully controlled — every input reads from `draft` and
+    // every change dispatches a Msg.
+    let draft = state.read().config_draft.encode.clone().unwrap_or_default();
+    let save_status = state.read().config_save_status.clone();
     let tx_opt = cmd_tx.read().clone();
-    let active = state.read().tasks.active.clone();
-    let input_dir = state.read().input_dir.clone();
-
-    // Start button enabled iff dir picked AND no active task.
-    let can_start = input_dir.is_some() && active.is_none();
 
     rsx! {
         section { class: "setup-page",
-            header { class: "page-header",
-                span { class: "section-label", "[ SETUP ]" }
-                div { class: "page-header-right",
-                    if let Some(tx) = tx_opt {
-                        button {
-                            class: "primary-btn",
-                            disabled: !can_start,
-                            onclick: move |_| {
-                                let cfg = config.read().clone();
-                                state.with_mut(|s| reduce(s, Msg::UserClickedStart, &tx, &cfg));
-                            },
-                            "Start ▸"
+            // No [SETUP] header — the page label is the section label.
+            // The Setup tab itself is already named "SETUP" in TopBar.
+
+            div { class: "settings-form",
+                span { class: "section-label", "SETTINGS" }
+
+                // ---- FORMAT (radio group) ----
+                div { class: "form-row",
+                    label { class: "form-label", "format" }
+                    div { class: "form-radios",
+                        for fmt in [FormatArg::Av1, FormatArg::Hevc, FormatArg::Vp9, FormatArg::X264] {
+                            {
+                                let checked = draft.format == Some(fmt);
+                                let kind = ConfigFieldKind::Format;
+                                let value = ConfigFieldValue::Format(fmt);
+                                // Clone the signals + tx once per closure
+                                // so each `move` closure captures its own
+                                // copy. Signals are cheap (Arc-like), Sender
+                                // is cloneable; the verbosity is worth it
+                                // for the ownership clarity.
+                                let mut state_c = state;
+                                let config_c = config;
+                                let tx_c = tx_opt.clone();
+                                rsx! {
+                                    label { class: "radio",
+                                        input {
+                                            r#type: "radio",
+                                            name: "format",
+                                            value: "{fmt:?}",
+                                            checked: "{checked}",
+                                            onchange: move |_| {
+                                                let cfg = config_c.read().clone();
+                                                if let Some(tx) = tx_c.clone() {
+                                                    state_c.with_mut(|s| {
+                                                        reduce(
+                                                            s,
+                                                            Msg::UserEditedConfigField {
+                                                                kind,
+                                                                value: value.clone(),
+                                                            },
+                                                            &tx,
+                                                            &cfg,
+                                                        )
+                                                    });
+                                                }
+                                            },
+                                        }
+                                        " {fmt:?}"
+                                    }
+                                }
+                            }
                         }
                     }
                 }
-            }
-            DirPicker { state: state, cmd_tx: cmd_tx, config: config }
-            SettingsPanel { config: cfg }
-        }
-    }
-}
 
-#[component]
-fn DirPicker(
-    state: Signal<AppState, SyncStorage>,
-    cmd_tx: Signal<Option<Sender<Command>>, SyncStorage>,
-    config: Signal<Arc<AppConfig>, SyncStorage>,
-) -> Element {
-    let input_dir = state.read().input_dir.clone();
-    let active_phase = state.read().tasks.active.as_ref().map(|t| t.phase);
-    // Picker disabled unless no active task.
-    let enabled = active_phase.is_none() || matches!(active_phase, Some(BatchPhase::Done));
-
-    rsx! {
-        div { class: "dir-picker",
-            label { class: "section-label", "INPUT DIRECTORY" }
-            div { class: "dir-display",
-                if let Some(ref d) = input_dir {
-                    span { class: "path", "{d.display()}" }
-                } else {
-                    span { class: "muted", "(none)" }
-                }
-            }
-            button {
-                class: "secondary-btn",
-                disabled: !enabled,
-                onclick: move |_| {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .set_title("Choose input directory")
-                        .pick_folder()
+                // ---- CRF (numeric input) ----
+                div { class: "form-row",
+                    label { class: "form-label", "crf" }
                     {
-                        if let Some(tx) = cmd_tx.read().clone() {
-                            let cfg = config.read().clone();
-                            state.with_mut(|st| {
-                                reduce(st, Msg::UserSelectedDir(path), &tx, &cfg)
-                            });
+                        let tx_for_crf = tx_opt.clone();
+                        rsx! {
+                            input {
+                                class: "form-input",
+                                r#type: "number",
+                                min: "0",
+                                max: "63",
+                                step: "1",
+                                value: "{draft.crf}",
+                                oninput: move |evt| {
+                                    let Ok(v) = evt.value().parse::<u32>() else {
+                                        return;
+                                    };
+                                    let cfg = config.read().clone();
+                                    if let Some(tx) = tx_for_crf.clone() {
+                                        state.with_mut(|s| {
+                                            reduce(
+                                                s,
+                                                Msg::UserEditedConfigField {
+                                                    kind: ConfigFieldKind::Crf,
+                                                    value: ConfigFieldValue::Crf(v),
+                                                },
+                                                &tx,
+                                                &cfg,
+                                            )
+                                        });
+                                    }
+                                },
+                            }
                         }
                     }
-                },
-                "pick directory"
-            }
-        }
-    }
-}
+                    span { class: "form-hint", "0 = bitrate mode (see [encode].bitrate)" }
+                }
 
-#[component]
-fn SettingsPanel(config: Arc<AppConfig>) -> Element {
-    let enc = config.encode.clone().unwrap_or_default();
-    rsx! {
-        div { class: "settings-panel",
-            label { class: "section-label", "SETTINGS" }
-            dl { class: "kv-list",
-                dt { "codec" }
-                dd { if let Some(f) = &enc.format { "{f:?}" } else { "av1 (default)" } }
-                dt { "crf" }
-                dd { "{enc.crf}" }
-                dt { "bitrate" }
-                dd { if let Some(b) = enc.bitrate { "{b}" } else { "—" } }
-                dt { "max_fps" }
-                dd { if let Some(m) = enc.max_fps { "{m}" } else { "off" } }
-                dt { "extensions" }
-                dd { if let Some(e) = &enc.extensions { "{e:?}" } else { "default (all)" } }
-                dt { "nv" }
-                dd { if let Some(n) = enc.nv { "{n}" } else { "off" } }
+                // ---- MAX FPS (radio group) ----
+                div { class: "form-row",
+                    label { class: "form-label", "max fps" }
+                    div { class: "form-radios",
+                        for cap in [None, Some(24u32), Some(25), Some(30), Some(60)] {
+                            {
+                                let checked = draft.max_fps == cap;
+                                let label = match cap {
+                                    None => "off".to_string(),
+                                    Some(n) => n.to_string(),
+                                };
+                                let kind = ConfigFieldKind::MaxFps;
+                                let value = ConfigFieldValue::MaxFps(cap);
+                                let mut state_c = state;
+                                let config_c = config;
+                                let tx_c = tx_opt.clone();
+                                rsx! {
+                                    label { class: "radio",
+                                        input {
+                                            r#type: "radio",
+                                            name: "max-fps",
+                                            value: "{label}",
+                                            checked: "{checked}",
+                                            onchange: move |_| {
+                                                let cfg = config_c.read().clone();
+                                                if let Some(tx) = tx_c.clone() {
+                                                    state_c.with_mut(|s| {
+                                                        reduce(
+                                                            s,
+                                                            Msg::UserEditedConfigField {
+                                                                kind,
+                                                                value: value.clone(),
+                                                            },
+                                                            &tx,
+                                                            &cfg,
+                                                        )
+                                                    });
+                                                }
+                                            },
+                                        }
+                                        " {label}"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ---- EXTENSIONS (csv text input) ----
+                div { class: "form-row",
+                    label { class: "form-label", "extensions" }
+                    {
+                        let tx_for_ext = tx_opt.clone();
+                        rsx! {
+                            input {
+                                class: "form-input",
+                                r#type: "text",
+                                placeholder: "mp4, mkk, mov (empty = all)",
+                                value: draft.extensions.clone().map(|v| v.join(", ")).unwrap_or_default(),
+                                oninput: move |evt| {
+                                    let cfg = config.read().clone();
+                                    if let Some(tx) = tx_for_ext.clone() {
+                                        state.with_mut(|s| {
+                                            reduce(
+                                                s,
+                                                Msg::UserEditedConfigField {
+                                                    kind: ConfigFieldKind::Extensions,
+                                                    value: ConfigFieldValue::Extensions(evt.value()),
+                                                },
+                                                &tx,
+                                                &cfg,
+                                            )
+                                        });
+                                    }
+                                },
+                            }
+                        }
+                    }
+                    span { class: "form-hint", "comma-separated; empty = all video files" }
+                }
+
+                // ---- SAVE STATUS (read-only) ----
+                div { class: "form-row",
+                    label { class: "form-label", "save status" }
+                    span { class: "save-status", "{save_status}" }
+                }
             }
-            p { class: "muted", "Edit values by hand in rencoder.toml, then click Save Settings (v1.2)." }
         }
     }
 }

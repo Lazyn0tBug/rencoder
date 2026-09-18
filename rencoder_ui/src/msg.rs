@@ -327,6 +327,8 @@ pub enum Msg {
     /// User picked a directory. Updates `state.input_dir`.
     /// Rejected if a task is in active phase (defense-in-depth;
     /// the picker is also disabled in the UI).
+    #[allow(dead_code)] // DirPicker component moved to TaskPage
+    // (review #133 part 3c, follows in the next commit).
     UserSelectedDir(PathBuf),
     /// Setup-page live edit (review #133). The Setup page's
     /// `<input>` and radio handlers fire this on every change;
