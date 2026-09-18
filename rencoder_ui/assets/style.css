@@ -318,6 +318,17 @@ html, body {
     color: var(--status-done);
 }
 
+/* v1.2 follow-up #2: cancelled is a terminal state distinct
+ * from Done (success) and Encoding (in-flight). Uses the warning
+ * amber token so the user doesn't mistake a cancelled batch for
+ * a successful one — pulse animation is OFF (terminal, no
+ * ongoing work to indicate). */
+.badge-cancelled {
+    border-color: var(--status-warning);
+    color: var(--status-warning);
+    animation: none;
+}
+
 @keyframes pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.4; }
