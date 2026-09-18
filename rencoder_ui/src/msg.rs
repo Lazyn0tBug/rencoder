@@ -40,9 +40,10 @@ use rencoder_lib::types::EncodingOutcome;
 /// Cap on the stderr log ring buffer. Per §3.8.6 + §8 item 30.
 const LOG_RING_CAP: usize = 1000;
 
-/// Lifecycle phase of a task (v1.2 final — review #133 follow-up):
-/// 4-state machine with a manual Confirm step between
-/// DryRunFinished and StartBatch.
+/// Lifecycle phase of a task (v1.2 follow-up #2):
+/// 6-state machine with a manual Confirm step between
+/// DryRunFinished and StartBatch, plus an explicit `Cancelled`
+/// terminal state for optimistic cancel.
 ///
 /// ```text
 /// [None]
@@ -52,28 +53,44 @@ const LOG_RING_CAP: usize = 1000;
 ///                                            | (to_encode > 0)
 ///                                            | UserClickedStart
 ///                                            v
-/// [Encoding] --BatchCompleted/Cancelled/Error--> [Done]
-/// [Done] --UserClickedStart (re-arm)--> [Analyzing]
+/// [Encoding] --BatchCompleted--> [Done]
+///           --UserClickedCancel--> [Cancelled]   (optimistic; late
+///             BatchCancelled events filtered out by apply_event)
+///           --Event::Error--> [Done]
+/// [Done/Cancelled] --dir re-pick / new dry-run--> [Analyzing]
 /// ```
+///
+/// Cancel is **optimistic**: `Msg::UserClickedCancel` sets
+/// `phase = Cancelled` immediately. `apply_event` then drops any
+/// late batch events (`BatchStarted` / `FileStarted` / `Progress`
+/// / `FileCompleted` / `BatchCompleted` / `BatchCancelled` /
+/// `Error`) for this batch — see `apply_event` phase guard.
+/// This eliminates the ~1.5s window where the badge flickered
+/// "encoding" after the user clicked cancel (lib cancel latency
+/// breakdown: §3.8.7.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchPhase {
     /// `Command::DryRun` dispatched; awaiting `Event::DryRunFinished`.
-    /// Dir picker disabled. Start button disabled (analyze in flight).
+    /// Dir picker enabled (re-pick resets). Start button disabled.
     Analyzing,
     /// DryRun done; user must click the bottom button to dispatch
-    /// `Command::StartBatch` (review #133 user feedback: encode
-    /// should be a deliberate user action, not auto-fired). The
-    /// button shows "Encode N files ▸" — the count is the dry-run's
-    /// to_encode total.
+    /// `Command::StartBatch`. The button shows **"Encode"** (no
+    /// count — we don't design for encoding a subset; per
+    /// §3.8.7.1 decision 2).
     AwaitingConfirm,
     /// `Command::StartBatch` dispatched; awaiting `BatchCompleted`
-    /// / `BatchCancelled` / `Event::Error`. Progress bar active.
-    /// Dir picker disabled. Start button shows "Cancel ✕".
+    /// / `BatchCancelled` / `Event::Error`. Start button shows
+    /// "Cancel ✕".
     Encoding,
-    /// Final state after the batch lifecycle ends. Dir picker
-    /// re-enables. Start button shows "Re-run ▸" (clicking
-    /// transitions back to `Analyzing` for a new cycle).
+    /// Final state after a successful batch lifecycle. Dir picker
+    /// re-enabled. Start button **disabled** (re-arm via dir
+    /// re-pick — per §3.8.7.1 decision 4).
     Done,
+    /// Final state after user-initiated cancel. Dir picker
+    /// re-enabled. Start button shows **"Encode"** (re-click
+    /// dispatches `StartBatch` with the cached dry-run records;
+    /// per §3.8.7.1 decision 5).
+    Cancelled,
 }
 
 /// 4 page tabs (per §3.8.7.2). `Setup` is the initial value.
@@ -515,29 +532,24 @@ pub fn reduce(
                     dispatch_dry_run_for_new_task(state, cmd_tx, config);
                 }
                 Some(BatchPhase::Done) => {
-                    // Active task is Done — user is re-arming.
-                    // Take the previous task out (it should already
-                    // be in task_history from apply_event, but the
-                    // take is defensive in case Some(Done) ever
-                    // surfaces without a prior move). Then start
-                    // fresh.
-                    //
-                    // **Do not** call `tasks.has_room()` here —
-                    // v1 capacity=1 means has_room returns false
-                    // whenever active.is_some() = true, which would
-                    // wrongly block re-arming with a "task queue
-                    // full" error.
-                    if let Some(prev) = state.tasks.active.take() {
-                        state.task_history.insert(0, prev);
-                    }
-                    dispatch_dry_run_for_new_task(state, cmd_tx, config);
+                    // v1.2 follow-up #2: Done requires dir re-pick
+                    // to re-arm. UserClickedStart in Done is a
+                    // no-op (button is disabled in the UI; this is
+                    // defense-in-depth — UI shouldn't dispatch
+                    // this, but if it does, ignore).
                 }
-                Some(BatchPhase::AwaitingConfirm) => {
-                    // v1.2 (review #133 follow-up): user clicked
-                    // 'Encode N files ▸' after reviewing the
-                    // dry-run results. Validate the dir is still
-                    // readable + non-empty (review-delta F2), then
-                    // dispatch StartBatch.
+                Some(BatchPhase::AwaitingConfirm) | Some(BatchPhase::Cancelled) => {
+                    // v1.2 follow-up #2: both AwaitingConfirm and
+                    // Cancelled dispatch StartBatch with the dir's
+                    // current files. AwaitingConfirm fires after
+                    // the user reviews the dry-run summary;
+                    // Cancelled fires after the user wants to
+                    // resume encoding post-cancel (button reads
+                    // "Encode" — §3.8.7.1 decision 5).
+                    //
+                    // Validate the dir is still readable +
+                    // non-empty (review-delta F2), then dispatch.
+                    // Same code path — keeps the contract tight.
                     let files = match collect_input_files(state, config) {
                         Ok(files) => files,
                         Err(CollectError::NoInputDir) => {
@@ -602,7 +614,31 @@ pub fn reduce(
         Msg::UserClickedCancel => {
             let phase = state.tasks.active.as_ref().map(|t| t.phase);
             match phase {
-                Some(BatchPhase::Analyzing) | Some(BatchPhase::Encoding) => {
+                Some(BatchPhase::Encoding) => {
+                    // v1.2 follow-up #2: optimistic cancel.
+                    // Set `phase = Cancelled` immediately so the
+                    // UI (badge / button) reflects the user's
+                    // intent without waiting for lib's late
+                    // `Event::BatchCancelled` (1-2s latency —
+                    // §3.8.7.6). The phase guard in `apply_event`
+                    // will drop the late event. Dispatch the
+                    // command so the lib can kill the in-flight
+                    // ffmpeg + clean up partial output.
+                    if let Some(t) = state.tasks.active.as_mut() {
+                        t.cancelled = true;
+                        t.phase = BatchPhase::Cancelled;
+                    }
+                    let _ = cmd_tx.try_send(Command::Cancel);
+                }
+                Some(BatchPhase::Analyzing) => {
+                    // v1.2 follow-up #2: best-effort cancel during
+                    // dry-run. lib doesn't poll cancel_token in
+                    // the analyze path (§3.8.7.4 limitations), so
+                    // the cancel signal is logged but the analyze
+                    // runs to completion. We still set
+                    // `cancelled = true` and let the eventual
+                    // `Event::DryRunFinished` handler check the
+                    // flag and discard the result.
                     if let Some(t) = state.tasks.active.as_mut() {
                         t.cancelled = true;
                     }
@@ -623,7 +659,19 @@ pub fn reduce(
                         // "this finished encoding".
                     });
                 }
-                None | Some(BatchPhase::Done) => {}
+                Some(BatchPhase::Cancelled) => {
+                    // Defense-in-depth: already cancelled. The
+                    // command was dispatched on the first click;
+                    // subsequent clicks are no-ops.
+                }
+                Some(BatchPhase::Done) => {
+                    // Done task — button is hidden (no active
+                    // encoding to cancel). User would need to
+                    // re-pick dir to start a new task.
+                }
+                None => {
+                    // No active task; nothing to cancel.
+                }
             }
         }
         Msg::UserClickedLoadHistory => {
@@ -651,6 +699,38 @@ pub fn reduce(
 }
 
 fn apply_event(state: &mut AppState, evt: Event) {
+    // v1.2 follow-up #2 — phase guard (optimistic cancel). Once
+    // a batch is Cancelled, the UI trusts the user's click over
+    // lib's eventual confirmation. All subsequent batch-scoped
+    // events for the current task are dropped. This eliminates
+    // the ~1-2s window where the badge flickered "encoding"
+    // after cancel (lib cancel latency breakdown §3.8.7.6) and
+    // the late `Event::BatchCancelled` flipping `phase` to
+    // `Done` (which would override the user's cancel intent).
+    //
+    // Non-batch events (`HistoryLoaded` / `ConfigSaved` /
+    // `AnalyzeStarted` / `AnalyzeFinished` / etc.) are NOT
+    // batch-scoped; the guard does not drop them.
+    if matches!(
+        evt,
+        Event::BatchStarted { .. }
+            | Event::FileStarted { .. }
+            | Event::Progress { .. }
+            | Event::FileCompleted { .. }
+            | Event::BatchCompleted { .. }
+            | Event::BatchCancelled { .. }
+            | Event::Error { .. }
+    ) && state
+        .tasks
+        .active
+        .as_ref()
+        .is_some_and(|t| t.phase == BatchPhase::Cancelled)
+    {
+        // Drop late events for the cancelled batch. lib cleanup
+        // happens silently in the background; user already saw
+        // the badge flip to [● CANCELLED] on click.
+        return;
+    }
     match evt {
         Event::BatchStarted { id, total_files } => {
             // Record the lib's batch_id on the active task
@@ -747,6 +827,12 @@ fn apply_event(state: &mut AppState, evt: Event) {
                 t.to_encode = to_encode;
                 t.to_skip = to_skip;
             }
+            // v1.2 follow-up #2: dry-run summary toast. The
+            // Analyze stats (`Found N to encode, M to skip` /
+            // `0 encodable`) live ONLY in the toast — the file
+            // list area is empty during Analyzing/AwaitingConfirm
+            // (§3.8.7.6 + the file list render in app.rs). Toast
+            // replaces the previous body-level summary line.
             if to_encode == 0 {
                 push_toast(
                     state,
@@ -759,12 +845,15 @@ fn apply_event(state: &mut AppState, evt: Event) {
                 });
                 return;
             }
-            // v1.2 (review #133 follow-up): set phase to
-            // AwaitingConfirm. The user reviews the file list
-            // (rendered from dry_run_records during this
-            // phase) and clicks "Encode N files ▸" in the
-            // bottom bar to start encoding. UserClickedStart's
-            // AwaitingConfirm arm dispatches StartBatch.
+            push_toast(
+                state,
+                format!("Found {to_encode} to encode ({to_skip} to skip)"),
+                ToastKind::Info,
+            );
+            // AwaitingConfirm: user reviews the toast, then
+            // clicks "Encode" (no count suffix — §3.8.7.1
+            // decision 2). UserClickedStart's AwaitingConfirm
+            // arm dispatches StartBatch.
             state.tasks.active.as_mut().unwrap().phase = BatchPhase::AwaitingConfirm;
         }
         Event::AnalyzeStarted { .. }
@@ -806,10 +895,25 @@ fn apply_event(state: &mut AppState, evt: Event) {
             state.progress.clear();
         }
         Event::BatchCancelled { completed, total } => {
+            // v1.2 follow-up #2: phase guard at the top of
+            // apply_event already dropped this event when the
+            // active task is in `Cancelled` phase (the optimistic
+            // cancel path). So reaching here means the active
+            // task is NOT Cancelled — most likely the cancel
+            // arrived during AwaitingConfirm (best-effort cancel
+            // before encoding started) or after a successful
+            // BatchCompleted but for a previous task. In both
+            // cases the existing finalize-with-cancelled=true
+            // behavior is the right fallback.
             finalize(state, |t| {
                 t.cancelled = true;
                 t.finished = true;
-                t.phase = BatchPhase::Done;
+                // Phase stays at whatever it was — could be
+                // AwaitingConfirm (best-effort cancel pre-Start)
+                // or Done (terminal cancel from a previous task).
+                // Don't force to Done because that would override
+                // a legitimate AwaitingConfirm in the best-effort
+                // case.
             });
             state.last_error = Some(format!("cancelled after {completed}/{total}"));
         }
@@ -1271,21 +1375,15 @@ mod tests {
     }
 
     #[test]
-    fn user_clicked_start_rearms_after_done() {
-        // Per review feedback: when the previous task is Done,
-        // clicking Start should NOT trigger a spurious "task queue
-        // full" error. The fix: take the done task out of active
-        // (push to history as a defensive fallback) and start
-        // fresh. The has_room() check inside the Some(Done) arm
-        // was the bug — it returned false because active.is_some()
-        // was true (capacity=1, no pending), even though the task
-        // was done and we wanted to overwrite it.
-        //
-        // Use /tmp as input_dir (real dir that should exist on
-        // Unix-like test envs). Even if /tmp is empty, the test
-        // still verifies the *re-arm path* doesn't trigger
-        // "task queue full" — last_error will be the empty-file
-        // warning instead.
+    fn user_clicked_start_in_done_is_noop() {
+        // v1.2 follow-up #2 (§3.8.7.1 decision 4): Done requires
+        // dir re-pick to re-arm. `Msg::UserClickedStart` in Done
+        // is a no-op (defense-in-depth — UI disables the button;
+        // the reducer arm ignores the click). The previous done
+        // task stays in `state.tasks.active` (already moved to
+        // `state.task_history` by `BatchCompleted` finalize, but
+        // a defensive Some(Done) might still surface during the
+        // race window).
         let mut state = fresh_state();
         let tx = cmd_tx();
         let prev_id = TaskId("20260101000000".into());
@@ -1305,26 +1403,25 @@ mod tests {
         });
         state.input_dir = Some(std::path::PathBuf::from("/tmp"));
         reduce(&mut state, Msg::UserClickedStart, &tx, &default_config());
-        // Previous done task moved to history (newest-first).
-        assert_eq!(state.task_history.len(), 1);
-        assert_eq!(state.task_history[0].task_id, prev_id);
-        // Active is now the new analyzing task (different task_id).
+
+        // No re-arm: the same task remains active, no new
+        // DryRun dispatched, no command sent to the lib.
         assert!(state.tasks.active.is_some());
-        let active_id = state.tasks.active.as_ref().unwrap().task_id.clone();
-        assert_ne!(active_id, prev_id);
         assert_eq!(
-            state.tasks.active.as_ref().unwrap().phase,
-            BatchPhase::Analyzing
+            state.tasks.active.as_ref().unwrap().task_id,
+            prev_id,
+            "Done-phase click must NOT replace the active task"
         );
-        // No spurious "task queue full" error. May be None (if
-        // /tmp has files matching extensions) or the empty-file
-        // warning — but never "task queue full".
-        if let Some(err) = state.last_error.as_deref() {
-            assert_ne!(
-                err, "task queue full",
-                "re-arm must not trigger spurious 'task queue full'"
-            );
-        }
+        assert_eq!(state.tasks.active.as_ref().unwrap().phase, BatchPhase::Done);
+        assert_eq!(
+            state.task_history.len(),
+            0,
+            "no movement to history (Done click is a no-op)"
+        );
+        // No toast / error fired (the button should be disabled
+        // in the UI; this path is unreachable in normal use).
+        assert!(state.toasts.is_empty());
+        assert!(state.last_error.is_none());
     }
 
     #[test]
@@ -1505,9 +1602,14 @@ mod tests {
     }
 
     #[test]
-    fn batch_cancelled_moves_to_task_history() {
+    fn user_clicked_cancel_sets_phase_to_cancelled_immediately() {
+        // v1.2 follow-up #2: optimistic cancel. The Encoding arm
+        // of `Msg::UserClickedCancel` sets `phase = Cancelled`
+        // immediately + dispatches `Command::Cancel`. The lib's
+        // eventual `Event::BatchCancelled` is filtered out by
+        // `apply_event`'s phase guard (separate test).
         let mut state = fresh_state();
-        let tx = cmd_tx();
+        let (tx, rx) = crossbeam_channel::unbounded::<Command>();
         state.tasks.active = Some(TaskInfo {
             task_id: TaskId("20260101000000".into()),
             batch_id: Some(1),
@@ -1522,6 +1624,59 @@ mod tests {
             records: vec![],
             dry_run_records: vec![],
         });
+        reduce(&mut state, Msg::UserClickedCancel, &tx, &default_config());
+
+        // Phase flips to Cancelled synchronously (no wait for
+        // lib's late Event::BatchCancelled).
+        assert_eq!(
+            state.tasks.active.as_ref().unwrap().phase,
+            BatchPhase::Cancelled,
+            "optimistic cancel: phase must be Cancelled in <1ms"
+        );
+        assert!(
+            state.tasks.active.as_ref().unwrap().cancelled,
+            "cancelled flag set alongside phase"
+        );
+        // Command::Cancel dispatched.
+        assert!(
+            matches!(rx.try_recv(), Ok(Command::Cancel)),
+            "Command::Cancel must be dispatched"
+        );
+        // No movement to history yet — the in-flight records stay
+        // visible until the user re-clicks Encode or picks a new
+        // dir (per §3.8.7.1 decision 5).
+        assert_eq!(state.task_history.len(), 0);
+    }
+
+    #[test]
+    fn cancelled_phase_filter_drops_late_batch_events() {
+        // v1.2 follow-up #2: phase guard at top of apply_event
+        // drops batch-scoped events (BatchStarted / FileStarted /
+        // Progress / FileCompleted / BatchCompleted /
+        // BatchCancelled / Error) when the active task is in
+        // Cancelled phase. This is the optimistic-cancel
+        // invariant: user click wins over lib's eventual
+        // confirmation.
+        let mut state = fresh_state();
+        let tx = cmd_tx();
+        state.tasks.active = Some(TaskInfo {
+            task_id: TaskId("20260101000000".into()),
+            batch_id: Some(1),
+            phase: BatchPhase::Cancelled,
+            dir: PathBuf::from("/x"),
+            total_files: 5,
+            to_encode: 5,
+            to_skip: 0,
+            encoded: 2,
+            cancelled: true,
+            finished: false,
+            records: vec![sample_record("/a.mp4", EncodingOutcome::Succeeded)],
+            dry_run_records: vec![],
+        });
+
+        // Late BatchCancelled — must be dropped (no state change).
+        let before_records_len = state.tasks.active.as_ref().unwrap().records.len();
+        let before_encoded = state.tasks.active.as_ref().unwrap().encoded;
         reduce(
             &mut state,
             Msg::Lib(Event::BatchCancelled {
@@ -1531,15 +1686,42 @@ mod tests {
             &tx,
             &default_config(),
         );
-        // Active should be None; history has the task with same id.
-        assert!(state.tasks.active.is_none());
-        assert_eq!(state.task_history.len(), 1);
-        let h = &state.task_history[0];
-        assert_eq!(h.task_id, TaskId("20260101000000".into()));
-        assert!(h.cancelled);
-        assert!(h.finished);
-        assert_eq!(h.phase, BatchPhase::Done);
-        assert_eq!(state.last_error.as_deref(), Some("cancelled after 2/5"));
+        assert_eq!(
+            state.tasks.active.as_ref().unwrap().phase,
+            BatchPhase::Cancelled,
+            "phase stays Cancelled after late BatchCancelled"
+        );
+        assert_eq!(
+            state.tasks.active.as_ref().unwrap().records.len(),
+            before_records_len,
+            "late BatchCancelled must NOT clear records"
+        );
+        assert_eq!(
+            state.tasks.active.as_ref().unwrap().encoded,
+            before_encoded,
+            "late BatchCancelled must NOT touch encoded count"
+        );
+        assert!(
+            state.last_error.is_none(),
+            "phase guard drops the event entirely; no last_error set"
+        );
+
+        // Late FileCompleted — must be dropped.
+        let before_records_len_2 = state.tasks.active.as_ref().unwrap().records.len();
+        reduce(
+            &mut state,
+            Msg::Lib(Event::FileCompleted {
+                index: 2,
+                record: sample_record("/late.mp4", EncodingOutcome::Succeeded),
+            }),
+            &tx,
+            &default_config(),
+        );
+        assert_eq!(
+            state.tasks.active.as_ref().unwrap().records.len(),
+            before_records_len_2,
+            "late FileCompleted dropped"
+        );
     }
 
     #[test]
@@ -1769,17 +1951,32 @@ mod tests {
             BatchPhase::AwaitingConfirm,
             "phase stays at AwaitingConfirm; no encoding happened"
         );
+        // v1.2 follow-up #2: DryRunFinished pushes a summary toast
+        // ("Found N to encode"); the AwaitingConfirm guard on
+        // UserClickedStart pushes a second toast ("no files").
+        // Both are user-action feedback; we expect 2 toasts.
         assert_eq!(
             state.toasts.len(),
-            1,
-            "expected one toast on empty-dir guard"
+            2,
+            "expected DryRun summary + empty-dir guard toasts"
         );
-        let toast = &state.toasts[0];
-        assert_eq!(toast.kind, ToastKind::Error);
+        // The empty-dir guard toast (most recent) is the Error
+        // kind — it's the actionable one for the user.
+        let guard_toast = state.toasts.back().unwrap();
+        assert_eq!(guard_toast.kind, ToastKind::Error);
         assert!(
-            toast.message.contains("no files"),
+            guard_toast.message.contains("no files"),
             "expected 'no files' message, got {}",
-            toast.message
+            guard_toast.message
+        );
+        // The DryRun summary toast is the Info kind, first in
+        // the deque.
+        let summary_toast = state.toasts.front().unwrap();
+        assert_eq!(summary_toast.kind, ToastKind::Info);
+        assert!(
+            summary_toast.message.contains("to encode"),
+            "expected 'to encode' message, got {}",
+            summary_toast.message
         );
     }
 

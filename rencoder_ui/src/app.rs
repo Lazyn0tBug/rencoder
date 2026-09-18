@@ -690,13 +690,20 @@ fn TaskPage(
             //   Encoding / Done: per-file encode records
             //     (the user watches progress; the file shows
             //      'Succeeded' only after ffmpeg completes it).
-            // The prior logic always preferred dry_run_records,
-            // which made the file list show 'Succeeded' during
-            // Encoding — the dry-run outcome, not the actual
-            // encode result. Fixed by phase-aware selection.
+            // v1.2 follow-up #2: phase-aware file list source.
+            // - Analyzing / AwaitingConfirm: file list area renders
+            //   EMPTY — dry-run results surface only via toast
+            //   (§3.8.7.6). Rendering dry_run_records here would
+            //   re-introduce the "show Succeeded during AwaitingConfirm"
+            //   bug (#1 in the user feedback).
+            // - Encoding: render records (per-file FileCompleted
+            //   events fill this in real time).
+            // - Done / Cancelled: render records (final outcomes).
             let list = match task.phase {
-                BatchPhase::Analyzing | BatchPhase::AwaitingConfirm => task.dry_run_records.clone(),
-                BatchPhase::Encoding | BatchPhase::Done => task.records.clone(),
+                BatchPhase::Analyzing | BatchPhase::AwaitingConfirm => Vec::new(),
+                BatchPhase::Encoding | BatchPhase::Done | BatchPhase::Cancelled => {
+                    task.records.clone()
+                }
             };
             (
                 list,
@@ -857,12 +864,10 @@ fn TaskPageButton(
             }
         }
         Some(BatchPhase::AwaitingConfirm) => {
-            // v1.2 (review #133 follow-up): the dry-run finished.
-            // Button shows the encode count and is enabled —
-            // click dispatches StartBatch (the reducer's
-            // AwaitingConfirm arm).
-            let active = state.read().tasks.active.clone();
-            let to_encode = active.as_ref().map(|t| t.to_encode).unwrap_or(0);
+            // v1.2 follow-up #2: dry-run finished; user reviews
+            // the summary toast, then clicks Encode. Button label
+            // is plain "Encode" — no count suffix (we don't
+            // design for encoding a subset; §3.8.7.1 decision 2).
             let tx_s = tx.clone();
             let cfg_s = cfg.clone();
             rsx! {
@@ -871,7 +876,24 @@ fn TaskPageButton(
                     onclick: move |_| {
                         state.with_mut(|s| reduce(s, Msg::UserClickedStart, &tx_s, &cfg_s));
                     },
-                    "Encode {to_encode} files ▸"
+                    "Encode"
+                }
+            }
+        }
+        Some(BatchPhase::Cancelled) => {
+            // v1.2 follow-up #2: post-cancel. Button shows
+            // "Encode" — re-click re-dispatches StartBatch with
+            // the cached dry_run_records. Same reducer arm as
+            // AwaitingConfirm (§3.8.7.1 decision 5).
+            let tx_s = tx.clone();
+            let cfg_s = cfg.clone();
+            rsx! {
+                button {
+                    class: "primary-btn",
+                    onclick: move |_| {
+                        state.with_mut(|s| reduce(s, Msg::UserClickedStart, &tx_s, &cfg_s));
+                    },
+                    "Encode"
                 }
             }
         }
@@ -969,12 +991,19 @@ fn BatchStatus(
         BatchPhase::AwaitingConfirm => "[● READY]",
         BatchPhase::Encoding => "[● ENCODING]",
         BatchPhase::Done => "[● DONE]",
+        BatchPhase::Cancelled => "[● CANCELLED]",
     };
     let badge_class = match phase {
         BatchPhase::Analyzing | BatchPhase::AwaitingConfirm | BatchPhase::Encoding => {
             "badge badge-active"
         }
         BatchPhase::Done => "badge badge-done",
+        // Cancelled: distinct visual from Done (terminal
+        // success) — uses a warning-style class so the user
+        // doesn't mistake a cancelled batch for a successful
+        // one. Style defined in style.css as `.badge-cancelled`
+        // (v1.2 follow-up #2).
+        BatchPhase::Cancelled => "badge badge-cancelled",
     };
     rsx! {
         div { class: "batch-status",
