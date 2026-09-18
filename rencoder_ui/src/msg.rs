@@ -181,6 +181,8 @@ pub const TOAST_DEFAULT_DURATION_MS: u32 = 4000;
 /// system). Renders as a fixed-position card in the top-right
 /// stack. Auto-dismissed after `duration_ms` unless the user
 /// clicks × first.
+#[allow(dead_code)] // fields read by the Toaster component
+// (app.rs); reducer pushes Toasts without reading them.
 #[derive(Debug, Clone)]
 pub struct Toast {
     /// Stable id — monotonic, wraps at u64::MAX (effectively
@@ -203,6 +205,8 @@ pub struct Toast {
 /// Toast severity. Drives both visual styling (left stripe
 /// color, icon) and a11y (aria-live="polite" for Info/Warning,
 /// "assertive" for Error).
+#[allow(dead_code)] // Info variant used by future paths;
+// current reducer only emits Warning / Error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToastKind {
     /// Neutral feedback (success, info). No special urgency.
@@ -509,7 +513,12 @@ pub fn reduce(
                     dispatch_dry_run_for_new_task(state, cmd_tx, config);
                 }
                 Some(BatchPhase::Analyzing) | Some(BatchPhase::Encoding) => {
-                    state.last_error = Some("task in progress".into());
+                    // Defense-in-depth: the bottom button is
+                    // disabled in these phases, so this is
+                    // unreachable via the UI. Keep the toast as
+                    // a last-resort signal for keyboard /
+                    // programmatic dispatch.
+                    push_toast(state, "task in progress", ToastKind::Warning);
                 }
             }
         }
@@ -661,9 +670,11 @@ fn apply_event(
                 t.to_skip = to_skip;
             }
             if to_encode == 0 {
-                state.last_error = Some(format!(
-                    "0 encodable files ({to_skip} skipped); pick a different dir"
-                ));
+                push_toast(
+                    state,
+                    format!("0 encodable files ({to_skip} skipped); pick a different dir"),
+                    ToastKind::Warning,
+                );
                 finalize(state, |t| {
                     t.cancelled = false;
                     // t.finished stays false — plan never ran.
@@ -680,7 +691,11 @@ fn apply_event(
             let files = match collect_input_files(state, config) {
                 Ok(files) => files,
                 Err(_) => {
-                    state.last_error = Some("input dir missing or unreadable after dry-run".into());
+                    push_toast(
+                        state,
+                        "input dir missing or unreadable after dry-run",
+                        ToastKind::Error,
+                    );
                     finalize(state, |t| {
                         t.cancelled = false;
                     });
@@ -697,10 +712,14 @@ fn apply_event(
             // user would see a confusing lib-side error instead of
             // the explicit 'no files' message.
             if files.is_empty() {
-                state.last_error = Some(format!(
-                    "no files in {} (file list changed since DryRun)",
-                    state.tasks.active.as_ref().unwrap().dir.display()
-                ));
+                push_toast(
+                    state,
+                    format!(
+                        "no files in {} (file list changed since DryRun)",
+                        state.tasks.active.as_ref().unwrap().dir.display()
+                    ),
+                    ToastKind::Error,
+                );
                 finalize(state, |t| {
                     t.cancelled = false;
                 });
@@ -783,15 +802,18 @@ fn apply_event(
             // review-delta F1: if the lib's save failed (it
             // emits this with the prefix 'save failed:'),
             // surface the error on the Setup-page save-status
-            // indicator too. The global last_error banner still
-            // shows; this gives the Setup form a specific
-            // status when the user is editing.
+            // indicator AND push a toast. Other Event::Error
+            // paths (transcoding failures etc.) set the global
+            // last_error banner but don't fire a toast —
+            // toasts are reserved for user-action feedback.
             if let Some(rest) = message.strip_prefix("save failed:") {
                 // rest is the lib's I/O error string (e.g.
                 // " permission denied (os error 13)" with a
                 // leading space — strip it so the indicator
-                // shows "Save failed: permission denied ...").
-                state.config_save_status = format!("Save failed: {}", rest.trim_start());
+                // and toast show "Save failed: permission denied ...").
+                let detail = rest.trim_start();
+                state.config_save_status = format!("Save failed: {detail}");
+                push_toast(state, format!("Save failed: {detail}"), ToastKind::Error);
             }
             state.last_error = Some(message);
             // Per §3.8.7.1: during Encoding, move to history
@@ -961,21 +983,26 @@ fn dispatch_dry_run_for_new_task(
     let files = match collect_input_files(state, config) {
         Ok(files) => files,
         Err(CollectError::NoInputDir) => {
-            state.last_error = Some("no input dir selected".into());
+            // v1.2 (review #133 follow-up): user-action feedback
+            // goes through the toast channel, not last_error
+            // (which is for lib-side errors per §3.8.7.2).
+            push_toast(state, "no input dir selected", ToastKind::Error);
             return;
         }
         Err(CollectError::UnreadableDir) => {
             // `UnreadableDir` only fires when `read_dir(state.input_dir)`
             // was attempted, which requires `state.input_dir` to be
             // `Some` (NoInputDir short-circuits before read_dir).
-            // So `unwrap()` is safe here — the alternative would be
-            // to thread the failing path back through CollectError,
-            // but it's a marginal ergonomic win.
+            // So `unwrap()` is safe here.
             let dir = state.input_dir.as_ref().unwrap();
-            state.last_error = Some(format!(
-                "cannot read {} (permission denied or path missing)",
-                dir.display()
-            ));
+            push_toast(
+                state,
+                format!(
+                    "cannot read {} (permission denied or path missing)",
+                    dir.display()
+                ),
+                ToastKind::Error,
+            );
             return;
         }
     };
@@ -997,7 +1024,9 @@ fn dispatch_dry_run_for_new_task(
                 extensions
             )
         };
-        state.last_error = Some(detail);
+        // Empty directory is a warning, not an error — the user
+        // can pick another dir without it being a "failure".
+        push_toast(state, detail, ToastKind::Warning);
         return;
     }
     let params = build_encode_params_from_config(config);
@@ -1170,17 +1199,24 @@ mod tests {
     }
 
     #[test]
-    fn user_clicked_start_without_dir_records_error() {
+    fn user_clicked_start_without_dir_pushes_toast() {
+        // review #133 v1.2: user-action feedback goes through
+        // the toast channel (not last_error).
         let mut state = fresh_state();
         let tx = cmd_tx();
         reduce(&mut state, Msg::UserClickedStart, &tx, &default_config());
-        assert!(state.last_error.is_some());
-        assert!(state.last_error.unwrap().contains("no input dir"));
         assert!(state.tasks.active.is_none());
+        assert_eq!(state.toasts.len(), 1);
+        let toast = &state.toasts[0];
+        assert_eq!(toast.kind, ToastKind::Error);
+        assert!(toast.message.contains("no input dir"));
     }
 
     #[test]
-    fn user_clicked_start_with_active_task_records_busy_error() {
+    fn user_clicked_start_with_active_task_pushes_toast() {
+        // Defense-in-depth: button is disabled during Analyzing,
+        // but if a click reaches the reducer, fire a warning
+        // toast (not last_error — that's for lib-side errors).
         let mut state = fresh_state();
         let tx = cmd_tx();
         state.tasks.active = Some(TaskInfo {
@@ -1199,11 +1235,10 @@ mod tests {
         });
         state.input_dir = Some(PathBuf::from("/y"));
         reduce(&mut state, Msg::UserClickedStart, &tx, &default_config());
-        assert_eq!(
-            state.last_error.as_deref(),
-            Some("task in progress"),
-            "second Start click during Analyzing should be rejected"
-        );
+        assert_eq!(state.toasts.len(), 1);
+        let toast = &state.toasts[0];
+        assert_eq!(toast.kind, ToastKind::Warning);
+        assert_eq!(toast.message, "task in progress");
     }
 
     #[test]
@@ -1647,8 +1682,8 @@ mod tests {
         );
         // The success path is gated on collect_input_files returning
         // Ok(non-empty). With an empty /nonexistent-for-test, this
-        // goes through the error branch:
-        //   last_error set, task finalized, active is None.
+        // goes through the error branch (toast pushed, task
+        // finalized, active is None).
         let _ = tx; // sender used
                     // Either path is acceptable; what we want to verify is:
                     //   - to_encode / to_skip are computed from records
@@ -1657,7 +1692,10 @@ mod tests {
         match state.tasks.active.as_ref() {
             None => {
                 // Error/finalize path.
-                assert!(state.last_error.is_some());
+                assert!(
+                    !state.toasts.is_empty(),
+                    "expected a toast on the error path"
+                );
             }
             Some(t) => {
                 // Success path (phase = Encoding, records cleared).
@@ -1723,20 +1761,23 @@ mod tests {
         // Cleanup the empty tempdir.
         let _ = std::fs::remove_dir_all(&tmp);
         // The guard should fire: the dir is empty after the
-        // test setup (we never created files). last_error set,
+        // test setup (we never created files). Toast pushed,
         // task finalized, no active task, NO StartBatch dispatched.
         assert!(
             state.tasks.active.is_none(),
             "expected finalize; active is still Some"
         );
-        assert!(
-            state.last_error.is_some(),
-            "expected last_error to be set on empty-dir guard"
+        assert_eq!(
+            state.toasts.len(),
+            1,
+            "expected one toast on empty-dir guard"
         );
-        let err = state.last_error.as_deref().unwrap();
+        let toast = &state.toasts[0];
+        assert_eq!(toast.kind, ToastKind::Error);
         assert!(
-            err.contains("no files"),
-            "expected 'no files' message, got {err}"
+            toast.message.contains("no files"),
+            "expected 'no files' message, got {}",
+            toast.message
         );
     }
 
@@ -1827,12 +1868,16 @@ mod tests {
         let h = &state.task_history[0];
         assert!(!h.finished);
         assert!(!h.cancelled);
-        let err = state.last_error.as_deref().expect("last_error must be set");
+        // v1.2: user-action feedback is a toast (not last_error).
+        assert_eq!(state.toasts.len(), 1);
+        let toast = &state.toasts[0];
+        assert_eq!(toast.kind, ToastKind::Warning);
         assert!(
-            err.contains("0 encodable files"),
-            "unexpected last_error: {err}"
+            toast.message.contains("0 encodable files"),
+            "unexpected toast message: {}",
+            toast.message
         );
-        assert!(err.contains("2 skipped"));
+        assert!(toast.message.contains("2 skipped"));
     }
 
     #[test]
