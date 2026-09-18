@@ -156,6 +156,79 @@ pub struct AppState {
     /// Display label for the Setup page's save-status indicator
     /// (`"Saved at HH:MM:SS"` / `"Saving…"` / `"Save failed: …"`).
     pub config_save_status: String,
+    /// v1.2 (review #133 follow-up): transient user-action
+    /// feedback toasts (top-right stack, 4s auto-dismiss, FIFO
+    /// cap 5). Distinct from `last_error` (which is the global
+    /// banner for lib-side errors; persistent until cleared).
+    /// Toasts are user-action feedback only.
+    pub toasts: VecDeque<Toast>,
+    /// Monotonic counter for `Toast.id` — lets the Toaster
+    /// component use the id as the Dioxus key (stable across
+    /// re-renders while the toast is on screen).
+    next_toast_id: u64,
+}
+
+/// Cap on the toasts queue. Older toasts are popped when the
+/// queue exceeds this — keeps the UI bounded even under bursts
+/// of failures.
+pub const TOAST_QUEUE_CAP: usize = 5;
+
+/// Default toast lifetime (ms). User can dismiss earlier via the
+/// × button; auto-dismiss otherwise.
+pub const TOAST_DEFAULT_DURATION_MS: u32 = 4000;
+
+/// One transient UI feedback message (review #133 v1.2 toast
+/// system). Renders as a fixed-position card in the top-right
+/// stack. Auto-dismissed after `duration_ms` unless the user
+/// clicks × first.
+#[derive(Debug, Clone)]
+pub struct Toast {
+    /// Stable id — monotonic, wraps at u64::MAX (effectively
+    /// never — billions of toasts before wrap). The Toaster
+    /// uses this as the Dioxus `key` so reordering / removal
+    /// doesn't remount unrelated toasts.
+    pub id: u64,
+    /// Display text. Single line (CSS truncates with ellipsis if
+    /// very long; in practice messages are < 80 chars).
+    pub message: String,
+    /// Drives the left-stripe color and icon (⚠ / ⚡ / ⓘ).
+    pub kind: ToastKind,
+    /// When the toast was pushed. The Toaster's setInterval
+    /// prunes entries where `now - created_at >= duration_ms`.
+    pub created_at: DateTime<Utc>,
+    /// Auto-dismiss delay in ms. Default 4000.
+    pub duration_ms: u32,
+}
+
+/// Toast severity. Drives both visual styling (left stripe
+/// color, icon) and a11y (aria-live="polite" for Info/Warning,
+/// "assertive" for Error).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToastKind {
+    /// Neutral feedback (success, info). No special urgency.
+    Info,
+    /// Non-fatal issue — user should know but action isn't
+    /// required (e.g. "0 encodable files; pick a different dir").
+    Warning,
+    /// Failed action — user did something and it didn't work.
+    Error,
+}
+
+/// Push a toast onto the queue with FIFO eviction at
+/// `TOAST_QUEUE_CAP`. Helper used by the reducer on user-action
+/// failure paths; tests assert on the queue contents.
+pub fn push_toast(state: &mut AppState, msg: impl Into<String>, kind: ToastKind) {
+    state.toasts.push_back(Toast {
+        id: state.next_toast_id,
+        message: msg.into(),
+        kind,
+        created_at: Utc::now(),
+        duration_ms: TOAST_DEFAULT_DURATION_MS,
+    });
+    state.next_toast_id = state.next_toast_id.wrapping_add(1);
+    while state.toasts.len() > TOAST_QUEUE_CAP {
+        state.toasts.pop_front();
+    }
 }
 
 /// Task queue. v1: capacity = 1, `pending` always empty. v1.1

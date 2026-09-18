@@ -2612,6 +2612,94 @@ phase == Done (unreachable; finalize moves task to history) -> button hidden
 - 同一份 `state.log` 数据(`[LOG]` page 渲染全 buffer;footer 渲染末 5 行)
 - 滚动 `[LOG]` page 时 footer 不动(footer 只是 viewport)
 
+**Toast notifications** (v1.2,所有 page 都有,叠加在内容上方):
+
+Transient UI feedback for user-action outcomes that should NOT occupy body space。区别于 `state.last_error` 的全局 banner:
+
+| 通道 | 用途 | 显示位置 | 持久性 |
+|------|------|----------|--------|
+| `state.last_error` banner | lib-side / 编码失败 / 系统错误(`Event::Error` 派生的) | TopBar 下方一行 | 持久(用户手动 dismiss 或新事件覆盖) |
+| Toast | user-action feedback(点 Analyze / pick dir / save 等的反馈) | Viewport 右上,叠加在内容上方 | 4 秒后自动消失,带 × 手动 dismiss 按钮 |
+
+**Toast 触发的 reducer paths** (v1.2):
+
+| 用户动作 / lib 事件 | Toast 文案 | kind |
+|---------------------|-----------|------|
+| 点 Analyze / Re-run, input_dir = None | `"no input dir selected"` | error |
+| 点 Analyze / Re-run, dir 不可读 | `"cannot read {dir} (permission denied or path missing)"` | error |
+| 点 Analyze / Re-run, dir 空 | `"no files in {dir} matching extensions {exts}"`(或 `"no files in {dir}"`) | warning |
+| DryRunFinished, to_encode == 0 | `"0 encodable files ({n} skipped); pick a different dir"` | warning |
+| DryRunFinished, dir 中途变空 | `"no files in {dir} (file list changed since DryRun)"` | error |
+| DryRunFinished, dir 中途消失 | `"input dir missing or unreadable after dry-run"` | error |
+| Setup page save 失败(`save failed:` 前缀) | `"Save failed: {detail}"` | error |
+| Setup page save 成功(`Event::ConfigSaved`) | (不弹 toast;Setup 页已有 save-status 指示) | — |
+| Cancel 完成 | (不弹 toast;`state.last_error = "cancelled after {n}/{m}"` 已经显示) | — |
+| lib Event::Error (非以上 save-failed) | 走 `state.last_error` banner(不弹 toast) | — |
+
+**Toast 数据模型** (`AppState`):
+
+```rust
+pub toasts: VecDeque<Toast>,
+
+pub struct Toast {
+    pub id: u64,                  // monotonic counter for keying
+    pub message: String,
+    pub kind: ToastKind,          // Info | Warning | Error
+    pub created_at: DateTime<Utc>,
+    pub duration_ms: u32,         // default 4000
+}
+
+pub enum ToastKind { Info, Warning, Error }
+```
+
+- `VecDeque` (不是 `Vec`)— `pop_front` 用于 prune 过期 toast
+- Capacity: 5(超过时 pop_front 最老的;够用就好,不阻塞 UI)
+
+**Reducer helper**:
+
+```rust
+fn push_toast(state: &mut AppState, msg: impl Into<String>, kind: ToastKind) {
+    state.toasts.push_back(Toast {
+        id: state.next_toast_id,
+        message: msg.into(),
+        kind,
+        created_at: Utc::now(),
+        duration_ms: 4000,
+    });
+    state.next_toast_id = state.next_toast_id.wrapping_add(1);
+    while state.toasts.len() > 5 {
+        state.toasts.pop_front();
+    }
+}
+```
+
+**Auto-dismiss** (`Toaster` 组件):
+
+每 250ms 跑一次 `setInterval` (Dioxus `use_future` + `gloo_timers` 或自旋)— 扫描 `state.toasts`,把 `now - created_at >= duration_ms` 的项 `pop_front`。4s 默认寿命下,4 次扫描轮询后过期 toast 消失,延迟 < 250ms。
+
+**Toast UI** (右上角 stacked):
+
+```text
+                                    ┌──────────────────────────┐
+                                    │ ⚠ no input dir selected  ×│
+                                    ├──────────────────────────┤
+                                    │ ⚠ 0 encodable files...   ×│
+                                    └──────────────────────────┘
+```
+
+- `position: fixed; top: 60px; right: 16px;` (60px 避开 sticky TopBar)
+- z-index: 20(高于 TopBar 的 10,也高于 button bar 的 10)
+- Stack 竖排,新 toast 在上(`flex-direction: column-reverse` 或插入到前端)
+- 每条 toast: ~40px 高 + padding,左侧 colored stripe 表 kind,右侧 × dismiss 按钮
+- 颜色:Info 用 accent(#16a34a),Warning 用 amber(#d97706),Error 用 red(#dc2626)
+- 不阻塞 main content(fixed + 透明背景)— 用户可以同时操作 button bar 和 file list
+
+**为什么不用 `state.last_error` 做这事**:`last_error` 是**全局** banner(顶部),`Event::Error` 派生,持续显示直到新事件覆盖或用户切 tab。Toast 是**局部**反馈(右上角),user-action outcome 专用,自动消失。两者并存:
+- 编码过程中遇到 ffmpeg 错误 → last_error 顶部 banner(用户应该注意到)
+- 用户点 Analyze,选了空目录 → toast 右上角(用户立刻看到,4s 后自动消失,不占据顶部 banner)
+
+**v1.2 limitations table 新行** (§3.8.7.4):"User-action feedback 占 body 空间" — v1.2 fixed via toast。
+
 **Active state 默认值**: app 启动时 active tab = `[SETUP]`,除非有未完成的 batch(没 v1 不存在)。Tab 切换走 reducer(`Msg::UserClickedTab(Page)` → `state.active_page = page`),保持 testable。
 
 **Concrete 组件** (按 page 分组):
@@ -2707,6 +2795,7 @@ phase == Done (unreachable; finalize moves task to history) -> button hidden
 | Cross-session task 导航缺失 | `task_history` 是 session 内 cache(进程退出即丢);`state.history` 是 cross-session 但以 per-file EncodingRecord 为单位。**没有** task 维度的 cross-session 视图——v1 看不到昨天跑的 batch 用了哪个 dir / 多少文件 | v1.1 启动时 load Parquet records → group by batch_id → 渲染成 TaskInfo 列表。数据后端已经是 Parquet(`encoding-*.parquet`),不引新 store |
 | Settings inline edit | **v1.2 implemented**: `[SETUP]` 页每个字段 `<input>` `oninput` 直接调 `AppConfig::save` (real-time TOML atomic write via `write_atomic`). 没有 Save 按钮 | — |
 | Page-header `[NAME]` 文字冗余 (`[TASK]` / `[HISTORY]` / `[LOG]` 与 TopBar tab 重名) | **v1.2 fixed**: drop `[TASK]` / `[HISTORY]` / `[LOG]` header rows。原 layout 把 header 留在 page 是为了给 top-right button 找一个 row——这版 button 改成 sticky 底部(随 phase 动态 show / hide),header 没有存在的必要。省 ~50px 垂直空间,按钮位置贴近 file list 看完后的视线终点。`[SETUP]` header 在 v1.2 早期已去(review #133 part 3b),这次扩展到剩余 3 页保持一致 | — |
+| User-action feedback 占据 main body 空间 | **v1.2 fixed**: 加 toast 通知系统(右上角 fixed,4s 自动 dismiss,带 × 按钮)。`state.last_error` banner 仍负责 lib-side 错误(`Event::Error` 派生,持久);toast 负责 user-action 反馈(点 Analyze 后 dir 不可读 / DryRun 0 encodable / save 失败等),不占 body 空间。两通道并存:lib 错误 → banner;action feedback → toast。容量 5(FIFO) | — |
 
 **v1 安全保证**(从 v1.1 deferred 提前到 v1 实现,per §3.8.7 product-lens / scope-guardian review 反馈):
 
