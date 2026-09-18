@@ -125,6 +125,15 @@ pub struct AppState {
     /// Last fatal error (any source). UI renders it as the global
     /// status badge.
     pub last_error: Option<String>,
+    /// In-memory mirror of the on-disk `AppConfig` for the Setup
+    /// page's inline-edit form (review #133). Updated by every
+    /// `Msg::UserEditedConfigField` reducer arm and written to
+    /// TOML via `Command::SaveConfig`. Initialized at app start
+    /// from the loaded `AppConfig`.
+    pub config_draft: rencoder_lib::config::app::AppConfig,
+    /// Display label for the Setup page's save-status indicator
+    /// (`"Saved at HH:MM:SS"` / `"Saving…"` / `"Save failed: …"`).
+    pub config_save_status: String,
 }
 
 /// Task queue. v1: capacity = 1, `pending` always empty. v1.1
