@@ -554,10 +554,15 @@ fn apply_event(state: &mut AppState, evt: Event) {
             }
             if let Some(t) = state.tasks.active.as_mut() {
                 t.dry_run_records = records.clone();
-                t.to_encode = records
+                // Hoist the to_encode count so phase 2b's
+                // auto-encode path can reuse it without re-iterating
+                // records. No behavior change in this commit —
+                // phase is still set to AwaitingConfirm (legacy).
+                let to_encode = records
                     .iter()
                     .filter(|r| matches!(r.outcome, EncodingOutcome::Succeeded))
                     .count();
+                t.to_encode = to_encode;
                 t.to_skip = t.total_files - t.to_encode;
                 t.phase = BatchPhase::AwaitingConfirm;
             }
