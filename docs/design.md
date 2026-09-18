@@ -2504,46 +2504,116 @@ fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>, config: &App
 
 #### 3.8.7.1 Workflow state machine
 
-> **TL;DR** — 一个 task 走四个 phase(Analyzing → AwaitingConfirm →
-> Encoding → Done),`BatchPhase` 是唯一真相。Dir picker 在任何 active
-> phase(Analyzing / AwaitingConfirm / Encoding)期间被锁;只有 `Done`
-> 之后才能再选目录。
+> **TL;DR** — 一个 task 走六个 phase(`None` / `Analyzing` /
+> `AwaitingConfirm` / `Encoding` / `Done` / `Cancelled`),`BatchPhase`
+> 是唯一真相。Cancel 是**乐观的**:用户点 Cancel 的瞬间
+> `phase = Cancelled`,lib 的延迟 `Event::BatchCancelled` 被 phase
+> filter 丢弃——避免"badge 还闪 encoding"的矛盾 UI。
 
-**State diagram** (v1.2 — AwaitingConfirm dropped; auto-encode
-on positive dry-run count):
+**State diagram** (v1.2 follow-up #2 — AwaitingConfirm restored
+2-click Confirm; Cancelled phase added for terminal-cancel
+semantics):
 
 ```text
-                UserSelectedDir / UserClickedStart (to_encode=0)
+                    UserSelectedDir / UserClickedStart
    [None] ──────────────────────────────────────────────> [Analyzing]
       ▲                                                          │
       │                                                          │ Event::DryRunFinished
       │                                                          │ (to_encode > 0)
-      │                                                          ▼  auto-dispatch
-      │                                                       [Encoding] ─────────────┐
-      │                                                          │                     │
-      │                                                          │ Event::BatchCompleted │
-      │                                                          │ Event::BatchCancelled │ Event::Error
-      │                                                          ▼                     │
-      └────────────────── UserClickedStart (re-arm) ───────> [Done] ◄─────────────────┘
-                                                              │
-                                                              └─ UserClickedStart → [Analyzing]
+      │                                                          ▼
+      │                                                  [AwaitingConfirm] ─┐
+      │                                                          │           │ UserClickedStart
+      │                                                          ▼           │ (dispatches StartBatch)
+      │ UserClickedCancel (optimistic) ┌──────────> [Cancelled]   │           ▼
+      │                                │                ▲          │      [Encoding] ────────────┐
+      │                                │                │          │         │                    │
+      │                                │ Event::BatchCancelled     │         │ Event::BatchCompleted│
+      │                                │ (LATE, ignored by filter) │         │ Event::BatchCancelled│
+      │                                │                           │         │ Event::Error         │
+      │                                │                           │         ▼                    │
+      │                                └───────────────────────────┴───> [Done] ◄─────────────────┘
+      │                                                                       │
+      └───────────────────── UserSelectedDir / Re-pick ──────────────────────┘
 ```
 
-**Per-phase semantics** (v1.2 — single Start button):
+**Per-phase semantics** (v1.2 follow-up #2 — 6 states; 2-click
+Confirm restored; cancel is optimistic):
 
-| Phase | 来源 | Dir picker | Start btn label | Start btn enabled | Task page 显示 |
-|-------|------|-----------|-----------------|------------------|---------------|
-| `None` + dir 未选 | initial | enabled | "Analyze…" | **disabled** (dir required) | "Pick a directory." |
-| `None` + dir 已选 + 正在 dry-run | `Msg::UserSelectedDir` auto-dispatch | enabled | "Analyze…" | **disabled** | spinner + "scanning N files…" |
-| `None` + dir 已选 + dry-run 完成 + `to_encode > 0` | `Event::DryRunFinished` auto-dispatch | enabled | "Encode N files ▸" | **enabled** | count summary + scrollable file list |
-| `None` + dir 已选 + dry-run 完成 + `to_encode == 0` | `Event::DryRunFinished` (no auto-encode) | enabled | "Encode (no encodable files)" | **disabled** (bug fix — was clickable before v1.2) | count summary + file list (all marked Skipped) |
-| `Analyzing` | dry-run in flight (UI button reflects "Analyze…" disabled) | **disabled** | "Analyze…" | **disabled** | spinner |
-| `Encoding` | `Event::BatchStarted` (lib accepted `Command::StartBatch`) | **disabled** | "Cancel ✕" | **enabled** (dispatches `Command::Cancel`) | progress bar + per-file table + ETA |
-| `Done` | `BatchCompleted` / `BatchCancelled` / `Error` | enabled | "Re-run ▸" | **enabled** (re-arms, transitions back to `Analyzing`) | summary: N encoded / M skipped / 0 failed |
+| Phase | 来源 | Dir picker | Button label | Button enabled | File list |
+|-------|------|-----------|--------------|----------------|-----------|
+| `None` + dir 未选 | initial | enabled | (placeholder) | **disabled** | empty |
+| `Analyzing` | `Command::DryRun` in flight | enabled (re-pick resets) | "Analyze…" | **disabled** | empty (dry-run results in toast, not list) |
+| `AwaitingConfirm` | `Event::DryRunFinished` (to_encode > 0) | enabled | **"Encode"** | **enabled** | empty (records → toast only) |
+| `Encoding` | `Event::BatchStarted` (lib accepted `Command::StartBatch`) | enabled (re-pick cancels + resets) | "Cancel ✕" | **enabled** (dispatches `Command::Cancel`) | records (Pending / Encoding / Succeeded / Failed) |
+| `Done` | `BatchCompleted` / late `BatchCancelled` (filtered to terminal) | enabled | (placeholder) | **disabled** (re-arm via dir re-pick) | records (final outcomes) |
+| `Cancelled` | `Msg::UserClickedCancel` 立即设;`Event::BatchCancelled` late events ignored | enabled | **"Encode"** | **enabled** (re-click re-dispatches `StartBatch`) | records at cancellation point (Succeeded up to cancel, in-flight record absent — deleted by lib cleanup) |
 
-**Single-button UX**: v1.2 collapses the old 5-state machine (Start ▸ / Analyzing… / AwaitingConfirm + Cancel / Cancel / Re-arm) into a **3-state button** on the Task tab. State 1 (idle, dir not picked) and State 2 (analyze running) both show "Analyze…" disabled; State 3 (dry-run done) shows "Encode N files ▸" or "Encode (no encodable files)" depending on the count; State 4 (encoding) shows "Cancel ✕". The AwaitingConfirm phase is gone — auto-encode from positive dry-run count is the new "1 click" experience.
+**Key semantic decisions**:
 
-**No auto-switch** (carried over from v1.1):用户在 `[SETUP]` 编辑配置后,UI **不自动切换**到 `[TASK]` 页——auto-switch 会把误改配置的用户困在 TASK 页。Setup 编辑是 real-time (每个字段的 `oninput` 直接调 `AppConfig::save`),所以切换到 Task 之前配置已落盘。Dir picker 锁仍然生效(per phase rules above)。
+1. **2-click Confirm restored** (v1.2 follow-up #2). After
+   `DryRunFinished`, phase = `AwaitingConfirm`. User reviews the
+   dry-run summary (delivered via **toast**, not persistent file
+   list — see `§3.8.7.6`), then clicks "Encode" to dispatch
+   `StartBatch`. We do NOT auto-encode on positive dry-run count —
+   the user must opt in.
+
+2. **Button label = "Encode" (no "N files")**. We don't design for
+   encoding a subset of files; the user either encodes all
+   eligible or none. Drop the count from the button label; the
+   count is in the toast summary.
+
+3. **Cancel is optimistic** (`§3.8.7.6`). On `Msg::UserClickedCancel`,
+   reducer sets `phase = Cancelled` **immediately** and dispatches
+   `Command::Cancel` to lib. All subsequent `Event::*` for this
+   batch are filtered out by a phase guard at the top of
+   `apply_event`. This eliminates the ~1.5s window where the
+   badge flickered "encoding" after user clicked cancel — see
+   `§3.8.7.6` for the lib cancel latency breakdown.
+
+4. **`Done` requires dir re-pick** to re-arm. The Done phase
+   leaves the button disabled; picking a directory (or re-picking
+   the same one) transitions back to `Analyzing` via a fresh
+   dry-run. This gives the user an explicit "I'm starting over"
+   gesture and avoids stale dry-run records being silently re-used.
+
+5. **`Cancelled` → "Encode"** (not "Re-run"). After cancel, the
+   button shows "Encode" enabled. Clicking re-dispatches
+   `StartBatch` with the dry-run records already in
+   `state.tasks.active.dry_run_records` — no second dry-run
+   unless the user changes the directory.
+
+**Phase guard for late lib events** (`apply_event`):
+
+```rust
+fn apply_event(state: &mut AppState, evt: Event) {
+    // Phase guard: once a batch is Cancelled, the UI trusts the
+    // user's click over lib's eventual confirmation. All subsequent
+    // batch-scoped events for the current task are dropped. This
+    // is the optimistic-cancel invariant.
+    if state.tasks.active.as_ref().map_or(false, |t| t.phase == BatchPhase::Cancelled) {
+        match evt {
+            Event::BatchStarted { .. }
+            | Event::FileStarted { .. }
+            | Event::Progress { .. }
+            | Event::FileCompleted { .. }
+            | Event::BatchCompleted { .. }
+            | Event::BatchCancelled { .. }
+            | Event::LogLine { .. }
+            | Event::Error { .. } => return,
+            // History / config / dry-run events are not batch-scoped
+            // — fall through.
+            _ => {}
+        }
+    }
+    match evt { /* ... */ }
+}
+```
+
+The guard is conservative (drops everything for the cancelled batch
+including Error / LogLine) because the user's intent has already
+been recorded; lib cleanup happens silently in the background.
+
+**No auto-switch** (carried over from v1.1):用户在 `[SETUP]` 编辑配置后,UI **不自动切换**到 `[TASK]` 页——auto-switch 会把误改配置的用户困在 TASK 页。Setup 编辑是 real-time (每个字段的 `oninput` 直接调 `AppConfig::save`),所以切换到 Task 之前配置已落盘。Dir picker 在所有 phase 都 enabled (per table above)——用户随时可以 re-pick 触发 reset。
 
 **TaskQueue capacity** (v1: 1, v1.1: N):guard 走 `tasks.active.is_some() || tasks.pending.len() >= tasks.capacity`,**不**走 batch id 比较(per review 反馈 ——task 是 gating unit,batch id 只是映射字段)。v1 capacity = 1 意味着最多一个 active task——空 queue 时 `UserClickedStart` 派 DryRun(填 `tasks.active`);active 非空 + phase != Done 时,start 被拒(reducer 设 `last_error`)。v1.1 提升 capacity 到 N 后,多余的 task push 进 `tasks.pending`(FIFO),active 完成时 promote。详见 §3.8.7 `TaskQueue` 结构。
 
@@ -2584,15 +2654,16 @@ on positive dry-run count):
 
 **Why drop the page headers**: `[TASK]` / `[HISTORY]` / `[LOG]` 文字标签与 TopBar 的同名 tab 重复。原 layout 把 `[NAME]────` 放在 page header 是为了给 top-right button 找一个 row;但 button 完全可以放到 page 底部(随 phase 动态 show / hide)。这样省 ~50px 垂直空间,且按钮位置贴近用户的视线终点(file list 看完即按按钮,不需要回头找)。`[SETUP]` 已经在 v1.2 早期工作里去掉 header(review #133 part 3b)——这次扩展到剩余 3 页保持一致。
 
-**Task page bottom button states** (与之前 §3.8.7.1 state machine 一致):
+**Task page bottom button states** (v1.2 follow-up #2 — 6 states; see
+`§3.8.7.1` for the canonical table):
 
 ```
-phase == None, no history, no dir           -> button hidden
-phase == None, no history, dir picked      -> enabled 'Analyze ▸'   (dry-run flow)
-phase == None, has history                  -> enabled 'Re-run ▸'   (re-arm flow)
-phase == Analyzing                          -> DISABLED 'Analyze…'   (cancel not allowed in v1)
-phase == Encoding                           -> enabled 'Cancel ✕'
-phase == Done (unreachable; finalize moves task to history) -> button hidden
+phase == None                -> placeholder (disabled)
+phase == Analyzing           -> DISABLED 'Analyze…'
+phase == AwaitingConfirm     -> enabled 'Encode'           (no "N files" — see §3.8.7.1 decision 2)
+phase == Encoding            -> enabled 'Cancel ✕'
+phase == Done                -> placeholder (disabled)     (re-arm via dir re-pick)
+phase == Cancelled           -> enabled 'Encode'           (re-click dispatches StartBatch with cached dry-run)
 ```
 
 **Bottom-button CSS** (`rencoder_ui/assets/style.css`): `--task-button-bar` sticky 到 viewport 底部 (`position: sticky; bottom: 0`),背景 + 上边框与 main panel 区分,占 ~50px。Footer log 在 button bar 下方(footer 不动——per spec)。
@@ -2710,18 +2781,19 @@ fn push_toast(state: &mut AppState, msg: impl Into<String>, kind: ToastKind) {
 | global | `LogFooter` | `state` | 5 行 log |
 | `[SETUP]` | `DirPicker` | `state`, `cmd_tx` | native folder dialog + 当前 path + disabled when batch active |
 | `[SETUP]` | `SettingsPanel` | `config` | 只读 `[encode]` key/value list |
-| `[TASK]` | `BatchStatus` | `state` | BATCH #N + phase badge + 12 files / 10 encode / 2 skipped 列表 |
+| `[TASK]` | `BatchStatus` | `state` | BATCH #N + phase badge (`[● ANALYZING]` / `[● READY]` / `[● ENCODING]` / `[● DONE]` / `[● CANCELLED]`) + ongoing counts |
 | `[TASK]` | `ProgressPanel` | `state` | 进度条 + per-file table(Encoding 时) |
-| `[TASK]` | `TaskPlanPanel` (NEW,替换 `DryRunPanel`) | `tasks.active.dry_run_records` | post-DryRun 的 file list,per-file outcome 标签(ENCODE / SKIP / FAIL) |
+| `[TASK]` | `TaskFileList` | `state.tasks.active.records` (or `dry_run_records` during `AwaitingConfirm` pre-v1.2 follow-up #2) | per-file outcome 标签。**v1.2 follow-up #2**: `Analyzing` / `AwaitingConfirm` phase renders empty — dry-run records surface only as a toast (§3.8.7.6); `Encoding` / `Done` / `Cancelled` renders encode records |
 | `[HISTORY]` | `HistoryPanel` | `state.history` | history records 表 |
 | `[LOG]` | `LogPanel` (full version) | `state.log` | 全 1000 行 scrollback |
 
 **Removed**:
 - `UserClickedAnalyze` / `UserClickedPreview` Msg variants(Start 流程 auto-runs analyze)
-- `DryRunPanel`(内容并入 `TaskPlanPanel`)
+- `DryRunPanel`(内容并入 `TaskFileList`)
 - `AnalyzePanel`(无 standalone analyze action)
 - `AnalyzeProgressInfo` / `state.analyze_progress` / `state.analyze_results`(subsumed)
 - 7-button controls bar(替换为 per-page buttons)
+- **v1.2 follow-up #2**: persistent dry-run file list rendering — `dry_run_records` surface only via toast (`§3.8.7.6`); the `AwaitingConfirm` phase has no file list area
 
 #### 3.8.7.3 Visual design tokens
 
@@ -2786,8 +2858,8 @@ fn push_toast(state: &mut AppState, msg: impl Into<String>, kind: ToastKind) {
 
 | 项 | 状态 | 后续 |
 |----|------|------|
-| Dir picker 锁 during whole batch lifecycle | v1:dir picker 在 `Analyzing` / `Encoding` 期间都被 disable(per §3.8.7.1),防止用户对 in-flight task 换目录 | v1.1 解锁 Encoding 期间的 picker(per spec point 6)——允许选下一个目录排队 |
-| AwaitingConfirm phase (v1 2-click flow) | **v1.2 removed** — auto-encode on positive dry-run count. Start button no longer needs a second click to begin encoding | — |
+| Dir picker 锁 during whole batch lifecycle | **v1.2 follow-up #2 fixed**: dir picker 在所有 phase 都 enabled(per §3.8.7.1),包括 `Encoding` / `Done`。Encoding 中 re-pick = 取消当前 batch + reset;Done 中 re-pick = 触发新的 dry-run。AwaitingConfirm 中 re-pick = 同样 reset 到 None + 新的 dry-run | — |
+| AwaitingConfirm phase (v1 2-click flow) | **v1.2 follow-up #2 restored** — after `DryRunFinished` (to_encode > 0), phase = `AwaitingConfirm` 不是 auto-encode。用户 review dry-run summary(toast)后点 `Encode`。Dry-run 0 结果还是走 toast 警告 + `None`,按钮 placeholder disabled | — |
 | Cancel during Analyzing 是 best-effort | v1.2 **decision**: button is **disabled** during Analyzing (no cancel during analyze). lib 的 `Command::Analyze` handler 不轮询 cancel_token,UI 发 `Command::Cancel` 时 lib 不真正中断。`Event::AnalyzeFinished` 仍到达并被 reducer 当正常结果处理 | v1.3 加 analyze cancel_token 轮询 |
 | "encode 0 files" 按钮可点击 | **v1.2 fixed**: Start button is **disabled** when `to_encode == 0`. `Event::DryRunFinished` only auto-dispatches `Command::StartBatch` when `to_encode > 0` | — |
 | `state.analyze_progress` / `state.analyze_results` 字段保留但未 populate | workflow 改造后 Start 自动调 `Command::DryRun`(不是 `Command::Analyze`),analyze state 字段未 populate。代码里还在(`#[allow(dead_code)]`),变成 dead field——AppState 代码块里保留定义以备 v1.1 / U22 重启用 | v1.1 移除 dead 字段 + 删除对应 `Event::Analyze*` reducer arm |
@@ -2796,6 +2868,10 @@ fn push_toast(state: &mut AppState, msg: impl Into<String>, kind: ToastKind) {
 | Settings inline edit | **v1.2 implemented**: `[SETUP]` 页每个字段 `<input>` `oninput` 直接调 `AppConfig::save` (real-time TOML atomic write via `write_atomic`). 没有 Save 按钮 | — |
 | Page-header `[NAME]` 文字冗余 (`[TASK]` / `[HISTORY]` / `[LOG]` 与 TopBar tab 重名) | **v1.2 fixed**: drop `[TASK]` / `[HISTORY]` / `[LOG]` header rows。原 layout 把 header 留在 page 是为了给 top-right button 找一个 row——这版 button 改成 sticky 底部(随 phase 动态 show / hide),header 没有存在的必要。省 ~50px 垂直空间,按钮位置贴近 file list 看完后的视线终点。`[SETUP]` header 在 v1.2 早期已去(review #133 part 3b),这次扩展到剩余 3 页保持一致 | — |
 | User-action feedback 占据 main body 空间 | **v1.2 fixed**: 加 toast 通知系统(右上角 fixed,4s 自动 dismiss,带 × 按钮)。`state.last_error` banner 仍负责 lib-side 错误(`Event::Error` 派生,持久);toast 负责 user-action 反馈(点 Analyze 后 dir 不可读 / DryRun 0 encodable / save 失败等),不占 body 空间。两通道并存:lib 错误 → banner;action feedback → toast。容量 5(FIFO) | — |
+| Cancel UI flicker (`badge = ENCODING` while progress shows "cancelled") | **v1.2 follow-up #2 fixed**: optimistic cancel(`§3.8.7.6`)。`Msg::UserClickedCancel` 立即设 `phase = Cancelled`;所有后续 batch-scoped `Event::*` 被 `apply_event` 的 phase guard 丢弃。Badge 切换瞬时,与 progress 行同步 | — |
+| Late `Event::BatchCancelled` 把 phase 翻成 `Done`(违反 cancel 终态语义) | **v1.2 follow-up #2 fixed**: phase guard 在 `apply_event` 入口丢弃 `BatchCancelled`(已经 Cancelled),不再触发 `phase = Done`。Button 保持 `Encode` 不变 | — |
+| Cancel 不删 in-flight partial output | **v1.2 follow-up #2 fixed**(`§3.8.7.6`):`run_ffmpeg_with_progress` 在 SIGTERM cancel 分支 `std::fs::remove_file(argv.last())` 删 partial output。CLI 路径已经接 `PartialOutputHandle` Guard,这次把 actor 路径补齐 | — |
+| Dry-run records 占据 body file list 空间 | **v1.2 follow-up #2 fixed**(`§3.8.7.6`):Dry-run records 只通过 toast 显示(`Found N to encode, M to skip`)。`Analyzing` / `AwaitingConfirm` 阶段 file list area 渲染为空,`Encoding` / `Done` / `Cancelled` 才显示 encode records | — |
 
 **v1 安全保证**(从 v1.1 deferred 提前到 v1 实现,per §3.8.7 product-lens / scope-guardian review 反馈):
 
@@ -2805,14 +2881,6 @@ fn push_toast(state: &mut AppState, msg: impl Into<String>, kind: ToastKind) {
 | Exit button 先 Cancel | Exit button onclick 分两阶段:active phase → 先 `cmd_tx.send(Command::Cancel)`,等 `Event::BatchCancelled`,再 `window().close()`;None/Done → 直接 `window().close()` |
 
 这些限制不影响协议契约（Command/Event 已端到端测试通过 mock_tests），只是 UI 渲染层不完整。
-
-#### 3.8.8 与 §3.4 CLI 前端的关系
-
-CLI 和 GUI 共享同一份 `rencoder.toml`（§1.2）和同一份 lib 实现：
-
-- **CLI 路径不变**：直接调 `transcode_batch`，写 Parquet，写终端日志。
-- **GUI 路径**：发 `Command` → 收 `Event` → reducer → 渲染。
-- 两条路径都触发 Parquet 写入；GUI 加载历史 = 读 Parquet（同一文件路径）。
 
 #### 3.8.7.5 Unified log pipeline (UI side)
 
@@ -2889,6 +2957,107 @@ stderr 不适合 desktop app(GUI 程序没控制台)。Sink 必须接到 UI
 state,才能在 footer / `[LOG]` 页显示。custom `MakeWriter` 把
 `tracing_subscriber::fmt::Layer` 接到 `crossbeam_channel` 是最小
 开销的方案。
+
+#### 3.8.7.6 Cancel semantics + dry-run records (v1.2 follow-up #2)
+
+> **TL;DR** — Cancel 是**乐观 UI**:用户 click 瞬间 `phase =
+> Cancelled`,lib 在背景慢慢清。In-flight partial output 由 lib
+> 在 ffmpeg kill 时删。Dry-run records 不进 file list,只通过
+> toast 反馈。
+
+**Cancel latency breakdown** (为什么需要乐观 UI):
+
+| 步骤 | 位置 | 耗时 |
+|---|---|---|
+| 用户 click → `Msg::UserClickedCancel` → `phase = Cancelled` (乐观) + `try_send(Command::Cancel)` | `msg.rs:602` reducer | <1ms |
+| cmd_tx channel → actor cmd_rx | `job.rs:815` | <1ms |
+| `cancel_token.cancel()` 写入 `Arc<AtomicBool>` | `job.rs:1099` | <1ms |
+| 等下一行 ffmpeg progress 输出(cancel poll 在 stdout 循环里,每 ~0.5s/line) | `batch.rs:1180-1198` | 0–500ms |
+| `child.kill()` + `child.wait()`(SIGTERM 等 ffmpeg 退出) | `batch.rs:1182-1183` | 200ms–1s |
+| Processor closure 返回 `Err(UserCancel)`(cancel poll between files in `job.rs:900-902`) | `job.rs:900` | <1ms |
+| `TaskManager::run` 返回 `Err((idx, _))` → actor 发 `Event::BatchCancelled` | `job.rs:1017-1033` | <1ms |
+| UI evt_rx → reducer 看到 `Event::BatchCancelled`(但 phase guard 丢弃,不处理) | `msg.rs:808` | <1ms |
+
+**总延迟 ≈ 1–2s**。如果 UI 等 `Event::BatchCancelled` 才改 phase,这段时间里 badge = `ENCODING`,progress 行 = `cancelled`(因为 `t.cancelled = true`)→ 矛盾 flicker(用户反馈 issue #4)。
+
+**Optimistic cancel invariant**: reducer `Msg::UserClickedCancel` 在 Encoding phase 时立即设 `phase = Cancelled`,**不等 lib**。`apply_event` 入口加 phase guard:任何 batch-scoped `Event::*`(`BatchStarted` / `FileStarted` / `Progress` / `FileCompleted` / `BatchCompleted` / `BatchCancelled` / `LogLine` for batch indices / `Error`)在 `state.tasks.active.phase == Cancelled` 时直接 return。Non-batch events(`HistoryLoaded` / `ConfigSaved` / `AnalyzeStarted` etc.) 不受 guard 影响。
+
+**In-flight partial output cleanup** (lib 侧):
+
+`run_ffmpeg_with_progress` 在 cancel branch(`batch.rs:1180-1198`)kill child 后,提取 argv 最后一项作为 output path,调 `std::fs::remove_file`。CLI 路径已经走 `PartialOutputHandle` Guard(actor 路径之前没接,这次补齐)。这保证 partial `.mkv` 不留在磁盘上——下一次跑同样文件时,`encode_prepare` 的 partial-output detector 也不会再误判。
+
+```rust
+// batch.rs run_ffmpeg_with_progress cancel branch (v1.2 follow-up #2)
+if cancel.is_cancelled() {
+    let _ = child.kill();
+    let _ = child.wait();
+    drop(stderr_thread);
+    // v1.2 follow-up #2: clean up the partial output file ffmpeg
+    // was writing when cancel hit. argv layout is
+    // `[ffmpeg, -y, -i, INPUT, ...encoders..., OUTPUT]`; output is
+    // the LAST element. Tolerant of missing file (already removed,
+    // e.g. by a parallel cleaner) — `remove_file` returns Err, we
+    // log + ignore.
+    if let Some(out) = argv.last() {
+        if let Err(e) = std::fs::remove_file(out) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                log::warn!("    cancel cleanup: failed to remove {out}: {e}");
+            }
+        }
+    }
+    return Err((ErrorCategory::Cancelled, ...));
+}
+```
+
+**Dry-run records → toast only**:
+
+v1.2 follow-up #2: `Analyzing` / `AwaitingConfirm` 阶段不渲染 file list。`dry_run_records` 字段保留在 state(toast 文案需要从中数 `to_encode` / `to_skip`),但 UI 不画。`Encoding` / `Done` / `Cancelled` 阶段渲染 `records`(encode 出来的真实结果)。
+
+`Event::DryRunFinished` reducer 路径:
+
+```rust
+Event::DryRunFinished { records } => {
+    let to_encode = records.iter().filter(|r| matches!(r.outcome, EncodingOutcome::Succeeded)).count();
+    let to_skip = total_files.saturating_sub(to_encode);
+
+    // 不管 to_encode 多少都 toast — 用户操作的反馈
+    if to_encode > 0 {
+        push_toast(state, format!("Found {to_encode} to encode ({to_skip} to skip)"), ToastKind::Info);
+    } else {
+        push_toast(state, format!("0 encodable files ({to_skip} skipped); pick a different dir"), ToastKind::Warning);
+    }
+
+    // records 仍存进 state(toast 已经消费了 counts,这是冗余存)
+    // 但 UI 不渲染它
+    state.tasks.active.as_mut().unwrap().dry_run_records = records;
+    state.tasks.active.as_mut().unwrap().to_encode = to_encode;
+    state.tasks.active.as_mut().unwrap().to_skip = to_skip;
+
+    if to_encode == 0 {
+        // 没文件可编码 — finalize + phase 回到 None,让用户重选 dir
+        finalize(state, |t| { t.cancelled = false; });
+        return;
+    }
+    state.tasks.active.as_mut().unwrap().phase = BatchPhase::AwaitingConfirm;
+}
+```
+
+**为什么 records 还要存进 state**(不直接丢):
+
+1. Toast 文案只展示 counts,但 future 可能有"显示哪些 file 被 skip"的展开(toast 上加 details 按钮 → modal)。那时直接读 `dry_run_records` 即可。
+2. 调试时可以通过 state inspector 看 dry-run 决策。
+3. Cancelled 之后重 click "Encode",会用 `dry_run_records` 决定 `Command::StartBatch` 的 `files` 参数——避免重新跑 dry-run。
+
+**Tests** (v1.2 follow-up #2):
+
+| Test | Covers |
+|---|---|
+| `user_clicked_cancel_in_encoding_sets_phase_to_cancelled_immediately` | Optimistic cancel — phase = Cancelled in <1ms |
+| `cancelled_phase_filter_drops_late_batch_events` | After cancel, FileStarted / Progress / FileCompleted / BatchCompleted / BatchCancelled / Error arriving late are dropped by phase guard |
+| `cancelled_phase_button_resets_to_encode_label` | AppState final state matches the button render decision |
+| `dry_run_finished_pushes_summary_toast` | `Found N to encode (M to skip)` toast fires; records stored but UI doesn't render them |
+| `lib_run_ffmpeg_cleans_up_partial_output_on_cancel` | `run_ffmpeg_with_progress` cancel branch removes argv.last() before returning Err |
+| `lib_run_ffmpeg_cancel_missing_output_is_tolerated` | `remove_file` returns NotFound — handled silently (no panic) |
 
 #### 3.8.8 与 §3.4 CLI 前端的关系
 
