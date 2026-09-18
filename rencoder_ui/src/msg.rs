@@ -37,16 +37,19 @@ use rencoder_lib::types::EncodingOutcome;
 /// Cap on the stderr log ring buffer. Per §3.8.6 + §8 item 30.
 const LOG_RING_CAP: usize = 1000;
 
-/// Lifecycle phase of a task. Drives the Task page header badge,
-/// the contextual button label, and the dir picker's enabled state
-/// (§3.8.7.1 state machine).
-/// Lifecycle phase of a task (review #133: AwaitingConfirm removed
-/// for 1-click workflow).
+/// Lifecycle phase of a task (review #133: AwaitingConfirm kept
+/// temporarily as a dead variant — the reducer never produces
+/// it under the new 1-click flow but surrounding code still
+/// references it; removed in the follow-up test-rewrite commit).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchPhase {
     /// `Command::DryRun` dispatched; awaiting `Event::DryRunFinished`.
     /// Dir picker disabled. Start button disabled (analyze in flight).
     Analyzing,
+    /// DryRun done; user must explicitly confirm before encoding
+    /// begins (legacy 2-click flow — review #133 makes this
+    /// unreachable via auto-encode on positive dry-run count).
+    AwaitingConfirm,
     /// `Command::StartBatch` dispatched; awaiting `BatchCompleted`
     /// / `BatchCancelled` / `Event::Error`. Progress bar active.
     /// Dir picker disabled. Start button shows "Cancel ✕".
