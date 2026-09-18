@@ -1190,6 +1190,13 @@ pub fn run_ffmpeg_with_progress(
             // already been moved into `stderr_buf` before the
             // drop, so we don't lose already-buffered output.
             drop(stderr_thread);
+            // v1.2 follow-up #2: delete the partial output file
+            // ffmpeg was writing when cancel hit. argv layout is
+            // v1.2 follow-up #2: remove the partial output file
+            // ffmpeg was writing when cancel hit. See
+            // [`cleanup_partial_output_from_argv`] for the
+            // tolerance contract (NotFound OK, other Errs logged).
+            cleanup_partial_output_from_argv(argv);
             return Err((
                 ErrorCategory::Cancelled,
                 format!("{program} cancelled by user"),
@@ -1277,6 +1284,37 @@ pub fn run_ffmpeg_with_progress(
     }
 
     Ok(())
+}
+
+/// Remove the partial output file ffmpeg was writing when cancel
+/// hit (v1.2 follow-up #2). Extracted so the cleanup is testable
+/// without spawning a real ffmpeg.
+///
+/// # Contract
+///
+/// - `argv.last()` is treated as the output path
+///   (`[ffmpeg, -y, -i, INPUT, ...encoders..., OUTPUT]`).
+/// - Empty argv (shouldn't happen — ffmpeg argv always has at
+///   least 2 elements) → no-op.
+/// - File missing → `NotFound` is silently ignored (already
+///   cleaned up by something else; nothing to do).
+/// - Any other I/O error → logged at warn, NOT propagated.
+///   The cancel branch is already returning `Err(Cancelled)`;
+///   we don't want to mask that with a cleanup error.
+///
+/// This is symmetric with the CLI path's `PartialOutputHandle`
+/// Guard but doesn't share an implementation (the actor path
+/// doesn't carry a handle — it's run on the actor thread
+/// directly via `TaskManager::run`).
+fn cleanup_partial_output_from_argv(argv: &[String]) {
+    let Some(out) = argv.last() else {
+        return;
+    };
+    match std::fs::remove_file(out) {
+        Ok(()) => log::info!("    cancel cleanup: removed {out}"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log::warn!("    cancel cleanup: failed to remove {out}: {e}"),
+    }
 }
 
 /// Extract the encoder name from a build_ffmpeg_command argv. The argv
@@ -1615,5 +1653,149 @@ Encoders:
         assert!(tail.contains('\u{FFFD}'));
         assert!(tail.contains('x'));
         assert!(tail.contains('y'));
+    }
+
+    // ---- cleanup_partial_output_from_argv (v1.2 follow-up #2) ----
+    //
+    // Tests verify the helper called from run_ffmpeg_with_progress's
+    // cancel branch. The integration with the live ffmpeg spawn is
+    // covered by the round-trip test below (script-as-ffmpeg).
+    //
+    // Each test creates a fresh tmp dir so parallel test runs don't
+    // interfere (unique_tmp pattern from job.rs::mock_tests).
+
+    fn cleanup_tmp(label: &str) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let p = std::env::temp_dir().join(format!(
+            "rencoder_cleanup_{label}_{}_{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn cleanup_partial_output_removes_existing_file() {
+        // v1.2 follow-up #2: when cancel hits mid-encode, the partial
+        // .mkv ffmpeg was writing should be removed. The helper
+        // extracts `argv.last()` as the output path and removes it.
+        let tmp = cleanup_tmp("removes");
+        let partial = tmp.join("partial.mkv");
+        std::fs::write(&partial, b"fake partial bytes").unwrap();
+        assert!(partial.exists());
+
+        let argv = vec![
+            "ffmpeg".into(),
+            "-y".into(),
+            "-i".into(),
+            "in.mp4".into(),
+            "-c:v".into(),
+            "libsvtav1".into(),
+            partial.to_string_lossy().into_owned(),
+        ];
+        cleanup_partial_output_from_argv(&argv);
+
+        assert!(!partial.exists(), "partial output should be removed");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn cleanup_partial_output_tolerates_missing_file() {
+        // NotFound is silently ignored — the cancel branch is
+        // already returning Err(Cancelled); we don't want to
+        // double-log or change the return shape.
+        let tmp = cleanup_tmp("missing");
+        let phantom = tmp.join("never_written.mkv");
+        assert!(!phantom.exists());
+
+        let argv = vec![
+            "ffmpeg".into(),
+            "-i".into(),
+            "in.mp4".into(),
+            phantom.to_string_lossy().into_owned(),
+        ];
+        // Must NOT panic.
+        cleanup_partial_output_from_argv(&argv);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn cleanup_partial_output_empty_argv_is_noop() {
+        // Defensive: empty argv (shouldn't happen, but the type
+        // allows it via `&[String]`). No panic.
+        cleanup_partial_output_from_argv(&[]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cleanup_partial_output_after_kill_removes_partial() {
+        // Integration test: spawn a shell process that mimics
+        // ffmpeg's `-progress pipe:1` stream — emits
+        // `progress=continue` blocks every 100ms, and writes some
+        // garbage to the output path so we have a partial file to
+        // clean up. On the first progress block, the test cancels
+        // the token; on the next block (within ~100ms), the cancel
+        // poll at the top of the run loop fires, the child is
+        // killed, the partial is cleaned up, and Err is returned.
+        //
+        // Why not just emit ONE progress block and sleep? Because
+        // `BufReader::lines()` blocks waiting for the next line —
+        // if no more lines arrive, the cancel check at the top of
+        // the loop never runs. The cancel poll cadence is "once
+        // per progress line" (not "once per X ms"), so we need
+        // the fake-ffmpeg to keep emitting lines for the cancel
+        // branch to actually be reached.
+        let tmp = cleanup_tmp("kill");
+        let partial = tmp.join("partial.mkv");
+        std::fs::write(&partial, b"x").unwrap(); // pre-create so output path exists
+
+        let cancel = CancelToken::new();
+        let cancel_for_signal = cancel.clone();
+
+        // Script: emit a progress block, write garbage, loop
+        // ~forever. The shell's `printf` flushes per-call so lines
+        // arrive promptly at the parent's BufReader.
+        let script = format!(
+            r#"
+            i=0
+            while [ $i -lt 200 ]; do
+                printf 'frame=%d\nfps=30\nspeed=1.0x\nout_time_us=1000000\nprogress=continue\n' $i
+                echo garbage >> {}
+                sleep 0.1
+                i=$((i+1))
+            done
+            "#,
+            partial.display()
+        );
+
+        let argv = vec![
+            "sh".into(),
+            "-c".into(),
+            script.clone(),
+            partial.to_string_lossy().into_owned(),
+        ];
+
+        let mut progress = |p: FfmpegProgress| {
+            // On the FIRST progress block, signal cancel. The
+            // next iteration of the BufReader loop will detect
+            // it and bail.
+            cancel_for_signal.cancel();
+            let _ = p.frame;
+        };
+
+        let result = run_ffmpeg_with_progress(&argv, &cancel, Some(60.0), &mut progress);
+
+        // Should return Cancelled (cancel branch fires after the
+        // next progress line, within ~100ms).
+        assert!(
+            matches!(result, Err((ErrorCategory::Cancelled, _, _))),
+            "expected Cancelled err, got {result:?}"
+        );
+        assert!(
+            !partial.exists(),
+            "cancel cleanup should have removed the partial output"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
