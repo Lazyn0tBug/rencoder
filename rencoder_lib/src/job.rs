@@ -24,7 +24,7 @@
 #[cfg(test)]
 use crossbeam_channel::unbounded;
 use crossbeam_channel::{bounded, Receiver, Sender};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -845,20 +845,21 @@ fn run_actor(
                     &dropped_counter,
                 );
 
-                // Review #122: hoist extension out of the per-task loop.
-                let ext = params.format.default_extension();
+                // Review #122: extension still hoisted (unused now — kept for
+                // the hoist comment / future use).
+                let _ext = params.format.default_extension();
                 let tasks: Vec<TranscodeTask> = files
                     .iter()
                     .map(|file| {
-                        let stem = file
-                            .as_path()
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("output");
-                        let parent = file.as_path().parent().unwrap_or_else(|| Path::new(""));
+                        // v1.2 follow-up #3: route through
+                        // output_path_for for the `_encoded`
+                        // collision guard.
                         TranscodeTask {
                             input: file.clone(),
-                            output: Some(parent.join(format!("{stem}.{ext}"))),
+                            output: Some(crate::utils::fs::output_path_for(
+                                file.as_path(),
+                                params.format,
+                            )),
                         }
                     })
                     .collect();
@@ -1387,20 +1388,21 @@ mod mock_tests {
 
                         let _total = files.len();
                         // Review #122: hoist extension out of the per-task loop.
-                        let ext = params.format.default_extension();
+                        let _ext = params.format.default_extension();
                         let tasks: Vec<TranscodeTask> = files
                             .iter()
                             .map(|file| {
-                                let stem = file
-                                    .as_path()
-                                    .file_stem()
-                                    .and_then(|s| s.to_str())
-                                    .unwrap_or("output");
-                                let parent =
-                                    file.as_path().parent().unwrap_or_else(|| Path::new(""));
+                                // v1.2 follow-up #3: route through output_path_for
+                                // for the `_encoded` collision
+                                // guard (consistent with the
+                                // production StartBatch arm
+                                // above).
                                 TranscodeTask {
                                     input: file.clone(),
-                                    output: Some(parent.join(format!("{stem}.{ext}"))),
+                                    output: Some(crate::utils::fs::output_path_for(
+                                        file.as_path(),
+                                        params.format,
+                                    )),
                                 }
                             })
                             .collect();
@@ -2238,18 +2240,19 @@ mod mock_tests {
         //
         // NOTE: `run_actor_inline` (job.rs:1355) ignores the
         // `params` from `Command::StartBatch` and uses its own
-        // `EncodeParams::default()` (X264, ext = "mp4"). So
-        // `task.output = file1.mp4` — same path the script writes
-        // to. The mock must use `task.output` as argv's last
-        // element for cleanup to hit the right file.
+        // `EncodeParams::default()` (X264, default ext = "mkv"
+        // after v1.2 follow-up #3). So `task.output = file1.mkv`
+        // — different from the input (`file1.mp4`). The mock must
+        // use `task.output` as argv's last element for cleanup to
+        // hit the right file.
         let tmp = unique_tmp("cancel-partial");
         std::fs::create_dir_all(&tmp).unwrap();
 
         let input_path = tmp.join("file1.mp4");
         std::fs::write(&input_path, b"fake video").unwrap();
-        // task.output = file1.mp4 (default X264 ext). Write to
-        // that exact path.
-        let partial = tmp.join("file1.mp4");
+        // task.output = file1.mkv (X264 → mkv, no collision
+        // with the .mp4 input). Write to that exact path.
+        let partial = tmp.join("file1.mkv");
         let partial_check_b = partial.clone();
         std::fs::write(&partial, b"garbage").unwrap();
 

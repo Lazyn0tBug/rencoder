@@ -618,19 +618,19 @@ pub fn transcode_batch(
     // per-task loop. The extension doesn't change across tasks;
     // computing it once saves one match per file. For a 1000-file
     // batch this is 1000 saved lookups.
-    let ext = params.format.default_extension();
+    let _ext = params.format.default_extension();
     let tasks: Vec<TranscodeTask> = files
         .iter()
         .map(|input| {
-            let stem = input
-                .as_path()
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("output");
-            let parent = input.as_path().parent().unwrap_or_else(|| Path::new(""));
+            // v1.2 follow-up #3: route through output_path_for
+            // for the `_encoded` collision guard (X264/HEVC/AV1 +
+            // .mkv input would otherwise overwrite input).
             TranscodeTask {
                 input: input.clone(),
-                output: Some(parent.join(format!("{stem}.{ext}"))),
+                output: Some(crate::utils::fs::output_path_for(
+                    input.as_path(),
+                    params.format,
+                )),
             }
         })
         .collect();
@@ -694,16 +694,12 @@ where
     I: IntoIterator<Item = &'a crate::types::InputPath>,
 {
     // Review #122: hoist extension out of the per-file loop.
-    let ext = params.format.default_extension();
+    let _ext = params.format.default_extension();
     let mut records = Vec::new();
     for file in files {
-        let stem = file
-            .as_path()
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("output");
-        let parent = file.as_path().parent().unwrap_or_else(|| Path::new(""));
-        let output_path = parent.join(format!("{stem}.{ext}"));
+        // v1.2 follow-up #3: route through output_path_for
+        // for the `_encoded` collision guard.
+        let output_path = crate::utils::fs::output_path_for(file.as_path(), params.format);
         let task = TranscodeTask {
             input: file.clone(),
             output: Some(output_path),

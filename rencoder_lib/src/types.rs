@@ -15,11 +15,17 @@ pub enum VideoFormat {
 
 impl VideoFormat {
     /// Default container extension for this format.
+    ///
+    /// v1.2 follow-up #3: X264 / HEVC / AV1 all produce `.mkv`.
+    /// VP9 stays `.webm` (VP9-in-WebM is the dominant browser-
+    /// facing format; AV1/WebM is less common and we don't auto-
+    /// promote). `output_path_for` adds a `_<ext>`-suffix to
+    /// disambiguate when the default would collide with the
+    /// input extension — see that function for the full matrix.
     pub fn default_extension(self) -> &'static str {
         match self {
-            VideoFormat::X264 | VideoFormat::Hevc => "mp4",
             VideoFormat::Vp9 => "webm",
-            VideoFormat::Av1 => "mkv",
+            VideoFormat::X264 | VideoFormat::Hevc | VideoFormat::Av1 => "mkv",
         }
     }
 }
@@ -569,8 +575,9 @@ mod tests {
 
     #[test]
     fn video_format_default_extension() {
-        assert_eq!(VideoFormat::X264.default_extension(), "mp4");
-        assert_eq!(VideoFormat::Hevc.default_extension(), "mp4");
+        // v1.2 follow-up #3: X264/HEVC/AV1 → mkv, VP9 → webm.
+        assert_eq!(VideoFormat::X264.default_extension(), "mkv");
+        assert_eq!(VideoFormat::Hevc.default_extension(), "mkv");
         assert_eq!(VideoFormat::Vp9.default_extension(), "webm");
         assert_eq!(VideoFormat::Av1.default_extension(), "mkv");
     }
