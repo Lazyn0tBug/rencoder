@@ -126,8 +126,8 @@ fs_perms::set_config_file_mode(&tmp)?;
 | 命令行解析 | `clap`（derive） | 仅 CLI 前端 |
 | 交互模式 | `dialoguer` | 仅 CLI 前端 |
 | 错误处理 | `anyhow`（CLI）+ `thiserror`（核心库） | 分层清晰 |
-| 日志（核心库） | `log` | 核心库用 `log` 宏，保持库 API 稳定 |
-| 日志（CLI 前端） | `tracing` + `tracing-subscriber` + `tracing-log` | CLI 用结构化 tracing；`tracing-log` 桥接库内 `log` 事件 |
+| 日志（核心库） | `tracing` | 核心库与 binary 同一栈（v1.2 follow-up #4）；`publish = false` 不再受外部兼容性约束 |
+| 日志（CLI 前端） | `tracing` + `tracing-subscriber` | CLI 用结构化 tracing；无桥接（lib 直接 emit `tracing` 事件） |
 | 日志（文件 sink） | `<app_dir>/log/rencoder.YYYY-MM-DD.NN.log`（U18） | 日滚 + 10MB 大小滚（NN 自增），7 天保留（`max_age_days=0` 不限）；自定义 `MakeWriter` 实现；`RENENCODER_LOG_DIR` 覆盖 |
 | 日志（span） | `#[instrument]` + `FmtSpan::CLOSE` | 关键函数（`encode_cmd` / `analyze_cmd`）记录 span 上下文，便于排障 |
 | 配置（用户面） | TOML via `AppConfig`（U18） | 替代 jq + 自写 JSON schema；unknown keys 立即报错（`#[serde(deny_unknown_fields)]`） |
@@ -178,20 +178,23 @@ fs_perms::set_config_file_mode(&tmp)?;
 
 ### 2.3 关于日志栈的决策
 
-**核心库仍用 `log`**：
+**核心库与 binary 全部用 `tracing`**（v1.2 follow-up #4，替代之前的 `log` + 桥接方案）：
 
-- 库对外暴露的是稳定的 `Result<_, EncodeError>` API；把 `tracing` 写进 API 表面会强制所有调用方依赖 `tracing`。
-- 库的日志语义是“底层发声”，固定为 `log` 即可，没必要结构化。
+- `rencoder_lib` 是 `publish = false`（U18，internal lib）—— 没有外部消费者，不再受 "API surface 不应依赖 tracing" 这条约束限制。
+- 关键收益：日志**结构化字段**（`output = %path`, `source_fps = f`, `batch_id = id`）—— 替代之前 `log::info!("...{} {}", a, b)` 这种把字段名丢进字符串拼接的做法。`tracing-subscriber` 的 `fmt::Layer().json()` 输出可以按字段聚合 / 检索。
+- 关键收益：`#[instrument]` 自动给函数挂 span context —— `run_ffmpeg_with_progress` 加 instrument 后，子事件（progress / stderr / cancel）自动继承函数名 + 参数作为字段。
+- 统一栈：`RUST_LOG` 一套规则控制 lib + CLI + UI，不需要 `tracing-log::LogTracer` 桥接。
+- 旧方案 `log` + 桥接的唯一好处是"库可被不依赖 tracing 的项目使用" —— 我们没有这种外部消费者，桥接是 dead weight。
 
-**CLI 用 `tracing`**：
+**CLI / UI 用 `tracing-subscriber`**：
 
-- `tracing` 提供结构化字段和 span 上下文（`#[instrument]` 自动给每个事件挂上函数名 + 字段），排障时比纯文本日志更清晰。
-- `tracing-subscriber` 的 `Registry` + 多 `Layer` 模式天然支持双 sink（stdout + 文件）。
-- `tracing-log::LogTracer::init()` 把库内 `log` 事件桥接到 `tracing` 的 subscriber，调用方无需关心两边日志格式差异，`RUST_LOG` 一套规则同时控制两层。
+- `Registry` + 多 `Layer` 模式天然支持双 sink（stdout + 文件）。
+- CLI: stdout + 自写 file sink（§"文件 sink" 段）。
+- UI: stdout（debug 时）+ `crossbeam_channel::Sender<LogLine>` 桥到 `state.log`，由专用 drain thread 推给 footer / `[LOG]` 页（§3.8.7.5）。
 
 **文件 sink 用自写 `MakeWriter` 而非 `tracing_appender`**：
 
-- `tracing_appender::rolling` 只支持按 `Rotation`（DAILY / HOURLY / NEVER）滚动，**不支持大小阈值**。我们需要“日滚 + 10 MB 大小滚”，必须自己实现 `MakeWriter`。
+- `tracing_appender::rolling` 只支持按 `Rotation`（DAILY / HOURLY / NEVER）滚动，**不支持大小阈值**。我们需要"日滚 + 10 MB 大小滚"，必须自己实现 `MakeWriter`。
 - 文件名 `rencoder.YYYY-MM-DD.NN.log`：日期每天更换，NN 在当天文件超过 `max_size` 时自增。
 - 启动时根据 `max_age_days` 清理过期文件（`0` 表示不清理）。
 - `FileSinkHandle` 仅持有 `&Mutex<Inner>`，利用 `Mutex` 的内部可变性避开 `MakeWriter` 给的 `&'a self` 限制。
@@ -2884,23 +2887,17 @@ fn push_toast(state: &mut AppState, msg: impl Into<String>, kind: ToastKind) {
 
 #### 3.8.7.5 Unified log pipeline (UI side)
 
-> **TL;DR** — lib 用 `log` facade 发事件;两个 binary 各自 init
-> `tracing-log::LogTracer` + 自己的 tracing subscriber。CLI 写到
-> stderr + 文件;UI 写到 `crossbeam_channel::Sender<LogLine>` → 专用
-> drain thread → `state.log`,footer / `[LOG]` 页统一显示。
+> **TL;DR** — lib 与两个 binary 都用 `tracing`(v1.2 follow-up #4 替代之前的 `log` + `tracing-log` 桥接)。CLI 写到 stderr + 文件;UI 写到 `crossbeam_channel::Sender<LogLine>` → 专用 drain thread → `state.log`,footer / `[LOG]` 页统一显示。`RUST_LOG` 一套规则同时控制两层。
 
-**Why this architecture**: lib 不知道也不该知道是哪个 binary 在消费
-log——`log` facade 是标准做法,`tracing-log` 是 bridge。两个 binary
-各装各的 subscriber,各自的 sink。Lib 一行代码不改。
+**Why this architecture**: lib 现在与 binary 用同一套 logging API,不再需要 `tracing-log` 桥接。`rencoder_lib` 是 `publish = false`,没有外部消费者依赖 `log` 兼容性,所以可以安全地让 lib 直接 emit `tracing` 事件。`tracing` 的结构化字段(`output = %path`, `source_fps = f`, `batch_id = id`)把 `log::info!("...{}...", arg)` 这种把字段名丢进字符串拼接的做法替代掉 —— `tracing-subscriber` 的 `fmt::Layer().json()` 输出可以按字段聚合 / 检索。`#[instrument]` 自动给函数挂 span context,子事件自动继承。
 
 **Flow**:
 
 ```
-         lib (log::info! / log::warn!)
+         lib (tracing::info! / tracing::warn!)
                   │
-                  ▼ tracing-log::LogTracer::init() (per-binary)
+                  ▼ (direct, no bridge)
                   │
-                  ▼
        ┌──────────┴──────────┐
        ▼                     ▼
    CLI subscriber        UI subscriber
@@ -2939,7 +2936,7 @@ log——`log` facade 是标准做法,`tracing-log` 是 bridge。两个 binary
 
 **Threading model**:
 
-- Lib 的 log 事件从 lib 内部线程发出(actor thread + rayon worker threads)
+- Lib 的 tracing 事件从 lib 内部线程发出(actor thread + rayon worker threads)
 - `crossbeam_channel` 是 MPMC,任意线程可 send
 - UI 端一个专用 drain thread 阻塞 `recv()`,push 到 state.log
 - state.log 的 `VecDeque<LogLine>` 用 `with_mut` 写,触发 Dioxus 响应式 re-render
@@ -3151,7 +3148,6 @@ ctrlc = "3.4"
 parking_lot = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-log = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 anyhow = "1"
 ```
