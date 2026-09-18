@@ -26,6 +26,11 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-log = "0.2"
+# Toaster's auto-dismiss loop uses tokio::time::sleep inside
+# a `use_future` block. Dioxus 0.6 already pulls tokio in as a
+# transitive dep, but doesn't re-export it; we add it here for
+# direct use. Only the `time` feature is needed.
+tokio = { version = "1", features = ["time"] }
 
 [[bin]]
 name = "rencoder-ui"

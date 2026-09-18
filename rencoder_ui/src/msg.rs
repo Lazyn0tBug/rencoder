@@ -183,7 +183,7 @@ pub const TOAST_DEFAULT_DURATION_MS: u32 = 4000;
 /// clicks × first.
 #[allow(dead_code)] // fields read by the Toaster component
 // (app.rs); reducer pushes Toasts without reading them.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Toast {
     /// Stable id — monotonic, wraps at u64::MAX (effectively
     /// never — billions of toasts before wrap). The Toaster

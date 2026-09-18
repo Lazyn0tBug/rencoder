@@ -43,6 +43,7 @@ use rencoder_lib::job::{start_controller, Command};
 
 use crate::msg::{
     reduce, AppState, BatchPhase, ConfigFieldKind, ConfigFieldValue, Msg, Page, TaskId, TaskQueue,
+    Toast, ToastKind,
 };
 use crate::tracing_init;
 
@@ -168,6 +169,115 @@ pub fn App() -> Element {
                 }
             }
             FooterLog { state: state }
+            // Toaster — fixed-position top-right stack of
+            // transient user-action feedback toasts (review
+            // #133 v1.2). See design.md §3.8.7.2.
+            Toaster { state: state }
+        }
+    }
+}
+
+// ============================================================================
+// Toaster — fixed top-right stack of transient feedback toasts
+// ============================================================================
+
+/// Top-right toast stack (review #133 v1.2). Each toast renders
+/// as a fixed-position card with a colored left stripe (driven
+/// by `ToastKind`), the message, and a × dismiss button. Auto-
+/// dismisses after `duration_ms` via a 250ms tick that prunes
+/// expired entries.
+///
+/// The auto-dismiss loop is implemented with `use_future` +
+/// `cx.sleep` so it integrates with Dioxus's scheduler — no
+/// raw `std::thread::spawn`. The future re-renders the component
+/// on every tick so the stack updates.
+#[component]
+fn Toaster(state: Signal<AppState, SyncStorage>) -> Element {
+    // Snapshot the toasts once per render. The auto-dismiss
+    // loop calls state.read() (not state.with_mut()) so the
+    // re-render is read-only — the loop's only mutating effect
+    // is pruning via state.with_mut() when an entry expires.
+    let toasts = state.read().toasts.clone();
+
+    // Auto-dismiss tick — every 250ms, scan for expired
+    // toasts and pop them from the front. We don't need a
+    // sleep cancellation — the future lives for the lifetime
+    // of the App() component, so it terminates when the app
+    // closes.
+    use_future(move || async move {
+        loop {
+            // Wait 250ms before each scan. tokio is a transitive
+            // dep of dioxus 0.6, so its async runtime is
+            // available in use_future blocks.
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            // Now scan + prune. Holds a write lock briefly.
+            let now = chrono::Utc::now();
+            let expired_ids: Vec<u64> = state
+                .read()
+                .toasts
+                .iter()
+                .filter(|t| {
+                    let elapsed = now.signed_duration_since(t.created_at);
+                    elapsed.num_milliseconds() as u64 >= t.duration_ms as u64
+                })
+                .map(|t| t.id)
+                .collect();
+            if !expired_ids.is_empty() {
+                state.with_mut(|s| {
+                    s.toasts.retain(|t| !expired_ids.contains(&t.id));
+                });
+            }
+        }
+    });
+
+    rsx! {
+        // z-index 20 (above TopBar=10 and task-button-bar=10).
+        // Top-right corner (top: 60px clears the sticky TopBar;
+        // right: 16px aligns with .app padding).
+        div { class: "toaster-container",
+            for t in toasts.iter() {
+                ToastCard { toast: t.clone(), state: state }
+            }
+        }
+    }
+}
+
+/// One toast card. Rendered by `Toaster`. The × button
+/// removes the toast from the queue (immediate, no auto-dismiss
+/// wait).
+#[component]
+fn ToastCard(toast: Toast, state: Signal<AppState, SyncStorage>) -> Element {
+    let kind_class = match toast.kind {
+        ToastKind::Info => "toast-info",
+        ToastKind::Warning => "toast-warning",
+        ToastKind::Error => "toast-error",
+    };
+    let icon = match toast.kind {
+        ToastKind::Info => "ⓘ",
+        ToastKind::Warning => "⚠",
+        ToastKind::Error => "⚡",
+    };
+    let aria_live = match toast.kind {
+        ToastKind::Error => "assertive",
+        ToastKind::Info | ToastKind::Warning => "polite",
+    };
+    let id = toast.id;
+    rsx! {
+        div {
+            key: "{id}",
+            class: "toast {kind_class}",
+            role: "alert",
+            aria_live: aria_live,
+            span { class: "toast-icon", "{icon}" }
+            span { class: "toast-msg", "{toast.message}" }
+            button {
+                class: "toast-dismiss",
+                title: "Dismiss",
+                onclick: move |_| {
+                    state.with_mut(|s| s.toasts.retain(|t| t.id != id));
+                },
+                "×"
+            }
         }
     }
 }
