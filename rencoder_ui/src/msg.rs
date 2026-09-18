@@ -627,11 +627,14 @@ fn apply_event(
             // (Start auto-DryRun subsumes it). Silently drop.
         }
         Event::ConfigSaved { .. } => {
-            // Save button was removed in the §3.8.7.2 redesign;
-            // if the lib ever emits this event (e.g., a future
-            // SaveConfig dispatch), we ignore it. v1.2 will wire
-            // this to a dedicated `state.last_success` field or a
-            // success banner UI element.
+            // review-delta F1 (was empty): wire the lib's save
+            // success ack to the Setup-page save-status indicator.
+            // Command::SaveConfig (job.rs:1107) emits
+            // Event::ConfigSaved on success and Event::Error
+            // with a 'save failed:' prefix on failure. The
+            // Setup page reads state.config_save_status; the
+            // prior empty handler left it stuck at 'Saving…'.
+            state.config_save_status = format!("Saved at {}", Local::now().format("%H:%M:%S"));
         }
         Event::FileCompleted { record, .. } => {
             if let Some(t) = state.tasks.active.as_mut() {
@@ -678,6 +681,19 @@ fn apply_event(
             state.history = records;
         }
         Event::Error { message, .. } => {
+            // review-delta F1: if the lib's save failed (it
+            // emits this with the prefix 'save failed:'),
+            // surface the error on the Setup-page save-status
+            // indicator too. The global last_error banner still
+            // shows; this gives the Setup form a specific
+            // status when the user is editing.
+            if let Some(rest) = message.strip_prefix("save failed:") {
+                // rest is the lib's I/O error string (e.g.
+                // " permission denied (os error 13)" with a
+                // leading space — strip it so the indicator
+                // shows "Save failed: permission denied ...").
+                state.config_save_status = format!("Save failed: {}", rest.trim_start());
+            }
             state.last_error = Some(message);
             // Per §3.8.7.1: during Encoding, move to history
             // (task did run, even if it failed); during
@@ -1744,6 +1760,71 @@ mod tests {
         );
         let enc = state.config_draft.encode.as_ref().unwrap();
         assert_eq!(enc.extensions, None, "empty csv should clear filter");
+    }
+
+    #[test]
+    fn event_config_saved_updates_save_status_to_timestamp() {
+        // review-delta F3: the Setup-page save-status indicator
+        // must transition from 'Saving…' to 'Saved at HH:MM:SS'
+        // when the lib acknowledges a successful save. The
+        // previous empty handler left it stuck at 'Saving…'
+        // forever, which the new test would have caught.
+        use chrono::Local;
+        let mut state = fresh_state();
+        let tx = cmd_tx();
+        state.config_save_status = "Saving…".into();
+        reduce(
+            &mut state,
+            Msg::Lib(Event::ConfigSaved {
+                path: std::path::PathBuf::from("/tmp/rencoder.toml"),
+            }),
+            &tx,
+            &default_config(),
+        );
+        let status = &state.config_save_status;
+        // Format: "Saved at HH:MM:SS" — assert prefix + 8 chars
+        // (the timestamp portion).
+        assert!(
+            status.starts_with("Saved at "),
+            "expected 'Saved at ...' prefix, got {status:?}"
+        );
+        // Verify the timestamp portion parses as HH:MM:SS.
+        let ts = status.strip_prefix("Saved at ").unwrap();
+        let expected_now = Local::now().format("%H:%M:%S").to_string();
+        // Allow ±1s tolerance for the boundary case where the
+        // test crosses a second between the two `now()` calls.
+        let drift_ok = ts == expected_now || ts == Local::now().format("%H:%M:%S").to_string();
+        assert!(drift_ok, "timestamp {ts} != {expected_now}");
+    }
+
+    #[test]
+    fn event_error_save_failed_updates_save_status() {
+        // review-delta F1: the lib emits Event::Error with the
+        // prefix 'save failed:' on Command::SaveConfig failure
+        // (job.rs:1119). The UI must surface this on the
+        // Setup-page save-status indicator (separate from the
+        // global last_error banner).
+        let mut state = fresh_state();
+        let tx = cmd_tx();
+        state.config_save_status = "Saving…".into();
+        reduce(
+            &mut state,
+            Msg::Lib(Event::Error {
+                category: rencoder_lib::types::ErrorCategory::ConfigError,
+                message: "save failed: permission denied".into(),
+            }),
+            &tx,
+            &default_config(),
+        );
+        assert_eq!(
+            state.config_save_status, "Save failed: permission denied",
+            "save-failure should overwrite the save-status indicator"
+        );
+        // last_error still set (global banner).
+        assert_eq!(
+            state.last_error.as_deref(),
+            Some("save failed: permission denied")
+        );
     }
 
     #[test]
