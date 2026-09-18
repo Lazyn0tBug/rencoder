@@ -607,17 +607,30 @@ fn DirPicker(
                 class: "secondary-btn",
                 disabled: !enabled,
                 onclick: move |_| {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .set_title("Choose input directory")
-                        .pick_folder()
-                    {
-                        if let Some(tx) = cmd_tx.read().clone() {
-                            let cfg = config.read().clone();
-                            state.with_mut(|st| {
-                                reduce(st, Msg::UserSelectedDir(path), &tx, &cfg)
-                            });
+                    // v1.2 (review #133 follow-up): use the
+                    // async file dialog + spawn on tokio so the
+                    // modal doesn't freeze the Dioxus main
+                    // thread. The sync version blocked for the
+                    // entire duration the user spent in the
+                    // picker (no re-renders, no Exit click).
+                    let mut state_async = state;
+                    let cmd_tx_async = cmd_tx;
+                    let config_async = config;
+                    tokio::spawn(async move {
+                        let result = rfd::AsyncFileDialog::new()
+                            .set_title("Choose input directory")
+                            .pick_folder()
+                            .await;
+                        if let Some(handle) = result {
+                            let path = handle.path().to_path_buf();
+                            if let Some(tx) = cmd_tx_async.read().clone() {
+                                let cfg = config_async.read().clone();
+                                state_async.with_mut(|st| {
+                                    reduce(st, Msg::UserSelectedDir(path), &tx, &cfg)
+                                });
+                            }
                         }
-                    }
+                    });
                 },
                 "pick directory"
             }

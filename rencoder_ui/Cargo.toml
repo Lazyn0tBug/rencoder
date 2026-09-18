@@ -14,10 +14,15 @@ crossbeam-channel = "0.5"
 # `rfd` (Rusty File Dialog) drives the native folder picker behind
 # `DirPicker` (§3.8.7). Default features pull in the platform backend
 # (rfd uses NSOpenPanel on macOS, IFileDialog on Windows, zenity /
-# kdialog / xdg-desktop-portal on Linux). Sync API (`pick_folder`)
-# is what we want — the onclick handler is on the main thread, so a
-# blocking dialog call there is fine and simpler than wrapping
-# `AsyncFileDialog` in a use_future.
+# kdialog / xdg-desktop-portal on Linux).
+#
+# v1.2 (review #133 follow-up): use `rfd::AsyncFileDialog` (not
+# the sync `FileDialog`). The sync version blocks the Dioxus
+# main thread for the entire duration the user spends in the
+# folder picker — the UI freezes (no re-renders, can't click
+# Exit, no animations). The async version returns a future;
+# we spawn it on tokio and dispatch the result back via
+# state.with_mut() when it resolves.
 rfd = "0.14"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # Unified logging (§3.8.7.5): lib emits via `log` facade; UI
