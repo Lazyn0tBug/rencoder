@@ -2215,6 +2215,154 @@ mod mock_tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn cancel_during_encode_removes_partial_output() {
+        // v1.2 follow-up #2: end-to-end test through the actor's
+        // full StartBatch path. The mock calls the REAL
+        // run_ffmpeg_with_progress with `argv[0] = "sh"` — a
+        // shell script acts as fake-ffmpeg, writes to a real
+        // partial output file, and emits `progress=continue`
+        // blocks like real ffmpeg.
+        //
+        // On the first progress block, the mock cancels the
+        // token. The next cancel poll in run_ffmpeg_with_progress
+        // fires (within ~100ms), kills the child, runs the
+        // cleanup helper, and returns Err. The actor's processor
+        // closure wraps the err into a Failed record; TaskManager
+        // moves to the next file (where the between-files cancel
+        // poll in job.rs fires and aborts the batch).
+        //
+        // After the actor drains, the partial output file must
+        // be GONE — proving the cleanup ran in the real flow,
+        // not just my isolated unit test.
+        //
+        // NOTE: `run_actor_inline` (job.rs:1355) ignores the
+        // `params` from `Command::StartBatch` and uses its own
+        // `EncodeParams::default()` (X264, ext = "mp4"). So
+        // `task.output = file1.mp4` — same path the script writes
+        // to. The mock must use `task.output` as argv's last
+        // element for cleanup to hit the right file.
+        let tmp = unique_tmp("cancel-partial");
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let input_path = tmp.join("file1.mp4");
+        std::fs::write(&input_path, b"fake video").unwrap();
+        // task.output = file1.mp4 (default X264 ext). Write to
+        // that exact path.
+        let partial = tmp.join("file1.mp4");
+        let partial_check_b = partial.clone();
+        std::fs::write(&partial, b"garbage").unwrap();
+
+        // Fake-ffmpeg script: emits progress blocks + writes more
+        // garbage to the output. Loops ~forever; we kill it via
+        // cancel.
+        let script = format!(
+            r#"
+            i=0
+            while [ $i -lt 200 ]; do
+                printf 'frame=%d\nfps=30\nspeed=1.0x\nout_time_us=1000000\nprogress=continue\n' $i
+                echo garbage >> {}
+                sleep 0.05
+                i=$((i+1))
+            done
+            "#,
+            partial.display()
+        );
+
+        let (cmd_tx, evt_rx) = run_actor_inline(
+            move |task: &TranscodeTask,
+                  _params: &EncodeParams,
+                  _cache: &EncoderCache,
+                  _config: &Config,
+                  cancel: &CancelToken,
+                  on_progress: &mut dyn FnMut(FfmpegProgress)| {
+                let output = task
+                    .output
+                    .as_ref()
+                    .expect("test: task has output")
+                    .to_string_lossy()
+                    .into_owned();
+                let argv = vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    script.clone(),
+                    output.clone(),
+                ];
+                assert_eq!(
+                    argv.last().unwrap(),
+                    &output,
+                    "argv.last() must equal task.output for cleanup to work"
+                );
+                let cancel_signal = cancel.clone();
+                let mut progress = move |p: FfmpegProgress| {
+                    cancel_signal.cancel();
+                    on_progress(p);
+                };
+                let res = crate::pipeline::batch::run_ffmpeg_with_progress(
+                    &argv,
+                    cancel,
+                    Some(60.0),
+                    &mut progress,
+                );
+                match res {
+                    Ok(()) => panic!("expected cancel err"),
+                    Err((category, msg, stderr)) => Ok(EncodingRecord {
+                        source_path: task.input.to_string(),
+                        source_size_bytes: 0,
+                        source_codec: None,
+                        source_container: None,
+                        source_width: None,
+                        source_height: None,
+                        source_fps: None,
+                        source_duration_secs: None,
+                        source_bit_rate_bps: None,
+                        started_at: chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 0)
+                            .unwrap(),
+                        ended_at: Some(
+                            chrono::DateTime::<Utc>::from_timestamp(1_700_000_010, 0).unwrap(),
+                        ),
+                        encoding_duration_secs: Some(10.0),
+                        encoder_selected: None,
+                        encoder_settings: EncoderSettings::default(),
+                        ffmpeg_argv: argv.clone(),
+                        ffmpeg_stderr_tail: stderr,
+                        output_path: None,
+                        output_size_bytes: None,
+                        output_duration_secs: None,
+                        output_codec: None,
+                        compression_ratio: None,
+                        outcome: EncodingOutcome::Failed,
+                        error: Some(crate::types::ErrorContext {
+                            category,
+                            message: msg,
+                            ffmpeg_stderr_tail: String::new(),
+                        }),
+                    }),
+                }
+            },
+            None,
+        );
+
+        let files: Vec<crate::types::InputPath> = vec![input(input_path.to_str().unwrap())];
+        cmd_tx
+            .send(Command::StartBatch {
+                params: EncodeParams::default(),
+                files,
+            })
+            .unwrap();
+        drop(cmd_tx);
+
+        let _events = collect_events(&evt_rx, std::time::Duration::from_secs(5));
+
+        assert!(
+            !partial_check_b.exists(),
+            "partial output {} still on disk after cancel; cleanup did NOT run in the full actor flow",
+            partial_check_b.display()
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn encode_error_category_mapping() {
         // Direct test of the mapping helper. Per design §3.8.6.
         let cases = [

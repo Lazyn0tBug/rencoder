@@ -905,6 +905,16 @@ fn apply_event(state: &mut AppState, evt: Event) {
             // BatchCompleted but for a previous task. In both
             // cases the existing finalize-with-cancelled=true
             // behavior is the right fallback.
+            //
+            // We previously set `state.last_error` to a
+            // "cancelled after N/M" string here, but the badge
+            // `[● CANCELLED]` already conveys the same info —
+            // the duplicate was visible below the batch progress
+            // line and looked contradictory with the optimistic
+            // cancel flow (where the badge flips instantly but
+            // the late BatchCancelled event might trigger a stale
+            // "cancelled after N/M" string seconds later).
+            let _ = (completed, total); // suppress unused
             finalize(state, |t| {
                 t.cancelled = true;
                 t.finished = true;
@@ -915,7 +925,6 @@ fn apply_event(state: &mut AppState, evt: Event) {
                 // a legitimate AwaitingConfirm in the best-effort
                 // case.
             });
-            state.last_error = Some(format!("cancelled after {completed}/{total}"));
         }
         Event::LogLine { file_index, line } => {
             state.log.push_back(LogLine {
