@@ -37,20 +37,15 @@ use rencoder_lib::types::EncodingOutcome;
 /// Cap on the stderr log ring buffer. Per §3.8.6 + §8 item 30.
 const LOG_RING_CAP: usize = 1000;
 
-/// Lifecycle phase of a task (review #133: AwaitingConfirm kept
-/// temporarily as a dead variant — the reducer never produces
-/// it under the new 1-click flow but surrounding code still
-/// references it; removed in the follow-up test-rewrite commit).
+/// Lifecycle phase of a task (review #133: 3-state machine —
+/// Analyzing -> Encoding -> Done, with auto-encode on
+/// positive DryRun count making the legacy AwaitingConfirm
+/// 2-click confirm step unreachable).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchPhase {
     /// `Command::DryRun` dispatched; awaiting `Event::DryRunFinished`.
     /// Dir picker disabled. Start button disabled (analyze in flight).
     Analyzing,
-    /// DryRun done; user must explicitly confirm before encoding
-    /// begins (legacy 2-click flow — review #133 makes this
-    /// unreachable via auto-encode on positive dry-run count).
-    #[allow(dead_code)] // dropped in review #133 part 3d (next commit)
-    AwaitingConfirm,
     /// `Command::StartBatch` dispatched; awaiting `BatchCompleted`
     /// / `BatchCancelled` / `Event::Error`. Progress bar active.
     /// Dir picker disabled. Start button shows "Cancel ✕".
@@ -342,12 +337,11 @@ pub enum Msg {
     },
     /// **Polymorphic** Start button:
     ///   - phase None / Done: dispatch `Command::DryRun` + create task
-    ///   - phase AwaitingConfirm: dispatch `Command::StartBatch`
-    ///   - phase Analyzing / Encoding: rejected (busy-gate)
+    ///   - phase Analyzing / Encoding: rejected (busy-gate — Encode/Cancel
+    ///     during Analyzing is intentionally not allowed; review #100)
     UserClickedStart,
     /// Phase-aware Cancel:
     ///   - Analyzing / Encoding: set `cancelled = true` + dispatch `Command::Cancel`
-    ///   - AwaitingConfirm: clear `tasks.active` (no command)
     ///   - None / Done: ignored
     UserClickedCancel,
     /// Reload history records from disk (Parquet). Manual
@@ -371,19 +365,17 @@ pub enum Msg {
 /// Reduce a message into a state change; emit Commands to the lib
 /// actor as needed.
 ///
-/// **Phase-aware `UserClickedStart`** (§3.8.7.1):
+/// **Phase-aware `UserClickedStart`** (§3.8.7.1, review #133):
 ///   - `None` / `Done` -> build params, collect files, dispatch
 ///     `Command::DryRun`, optimistically transition to `Analyzing`
-///   - `AwaitingConfirm` -> dispatch `Command::StartBatch`,
-///     transition phase to `Encoding`
 ///   - `Analyzing` / `Encoding` -> set `last_error = "task in
-///     progress"`, return early (busy-gate)
+///     progress"`, return early (busy-gate; Cancel-during-Analyzing
+///     is review #100, still pending — the button is disabled)
 ///
 /// **Phase-aware `UserClickedCancel`**:
 ///   - `Analyzing` / `Encoding`: set `cancelled = true`, dispatch
 ///     `Command::Cancel`. The lib respects cancel_token only
 ///     during encoding (Analyze is best-effort).
-///   - `AwaitingConfirm`: clear `tasks.active` (no command)
 ///   - `None` / `Done`: ignored
 pub fn reduce(
     state: &mut AppState,
@@ -443,77 +435,6 @@ pub fn reduce(
                     }
                     dispatch_dry_run_for_new_task(state, cmd_tx, config);
                 }
-                Some(BatchPhase::AwaitingConfirm) => {
-                    // v1.2 review #133 part 2b (micro): bug fix.
-                    // If the dry-run found 0 encodable files, do NOT
-                    // dispatch StartBatch — the lib would emit
-                    // BatchCompleted with 0 records. Set last_error
-                    // and clear the active task so the Task page
-                    // returns to a fresh "None" state for re-arm.
-                    //
-                    // (The Task-page button — done in app.rs — is
-                    //  also disabled when `to_encode == 0`, so this
-                    //  is defense-in-depth.)
-                    if let Some(t) = state.tasks.active.as_ref() {
-                        if t.to_encode == 0 {
-                            state.last_error = Some(format!(
-                                "0 encodable files ({} skipped); pick a different dir",
-                                t.to_skip
-                            ));
-                            finalize(state, |t| {
-                                t.cancelled = false;
-                                // t.finished stays false — plan
-                                // never ran. The history record
-                                // exists for audit.
-                            });
-                            return;
-                        }
-                    }
-                    // Validate the directory is still readable and
-                    // non-empty before dispatching StartBatch. The
-                    // user might have emptied/deleted the dir
-                    // between DryRun and Confirm — the original
-                    // code dispatched StartBatch with 0 files, which
-                    // the lib would error on with no UI feedback.
-                    let files = match collect_input_files(state, config) {
-                        Ok(files) => files,
-                        Err(CollectError::NoInputDir) => {
-                            // Defensive: input_dir is None while an
-                            // active task exists. Should be impossible
-                            // (the dir picker is gated), but show
-                            // an error rather than silent failure.
-                            state.last_error = Some("input dir missing (re-pick)".into());
-                            return;
-                        }
-                        Err(CollectError::UnreadableDir) => {
-                            let dir = state.tasks.active.as_ref().unwrap().dir.display();
-                            state.last_error = Some(format!(
-                                "cannot read {} (permission denied or path missing)",
-                                dir
-                            ));
-                            return;
-                        }
-                    };
-                    if files.is_empty() {
-                        let dir = state.tasks.active.as_ref().unwrap().dir.display();
-                        state.last_error = Some(format!(
-                            "no files in {} (file list changed since DryRun)",
-                            dir
-                        ));
-                        return;
-                    }
-                    let params = build_encode_params_from_config(config);
-                    if let Some(t) = state.tasks.active.as_mut() {
-                        t.phase = BatchPhase::Encoding;
-                        t.records.clear();
-                    }
-                    // Review #111: cmd_tx is bounded (capacity 16). `try_send` is
-                    // non-blocking; on Full or Disconnected the
-                    // command is dropped. A dropped Cmd is equivalent
-                    // to a no-op (the user sees no BatchStarted
-                    // response and can retry).
-                    let _ = cmd_tx.try_send(Command::StartBatch { params, files });
-                }
                 Some(BatchPhase::Analyzing) | Some(BatchPhase::Encoding) => {
                     state.last_error = Some("task in progress".into());
                 }
@@ -527,22 +448,6 @@ pub fn reduce(
                         t.cancelled = true;
                     }
                     let _ = cmd_tx.try_send(Command::Cancel);
-                }
-                Some(BatchPhase::AwaitingConfirm) => {
-                    // P2.7 fix: keep the cancelled plan in history
-                    // (with `cancelled = true`) so the user has a
-                    // record of "I planned X but cancelled". Without
-                    // this, cancelling a plan silently vanishes with
-                    // no audit trail.
-                    finalize(state, |t| {
-                        t.cancelled = true;
-                        // `finished` stays false — that flag is
-                        // reserved for tasks that actually ran.
-                        // Phase stays at AwaitingConfirm so the user
-                        // can see "this was a cancelled plan" vs
-                        // "this finished encoding". History renderer
-                        // can colour-code based on phase if needed.
-                    });
                 }
                 None | Some(BatchPhase::Done) => {}
             }
@@ -579,9 +484,12 @@ fn apply_event(
 ) {
     match evt {
         Event::BatchStarted { id, total_files } => {
-            // AwaitingConfirm -> Encoding. Record lib's
-            // batch_id on the active task (id-as-mapping; not a
-            // gating decision per §3.8.7.4).
+            // Record the lib's batch_id on the active task
+            // (id-as-mapping; not a gating decision per
+            // §3.8.7.4). Phase is already Encoding by the time
+            // BatchStarted arrives — DryRunFinished set it before
+            // dispatching StartBatch (auto-encode path, review
+            // #133 part 3d).
             if let Some(t) = state.tasks.active.as_mut() {
                 t.batch_id = Some(id);
                 t.total_files = total_files;
@@ -774,8 +682,8 @@ fn apply_event(
             // Per §3.8.7.1: during Encoding, move to history
             // (task did run, even if it failed); during
             // Analyzing, drop without history (task never
-            // started); AwaitingConfirm is no-op (lib hasn't
-            // been asked to do anything yet).
+            // started). review #133 part 3d removed the
+            // AwaitingConfirm arm (unreachable under auto-encode).
             let phase = state.tasks.active.as_ref().map(|t| t.phase);
             match phase {
                 Some(BatchPhase::Encoding) => {
@@ -788,10 +696,11 @@ fn apply_event(
                     drop_active(state);
                 }
                 _ => {
-                    // AwaitingConfirm (or other): restore to active.
-                    if let Some(t) = state.tasks.active.take() {
-                        state.tasks.active = Some(t);
-                    }
+                    // Future variants — silently drop (active
+                    // stays as-is). review #133 removed the
+                    // AwaitingConfirm arm; the catch-all covers
+                    // any new phases the lib might surface.
+                    let _ = state.tasks.active.as_ref();
                 }
             }
         }
@@ -875,9 +784,10 @@ fn collect_input_files(
 
 /// Move the active task to history, applying `mutate` to it first.
 /// Centralizes the take + insert + viewing_task clear used by
-/// 4 call sites (BatchCompleted, BatchCancelled, Error-Encoding,
-/// Cancel-AwaitingConfirm). Also handles the Some(Done) re-arm
-/// pre-move (no flag changes needed — just move).
+/// 3 call sites (BatchCompleted, BatchCancelled, Error-Encoding,
+/// DryRunFinished-with-zero-encode). The Some(Done) re-arm
+/// pre-move (no flag changes needed — just move) is handled by
+/// the UserClickedStart reducer arm, not here.
 fn finalize<F>(state: &mut AppState, mutate: F)
 where
     F: FnOnce(&mut TaskInfo),
@@ -1239,76 +1149,6 @@ mod tests {
     }
 
     #[test]
-    fn awaiting_confirm_with_empty_dir_records_error_no_dispatch() {
-        // P1.2 fix: between DryRun and Confirm, the user could
-        // empty/delete the directory. The old code dispatched
-        // StartBatch with 0 files, which the lib would error on
-        // with no UI feedback. Now the reducer validates the dir
-        // is still readable + non-empty before dispatching.
-        let mut state = fresh_state();
-        let tx = cmd_tx();
-        state.tasks.active = Some(TaskInfo {
-            task_id: TaskId("20260101000000".into()),
-            batch_id: None,
-            phase: BatchPhase::AwaitingConfirm,
-            dir: PathBuf::from("/y"), // dir doesn't exist (read_dir errors)
-            total_files: 1,
-            to_encode: 1,
-            to_skip: 0,
-            encoded: 0,
-            cancelled: false,
-            finished: false,
-            records: vec![],
-            dry_run_records: vec![],
-        });
-        state.input_dir = Some(PathBuf::from("/y"));
-        reduce(&mut state, Msg::UserClickedStart, &tx, &default_config());
-        // Phase should still be AwaitingConfirm — Confirm was rejected.
-        assert_eq!(
-            state.tasks.active.as_ref().unwrap().phase,
-            BatchPhase::AwaitingConfirm
-        );
-        // last_error should mention the unreadable dir.
-        let err = state.last_error.expect("expected last_error to be set");
-        assert!(
-            err.contains("cannot read") || err.contains("no files"),
-            "unexpected last_error: {err}"
-        );
-    }
-
-    #[test]
-    fn cancel_during_awaiting_confirm_keeps_plan_in_history() {
-        // P2.7 fix: cancelling a plan should leave an audit trail
-        // in task_history (with `cancelled = true`) instead of
-        // silently vanishing.
-        let mut state = fresh_state();
-        let tx = cmd_tx();
-        let task_id = TaskId("20260101000000".into());
-        state.tasks.active = Some(TaskInfo {
-            task_id: task_id.clone(),
-            batch_id: None,
-            phase: BatchPhase::AwaitingConfirm,
-            dir: PathBuf::from("/x"),
-            total_files: 3,
-            to_encode: 2,
-            to_skip: 1,
-            encoded: 0,
-            cancelled: false,
-            finished: false,
-            records: vec![],
-            dry_run_records: vec![],
-        });
-        reduce(&mut state, Msg::UserClickedCancel, &tx, &default_config());
-        assert!(state.tasks.active.is_none());
-        assert_eq!(state.task_history.len(), 1);
-        let h = &state.task_history[0];
-        assert_eq!(h.task_id, task_id);
-        assert!(h.cancelled);
-        assert!(!h.finished); // finished reserved for actually-completed tasks
-        assert_eq!(state.viewing_task, None);
-    }
-
-    #[test]
     fn user_selected_dir_rejected_clears_stale_error() {
         // P2.5 fix: when picker is rejected (active task in
         // Analyzing/Encoding), clear any stale last_error so the
@@ -1378,12 +1218,17 @@ mod tests {
 
     #[test]
     fn batch_started_records_batch_id_as_mapping() {
+        // review #133 part 3d: Event::BatchStarted now records the
+        // lib's batch_id on the active task but does NOT change
+        // phase. Phase is set to Encoding by Event::DryRunFinished
+        // (auto-encode path) before BatchStarted ever fires — the
+        // lib transitions Analyzing -> Encoding itself by emitting
+        // BatchStarted in response to Command::StartBatch.
         let mut state = fresh_state();
-        // Drive into AwaitingConfirm.
         state.tasks.active = Some(TaskInfo {
             task_id: TaskId("20260101000000".into()),
             batch_id: None,
-            phase: BatchPhase::AwaitingConfirm,
+            phase: BatchPhase::Encoding,
             dir: PathBuf::from("/x"),
             total_files: 5,
             to_encode: 4,
@@ -1406,6 +1251,7 @@ mod tests {
         let t = state.tasks.active.as_ref().unwrap();
         assert_eq!(t.batch_id, Some(7));
         assert_eq!(t.phase, BatchPhase::Encoding);
+        assert_eq!(t.total_files, 5);
     }
 
     #[test]
@@ -1788,8 +1634,13 @@ mod tests {
 
     #[test]
     fn cancel_during_analyzing_drops_dry_run_finished() {
-        // Phantom-AwaitingConfirm guard: cancel during Analyzing,
-        // then DryRunFinished arrives -> drop, not a phantom plan.
+        // review #133 part 3d: cancel during Analyzing sets
+        // cancelled = true. The DryRunFinished handler discards
+        // the event (no auto-encode dispatch, no phase change,
+        // no finalize). Without this guard, an in-flight
+        // DryRunFinished after a Cancel would silently transition
+        // the (already-cancelled) task through the auto-encode
+        // path.
         let mut state = fresh_state();
         let tx = cmd_tx();
         state.tasks.active = Some(TaskInfo {
@@ -1811,8 +1662,7 @@ mod tests {
         // race fix).
         reduce(&mut state, Msg::UserClickedCancel, &tx, &default_config());
         assert!(state.tasks.active.as_ref().unwrap().cancelled);
-        // DryRun still arrives — should drop without
-        // transitioning to AwaitingConfirm.
+        // DryRun still arrives — should drop without auto-encoding.
         reduce(
             &mut state,
             Msg::Lib(Event::DryRunFinished {

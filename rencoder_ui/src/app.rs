@@ -673,30 +673,6 @@ fn TaskPageButton(
                 }
             }
         }
-        Some(BatchPhase::AwaitingConfirm) => {
-            let active = state.read().tasks.active.clone();
-            let to_encode = active.as_ref().map(|t| t.to_encode).unwrap_or(0);
-            let tx_s1 = tx.clone();
-            let cfg_s1 = cfg.clone();
-            let tx_s2 = tx.clone();
-            let cfg_s2 = cfg.clone();
-            rsx! {
-                button {
-                    class: "primary-btn",
-                    onclick: move |_| {
-                        state.with_mut(|s| reduce(s, Msg::UserClickedStart, &tx_s1, &cfg_s1));
-                    },
-                    "encode {to_encode} files ▸"
-                }
-                button {
-                    class: "secondary-btn",
-                    onclick: move |_| {
-                        state.with_mut(|s| reduce(s, Msg::UserClickedCancel, &tx_s2, &cfg_s2));
-                    },
-                    "Cancel ✕"
-                }
-            }
-        }
         Some(BatchPhase::Encoding) => {
             let tx_c = tx.clone();
             rsx! {
@@ -728,14 +704,11 @@ fn BatchStatus(
 ) -> Element {
     let badge = match phase {
         BatchPhase::Analyzing => "[● ANALYZING]",
-        BatchPhase::AwaitingConfirm => "[● AWAITING]",
         BatchPhase::Encoding => "[● ENCODING]",
         BatchPhase::Done => "[● DONE]",
     };
     let badge_class = match phase {
-        BatchPhase::Analyzing | BatchPhase::AwaitingConfirm | BatchPhase::Encoding => {
-            "badge badge-active"
-        }
+        BatchPhase::Analyzing | BatchPhase::Encoding => "badge badge-active",
         BatchPhase::Done => "badge badge-done",
     };
     rsx! {
