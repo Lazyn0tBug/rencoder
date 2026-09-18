@@ -545,7 +545,7 @@ fn send_evt_lossy(
             }
         }
         Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-            tracing::warn!("    evt_tx disconnected (UI dropped receiver)");
+            tracing::warn!("evt_tx disconnected (UI dropped receiver)");
         }
     }
 }
@@ -557,8 +557,8 @@ fn send_evt_lossy(
 fn send_cmd_lossy(tx: &Sender<Command>, cmd: Command) {
     if let Err(crossbeam_channel::TrySendError::Full(cmd)) = tx.try_send(cmd) {
         tracing::warn!(
-            "    cmd_tx full, dropping command: {:?}",
-            std::mem::discriminant(&cmd)
+            cmd_variant = ?std::mem::discriminant(&cmd),
+            "cmd_tx full; dropping command"
         );
     }
 }

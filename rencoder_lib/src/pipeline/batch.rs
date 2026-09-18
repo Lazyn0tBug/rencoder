@@ -242,19 +242,28 @@ fn encode_prepare(
         if is_partial {
             match std::fs::remove_file(&output_path) {
                 Ok(()) => {
+                    // v1.2 follow-up #4 commit 2: structured fields.
+                    // `output_path` is borrowed twice below — bind to
+                    // a local first so the closure in `tracing` doesn't
+                    // outlive it.
+                    let out_dur = output_meta
+                        .as_ref()
+                        .and_then(|m| m.duration_secs)
+                        .unwrap_or(0.0);
+                    let src_dur = metadata.duration_secs.unwrap_or(0.0);
                     tracing::warn!(
-                        "    partial output detected at {} (output {:.2}s vs source {:.2}s); removed, re-encoding",
-                        output_path.display(),
-                        output_meta.as_ref().and_then(|m| m.duration_secs).unwrap_or(0.0),
-                        metadata.duration_secs.unwrap_or(0.0),
+                        output = %output_path.display(),
+                        output_duration_secs = out_dur,
+                        source_duration_secs = src_dur,
+                        "partial output detected; removed, re-encoding"
                     );
                     // Fall through.
                 }
                 Err(e) => {
                     tracing::warn!(
-                        "    partial output detected at {} but removal failed: {}; skipping",
-                        output_path.display(),
-                        e,
+                        output = %output_path.display(),
+                        error = %e,
+                        "partial output detected but removal failed; skipping"
                     );
                     return EncodePrepareResult::Skipped(make_skipped_record(
                         task,
@@ -267,8 +276,8 @@ fn encode_prepare(
             }
         } else {
             tracing::info!(
-                "    task skipped: output already exists at {}",
-                output_path.display()
+                output = %output_path.display(),
+                "task skipped: output already exists"
             );
             return EncodePrepareResult::Skipped(make_skipped_record(
                 task,
@@ -490,19 +499,19 @@ fn build_encode_record(
                     if output_path.exists() {
                         match std::fs::remove_file(output_path) {
                             Ok(()) => tracing::warn!(
-                                "    ffmpeg exit 0 but {} was zero bytes; removed, recording Failed",
-                                output_path.display()
+                                output = %output_path.display(),
+                                "ffmpeg exit 0 but output was zero bytes; removed, recording Failed"
                             ),
                             Err(e) => tracing::warn!(
-                                "    ffmpeg exit 0 but {} was zero bytes and remove failed: {}; recording Failed",
-                                output_path.display(),
-                                e
+                                output = %output_path.display(),
+                                error = %e,
+                                "ffmpeg exit 0 but output was zero bytes and remove failed; recording Failed"
                             ),
                         }
                     } else {
                         tracing::warn!(
-                            "    ffmpeg exit 0 but {} missing; recording Failed",
-                            output_path.display()
+                            output = %output_path.display(),
+                            "ffmpeg exit 0 but output missing; recording Failed"
                         );
                     }
                     (EncodingOutcome::Failed, None)
@@ -655,8 +664,9 @@ pub fn transcode_batch(
         Ok(records) => records,
         Err((idx, e)) => {
             tracing::warn!(
-                "    batch aborted at task {idx}: {e}; returning {} partial records",
-                idx
+                task_idx = idx,
+                error = %e,
+                "batch aborted; returning partial records"
             );
             Vec::new()
         }
@@ -1306,10 +1316,17 @@ fn cleanup_partial_output_from_argv(argv: &[String]) {
     let Some(out) = argv.last() else {
         return;
     };
+    // v1.2 follow-up #4 commit 2: structured fields. The output
+    // path is the cleanest key to grep on when a user reports
+    // "did cancel actually clean up the partial for THIS file?".
     match std::fs::remove_file(out) {
-        Ok(()) => tracing::info!("    cancel cleanup: removed {out}"),
+        Ok(()) => tracing::info!(output = %out, "cancel cleanup: removed partial"),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => tracing::warn!("    cancel cleanup: failed to remove {out}: {e}"),
+        Err(e) => tracing::warn!(
+            output = %out,
+            error = %e,
+            "cancel cleanup: failed to remove partial"
+        ),
     }
 }
 

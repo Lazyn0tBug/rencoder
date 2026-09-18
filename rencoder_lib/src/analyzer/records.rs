@@ -203,7 +203,7 @@ pub fn analyze_records_parallel(files: &[PathBuf]) -> Result<Vec<AnalysisRecord>
                     file_bytes,
                 },
                 Err(e) => {
-                    tracing::warn!("probe failed for {}: {e}", path.display());
+                    tracing::warn!(path = %path.display(), error = %e, "probe failed");
                     AnalysisRecord {
                         path: path.clone(),
                         fps: None,
@@ -241,7 +241,7 @@ where
                     file_bytes,
                 },
                 Err(e) => {
-                    tracing::warn!("probe failed for {}: {e}", path.display());
+                    tracing::warn!(path = %path.display(), error = %e, "probe failed");
                     AnalysisRecord {
                         path: path.clone(),
                         fps: None,
@@ -334,7 +334,7 @@ where
                     // Per-file failure log: same shape as the no-progress
                     // parallel variant (`tracing::warn!` for the operator's
                     // stderr; LogPanel surfaces it in the UI).
-                    tracing::warn!("probe failed for {}: {e}", path.display());
+                    tracing::warn!(path = %path.display(), error = %e, "probe failed");
                     let last = AnalyzedFile {
                         path: path_buf.clone(),
                         outcome: FileOutcome::ProbeFailed(e),

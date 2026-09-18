@@ -39,7 +39,7 @@ fn collect_single_file(p: &Path, extensions: &[String]) -> Vec<InputPath> {
         match InputPath::new(p) {
             Ok(ip) => vec![ip],
             Err(e) => {
-                tracing::warn!("    skipping {}: {e}", p.display());
+                tracing::warn!(path = %p.display(), error = %e, "skipping file");
                 vec![]
             }
         }
@@ -68,7 +68,7 @@ fn collect_dir(root: &Path, extensions: &[String]) -> Result<Vec<InputPath>, Enc
             // v1 collect_dir behavior.
             match InputPath::new(path) {
                 Ok(ip) => results.push(ip),
-                Err(e) => tracing::warn!("    skipping {}: {e}", path.display()),
+                Err(e) => tracing::warn!(path = %path.display(), error = %e, "skipping file"),
             }
         }
     }

@@ -138,10 +138,10 @@ impl TaskManager {
     {
         let total = tasks.len();
         tracing::info!(
-            "{} start at {}, {} files",
-            label,
-            batch_path.display(),
-            total
+            label = %label,
+            batch_path = %batch_path.display(),
+            total_files = total,
+            "batch start"
         );
         let mut results = Vec::with_capacity(total);
         for (idx, task) in tasks.iter().enumerate() {
@@ -159,10 +159,10 @@ impl TaskManager {
             // operators which file the in-flight row corresponds to
             // without parsing the batch label.
             tracing::info!(
-                "    task {}/{} {} start",
-                ctx.index,
-                ctx.total,
-                ctx.source.display()
+                task_idx = ctx.index,
+                total = ctx.total,
+                source = %ctx.source.display(),
+                "task start"
             );
 
             // The Guard lives only across the processor call so the
@@ -176,10 +176,10 @@ impl TaskManager {
             };
 
             tracing::info!(
-                "    task {}/{} {} end",
-                ctx.index,
-                ctx.total,
-                ctx.source.display()
+                task_idx = ctx.index,
+                total = ctx.total,
+                source = %ctx.source.display(),
+                "task end"
             );
 
             match result {
@@ -193,20 +193,22 @@ impl TaskManager {
                     // `build_failed_record`, so this branch
                     // typically means cancel / UI disconnect).
                     tracing::warn!(
-                        "    batch aborted at task {}/{}: {}",
-                        ctx.index,
-                        ctx.total,
-                        e
+                        task_idx = ctx.index,
+                        total = ctx.total,
+                        source = %ctx.source.display(),
+                        error = %e,
+                        "batch aborted at task"
                     );
                     return Err((idx, e));
                 }
             }
         }
         tracing::info!(
-            "{}, end at {}, {} files successed",
-            label,
-            batch_path.display(),
-            total
+            label = %label,
+            batch_path = %batch_path.display(),
+            total_files = total,
+            successful = results.len(),
+            "batch end"
         );
         Ok(results)
     }

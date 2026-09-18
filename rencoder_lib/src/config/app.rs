@@ -259,11 +259,11 @@ impl AppConfig {
             let content = DEFAULT_CONFIG_TOML;
             write_atomic(path, content.as_bytes())?;
             // Surface auto-create via the project's log infrastructure
-            // (design doc §2.3: lib uses `log`, CLI bridges via
-            // `tracing-log`). User can silence via RUST_LOG.
+            // v1.2 follow-up #4: lib uses `tracing` directly (was `log`).
+            // User can silence via RUST_LOG.
             tracing::info!(
-                "rencoder: created {} (no config found; edit to customize)",
-                path.display()
+                config_path = %path.display(),
+                "rencoder: created default config (no config found; edit to customize)"
             );
             // Re-parse the constant as a self-consistency check: catches
             // drift between DEFAULT_CONFIG_TOML and the schema. If the

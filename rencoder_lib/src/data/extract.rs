@@ -73,9 +73,9 @@ pub fn probe_video_metadata_auto(input: &Path) -> Result<VideoMetadata, EncodeEr
             Ok(m) => Ok(m),
             Err(e) => {
                 tracing::warn!(
-                    "c-probe failed for {}, falling back to ffprobe CLI: {}",
-                    input.display(),
-                    e
+                    input = %input.display(),
+                    error = %e,
+                    "c-probe failed; falling back to ffprobe CLI"
                 );
                 probe_video_metadata(input)
             }
