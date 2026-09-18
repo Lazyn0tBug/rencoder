@@ -73,6 +73,9 @@ pub enum Page {
 /// Setup-page config field identifiers (review #133 part 2d).
 /// One enum per editable field — the reducer's match is exhaustive
 /// at compile time (no wildcard string-keyed updates).
+#[allow(dead_code)]
+// constructed by the Setup-page form (app.rs) on
+// every <input>/radio change; not constructed by the reducer itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigFieldKind {
     Format,
@@ -82,6 +85,7 @@ pub enum ConfigFieldKind {
 }
 
 /// Generic value type for `UserEditedConfigField` (review #133).
+#[allow(dead_code)] // constructed by the Setup-page form (app.rs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigFieldValue {
     Format(rencoder_lib::config::app::FormatArg),
@@ -328,6 +332,7 @@ pub enum Msg {
     /// `<input>` and radio handlers fire this on every change;
     /// the reducer updates `state.config_draft` AND fires
     /// `Command::SaveConfig` so each keystroke persists atomically.
+    #[allow(dead_code)] // constructed by the Setup-page form (app.rs).
     UserEditedConfigField {
         kind: ConfigFieldKind,
         value: ConfigFieldValue,
@@ -940,20 +945,12 @@ fn dispatch_dry_run_for_new_task(
 ///
 /// Defensive: missing `encode` section in `config_draft` is
 /// populated with a default so the first edit doesn't crash.
-fn apply_config_field_edit(
-    state: &mut AppState,
-    kind: ConfigFieldKind,
-    value: ConfigFieldValue,
-) {
+fn apply_config_field_edit(state: &mut AppState, kind: ConfigFieldKind, value: ConfigFieldValue) {
     use rencoder_lib::config::app::EncodeConfig;
     if state.config_draft.encode.is_none() {
         state.config_draft.encode = Some(EncodeConfig::default());
     }
-    let enc = state
-        .config_draft
-        .encode
-        .as_mut()
-        .expect("just inserted");
+    let enc = state.config_draft.encode.as_mut().expect("just inserted");
     match (kind, value) {
         (ConfigFieldKind::Format, ConfigFieldValue::Format(v)) => {
             enc.format = Some(v);

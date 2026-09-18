@@ -111,7 +111,7 @@ parallel = true
 
 /// Top-level user-facing config. Both sections are optional; missing
 /// sections fall back to their per-action defaults.
-#[derive(Debug, Default, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     #[serde(default)]

@@ -65,7 +65,15 @@ pub fn App() -> Element {
         config.set(cfg);
         cmd_tx.set(Some(tx.clone()));
 
+        // v1.2 review #133: seed the Setup-page editor's
+        // in-memory draft from the loaded config so the form
+        // shows the user's actual values, not `AppConfig::default()`.
+        // `apply_config_field_edit` (msg.rs) mutates `config_draft`
+        // on every edit; the form dispatches `UserEditedConfigField`
+        // which fires `Command::SaveConfig` for atomic TOML write.
+        let cfg_seed = config.read().clone();
         let mut state_thread = state;
+        state_thread.with_mut(|s| s.config_draft = (*cfg_seed).clone());
         // Per the /code-review medium perf finding: hoist the
         // .read().clone() out of the event loop. config and
         // cmd_tx are set once at startup (v1: no Save button, no
