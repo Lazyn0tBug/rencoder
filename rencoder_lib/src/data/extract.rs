@@ -72,7 +72,7 @@ pub fn probe_video_metadata_auto(input: &Path) -> Result<VideoMetadata, EncodeEr
         match crate::ffi::probe_video_metadata_fast(input) {
             Ok(m) => Ok(m),
             Err(e) => {
-                log::warn!(
+                tracing::warn!(
                     "c-probe failed for {}, falling back to ffprobe CLI: {}",
                     input.display(),
                     e

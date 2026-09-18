@@ -261,7 +261,7 @@ impl AppConfig {
             // Surface auto-create via the project's log infrastructure
             // (design doc §2.3: lib uses `log`, CLI bridges via
             // `tracing-log`). User can silence via RUST_LOG.
-            log::info!(
+            tracing::info!(
                 "rencoder: created {} (no config found; edit to customize)",
                 path.display()
             );

@@ -242,7 +242,7 @@ fn encode_prepare(
         if is_partial {
             match std::fs::remove_file(&output_path) {
                 Ok(()) => {
-                    log::warn!(
+                    tracing::warn!(
                         "    partial output detected at {} (output {:.2}s vs source {:.2}s); removed, re-encoding",
                         output_path.display(),
                         output_meta.as_ref().and_then(|m| m.duration_secs).unwrap_or(0.0),
@@ -251,7 +251,7 @@ fn encode_prepare(
                     // Fall through.
                 }
                 Err(e) => {
-                    log::warn!(
+                    tracing::warn!(
                         "    partial output detected at {} but removal failed: {}; skipping",
                         output_path.display(),
                         e,
@@ -266,7 +266,7 @@ fn encode_prepare(
                 }
             }
         } else {
-            log::info!(
+            tracing::info!(
                 "    task skipped: output already exists at {}",
                 output_path.display()
             );
@@ -325,7 +325,7 @@ where
         .unwrap_or(false);
 
     if should_skip_encoding(codec, params.format, need_reduce) {
-        log::info!("    task skipped: source codec matches target ({})", codec);
+        tracing::info!("    task skipped: source codec matches target ({})", codec);
         return Ok(make_skipped_record(
             task,
             params,
@@ -489,18 +489,18 @@ fn build_encode_record(
                     // run's partial detector will retry.
                     if output_path.exists() {
                         match std::fs::remove_file(output_path) {
-                            Ok(()) => log::warn!(
+                            Ok(()) => tracing::warn!(
                                 "    ffmpeg exit 0 but {} was zero bytes; removed, recording Failed",
                                 output_path.display()
                             ),
-                            Err(e) => log::warn!(
+                            Err(e) => tracing::warn!(
                                 "    ffmpeg exit 0 but {} was zero bytes and remove failed: {}; recording Failed",
                                 output_path.display(),
                                 e
                             ),
                         }
                     } else {
-                        log::warn!(
+                        tracing::warn!(
                             "    ffmpeg exit 0 but {} missing; recording Failed",
                             output_path.display()
                         );
@@ -654,7 +654,7 @@ pub fn transcode_batch(
     let records: Vec<EncodingRecord> = match run_result {
         Ok(records) => records,
         Err((idx, e)) => {
-            log::warn!(
+            tracing::warn!(
                 "    batch aborted at task {idx}: {e}; returning {} partial records",
                 idx
             );
@@ -1307,9 +1307,9 @@ fn cleanup_partial_output_from_argv(argv: &[String]) {
         return;
     };
     match std::fs::remove_file(out) {
-        Ok(()) => log::info!("    cancel cleanup: removed {out}"),
+        Ok(()) => tracing::info!("    cancel cleanup: removed {out}"),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => log::warn!("    cancel cleanup: failed to remove {out}: {e}"),
+        Err(e) => tracing::warn!("    cancel cleanup: failed to remove {out}: {e}"),
     }
 }
 

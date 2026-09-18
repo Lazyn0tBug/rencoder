@@ -16,7 +16,12 @@ walkdir = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-log = "0.4"
+# v1.2 follow-up #4: lib uses tracing directly. `publish = false`
+# (U18, internal lib) means no external consumer pins us to the
+# `log` facade; structured fields + #[instrument] are the
+# win we wanted. CLI / UI keep their `tracing-log` bridge
+# until commit 3 drops it.
+tracing = "0.1"
 thiserror = "1"
 num_cpus = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

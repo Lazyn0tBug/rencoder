@@ -70,7 +70,7 @@ where
     match runner("nvidia-smi", &["-L"]) {
         Ok(out) => !out.trim().is_empty(),
         Err(e) => {
-            log::info!("nvidia-smi unavailable, falling back to software encoding: {e}");
+            tracing::info!("nvidia-smi unavailable, falling back to software encoding: {e}");
             false
         }
     }

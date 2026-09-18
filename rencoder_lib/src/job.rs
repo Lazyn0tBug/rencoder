@@ -545,7 +545,7 @@ fn send_evt_lossy(
             }
         }
         Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-            log::warn!("    evt_tx disconnected (UI dropped receiver)");
+            tracing::warn!("    evt_tx disconnected (UI dropped receiver)");
         }
     }
 }
@@ -556,7 +556,7 @@ fn send_evt_lossy(
 /// `StartBatch` via the busy-gate.
 fn send_cmd_lossy(tx: &Sender<Command>, cmd: Command) {
     if let Err(crossbeam_channel::TrySendError::Full(cmd)) = tx.try_send(cmd) {
-        log::warn!(
+        tracing::warn!(
             "    cmd_tx full, dropping command: {:?}",
             std::mem::discriminant(&cmd)
         );

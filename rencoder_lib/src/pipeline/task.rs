@@ -137,7 +137,7 @@ impl TaskManager {
         P: FnMut(&TranscodeTask, &TaskContext) -> Result<R, EncodeError>,
     {
         let total = tasks.len();
-        log::info!(
+        tracing::info!(
             "{} start at {}, {} files",
             label,
             batch_path.display(),
@@ -158,7 +158,7 @@ impl TaskManager {
             // events (system logs, ticket timelines). Filename tells
             // operators which file the in-flight row corresponds to
             // without parsing the batch label.
-            log::info!(
+            tracing::info!(
                 "    task {}/{} {} start",
                 ctx.index,
                 ctx.total,
@@ -175,7 +175,7 @@ impl TaskManager {
                 processor(task, &ctx)
             };
 
-            log::info!(
+            tracing::info!(
                 "    task {}/{} {} end",
                 ctx.index,
                 ctx.total,
@@ -192,7 +192,7 @@ impl TaskManager {
                     // per-file errors into Ok via
                     // `build_failed_record`, so this branch
                     // typically means cancel / UI disconnect).
-                    log::warn!(
+                    tracing::warn!(
                         "    batch aborted at task {}/{}: {}",
                         ctx.index,
                         ctx.total,
@@ -202,7 +202,7 @@ impl TaskManager {
                 }
             }
         }
-        log::info!(
+        tracing::info!(
             "{}, end at {}, {} files successed",
             label,
             batch_path.display(),
