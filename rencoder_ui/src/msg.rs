@@ -70,6 +70,28 @@ pub enum Page {
     Log,
 }
 
+/// Setup-page config field identifiers (review #133 part 2d).
+/// One enum per editable field — the reducer's match is exhaustive
+/// at compile time (no wildcard string-keyed updates).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigFieldKind {
+    Format,
+    Crf,
+    MaxFps,
+    Extensions,
+}
+
+/// Generic value type for `UserEditedConfigField` (review #133).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigFieldValue {
+    Format(rencoder_lib::config::app::FormatArg),
+    Crf(u32),
+    /// `None` = cap disabled, `Some(30)` = cap at 30 fps.
+    MaxFps(Option<u32>),
+    /// Comma-separated. Empty string clears the filter (= "all").
+    Extensions(String),
+}
+
 /// UI-side task id — timestamp-based `yyyymmddhhmmss` (per spec).
 /// Queue and history share the same id space; the id is preserved
 /// across active -> history moves (no re-key).
@@ -302,6 +324,14 @@ pub enum Msg {
     /// Rejected if a task is in active phase (defense-in-depth;
     /// the picker is also disabled in the UI).
     UserSelectedDir(PathBuf),
+    /// Setup-page live edit (review #133). The Setup page's
+    /// `<input>` and radio handlers fire this on every change;
+    /// the reducer updates `state.config_draft` AND fires
+    /// `Command::SaveConfig` so each keystroke persists atomically.
+    UserEditedConfigField {
+        kind: ConfigFieldKind,
+        value: ConfigFieldValue,
+    },
     /// **Polymorphic** Start button:
     ///   - phase None / Done: dispatch `Command::DryRun` + create task
     ///   - phase AwaitingConfirm: dispatch `Command::StartBatch`
@@ -367,6 +397,18 @@ pub fn reduce(
             }
             state.last_error = None;
             state.input_dir = Some(path);
+        }
+        Msg::UserEditedConfigField { kind, value } => {
+            // v1.2 review #133 part 2d: real-time save on every
+            // Setup field change. Update the in-memory draft
+            // (Setup page reads it on next render) AND fire
+            // `Command::SaveConfig` which writes the full
+            // AppConfig to TOML atomically via `write_atomic`.
+            // Each field change is one save — cheap for small
+            // TOML, safe on every keystroke.
+            apply_config_field_edit(state, kind, value);
+            state.config_save_status = "Saving…".into();
+            let _ = cmd_tx.try_send(Command::SaveConfig);
         }
         Msg::UserClickedStart => {
             let phase = state.tasks.active.as_ref().map(|t| t.phase);
@@ -888,6 +930,58 @@ fn dispatch_dry_run_for_new_task(
     });
     state.viewing_task = Some(task_id);
     let _ = cmd_tx.try_send(Command::DryRun { params, files });
+}
+
+/// v1.2 review #133 part 2d: Setup-page real-time save helper.
+/// The reducer arm for `Msg::UserEditedConfigField` calls this
+/// to update the in-memory `config_draft`. The
+/// `Command::SaveConfig` dispatch (separate) atomically
+/// persists the full `AppConfig` to TOML via `write_atomic`.
+///
+/// Defensive: missing `encode` section in `config_draft` is
+/// populated with a default so the first edit doesn't crash.
+fn apply_config_field_edit(
+    state: &mut AppState,
+    kind: ConfigFieldKind,
+    value: ConfigFieldValue,
+) {
+    use rencoder_lib::config::app::EncodeConfig;
+    if state.config_draft.encode.is_none() {
+        state.config_draft.encode = Some(EncodeConfig::default());
+    }
+    let enc = state
+        .config_draft
+        .encode
+        .as_mut()
+        .expect("just inserted");
+    match (kind, value) {
+        (ConfigFieldKind::Format, ConfigFieldValue::Format(v)) => {
+            enc.format = Some(v);
+        }
+        (ConfigFieldKind::Crf, ConfigFieldValue::Crf(v)) => {
+            enc.crf = v;
+        }
+        (ConfigFieldKind::MaxFps, ConfigFieldValue::MaxFps(v)) => {
+            enc.max_fps = v;
+        }
+        (ConfigFieldKind::Extensions, ConfigFieldValue::Extensions(s)) => {
+            // Parse "mp4, mkv, mov " -> ["mp4", "mkv", "mov"].
+            // Empty string clears the filter (= "all").
+            let parts: Vec<String> = s
+                .split(',')
+                .map(|p| p.trim())
+                .filter(|p| !p.is_empty())
+                .map(String::from)
+                .collect();
+            enc.extensions = if parts.is_empty() { None } else { Some(parts) };
+        }
+        // Exhaustiveness: 4 ConfigFieldKind variants; the matching
+        // ConfigFieldValue arm exists for each. Any mismatch is a
+        // compile error.
+        (k, v) => unreachable!(
+            "ConfigFieldKind {k:?} + ConfigFieldValue {v:?} mismatch (impossible by construction)"
+        ),
+    }
 }
 
 #[cfg(test)]
