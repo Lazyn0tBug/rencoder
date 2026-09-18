@@ -101,7 +101,9 @@ html, body {
     min-height: 100vh;
     max-width: 1200px;
     margin: 0 auto;
-    padding: 0 var(--space-4);
+    padding: 0 var(--space-4) 64px;
+    /* 64px bottom padding = room for the fixed .task-button-bar
+     * (~50px) + a small buffer so the file list isn't covered. */
 }
 
 .app-header {
@@ -391,19 +393,24 @@ html, body {
 /* Sticky bottom button bar — Task page only (review #133 follow-up).
  * The contextual Start/Cancel/Re-run button lives here so the page
  * can drop the redundant `──[ TASK ]────` header (TopBar tab names
- * the page already). The bar sticks to the viewport bottom while the
- * file list above scrolls; the footer log stays below it (per spec).
- * The bar shows only when needed — TaskPageButton internally
- * returns <span/> when there's nothing to do. */
+ * the page already). Uses `position: fixed` (not sticky) so the
+ * bar pins to the viewport bottom even on short pages where no
+ * scrolling occurs — sticky would only engage when content
+ * overflows. The bar overlays the FooterLog; the .app
+ * padding-bottom (60px) reserves space so the file list isn't
+ * covered. */
 .task-button-bar {
-    position: sticky;
+    position: fixed;
     bottom: 0;
+    left: 50%;
+    transform: translateX(-50%);
+    width: calc(100% - var(--space-4) * 2);
+    max-width: 1200px;
     display: flex;
     justify-content: flex-end;
     align-items: center;
     gap: var(--space-3);
     padding: var(--space-3) var(--space-4);
-    margin-top: var(--space-4);
     background: var(--bg-surface);
     border-top: 1px solid var(--border);
     z-index: 10;
