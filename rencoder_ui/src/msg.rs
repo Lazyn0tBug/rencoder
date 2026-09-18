@@ -423,8 +423,10 @@ pub enum LogSource {
     /// Per-file ffmpeg stderr line (`Event::LogLine`). Has a
     /// meaningful `file_index`.
     FfmpegStderr,
-    /// Lib-internal log event bridged via `tracing-log::LogTracer`.
-    /// No file context — `file_index` is `NO_FILE_INDEX`.
+    /// Lib-internal tracing event (v1.2 follow-up #4: no longer bridged
+    /// via `tracing-log::LogTracer` — lib emits `tracing` directly
+    /// and UI consumes via the same subscriber). No file context —
+    /// `file_index` is `NO_FILE_INDEX`.
     LibInternal,
 }
 
@@ -469,10 +471,10 @@ pub enum Msg {
     /// Wrapper for lib -> UI events. All lib events flow
     /// through here; reducer routes them in `apply_event`.
     Lib(Event),
-    /// Lib-internal log line (bridged via tracing-log, pushed
-    /// through a crossbeam channel from the log drain thread).
-    /// v1 source field is fixed to `LogSource::LibInternal`;
-    /// v1.2 may add per-event severity / structured fields.
+    /// Lib-internal tracing line (v1.2 follow-up #4: not bridged
+    /// via tracing-log; pushed through a crossbeam channel from the
+    /// log drain thread). Source field is fixed to
+    /// `LogSource::LibInternal`.
     LibLogLine(String),
 }
 

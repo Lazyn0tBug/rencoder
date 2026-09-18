@@ -1,16 +1,18 @@
 //! Tracing initialization for the UI binary (§3.8.7.5).
 //!
-//! Mirrors `rencoder_cli/src/tracing_init.rs` in shape (both
-//! binaries bridge lib's `log` events via `tracing-log`) but the
-//! sink is different: UI doesn't have a console (desktop app),
-//! so events flow into a `crossbeam_channel::Sender<String>`
-//! drained by a dedicated thread that pushes into `state.log`
-//! via the reducer.
+//! v1.2 follow-up #4: lib emits `tracing` events directly (was
+//! `log` bridged via `tracing-log`). The bridge is dropped here;
+//! UI consumes lib events the same way it consumes its own
+//! tracing events — single channel, single subscriber.
+//!
+//! Sink: UI doesn't have a console (desktop app), so events
+//! flow into a `crossbeam_channel::Sender<String>` drained by
+//! a dedicated thread that pushes into `state.log` via the reducer.
 //!
 //! Flow:
 //!
 //! ```text
-//! lib `log::info!` -> tracing-log::LogTracer -> tracing subscriber
+//! lib `tracing::info!` -> tracing subscriber (this module)
 //!     -> custom MakeWriter -> crossbeam_channel::Sender
 //!     -> log drain thread (App's use_hook) -> Msg::LibLogLine
 //!     -> reducer -> state.log.push_back -> Dioxus re-render
@@ -37,15 +39,12 @@ use tracing_subscriber::fmt::MakeWriter;
 /// `set` happens after `get`.
 pub static LOG_RECEIVER: OnceLock<Receiver<String>> = OnceLock::new();
 
-/// Initialize the global tracing subscriber + tracing-log bridge.
+/// Initialize the global tracing subscriber.
 ///
 /// Idempotent: subsequent calls are no-ops (subscriber init
 /// returns `Err` and is swallowed). The receiver becomes
 /// available via `LOG_RECEIVER.get()`.
 pub fn init() {
-    // Bridge log -> tracing so library events flow through our subscriber.
-    let _ = tracing_log::LogTracer::init();
-
     let (tx, rx) = unbounded::<String>();
     LOG_RECEIVER
         .set(rx)

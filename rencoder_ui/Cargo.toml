@@ -25,12 +25,13 @@ crossbeam-channel = "0.5"
 # state.with_mut() when it resolves.
 rfd = "0.14"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-# Unified logging (§3.8.7.5): lib emits via `log` facade; UI
-# bridges to tracing via `tracing-log::LogTracer` and writes into
-# `state.log` via a custom MakeWriter + crossbeam channel.
+# Unified logging (§3.8.7.5): v1.2 follow-up #4 — lib emits via
+# `tracing` directly (was `log` bridged via `tracing-log`). UI
+# consumes lib events the same way it consumes its own tracing
+# events — single subscriber, no bridge layer. Custom MakeWriter
+# pushes lines into `state.log` via crossbeam channel.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-log = "0.2"
 # Toaster's auto-dismiss loop uses tokio::time::sleep inside
 # a `use_future` block. Dioxus 0.6 already pulls tokio in as a
 # transitive dep, but doesn't re-export it; we add it here for
