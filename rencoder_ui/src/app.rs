@@ -637,16 +637,22 @@ fn TaskPage(
     }
 }
 
-/// Contextual button on the Task page — phase-driven 3-state
-/// machine (review #133 part 3e).
+/// Contextual button on the Task page — phase-driven state
+/// machine. The button lives in the sticky bottom bar and is
+/// always visible (v1.2); when there's no action available it
+/// renders as a disabled placeholder so the user can tell at a
+/// glance what they need to do next.
 ///
 /// States:
-///  - **No active task, no history, no dir picked**: hidden
-///    (nothing to do until the user picks a directory).
-///  - **No active task, dir picked (or has history)**: enabled
-///    "Analyze ▸" / "Re-run ▸". Clicking dispatches
-///    `Msg::UserClickedStart` (the reducer's None / Done arms
-///    re-arm the dry-run flow).
+///  - **No active task, no history, no dir picked**: disabled
+///    "Pick a directory first" — placeholder; user uses the
+///    DirPicker at the top of the page to enable Analyze.
+///  - **No active task, dir picked, no history**: enabled
+///    "Analyze ▸" — Clicking dispatches `Msg::UserClickedStart`
+///    (reducer's None arm runs the dry-run flow).
+///  - **No active task, has history**: enabled "Re-run ▸" —
+///    same Msg as Analyze; reducer's None arm runs the
+///    dry-run flow after taking the prior Done task.
 ///  - **Analyzing**: disabled "Analyze…" — defense-in-depth
 ///    against Cancel during Analyzing (review #100 stays
 ///    pending; the lib doesn't honor cancel_token until
@@ -656,7 +662,8 @@ fn TaskPage(
 ///
 /// Active-task Done is unreachable under the auto-encode flow
 /// (the reducer moves Done tasks to history immediately), so
-/// no arm is needed for it.
+/// the `Some(Done)` arm is defensive — renders a disabled
+/// placeholder rather than nothing.
 #[component]
 fn TaskPageButton(
     state: Signal<AppState, SyncStorage>,
@@ -708,16 +715,23 @@ fn TaskPageButton(
         Some(BatchPhase::Done) => {
             // Unreachable: the reducer's BatchCompleted /
             // BatchCancelled / Error-Encoding arms move Done
-            // tasks to history immediately. Defensive: show
-            // empty rather than a stale button.
-            rsx! { span {} }
+            // tasks to history immediately. Defensive: show a
+            // disabled placeholder rather than nothing so the
+            // bottom bar is never empty.
+            rsx! {
+                button {
+                    class: "primary-btn",
+                    disabled: true,
+                    "Done"
+                }
+            }
         }
         // No active task.
         None => {
             if !history.is_empty() {
                 // Re-arm: previous task is in history, user can
                 // re-run the dry-run flow. Same Msg as a fresh
-                // "Analyze ▸" (the reducer's Done re-arm arm).
+                // "Analyze ▸" (the reducer's None arm).
                 let tx_s = tx.clone();
                 let cfg_s = cfg.clone();
                 rsx! {
@@ -744,9 +758,19 @@ fn TaskPageButton(
                     }
                 }
             } else {
-                // No dir, no history, no active: nothing to do
-                // until the user picks a directory.
-                rsx! { span {} }
+                // v1.2 (review #133 follow-up): show a
+                // disabled placeholder instead of an empty
+                // span. The bottom bar is always visible — the
+                // button tells the user what they need to do
+                // next ("pick a directory" — see DirPicker
+                // above).
+                rsx! {
+                    button {
+                        class: "primary-btn",
+                        disabled: true,
+                        "Pick a directory first"
+                    }
+                }
             }
         }
     }
