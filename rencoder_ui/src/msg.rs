@@ -1676,6 +1676,77 @@ mod tests {
     }
 
     #[test]
+    fn user_edited_config_field_updates_draft_and_saves() {
+        // review #133 part 2d/3d: each Setup-page field edit
+        //   (a) updates state.config_draft (the Setup form reads
+        //       it on next render),
+        //   (b) sets config_save_status to "Saving…",
+        //   (c) fires Command::SaveConfig for atomic TOML write.
+        // The receiver side is tested separately by the lib;
+        // here we verify the reducer's three side effects.
+        use crossbeam_channel::unbounded;
+        let (tx, rx) = unbounded::<Command>();
+        let mut state = fresh_state();
+        reduce(
+            &mut state,
+            Msg::UserEditedConfigField {
+                kind: ConfigFieldKind::Crf,
+                value: ConfigFieldValue::Crf(28),
+            },
+            &tx,
+            &default_config(),
+        );
+        // (a) config_draft updated.
+        let enc = state
+            .config_draft
+            .encode
+            .as_ref()
+            .expect("encode section should be auto-populated");
+        assert_eq!(enc.crf, 28);
+        // (b) save status set.
+        assert_eq!(state.config_save_status, "Saving…");
+        // (c) SaveConfig dispatched.
+        let cmd = rx.try_recv().expect("expected a SaveConfig command");
+        assert!(matches!(cmd, Command::SaveConfig), "expected SaveConfig");
+    }
+
+    #[test]
+    fn user_edited_config_field_extensions_parses_csv() {
+        // review #133 part 2d: Extensions edit parses "mp4, mkv, mov "
+        // into ["mp4", "mkv", "mov"]. Empty string clears the filter
+        // (= all). The apply_config_field_edit helper is the source of
+        // truth for this parsing — verify it directly.
+        let mut state = fresh_state();
+        let tx = cmd_tx();
+        reduce(
+            &mut state,
+            Msg::UserEditedConfigField {
+                kind: ConfigFieldKind::Extensions,
+                value: ConfigFieldValue::Extensions("mp4, mkv , mov".into()),
+            },
+            &tx,
+            &default_config(),
+        );
+        let enc = state.config_draft.encode.as_ref().unwrap();
+        assert_eq!(
+            enc.extensions,
+            Some(vec!["mp4".into(), "mkv".into(), "mov".into()])
+        );
+
+        reduce(
+            &mut state,
+            Msg::UserEditedConfigField {
+                kind: ConfigFieldKind::Extensions,
+                value: ConfigFieldValue::Extensions(String::new()),
+            },
+            &tx,
+            &default_config(),
+        );
+        let enc = state.config_draft.encode.as_ref().unwrap();
+        assert_eq!(enc.extensions, None, "empty csv should clear filter");
+    }
+
+    #[test]
     fn user_clicked_tab_updates_active_page() {
         let mut state = fresh_state();
         let tx = cmd_tx();
