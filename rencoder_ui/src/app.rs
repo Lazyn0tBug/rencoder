@@ -628,8 +628,26 @@ fn TaskPage(
     }
 }
 
-/// Contextual button on Task page — label + enabled state depend
-/// on the active task's phase.
+/// Contextual button on the Task page — phase-driven 3-state
+/// machine (review #133 part 3e).
+///
+/// States:
+///  - **No active task, no history, no dir picked**: hidden
+///    (nothing to do until the user picks a directory).
+///  - **No active task, dir picked (or has history)**: enabled
+///    "Analyze ▸" / "Re-run ▸". Clicking dispatches
+///    `Msg::UserClickedStart` (the reducer's None / Done arms
+///    re-arm the dry-run flow).
+///  - **Analyzing**: disabled "Analyze…" — defense-in-depth
+///    against Cancel during Analyzing (review #100 stays
+///    pending; the lib doesn't honor cancel_token until
+///    encoding starts).
+///  - **Encoding**: enabled "Cancel ✕" — dispatches
+///    `Msg::UserClickedCancel`.
+///
+/// Active-task Done is unreachable under the auto-encode flow
+/// (the reducer moves Done tasks to history immediately), so
+/// no arm is needed for it.
 #[component]
 fn TaskPageButton(
     state: Signal<AppState, SyncStorage>,
@@ -638,6 +656,7 @@ fn TaskPageButton(
 ) -> Element {
     let active = state.read().tasks.active.clone();
     let history = state.read().task_history.clone();
+    let input_dir = state.read().input_dir.clone();
     let phase = active.as_ref().map(|t| t.phase);
     let cfg = config.read().clone();
     let tx_opt = cmd_tx.read().clone();
@@ -646,49 +665,80 @@ fn TaskPageButton(
     };
 
     match phase {
-        None if !history.is_empty() => {
-            // Done state with history: re-arm Start.
-            let tx_s = tx.clone();
-            let cfg_s = cfg.clone();
+        // Active task in flight: button reflects the phase.
+        Some(BatchPhase::Analyzing) => {
+            // Disabled "Analyze…" — Cancel during Analyzing is
+            // review #100 (pending); the lib doesn't honor
+            // cancel_token in this phase, so showing Cancel
+            // would mislead the user. v1 keeps Analyzing
+            // non-cancellable.
             rsx! {
                 button {
                     class: "primary-btn",
-                    onclick: move |_| {
-                        state.with_mut(|s| reduce(s, Msg::UserClickedStart, &tx_s, &cfg_s));
-                    },
-                    "Start ▸"
-                }
-            }
-        }
-        None => rsx! { span {} },
-        Some(BatchPhase::Analyzing) => {
-            let tx_c = tx.clone();
-            rsx! {
-                button {
-                    class: "secondary-btn",
-                    onclick: move |_| {
-                        state.with_mut(|s| reduce(s, Msg::UserClickedCancel, &tx_c, &cfg));
-                    },
-                    "Cancel ✕"
+                    disabled: true,
+                    "Analyze…"
                 }
             }
         }
         Some(BatchPhase::Encoding) => {
+            // Enabled "Cancel ✕" — only Encoding-phase Cancel
+            // is wired to the lib's cancel_token (which the
+            // task manager polls between ffmpeg frames).
             let tx_c = tx.clone();
+            let cfg_c = cfg.clone();
             rsx! {
                 button {
                     class: "secondary-btn",
                     onclick: move |_| {
-                        state.with_mut(|s| reduce(s, Msg::UserClickedCancel, &tx_c, &cfg));
+                        state.with_mut(|s| reduce(s, Msg::UserClickedCancel, &tx_c, &cfg_c));
                     },
                     "Cancel ✕"
                 }
             }
         }
         Some(BatchPhase::Done) => {
-            // Active task is Done — shouldn't happen (move to
-            // history). Show empty.
+            // Unreachable: the reducer's BatchCompleted /
+            // BatchCancelled / Error-Encoding arms move Done
+            // tasks to history immediately. Defensive: show
+            // empty rather than a stale button.
             rsx! { span {} }
+        }
+        // No active task.
+        None => {
+            if !history.is_empty() {
+                // Re-arm: previous task is in history, user can
+                // re-run the dry-run flow. Same Msg as a fresh
+                // "Analyze ▸" (the reducer's Done re-arm arm).
+                let tx_s = tx.clone();
+                let cfg_s = cfg.clone();
+                rsx! {
+                    button {
+                        class: "primary-btn",
+                        onclick: move |_| {
+                            state.with_mut(|s| reduce(s, Msg::UserClickedStart, &tx_s, &cfg_s));
+                        },
+                        "Re-run ▸"
+                    }
+                }
+            } else if input_dir.is_some() {
+                // Fresh first-run: dir picked, no active, no
+                // history. Click dispatches DryRun.
+                let tx_s = tx.clone();
+                let cfg_s = cfg.clone();
+                rsx! {
+                    button {
+                        class: "primary-btn",
+                        onclick: move |_| {
+                            state.with_mut(|s| reduce(s, Msg::UserClickedStart, &tx_s, &cfg_s));
+                        },
+                        "Analyze ▸"
+                    }
+                }
+            } else {
+                // No dir, no history, no active: nothing to do
+                // until the user picks a directory.
+                rsx! { span {} }
+            }
         }
     }
 }
