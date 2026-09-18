@@ -460,8 +460,60 @@ fn SetupPage(
 }
 
 // ============================================================================
-// TaskPage — BatchStatus + TaskPlan + Progress + Start/Cancel (contextual)
+// TaskPage — DirPicker + count summary + file list + 3-state button
+// (review #133 part 3c).
+//
+// Layout (top to bottom):
+//   1. Header bar with [TASK] label + TaskPageButton (top-right)
+//   2. DirPicker — moved from Setup page (review #133 part 1)
+//   3. Count summary line ("N to encode, M to skip") when known
+//   4. BatchStatus badge (current phase)
+//   5. File list — dry-run records (active) or final records (history)
+//   6. ProgressPanel (during Encoding phase)
 // ============================================================================
+
+#[component]
+fn DirPicker(
+    state: Signal<AppState, SyncStorage>,
+    cmd_tx: Signal<Option<Sender<Command>>, SyncStorage>,
+    config: Signal<Arc<AppConfig>, SyncStorage>,
+) -> Element {
+    let input_dir = state.read().input_dir.clone();
+    let active_phase = state.read().tasks.active.as_ref().map(|t| t.phase);
+    // Picker disabled unless no active task (None / Done).
+    let enabled = active_phase.is_none() || matches!(active_phase, Some(BatchPhase::Done));
+
+    rsx! {
+        div { class: "dir-picker",
+            label { class: "section-label", "INPUT DIRECTORY" }
+            div { class: "dir-display",
+                if let Some(ref d) = input_dir {
+                    span { class: "path", "{d.display()}" }
+                } else {
+                    span { class: "muted", "(none — click pick directory)" }
+                }
+            }
+            button {
+                class: "secondary-btn",
+                disabled: !enabled,
+                onclick: move |_| {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_title("Choose input directory")
+                        .pick_folder()
+                    {
+                        if let Some(tx) = cmd_tx.read().clone() {
+                            let cfg = config.read().clone();
+                            state.with_mut(|st| {
+                                reduce(st, Msg::UserSelectedDir(path), &tx, &cfg)
+                            });
+                        }
+                    }
+                },
+                "pick directory"
+            }
+        }
+    }
+}
 
 #[component]
 fn TaskPage(
@@ -473,6 +525,42 @@ fn TaskPage(
     let history = state.read().task_history.clone();
     let progress = state.read().progress.clone();
 
+    // Pick the source of records to show in the file list. Active task
+    // wins (its dry-run records during Analyzing, its records during
+    // Encoding / Done). If no active task, fall back to the most
+    // recent history entry.
+    let (records_for_list, to_encode, to_skip, total_files, phase, task_id, cancelled) =
+        if let Some(task) = active.as_ref() {
+            let list = if !task.dry_run_records.is_empty() {
+                task.dry_run_records.clone()
+            } else if !task.records.is_empty() {
+                task.records.clone()
+            } else {
+                Vec::new()
+            };
+            (
+                list,
+                task.to_encode,
+                task.to_skip,
+                task.total_files,
+                task.phase,
+                task.task_id.as_str().to_string(),
+                task.cancelled,
+            )
+        } else if let Some(latest) = history.first() {
+            (
+                latest.records.clone(),
+                latest.to_encode,
+                latest.to_skip,
+                latest.total_files,
+                latest.phase,
+                latest.task_id.as_str().to_string(),
+                latest.cancelled,
+            )
+        } else {
+            (Vec::new(), 0, 0, 0, BatchPhase::Done, String::new(), false)
+        };
+
     rsx! {
         section { class: "task-page",
             header { class: "page-header",
@@ -481,55 +569,60 @@ fn TaskPage(
                     TaskPageButton { state: state, cmd_tx: cmd_tx, config: config }
                 }
             }
-            if let Some(task) = active.as_ref() {
-                BatchStatus {
-                    task_id: task.task_id.as_str().to_string(),
-                    phase: task.phase,
-                    total_files: task.total_files,
-                    to_encode: task.to_encode,
-                    to_skip: task.to_skip,
-                    cancelled: task.cancelled,
+
+            DirPicker { state: state, cmd_tx: cmd_tx, config: config }
+
+            // Count summary — only when at least one phase has run
+            // a dry-run (to_encode/to_skip > 0 means the dry-run is
+            // done). When no active task and no history, skip.
+            if active.is_some() && (to_encode > 0 || to_skip > 0 || total_files > 0) {
+                div { class: "count-summary",
+                    span { class: "count-encode", "{to_encode} to encode" }
+                    span { class: "sep", " · " }
+                    span { class: "count-skip", "{to_skip} to skip" }
+                    span { class: "sep", " · " }
+                    span { class: "count-total", "{total_files} total" }
                 }
-                if !task.dry_run_records.is_empty() {
-                    div { class: "task-plan-panel",
-                        span { class: "section-label", "TASK PLAN" }
-                        div { class: "plan-table-wrap",
-                            for r in task.dry_run_records.iter() {
-                                div { class: "plan-row",
-                                    span { class: "path", "{r.source_path}" }
-                                    span {
-                                        class: match r.outcome {
-                                            rencoder_lib::types::EncodingOutcome::Succeeded => "outcome-encode",
-                                            rencoder_lib::types::EncodingOutcome::Failed => "outcome-fail",
-                                            _ => "outcome-skip",
-                                        },
-                                        "{r.outcome:?}"
-                                    }
+            }
+
+            if active.is_some() || !history.is_empty() {
+                BatchStatus {
+                    task_id: task_id.clone(),
+                    phase,
+                    total_files,
+                    to_encode,
+                    to_skip,
+                    cancelled,
+                }
+            }
+
+            // File list — dry-run records (with `?` for unknown
+            // outcomes like Failed), or final records after a run.
+            if !records_for_list.is_empty() {
+                div { class: "task-plan-panel",
+                    span { class: "section-label", "FILES" }
+                    div { class: "plan-table-wrap",
+                        for r in records_for_list.iter() {
+                            div { class: "plan-row",
+                                span { class: "path", "{r.source_path}" }
+                                span {
+                                    class: match r.outcome {
+                                        rencoder_lib::types::EncodingOutcome::Succeeded => "outcome-encode",
+                                        rencoder_lib::types::EncodingOutcome::Failed => "outcome-fail",
+                                        _ => "outcome-skip",
+                                    },
+                                    "{r.outcome:?}"
                                 }
                             }
                         }
                     }
                 }
-                if !progress.is_empty() {
-                    ProgressPanel { state: state }
-                }
-            } else if let Some(latest) = history.first() {
-                // After Done: show last completed task's stats.
-                BatchStatus {
-                    task_id: latest.task_id.as_str().to_string(),
-                    phase: latest.phase,
-                    total_files: latest.total_files,
-                    to_encode: latest.to_encode,
-                    to_skip: latest.to_skip,
-                    cancelled: latest.cancelled,
-                }
-                if !latest.records.is_empty() {
-                    p { class: "muted",
-                        "Last completed task: {latest.task_id.as_str()} (moved to history)"
-                    }
-                }
-            } else {
-                p { class: "muted", "No task running. Pick a directory and click Start." }
+            } else if active.is_none() && history.is_empty() {
+                p { class: "muted", "No task running. Pick a directory above, then click the button." }
+            }
+
+            if !progress.is_empty() && active.is_some() {
+                ProgressPanel { state: state }
             }
         }
     }
