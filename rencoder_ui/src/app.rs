@@ -660,12 +660,20 @@ fn TaskPage(
     // recent history entry.
     let (records_for_list, to_encode, to_skip, total_files, phase, task_id, cancelled) =
         if let Some(task) = active.as_ref() {
-            let list = if !task.dry_run_records.is_empty() {
-                task.dry_run_records.clone()
-            } else if !task.records.is_empty() {
-                task.records.clone()
-            } else {
-                Vec::new()
+            // Pick the file list source by phase (v1.2 review
+            // #133 follow-up):
+            //   Analyzing / AwaitingConfirm: dry-run records
+            //     (the user reviews what will be encoded)
+            //   Encoding / Done: per-file encode records
+            //     (the user watches progress; the file shows
+            //      'Succeeded' only after ffmpeg completes it).
+            // The prior logic always preferred dry_run_records,
+            // which made the file list show 'Succeeded' during
+            // Encoding — the dry-run outcome, not the actual
+            // encode result. Fixed by phase-aware selection.
+            let list = match task.phase {
+                BatchPhase::Analyzing | BatchPhase::AwaitingConfirm => task.dry_run_records.clone(),
+                BatchPhase::Encoding | BatchPhase::Done => task.records.clone(),
             };
             (
                 list,
@@ -825,6 +833,25 @@ fn TaskPageButton(
                 }
             }
         }
+        Some(BatchPhase::AwaitingConfirm) => {
+            // v1.2 (review #133 follow-up): the dry-run finished.
+            // Button shows the encode count and is enabled —
+            // click dispatches StartBatch (the reducer's
+            // AwaitingConfirm arm).
+            let active = state.read().tasks.active.clone();
+            let to_encode = active.as_ref().map(|t| t.to_encode).unwrap_or(0);
+            let tx_s = tx.clone();
+            let cfg_s = cfg.clone();
+            rsx! {
+                button {
+                    class: "primary-btn",
+                    onclick: move |_| {
+                        state.with_mut(|s| reduce(s, Msg::UserClickedStart, &tx_s, &cfg_s));
+                    },
+                    "Encode {to_encode} files ▸"
+                }
+            }
+        }
         Some(BatchPhase::Encoding) => {
             // Enabled "Cancel ✕" — only Encoding-phase Cancel
             // is wired to the lib's cancel_token (which the
@@ -916,11 +943,14 @@ fn BatchStatus(
 ) -> Element {
     let badge = match phase {
         BatchPhase::Analyzing => "[● ANALYZING]",
+        BatchPhase::AwaitingConfirm => "[● READY]",
         BatchPhase::Encoding => "[● ENCODING]",
         BatchPhase::Done => "[● DONE]",
     };
     let badge_class = match phase {
-        BatchPhase::Analyzing | BatchPhase::Encoding => "badge badge-active",
+        BatchPhase::Analyzing | BatchPhase::AwaitingConfirm | BatchPhase::Encoding => {
+            "badge badge-active"
+        }
         BatchPhase::Done => "badge badge-done",
     };
     rsx! {

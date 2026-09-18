@@ -4,21 +4,24 @@
 //! only via `reduce(state, msg, cmd_tx)` which also dispatches
 //! Commands back to the lib actor as needed.
 //!
-//! **Workflow state machine** (§3.8.7.1, v1.2 redesign — review #133):
+//! **Workflow state machine** (§3.8.7.1, v1.2 final — review #133):
 //!
 //! ```text
 //! [None]
 //!   |  (UserClickedStart or UserSelectedDir)
-//!   |  when to_encode=0 -> [Analyzing]
-//!   |  when to_encode>0 -> [Encoding] (auto-dispatch via
-//!   |                       Event::DryRunFinished with to_encode>0)
 //!   v
-//! [Analyzing] --Event::DryRunFinished--> [Encoding] (auto) | (no
-//!   auto-encode, leaves button disabled: "Encode (no encodable
-//!   files)" stays on the page)
-//! [Encoding] --BatchCompleted/BatchCancelled/Error--> [Done]
+//! [Analyzing] --Event::DryRunFinished--> [AwaitingConfirm]
+//!                                          | (to_encode > 0)
+//!                                          | UserClickedStart
+//!                                          v
+//! [Encoding] --BatchCompleted/Cancelled/Error--> [Done]
 //! [Done]    --UserClickedStart (re-arm)--> [Analyzing]
 //! ```
+//!
+//! v1.2 user feedback (review #133 follow-up): removed the
+//! auto-encode on positive dry-run count. Encoding is a
+//! deliberate user action — the user clicks "Encode N files ▸"
+//! after reviewing the dry-run results.
 //!
 //! v1 invariant: TaskQueue capacity = 1. Gating unit is task
 //! existence (`tasks.active.is_some()`), not batch id (batch_id
@@ -37,15 +40,32 @@ use rencoder_lib::types::EncodingOutcome;
 /// Cap on the stderr log ring buffer. Per §3.8.6 + §8 item 30.
 const LOG_RING_CAP: usize = 1000;
 
-/// Lifecycle phase of a task (review #133: 3-state machine —
-/// Analyzing -> Encoding -> Done, with auto-encode on
-/// positive DryRun count making the legacy AwaitingConfirm
-/// 2-click confirm step unreachable).
+/// Lifecycle phase of a task (v1.2 final — review #133 follow-up):
+/// 4-state machine with a manual Confirm step between
+/// DryRunFinished and StartBatch.
+///
+/// ```text
+/// [None]
+///   |  (UserClickedStart or UserSelectedDir)
+///   v
+/// [Analyzing] --Event::DryRunFinished--> [AwaitingConfirm]
+///                                            | (to_encode > 0)
+///                                            | UserClickedStart
+///                                            v
+/// [Encoding] --BatchCompleted/Cancelled/Error--> [Done]
+/// [Done] --UserClickedStart (re-arm)--> [Analyzing]
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchPhase {
     /// `Command::DryRun` dispatched; awaiting `Event::DryRunFinished`.
     /// Dir picker disabled. Start button disabled (analyze in flight).
     Analyzing,
+    /// DryRun done; user must click the bottom button to dispatch
+    /// `Command::StartBatch` (review #133 user feedback: encode
+    /// should be a deliberate user action, not auto-fired). The
+    /// button shows "Encode N files ▸" — the count is the dry-run's
+    /// to_encode total.
+    AwaitingConfirm,
     /// `Command::StartBatch` dispatched; awaiting `BatchCompleted`
     /// / `BatchCancelled` / `Event::Error`. Progress bar active.
     /// Dir picker disabled. Start button shows "Cancel ✕".
@@ -512,6 +532,63 @@ pub fn reduce(
                     }
                     dispatch_dry_run_for_new_task(state, cmd_tx, config);
                 }
+                Some(BatchPhase::AwaitingConfirm) => {
+                    // v1.2 (review #133 follow-up): user clicked
+                    // 'Encode N files ▸' after reviewing the
+                    // dry-run results. Validate the dir is still
+                    // readable + non-empty (review-delta F2), then
+                    // dispatch StartBatch.
+                    let files = match collect_input_files(state, config) {
+                        Ok(files) => files,
+                        Err(CollectError::NoInputDir) => {
+                            // Defensive: input_dir is None while
+                            // an active task exists. Should be
+                            // impossible (the dir picker is gated)
+                            // but show an error rather than silent
+                            // failure.
+                            push_toast(state, "input dir missing (re-pick)", ToastKind::Error);
+                            return;
+                        }
+                        Err(CollectError::UnreadableDir) => {
+                            let dir = state.tasks.active.as_ref().unwrap().dir.display();
+                            push_toast(
+                                state,
+                                format!("cannot read {} (permission denied or path missing)", dir),
+                                ToastKind::Error,
+                            );
+                            return;
+                        }
+                    };
+                    if files.is_empty() {
+                        let dir = state.tasks.active.as_ref().unwrap().dir.display();
+                        push_toast(
+                            state,
+                            format!("no files in {} (file list changed since DryRun)", dir),
+                            ToastKind::Error,
+                        );
+                        return;
+                    }
+                    let params = build_encode_params_from_config(config);
+                    {
+                        let t = state.tasks.active.as_mut().unwrap();
+                        t.phase = BatchPhase::Encoding;
+                        // Clear dry_run_records so the file list
+                        // switches from dry-run outcomes
+                        // (Succeeded/Skipped/Failed from probe)
+                        // to encoding outcomes (per-file FileCompleted
+                        // events). Without this, the UI would keep
+                        // showing the dry-run results during
+                        // Encoding — misleading.
+                        t.dry_run_records.clear();
+                        t.records.clear();
+                    }
+                    // Review #111: cmd_tx is bounded (capacity 16).
+                    // `try_send` is non-blocking; on Full or
+                    // Disconnected the command is dropped. A dropped
+                    // Cmd is equivalent to a no-op (the user sees
+                    // no BatchStarted response and can retry).
+                    let _ = cmd_tx.try_send(Command::StartBatch { params, files });
+                }
                 Some(BatchPhase::Analyzing) | Some(BatchPhase::Encoding) => {
                     // Defense-in-depth: the bottom button is
                     // disabled in these phases, so this is
@@ -531,6 +608,21 @@ pub fn reduce(
                     }
                     let _ = cmd_tx.try_send(Command::Cancel);
                 }
+                Some(BatchPhase::AwaitingConfirm) => {
+                    // P2.7 fix: keep the cancelled plan in history
+                    // (with `cancelled = true`) so the user has a
+                    // record of "I planned X but cancelled". Without
+                    // this, cancelling a plan silently vanishes with
+                    // no audit trail.
+                    finalize(state, |t| {
+                        t.cancelled = true;
+                        // `finished` stays false — that flag is
+                        // reserved for tasks that actually ran.
+                        // Phase stays at AwaitingConfirm so the user
+                        // can see "this was a cancelled plan" vs
+                        // "this finished encoding".
+                    });
+                }
                 None | Some(BatchPhase::Done) => {}
             }
         }
@@ -543,7 +635,7 @@ pub fn reduce(
         Msg::UserClickedTab(page) => {
             state.active_page = page;
         }
-        Msg::Lib(evt) => apply_event(state, evt, cmd_tx, config),
+        Msg::Lib(evt) => apply_event(state, evt),
         Msg::LibLogLine(line) => {
             state.log.push_back(LogLine {
                 file_index: NO_FILE_INDEX,
@@ -558,12 +650,7 @@ pub fn reduce(
     }
 }
 
-fn apply_event(
-    state: &mut AppState,
-    evt: Event,
-    cmd_tx: &crossbeam_channel::Sender<Command>,
-    config: &rencoder_lib::config::app::AppConfig,
-) {
+fn apply_event(state: &mut AppState, evt: Event) {
     match evt {
         Event::BatchStarted { id, total_files } => {
             // Record the lib's batch_id on the active task
@@ -608,20 +695,17 @@ fn apply_event(
             );
         }
         Event::DryRunFinished { records } => {
-            // review #133 part 3d: DryRunFinished is now the
-            // auto-encode trigger. Two outcomes:
-            //   - to_encode > 0 -> set phase = Encoding, clear
-            //     records, dispatch Command::StartBatch. The
-            //     user sees Encoding immediately (no second
-            //     click needed). The Start button stays
-            //     clickable during Encoding as a "Cancel"
-            //     affordance (see part 3e collapse).
-            //   - to_encode == 0 -> no files would be encoded.
-            //     Set last_error + finalize (move to history
-            //     with finished=false so the audit trail is
-            //     preserved). This is the bug fix for "encode
-            //     0 files" being structurally impossible to
-            //     trigger via the new 1-click flow.
+            // v1.2 final (review #133 follow-up): DryRunFinished
+            // transitions to AwaitingConfirm (NOT auto-encode
+            // anymore — user must explicitly click the bottom
+            // button to start encoding). Two outcomes:
+            //   - to_encode == 0 -> set last_error + finalize
+            //     (audit trail preserved with finished=false).
+            //   - to_encode > 0  -> set phase = AwaitingConfirm.
+            //     User reviews the dry-run results + the
+            //     "Encode N files ▸" button in the bottom bar;
+            //     UserClickedStart (AwaitingConfirm arm) then
+            //     dispatches StartBatch.
             //
             // EncodingOutcome match scope: DryRun records only
             // carry `Succeeded` / `Skipped(...)` / `Failed` —
@@ -647,10 +731,6 @@ fn apply_event(
                 .iter()
                 .filter(|r| matches!(r.outcome, EncodingOutcome::Succeeded))
                 .count();
-            // Update task counters in a small scope so the
-            // auto-encode / no-files branches below can take
-            // `t` mutably without holding an `active.as_mut()`
-            // borrow across the cmd_tx.try_send below.
             if state.tasks.active.is_none() {
                 return;
             }
@@ -659,9 +739,7 @@ fn apply_event(
             // path has records.len() == total_files (each file
             // produces one record); if a file vanished mid-dry-run
             // and records.len() < total_files, subtracting gives a
-            // stale 'skip' count. Clamping surfaces the right
-            // number for the UI; the underlying file count is
-            // already recorded in t.total_files.
+            // stale 'skip' count.
             let to_skip = total_files.saturating_sub(to_encode);
             {
                 let t = state.tasks.active.as_mut().unwrap();
@@ -681,62 +759,13 @@ fn apply_event(
                 });
                 return;
             }
-            // Auto-encode: set phase = Encoding now, then
-            // dispatch StartBatch. Records are cleared so the
-            // Encoding-phase file list starts fresh (the lib
-            // will push per-file records via Event::FileCompleted).
-            // The lib re-reads the directory during StartBatch;
-            // we re-collect the same files here so the params
-            // + files pair is consistent.
-            let files = match collect_input_files(state, config) {
-                Ok(files) => files,
-                Err(_) => {
-                    push_toast(
-                        state,
-                        "input dir missing or unreadable after dry-run",
-                        ToastKind::Error,
-                    );
-                    finalize(state, |t| {
-                        t.cancelled = false;
-                    });
-                    return;
-                }
-            };
-            // review-delta F2: empty-dir race. The user can delete
-            // every file between DryRun dispatch and DryRunFinished
-            // arrival; the dry-run records still report those files
-            // because the lib snapshot was taken before deletion.
-            // collect_input_files re-reads the directory NOW and
-            // returns Ok(empty). Without this guard we'd dispatch
-            // StartBatch with 0 files; the lib would error and the
-            // user would see a confusing lib-side error instead of
-            // the explicit 'no files' message.
-            if files.is_empty() {
-                push_toast(
-                    state,
-                    format!(
-                        "no files in {} (file list changed since DryRun)",
-                        state.tasks.active.as_ref().unwrap().dir.display()
-                    ),
-                    ToastKind::Error,
-                );
-                finalize(state, |t| {
-                    t.cancelled = false;
-                });
-                return;
-            }
-            let params = build_encode_params_from_config(config);
-            {
-                let t = state.tasks.active.as_mut().unwrap();
-                t.phase = BatchPhase::Encoding;
-                t.records.clear();
-            }
-            // Review #111: cmd_tx is bounded (capacity 16).
-            // `try_send` is non-blocking; on Full or Disconnected
-            // the command is dropped. A dropped Cmd is equivalent
-            // to a no-op (the user sees no BatchStarted response
-            // and can retry).
-            let _ = cmd_tx.try_send(Command::StartBatch { params, files });
+            // v1.2 (review #133 follow-up): set phase to
+            // AwaitingConfirm. The user reviews the file list
+            // (rendered from dry_run_records during this
+            // phase) and clicks "Encode N files ▸" in the
+            // bottom bar to start encoding. UserClickedStart's
+            // AwaitingConfirm arm dispatches StartBatch.
+            state.tasks.active.as_mut().unwrap().phase = BatchPhase::AwaitingConfirm;
         }
         Event::AnalyzeStarted { .. }
         | Event::AnalyzeProgress { .. }
@@ -1633,25 +1662,13 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_finished_auto_encodes_when_to_encode_positive() {
-        // review #133 part 3d: DryRunFinished now auto-dispatches
-        // Command::StartBatch when to_encode > 0. The task transitions
-        // Analyzing -> Encoding (no AwaitingConfirm intermediate).
-        // Records are cleared (the lib will repopulate via
-        // Event::FileCompleted during Encoding).
-        //
-        // Auto-encode requires re-collecting files for StartBatch.
-        // We use /tmp as the input dir; /tmp is empty on most test
-        // hosts so collect_input_files will return an empty vec.
-        // Empty-file error path is short-circuited here by setting
-        // state.input_dir to a non-existent path? No — we want to
-        // test the success path. Use a synthetic config with no
-        // extensions filter and pick a path that does exist with
-        // files. /tmp fits; if it's empty the test's last_error
-        // will be set instead and the assertion on phase=Encoding
-        // will fail. To make the test deterministic, we construct
-        // a non-existent input dir and verify the error path here,
-        // and add a separate test for the success path below.
+    fn dry_run_finished_transitions_to_awaiting_confirm() {
+        // v1.2 final (review #133 follow-up): DryRunFinished
+        // no longer auto-encodes. When to_encode > 0, it
+        // transitions to AwaitingConfirm — the user reviews the
+        // file list, then clicks "Encode N files ▸" in the
+        // bottom bar (which dispatches StartBatch via the
+        // reducer's AwaitingConfirm arm).
         let mut state = fresh_state();
         let tx = cmd_tx();
         state.input_dir = Some(std::path::PathBuf::from("/nonexistent-for-test"));
@@ -1680,47 +1697,31 @@ mod tests {
             &tx,
             &default_config(),
         );
-        // The success path is gated on collect_input_files returning
-        // Ok(non-empty). With an empty /nonexistent-for-test, this
-        // goes through the error branch (toast pushed, task
-        // finalized, active is None).
-        let _ = tx; // sender used
-                    // Either path is acceptable; what we want to verify is:
-                    //   - to_encode / to_skip are computed from records
-                    //   - dry_run_records are stored
-                    //   - phase is no longer AwaitingConfirm
-        match state.tasks.active.as_ref() {
-            None => {
-                // Error/finalize path.
-                assert!(
-                    !state.toasts.is_empty(),
-                    "expected a toast on the error path"
-                );
-            }
-            Some(t) => {
-                // Success path (phase = Encoding, records cleared).
-                assert_eq!(t.phase, BatchPhase::Encoding);
-                assert_eq!(t.to_encode, 1);
-                assert_eq!(t.to_skip, 2);
-                assert_eq!(t.dry_run_records.len(), 3);
-                assert!(t.records.is_empty());
-            }
-        }
+        // AwaitingConfirm path: phase transitioned, no StartBatch
+        // dispatched (the reducer doesn't touch cmd_tx in this
+        // branch). dry_run_records populated for the UI.
+        let t = state.tasks.active.as_ref().unwrap();
+        assert_eq!(t.phase, BatchPhase::AwaitingConfirm);
+        assert_eq!(t.to_encode, 1);
+        assert_eq!(t.to_skip, 2);
+        assert_eq!(t.dry_run_records.len(), 3);
+        assert!(t.records.is_empty());
     }
 
     #[test]
-    fn dry_run_finished_empty_dir_after_dry_run_finalizes_no_dispatch() {
-        // review-delta F2: the user can delete every file from
-        // the input dir between DryRun dispatch and DryRunFinished
-        // arrival. The lib's records still reflect the
+    fn awaiting_confirm_empty_dir_guards_against_zero_file_dispatch() {
+        // review-delta F2 (v1.2 path moved): the user can delete
+        // every file between DryRun dispatch and the manual
+        // Confirm click. The lib's records still reflect the
         // pre-deletion snapshot (to_encode > 0), but the
-        // re-collection in the auto-encode path returns an empty
-        // vec. Without this guard we'd dispatch StartBatch with 0
-        // files; the lib would error with a confusing message.
-        // With the guard: last_error is set, task is finalized,
-        // StartBatch is NOT dispatched.
+        // collect_input_files re-read in the AwaitingConfirm
+        // arm returns empty. Without this guard we'd dispatch
+        // StartBatch with 0 files; the lib would error with a
+        // confusing message.
         //
-        // Use a tempdir for a hermetic test.
+        // v1.2 path: this guard is now in UserClickedStart's
+        // AwaitingConfirm arm (was in DryRunFinished's auto-encode
+        // path before review #133 user feedback removed auto-encode).
         let tmp = std::env::temp_dir().join(format!(
             "rencoder-test-{}",
             std::time::SystemTime::now()
@@ -1729,10 +1730,6 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&tmp).unwrap();
-        // Pre-create a file so the dry-run has at least one
-        // Succeeded record (the lib would actually run ffprobe;
-        // for the unit test we bypass that by constructing the
-        // TaskInfo + records manually).
         let mut state = fresh_state();
         let tx = cmd_tx();
         state.input_dir = Some(tmp.clone());
@@ -1750,7 +1747,8 @@ mod tests {
             records: vec![],
             dry_run_records: vec![],
         });
-        // Simulate DryRunFinished with a Succeeded record.
+        // Step 1: DryRunFinished with a Succeeded record — moves
+        // phase to AwaitingConfirm.
         let records = vec![sample_record("/dummy.mp4", EncodingOutcome::Succeeded)];
         reduce(
             &mut state,
@@ -1758,14 +1756,18 @@ mod tests {
             &tx,
             &default_config(),
         );
-        // Cleanup the empty tempdir.
+        assert_eq!(
+            state.tasks.active.as_ref().unwrap().phase,
+            BatchPhase::AwaitingConfirm
+        );
+        // Step 2: user clicks Encode — but the dir is empty
+        // (we never created files). The guard fires.
+        reduce(&mut state, Msg::UserClickedStart, &tx, &default_config());
         let _ = std::fs::remove_dir_all(&tmp);
-        // The guard should fire: the dir is empty after the
-        // test setup (we never created files). Toast pushed,
-        // task finalized, no active task, NO StartBatch dispatched.
-        assert!(
-            state.tasks.active.is_none(),
-            "expected finalize; active is still Some"
+        assert_eq!(
+            state.tasks.active.as_ref().unwrap().phase,
+            BatchPhase::AwaitingConfirm,
+            "phase stays at AwaitingConfirm; no encoding happened"
         );
         assert_eq!(
             state.toasts.len(),
@@ -1782,12 +1784,13 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_finished_to_skip_clamps_at_zero() {
-        // review-delta F5: if records.len() < total_files (a file
-        // vanished mid-dry-run), total_files - to_encode could
-        // underflow the displayed 'skip' count. saturating_sub
-        // clamps at 0. This test directly drives the handler with
-        // a stale total_files and asserts the clamp.
+    fn dry_run_finished_to_skip_saturates_at_zero() {
+        // review-delta F5: if total_files underflows the
+        // subtraction `total_files - to_encode` (e.g., a stale
+        // total_files carried over after files vanished mid-dry-run),
+        // saturating_sub clamps to 0. To trigger this, the
+        // task must have to_encode > total_files, which is
+        // pathological but possible if total_files got stale.
         let mut state = fresh_state();
         let tx = cmd_tx();
         state.input_dir = Some(std::path::PathBuf::from("/nonexistent-for-test"));
@@ -1796,7 +1799,12 @@ mod tests {
             batch_id: None,
             phase: BatchPhase::Analyzing,
             dir: PathBuf::from("/nonexistent-for-test"),
-            total_files: 5, // stale: was 5 before file deletion
+            // Pathological: total_files < records.len(). Pretend the
+            // task was set up with total_files=1 but the dry-run
+            // found 3 records (1 Succeeded). Old code: to_skip =
+            // 1 - 1 = 0 (fine). To force the underflow path, set
+            // total_files=0.
+            total_files: 0,
             to_encode: 0,
             to_skip: 0,
             encoded: 0,
@@ -1805,12 +1813,10 @@ mod tests {
             records: vec![],
             dry_run_records: vec![],
         });
-        // Only 2 records arrive (3 vanished). 1 Succeeded, 1 Failed.
-        // total_files - to_encode = 5 - 1 = 4 would be the wrong
-        // (too-high) displayed count. saturating_sub clamps to 0.
         let records = vec![
             sample_record("/a.mp4", EncodingOutcome::Succeeded),
             sample_skipped("/b.mp4"),
+            sample_skipped("/c.mp4"),
         ];
         reduce(
             &mut state,
@@ -1818,19 +1824,12 @@ mod tests {
             &tx,
             &default_config(),
         );
-        // The handler either finalizes (no active) or transitions
-        // to error (active still exists but error path). In both
-        // cases, the to_skip value written to the task must be
-        // clamped at 0.
-        if let Some(t) = state.tasks.active.as_ref() {
-            assert_eq!(t.to_encode, 1);
-            assert_eq!(t.to_skip, 0, "to_skip must saturate at 0");
-        }
-        // If the path finalized, last_error is set.
-        if state.last_error.is_some() {
-            // No assertion needed — the clamp happened before the
-            // finalize and is no longer observable from state.
-        }
+        // to_encode = 1, to_skip = saturating_sub(0, 1) = 0.
+        // Phase: AwaitingConfirm (positive count).
+        let t = state.tasks.active.as_ref().unwrap();
+        assert_eq!(t.phase, BatchPhase::AwaitingConfirm);
+        assert_eq!(t.to_encode, 1);
+        assert_eq!(t.to_skip, 0, "to_skip must saturate at 0");
     }
 
     #[test]
