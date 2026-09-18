@@ -2578,39 +2578,24 @@ on positive dry-run count):
 | Page | Body | 按钮位置 | 按钮 states |
 |------|------|----------|-------------|
 | `[SETUP]` | live-edit form(format radios / crf / max fps / extensions) + save-status 行 | (无 contextual button;setup page 是配置编辑页,不是 action 页) | — |
-| `[TASK]` | DirPicker + scrollable file list (count summary / batch status / progress 都收进 **info popover**) | **底部 fixed**(随 task phase 动态 show / hide) + info icon 触发 popover | `Analyze ▸`(dir 选了无 history) / `Re-run ▸`(history 非空) / 禁用 `Analyze…`(Analyzing 中) / `Cancel ✕`(Encoding 中) |
+| `[TASK]` | DirPicker + count summary + `[● phase] badge` + scrollable file list + ProgressPanel | **底部 sticky**(随 task phase 动态 show / hide) | `Analyze ▸`(dir 选了无 history) / `Re-run ▸`(history 非空) / 禁用 `Analyze…`(Analyzing 中) / `Cancel ✕`(Encoding 中) |
 | `[HISTORY]` | history table(source / outcome / size) | body 顶部 inline(无 page header 占用 row) | `[ Refresh ⟳ ]`(per v1.1 deferred——见 §3.8.7.4) |
 | `[LOG]` | 完整 log scrollback(全 1000 行) | body 顶部 inline | `[ Clear ]` |
 
 **Why drop the page headers**: `[TASK]` / `[HISTORY]` / `[LOG]` 文字标签与 TopBar 的同名 tab 重复。原 layout 把 `[NAME]────` 放在 page header 是为了给 top-right button 找一个 row;但 button 完全可以放到 page 底部(随 phase 动态 show / hide)。这样省 ~50px 垂直空间,且按钮位置贴近用户的视线终点(file list 看完即按按钮,不需要回头找)。`[SETUP]` 已经在 v1.2 早期工作里去掉 header(review #133 part 3b)——这次扩展到剩余 3 页保持一致。
 
-**Why info → popover**: count summary / batch status / ProgressPanel 这些 info 在 body 里占了 ~150px 垂直空间,但用户大部分时间(看 file list、按 button)用不到。收进 popover:
-- 省 ~150px 视觉空间(body 更干净)
-- 用户想看 info 时点 info icon(ℹ︎)→ 弹出 popover;看完点外面 / 再点一次 info icon → 关闭
-- popover 锚定到 button bar 上方,位置贴近用户视线终点
-
-**Info popover 内容** (Task page only):
-- count summary line(`N to encode · M to skip · T total`,when known)
-- `[● phase] badge`
-- ProgressPanel(when Encoding + progress data available)
-
-打开 / 关闭:
-- 点 info icon → 切换
-- 点 popover 外 → 关闭
-- Popover 锚定到 button bar 上方,位置在 viewport 右下对齐 button 的右边缘
-
 **Task page bottom button states** (与之前 §3.8.7.1 state machine 一致):
 
 ```
-phase == None, no history, no dir           -> disabled 'Pick a directory first'
+phase == None, no history, no dir           -> button hidden
 phase == None, no history, dir picked      -> enabled 'Analyze ▸'   (dry-run flow)
 phase == None, has history                  -> enabled 'Re-run ▸'   (re-arm flow)
 phase == Analyzing                          -> DISABLED 'Analyze…'   (cancel not allowed in v1)
 phase == Encoding                           -> enabled 'Cancel ✕'
-phase == Done (unreachable; finalize moves task to history) -> disabled 'Done'
+phase == Done (unreachable; finalize moves task to history) -> button hidden
 ```
 
-**Bottom-button CSS** (`rencoder_ui/assets/style.css`): `--task-button-bar` fixed 到 viewport 底部 (`position: fixed; bottom: 0`),背景 + 上边框与 main panel 区分,占 ~50px。`.app` 加 `padding-bottom: 64px` 给 bar 留空间避免覆盖 file list。Info icon (ℹ︎) 在 bar 左侧,popover 锚定在 bar 上方。Footer log 在 button bar 下方(footer 不动——per spec),但因 bar 占用底部 50px,footer 被部分遮挡——可接受,因为 footer 是 5 行 log 的 viewport 不是核心信息,被遮挡时用户切到 `[LOG]` page 看完整。
+**Bottom-button CSS** (`rencoder_ui/assets/style.css`): `--task-button-bar` sticky 到 viewport 底部 (`position: sticky; bottom: 0`),背景 + 上边框与 main panel 区分,占 ~50px。Footer log 在 button bar 下方(footer 不动——per spec)。
 
 **Footer log** (所有 page 都有):
 

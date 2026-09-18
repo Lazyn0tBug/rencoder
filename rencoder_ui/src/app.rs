@@ -525,13 +525,6 @@ fn TaskPage(
     let history = state.read().task_history.clone();
     let progress = state.read().progress.clone();
 
-    // v1.2 (review #133 follow-up): popover show/hide state is
-    // local UI state, not part of the reducer's domain — use a
-    // local signal so the toggle doesn't need to round-trip
-    // through reduce(). `popover_open` flips on info-icon click
-    // and on backdrop click; default closed.
-    let mut popover_open = use_signal(|| false);
-
     // Pick the source of records to show in the file list. Active task
     // wins (its dry-run records during Analyzing, its records during
     // Encoding / Done). If no active task, fall back to the most
@@ -568,20 +561,42 @@ fn TaskPage(
             (Vec::new(), 0, 0, 0, BatchPhase::Done, String::new(), false)
         };
 
-    let info_content = active.is_some()
-        || !history.is_empty()
-        || (to_encode > 0 || to_skip > 0 || total_files > 0);
-
     rsx! {
         section { class: "task-page",
-            // v1.2 (review #133 follow-up): the page body holds
-            // only the essentials (DirPicker + file list). The
-            // count summary / batch status badge / ProgressPanel
-            // moved into an info popover anchored to the bottom
-            // button bar — saves ~150px of vertical space when
-            // closed.
+            // v1.2 (review #133 follow-up): drop the
+            // `──[ TASK ]────` page header. The TopBar tab
+            // already names the page; the header only existed
+            // to host the top-right button — which now lives
+            // in the sticky bottom row below.
+            //
+            // Body order: DirPicker -> count summary -> badge
+            // -> file list -> progress -> bottom button bar.
 
             DirPicker { state: state, cmd_tx: cmd_tx, config: config }
+
+            // Count summary — only when at least one phase has run
+            // a dry-run (to_encode/to_skip > 0 means the dry-run is
+            // done). When no active task and no history, skip.
+            if active.is_some() && (to_encode > 0 || to_skip > 0 || total_files > 0) {
+                div { class: "count-summary",
+                    span { class: "count-encode", "{to_encode} to encode" }
+                    span { class: "sep", " · " }
+                    span { class: "count-skip", "{to_skip} to skip" }
+                    span { class: "sep", " · " }
+                    span { class: "count-total", "{total_files} total" }
+                }
+            }
+
+            if active.is_some() || !history.is_empty() {
+                BatchStatus {
+                    task_id: task_id.clone(),
+                    phase,
+                    total_files,
+                    to_encode,
+                    to_skip,
+                    cancelled,
+                }
+            }
 
             // File list — dry-run records (with `?` for unknown
             // outcomes like Failed), or final records after a run.
@@ -608,60 +623,15 @@ fn TaskPage(
                 p { class: "muted", "No task running. Pick a directory above, then click the button below." }
             }
 
-            // Bottom button bar — fixed at viewport bottom (CSS).
-            // Contains info icon (left) + primary action (right).
-            // The info icon toggles the popover.
-            div { class: "task-button-bar",
-                button {
-                    class: "info-icon",
-                    disabled: !info_content,
-                    title: if info_content { "Show task info" } else { "No info yet" },
-                    onclick: move |_| {
-                        let current = popover_open();
-                        popover_open.set(!current);
-                    },
-                    "ℹ"
-                }
-                TaskPageButton { state: state, cmd_tx: cmd_tx, config: config }
+            if !progress.is_empty() && active.is_some() {
+                ProgressPanel { state: state }
             }
 
-            // Info popover — anchored above the button bar,
-            // right-aligned. Renders the count summary /
-            // BatchStatus / ProgressPanel that previously lived
-            // in the body. Outside-click (backdrop) closes.
-            if popover_open() && info_content {
-                // Transparent backdrop catches outside clicks.
-                // Sibling (not parent) of the popover so popover
-                // clicks don't bubble to backdrop. z-index 11
-                // puts popover above backdrop (10).
-                div {
-                    class: "popover-backdrop",
-                    onclick: move |_| popover_open.set(false),
-                }
-                div { class: "task-info-popover",
-                    if active.is_some() && (to_encode > 0 || to_skip > 0 || total_files > 0) {
-                        div { class: "count-summary",
-                            span { class: "count-encode", "{to_encode} to encode" }
-                            span { class: "sep", " · " }
-                            span { class: "count-skip", "{to_skip} to skip" }
-                            span { class: "sep", " · " }
-                            span { class: "count-total", "{total_files} total" }
-                        }
-                    }
-                    if active.is_some() || !history.is_empty() {
-                        BatchStatus {
-                            task_id: task_id.clone(),
-                            phase,
-                            total_files,
-                            to_encode,
-                            to_skip,
-                            cancelled,
-                        }
-                    }
-                    if !progress.is_empty() && active.is_some() {
-                        ProgressPanel { state: state }
-                    }
-                }
+            // Bottom button bar — sticky, shows only when needed.
+            // TaskPageButton internally decides hidden vs visible
+            // (per §3.8.7.2 state table).
+            div { class: "task-button-bar",
+                TaskPageButton { state: state, cmd_tx: cmd_tx, config: config }
             }
         }
     }
