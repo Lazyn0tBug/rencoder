@@ -385,6 +385,31 @@ pub fn reduce(
                     dispatch_dry_run_for_new_task(state, cmd_tx, config);
                 }
                 Some(BatchPhase::AwaitingConfirm) => {
+                    // v1.2 review #133 part 2b (micro): bug fix.
+                    // If the dry-run found 0 encodable files, do NOT
+                    // dispatch StartBatch — the lib would emit
+                    // BatchCompleted with 0 records. Set last_error
+                    // and clear the active task so the Task page
+                    // returns to a fresh "None" state for re-arm.
+                    //
+                    // (The Task-page button — done in app.rs — is
+                    //  also disabled when `to_encode == 0`, so this
+                    //  is defense-in-depth.)
+                    if let Some(t) = state.tasks.active.as_ref() {
+                        if t.to_encode == 0 {
+                            state.last_error = Some(format!(
+                                "0 encodable files ({} skipped); pick a different dir",
+                                t.to_skip
+                            ));
+                            finalize(state, |t| {
+                                t.cancelled = false;
+                                // t.finished stays false — plan
+                                // never ran. The history record
+                                // exists for audit.
+                            });
+                            return;
+                        }
+                    }
                     // Validate the directory is still readable and
                     // non-empty before dispatching StartBatch. The
                     // user might have emptied/deleted the dir
