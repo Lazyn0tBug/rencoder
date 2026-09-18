@@ -2573,14 +2573,29 @@ on positive dry-run count):
 - Tab click 派 `Msg::UserClickedTab(Page)`,reducer 写 `state.active_page`(per §3.8.7 design);App() 通过 `use_signal_sync` 镜像此字段给 Dioxus 渲染层
 - `[Exit]` 在最右侧,所有 page 可见。**v1 行为**(per §3.8.7.4):点 Exit 先派 `Command::Cancel`(若 batch active),等 `Event::BatchCancelled`,再 `window().close()`;若 no batch active,直接 `window().close()`
 
-**Per-page layout** (active tab 在 page header 的 badge 反映 phase):
+**Per-page layout** (active tab 在 TopBar 已命名,page body 不再带 `──[ NAME ]────` header——冗余):
 
-| Page | Header | Body | Top-right 按钮 |
-|------|--------|------|---------------|
-| `[SETUP]` | `──[ SETUP ]──────────────────────────` | INPUT DIRECTORY + `[ pick directory ]` + SETTINGS list | `[ Start ▸ ]`(dir 未选时 disabled) |
-| `[TASK]` | `──[ TASK ]────[● <phase> badge]` | BATCH# + 统计 + TASK PLAN + ProgressPanel | `[ Cancel ✕ ]`(active 时)/ `[ Start ▸ ]`(Done 时 re-arm) |
-| `[HISTORY]` | `──[ HISTORY ]───────────────────` | history table(source / outcome / size) | `[ Refresh ⟳ ]` |
-| `[LOG]` | `──[ LOG ]────────────────────────` | 完整 log scrollback(全 1000 行) | `[ Clear ]`(清 log buffer) |
+| Page | Body | 按钮位置 | 按钮 states |
+|------|------|----------|-------------|
+| `[SETUP]` | live-edit form(format radios / crf / max fps / extensions) + save-status 行 | (无 contextual button;setup page 是配置编辑页,不是 action 页) | — |
+| `[TASK]` | DirPicker + count summary + `[● phase] badge` + scrollable file list + ProgressPanel | **底部 sticky**(随 task phase 动态 show / hide) | `Analyze ▸`(dir 选了无 history) / `Re-run ▸`(history 非空) / 禁用 `Analyze…`(Analyzing 中) / `Cancel ✕`(Encoding 中) |
+| `[HISTORY]` | history table(source / outcome / size) | body 顶部 inline(无 page header 占用 row) | `[ Refresh ⟳ ]`(per v1.1 deferred——见 §3.8.7.4) |
+| `[LOG]` | 完整 log scrollback(全 1000 行) | body 顶部 inline | `[ Clear ]` |
+
+**Why drop the page headers**: `[TASK]` / `[HISTORY]` / `[LOG]` 文字标签与 TopBar 的同名 tab 重复。原 layout 把 `[NAME]────` 放在 page header 是为了给 top-right button 找一个 row;但 button 完全可以放到 page 底部(随 phase 动态 show / hide)。这样省 ~50px 垂直空间,且按钮位置贴近用户的视线终点(file list 看完即按按钮,不需要回头找)。`[SETUP]` 已经在 v1.2 早期工作里去掉 header(review #133 part 3b)——这次扩展到剩余 3 页保持一致。
+
+**Task page bottom button states** (与之前 §3.8.7.1 state machine 一致):
+
+```
+phase == None, no history, no dir           -> button hidden
+phase == None, no history, dir picked      -> enabled 'Analyze ▸'   (dry-run flow)
+phase == None, has history                  -> enabled 'Re-run ▸'   (re-arm flow)
+phase == Analyzing                          -> DISABLED 'Analyze…'   (cancel not allowed in v1)
+phase == Encoding                           -> enabled 'Cancel ✕'
+phase == Done (unreachable; finalize moves task to history) -> button hidden
+```
+
+**Bottom-button CSS** (`rencoder_ui/assets/style.css`): `--task-button-bar` sticky 到 viewport 底部 (`position: sticky; bottom: 0`),背景 + 上边框与 main panel 区分,占 ~50px。Footer log 在 button bar 下方(footer 不动——per spec)。
 
 **Footer log** (所有 page 都有):
 
@@ -2691,6 +2706,7 @@ on positive dry-run count):
 | `UserClickedLoadHistory` 自动派 on app start | app 启动时 `use_hook` 派一次(per §3.8.7.2 history page);但目前没有显式 init code,history 是空直到用户手动 reload | v1.1 在 `use_hook` 里加 `cmd_tx.send(Command::LoadHistory { limit: Some(100), after: None })` |
 | Cross-session task 导航缺失 | `task_history` 是 session 内 cache(进程退出即丢);`state.history` 是 cross-session 但以 per-file EncodingRecord 为单位。**没有** task 维度的 cross-session 视图——v1 看不到昨天跑的 batch 用了哪个 dir / 多少文件 | v1.1 启动时 load Parquet records → group by batch_id → 渲染成 TaskInfo 列表。数据后端已经是 Parquet(`encoding-*.parquet`),不引新 store |
 | Settings inline edit | **v1.2 implemented**: `[SETUP]` 页每个字段 `<input>` `oninput` 直接调 `AppConfig::save` (real-time TOML atomic write via `write_atomic`). 没有 Save 按钮 | — |
+| Page-header `[NAME]` 文字冗余 (`[TASK]` / `[HISTORY]` / `[LOG]` 与 TopBar tab 重名) | **v1.2 fixed**: drop `[TASK]` / `[HISTORY]` / `[LOG]` header rows。原 layout 把 header 留在 page 是为了给 top-right button 找一个 row——这版 button 改成 sticky 底部(随 phase 动态 show / hide),header 没有存在的必要。省 ~50px 垂直空间,按钮位置贴近 file list 看完后的视线终点。`[SETUP]` header 在 v1.2 早期已去(review #133 part 3b),这次扩展到剩余 3 页保持一致 | — |
 
 **v1 安全保证**(从 v1.1 deferred 提前到 v1 实现,per §3.8.7 product-lens / scope-guardian review 反馈):
 

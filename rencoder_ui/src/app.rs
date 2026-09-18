@@ -563,12 +563,14 @@ fn TaskPage(
 
     rsx! {
         section { class: "task-page",
-            header { class: "page-header",
-                span { class: "section-label", "[ TASK ]" }
-                div { class: "page-header-right",
-                    TaskPageButton { state: state, cmd_tx: cmd_tx, config: config }
-                }
-            }
+            // v1.2 (review #133 follow-up): drop the
+            // `──[ TASK ]────` page header. The TopBar tab
+            // already names the page; the header only existed
+            // to host the top-right button — which now lives
+            // in the sticky bottom row below.
+            //
+            // Body order: DirPicker -> count summary -> badge
+            // -> file list -> progress -> bottom button bar.
 
             DirPicker { state: state, cmd_tx: cmd_tx, config: config }
 
@@ -618,11 +620,18 @@ fn TaskPage(
                     }
                 }
             } else if active.is_none() && history.is_empty() {
-                p { class: "muted", "No task running. Pick a directory above, then click the button." }
+                p { class: "muted", "No task running. Pick a directory above, then click the button below." }
             }
 
             if !progress.is_empty() && active.is_some() {
                 ProgressPanel { state: state }
+            }
+
+            // Bottom button bar — sticky, shows only when needed.
+            // TaskPageButton internally decides hidden vs visible
+            // (per §3.8.7.2 state table).
+            div { class: "task-button-bar",
+                TaskPageButton { state: state, cmd_tx: cmd_tx, config: config }
             }
         }
     }
@@ -831,18 +840,19 @@ fn HistoryPage(
 
     rsx! {
         section { class: "history-page",
-            header { class: "page-header",
-                span { class: "section-label", "[ HISTORY ]" }
-                div { class: "page-header-right",
-                    if let Some(tx) = tx_opt {
-                        button {
-                            class: "secondary-btn",
-                            onclick: move |_| {
-                                let cfg = config.read().clone();
-                                state.with_mut(|s| reduce(s, Msg::UserClickedLoadHistory, &tx, &cfg));
-                            },
-                            "Refresh ⟳"
-                        }
+            // v1.2 (review #133 follow-up): drop the
+            // `──[ HISTORY ]────` page header. Refresh button
+            // moves to the top of the body, inline with the
+            // content (no header row needed).
+            if let Some(tx) = tx_opt {
+                div { class: "page-toolbar",
+                    button {
+                        class: "secondary-btn",
+                        onclick: move |_| {
+                            let cfg = config.read().clone();
+                            state.with_mut(|s| reduce(s, Msg::UserClickedLoadHistory, &tx, &cfg));
+                        },
+                        "Refresh ⟳"
                     }
                 }
             }
@@ -903,9 +913,10 @@ fn HistoryPanel(state: Signal<AppState, SyncStorage>) -> Element {
 fn LogPage(state: Signal<AppState, SyncStorage>) -> Element {
     rsx! {
         section { class: "log-page",
-            header { class: "page-header",
-                span { class: "section-label", "[ LOG ]" }
-            }
+            // v1.2 (review #133 follow-up): drop the
+            // `──[ LOG ]────` page header. The TopBar tab
+            // already names the page; no contextual button on
+            // this page.
             LogPanel { state: state }
         }
     }

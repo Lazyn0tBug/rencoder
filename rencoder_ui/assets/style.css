@@ -388,6 +388,39 @@ html, body {
     gap: var(--space-4);
 }
 
+/* Sticky bottom button bar — Task page only (review #133 follow-up).
+ * The contextual Start/Cancel/Re-run button lives here so the page
+ * can drop the redundant `──[ TASK ]────` header (TopBar tab names
+ * the page already). The bar sticks to the viewport bottom while the
+ * file list above scrolls; the footer log stays below it (per spec).
+ * The bar shows only when needed — TaskPageButton internally
+ * returns <span/> when there's nothing to do. */
+.task-button-bar {
+    position: sticky;
+    bottom: 0;
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-3) var(--space-4);
+    margin-top: var(--space-4);
+    background: var(--bg-surface);
+    border-top: 1px solid var(--border);
+    z-index: 10;
+}
+
+/* History/Log pages: page-toolbar replaces the dropped page-header's
+ * top-right slot. Inline at the top of the body, no header row. */
+.page-toolbar {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-2) 0;
+    margin-bottom: var(--space-2);
+    border-bottom: 1px dashed var(--border);
+}
+
 .batch-status {
     background: var(--bg-surface);
     border: 1px solid var(--border);
