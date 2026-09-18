@@ -77,6 +77,29 @@ pub fn App() -> Element {
         let cfg_seed = config.read().clone();
         let mut state_thread = state;
         state_thread.with_mut(|s| s.config_draft = (*cfg_seed).clone());
+        // v1.2 (review #133 follow-up): seed the log with a
+        // "controller ready" line so the user sees the log is
+        // wired up before any ffmpeg activity. Purely cosmetic —
+        // real log entries arrive via Msg::LibLogLine + Event::LogLine.
+        state_thread.with_mut(|s| {
+            use crate::msg::{LogLine, LogSource, NO_FILE_INDEX};
+            s.log.push_back(LogLine {
+                file_index: NO_FILE_INDEX,
+                source: LogSource::LibInternal,
+                line: format!("app started at {}", chrono::Local::now().format("%H:%M:%S")),
+                at: chrono::Utc::now(),
+            });
+        });
+        // v1.2 (review #133 follow-up): auto-dispatch
+        // Command::LoadHistory on app start so the History tab
+        // isn't empty on first launch. Limit to 100 most-recent
+        // records (per §3.8.7.4 history-page design).
+        if let Some(tx) = cmd_tx.read().clone() {
+            let _ = tx.try_send(Command::LoadHistory {
+                limit: Some(100),
+                after: None,
+            });
+        }
         // Per the /code-review medium perf finding: hoist the
         // .read().clone() out of the event loop. config and
         // cmd_tx are set once at startup (v1: no Save button, no
