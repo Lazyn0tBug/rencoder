@@ -56,17 +56,12 @@ fn encode_cmd(args: args::EncodeArgs) -> Result<()> {
 
     let extensions = enc.and_then(|e| e.extensions.clone()).unwrap_or_default();
 
-    // v1.2 follow-up #5: env override for batch cap. Used by CI
-    // and one-off large-batch runs where 5000 (the TOML default)
-    // isn't enough. `parse::from_str` failure surfaces via anyhow
-    // -- the CLI prints "invalid environment variable" + exits.
-    let max_batch_size = std::env::var("RENENCODER_MAX_BATCH_SIZE")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or_else(|| {
-            enc.map(|e| e.max_batch_size)
-                .unwrap_or_else(rencoder_lib::config::app::default_max_batch_size)
-        });
+    // v1.2 follow-up #5: batch cap. env > TOML > default.
+    // `resolve_max_batch_size` handles `RENENCODER_MAX_BATCH_SIZE=0`
+    // (warn + fallback) and parse errors (warn + fallback), so a
+    // misconfigured env var doesn't silently allow a 0-cap run that
+    // would trip on entry #1.
+    let max_batch_size = rencoder_lib::config::app::resolve_max_batch_size(enc);
 
     let files = collect_files(&target, &extensions, max_batch_size).with_context(|| {
         format!(
@@ -225,13 +220,14 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
     let extensions = an.and_then(|a| a.extensions.clone()).unwrap_or_default();
 
     // v1.2 follow-up #5: `analyze` is read-only and per-file
-    // bounded by wall-clock (no ffmpeg). Default cap is the same
-    // 5000 as encode; CI / large corpora override via
-    // RENENCODER_MAX_BATCH_SIZE.
-    let max_batch_size = std::env::var("RENENCODER_MAX_BATCH_SIZE")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or_else(rencoder_lib::config::app::default_max_batch_size);
+    // bounded by wall-clock (no ffmpeg). Same cap-resolution as
+    // encode: env > TOML > default. Note: `AnalyzeConfig` has no
+    // own `max_batch_size` field today — the encode config's
+    // cap is shared with analyze (treating cap as a global
+    // collector knob). If we ever want per-section caps, that's
+    // a follow-up.
+    let max_batch_size =
+        rencoder_lib::config::app::resolve_max_batch_size(app_config.encode.as_ref());
 
     let files = collect_files(&target, &extensions, max_batch_size).with_context(|| {
         format!(

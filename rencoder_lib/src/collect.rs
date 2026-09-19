@@ -85,7 +85,16 @@ fn collect_dir(
                     // InputPath wrappers. The +1 lets `count` in the
                     // error carry "you had at least `max + 1`" — the
                     // user knows they overshot by 1+.
-                    if results.len() as u32 >= max_batch_size {
+                    //
+                    // v1.2 follow-up #5 fix: compare in `usize` (the
+                    // count's natural type), not `as u32`. A 64-bit
+                    // `walkdir` walk over a pathological root could
+                    // push `results.len() > u32::MAX`; the cast
+                    // would truncate, the comparison would misfire,
+                    // and the cap would never trip. Promoting
+                    // `max_batch_size` to usize is safe (u32 always
+                    // fits) and avoids the silent truncation.
+                    if results.len() >= max_batch_size as usize {
                         return Err(EncodeError::BatchTooLarge {
                             count: results.len() + 1,
                             max: max_batch_size,

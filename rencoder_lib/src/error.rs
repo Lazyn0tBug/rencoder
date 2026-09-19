@@ -142,6 +142,18 @@ mod tests {
                 ErrorCategory::ConfigError,
             ),
             (EncodeError::UserCancel, ErrorCategory::Cancelled),
+            (
+                // v1.2 follow-up #5: collector-level cap fires when
+                // collect_files sees more than max_batch_size entries.
+                // Treat as ConfigError (operator misconfigured the
+                // cap, or picked too large a dir without narrowing
+                // extensions).
+                EncodeError::BatchTooLarge {
+                    count: 5001,
+                    max: 5000,
+                },
+                ErrorCategory::ConfigError,
+            ),
         ];
         for (err, expected) in cases {
             assert_eq!(err.category(), expected, "wrong category for {err:?}");

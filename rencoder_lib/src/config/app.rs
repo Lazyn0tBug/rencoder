@@ -149,6 +149,47 @@ pub fn default_max_batch_size() -> u32 {
     5000
 }
 
+/// Resolve the effective batch size cap.
+///
+/// Precedence (highest first):
+/// 1. `RENENCODER_MAX_BATCH_SIZE` env var — for CI / one-off
+///    overrides where editing `rencoder.toml` is impractical.
+///    Parse failures (non-numeric, empty, or `0`) emit a
+///    `tracing::warn!` and fall through to the next tier — the
+///    `0` case is rejected because `collect_dir` treats 0 as
+///    "every file rejected" (would always trip on entry #1).
+/// 2. `encode.max_batch_size` from the loaded config — the
+///    TOML override for normal users.
+/// 3. [`default_max_batch_size()`] — the lib default.
+///
+/// Centralised here so CLI (encode + analyze) and UI agree on
+/// precedence. Previously each site repeated the chain inline and
+/// the UI didn't read the env var at all (CI inconsistency).
+pub fn resolve_max_batch_size(encode: Option<&EncodeConfig>) -> u32 {
+    if let Some(s) = std::env::var_os("RENENCODER_MAX_BATCH_SIZE") {
+        match s.to_string_lossy().parse::<u32>() {
+            Ok(0) => {
+                tracing::warn!(
+                    "RENENCODER_MAX_BATCH_SIZE=0 is not allowed \
+                     (every file would trip the cap); using config or default"
+                );
+            }
+            Ok(n) => return n,
+            Err(e) => {
+                tracing::warn!(
+                    value = %s.to_string_lossy(),
+                    error = %e,
+                    "RENENCODER_MAX_BATCH_SIZE failed to parse; \
+                     using config or default"
+                );
+            }
+        }
+    }
+    encode
+        .map(|e| e.max_batch_size)
+        .unwrap_or_else(default_max_batch_size)
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct EncodeConfig {

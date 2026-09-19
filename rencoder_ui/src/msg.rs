@@ -561,11 +561,11 @@ pub fn reduce(
                             push_toast(state, "input dir missing (re-pick)", ToastKind::Error);
                             return;
                         }
-                        Err(CollectError::UnreadableDir) => {
-                            let dir = state.tasks.active.as_ref().unwrap().dir.display();
+                        Err(CollectError::UnreadableDir(e)) => {
+                            let dir = state.tasks.active.as_ref().unwrap().dir.clone();
                             push_toast(
                                 state,
-                                format!("cannot read {} (permission denied or path missing)", dir),
+                                format!("cannot read {}: {}", dir.display(), e),
                                 ToastKind::Error,
                             );
                             return;
@@ -1021,10 +1021,12 @@ fn build_encode_params_from_config(
 enum CollectError {
     /// `state.input_dir` is None. User hasn't picked a directory.
     NoInputDir,
-    /// `std::fs::read_dir` failed (permission denied, not found,
-    /// or other I/O error). The user gets a distinct error message
-    /// so they can fix permissions / path.
-    UnreadableDir,
+    /// I/O failure reading the directory — permission denied, path
+    /// doesn't exist, deleted mid-walk, walkdir errored on a symlink
+    /// loop, etc. Carries the lib's `EncodeError` so the toast
+    /// can show the underlying category / message rather than a
+    /// generic "unreadable dir".
+    UnreadableDir(rencoder_lib::error::EncodeError),
     /// v1.2 follow-up #5: lib's `collect_files` exceeded
     /// `[encode] max_batch_size`. The user needs to narrow
     /// extensions or split the directory — surfaced as a toast
@@ -1059,18 +1061,20 @@ fn collect_input_files(
     // tree). Now the UI's "files found" count matches what
     // StartBatch will actually process, AND the batch cap is enforced
     // uniformly at the same site as the lib.
-    let max_batch_size = config
-        .encode
-        .as_ref()
-        .map(|e| e.max_batch_size)
-        .unwrap_or_else(rencoder_lib::config::app::default_max_batch_size);
+    let max_batch_size = rencoder_lib::config::app::resolve_max_batch_size(config.encode.as_ref());
     let target = rencoder_lib::types::Target::Dir(dir.clone());
     rencoder_lib::collect::collect_files(&target, &extensions, max_batch_size).map_err(
         |e| match e {
             rencoder_lib::error::EncodeError::BatchTooLarge { count, max } => {
                 CollectError::BatchTooLarge { count, max }
             }
-            _ => CollectError::UnreadableDir,
+            // v1.2 follow-up #5 fix: forward the lib's specific error
+            // rather than collapsing every non-BatchTooLarge into a
+            // generic UnreadableDir. The toast path uses
+            // `Display` (which the lib's thiserror derives) so the
+            // user sees "Probe error: walkdir: ..." vs "I/O error:
+            // ..." distinctly.
+            other => CollectError::UnreadableDir(other),
         },
     )
 }
@@ -1128,18 +1132,18 @@ fn dispatch_dry_run_for_new_task(
             push_toast(state, "no input dir selected", ToastKind::Error);
             return;
         }
-        Err(CollectError::UnreadableDir) => {
+        Err(CollectError::UnreadableDir(e)) => {
             // `UnreadableDir` only fires when `read_dir(state.input_dir)`
             // was attempted, which requires `state.input_dir` to be
             // `Some` (NoInputDir short-circuits before read_dir).
-            // So `unwrap()` is safe here.
-            let dir = state.input_dir.as_ref().unwrap();
+            // So `unwrap()` is safe here. Forward the lib error
+            // so the toast distinguishes "Probe error: walkdir:
+            // ..." from "I/O error: ..." — these have different
+            // remediations (symlink-loop vs permission).
+            let dir = state.input_dir.as_ref().unwrap().clone();
             push_toast(
                 state,
-                format!(
-                    "cannot read {} (permission denied or path missing)",
-                    dir.display()
-                ),
+                format!("cannot read {}: {}", dir.display(), e),
                 ToastKind::Error,
             );
             return;
