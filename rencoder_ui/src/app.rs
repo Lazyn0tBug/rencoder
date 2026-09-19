@@ -1339,4 +1339,39 @@ mod tests {
             },
         );
     }
+
+    #[test]
+    fn format_log_entry_uses_global_label_for_lib_events() {
+        // Per-file ffmpeg stderr uses the file_index; lib-internal
+        // tracing events use NO_FILE_INDEX sentinel which renders
+        // as "global" in the log panel.
+        use crate::msg::{LogLine, LogSource, NO_FILE_INDEX};
+        use chrono::{TimeZone, Utc};
+        let lib_line = LogLine {
+            file_index: NO_FILE_INDEX,
+            source: LogSource::LibInternal,
+            line: "lib event".to_string(),
+            at: Utc.with_ymd_and_hms(2026, 1, 1, 12, 34, 56).unwrap(),
+        };
+        let (time, file_label, message) = format_log_entry(&lib_line);
+        assert_eq!(time, "12:34:56");
+        assert_eq!(file_label, "global");
+        assert_eq!(message, "lib event");
+    }
+
+    #[test]
+    fn format_log_entry_uses_index_label_for_ffmpeg_stderr() {
+        // Per-file ffmpeg stderr carries a real file_index (the
+        // batch's per-file index, not the global sentinel).
+        use crate::msg::{LogLine, LogSource};
+        use chrono::{TimeZone, Utc};
+        let ffmpeg_line = LogLine {
+            file_index: 2,
+            source: LogSource::FfmpegStderr,
+            line: "frame= 100".to_string(),
+            at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        };
+        let (_, file_label, _) = format_log_entry(&ffmpeg_line);
+        assert_eq!(file_label, "2");
+    }
 }
