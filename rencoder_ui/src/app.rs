@@ -847,27 +847,20 @@ fn TaskPageButton(
         return rsx! { span {} };
     };
 
-    match phase {
-        // Active task in flight: button reflects the phase.
-        Some(BatchPhase::Analyzing) => {
-            // Disabled "Analyze…" — Cancel during Analyzing is
-            // review #100 (pending); the lib doesn't honor
-            // cancel_token in this phase, so showing Cancel
-            // would mislead the user. v1 keeps Analyzing
-            // non-cancellable.
-            rsx! {
-                button {
-                    class: "primary-btn",
-                    disabled: true,
-                    "Analyze…"
-                }
+    let kind = task_button_decision(phase, !history.is_empty(), input_dir.is_some());
+    match kind {
+        TaskButtonKind::Disabled { label } => rsx! {
+            button {
+                class: "primary-btn",
+                disabled: true,
+                "{label}"
             }
-        }
-        Some(BatchPhase::AwaitingConfirm) => {
-            // v1.2 follow-up #2: dry-run finished; user reviews
-            // the summary toast, then clicks Encode. Button label
-            // is plain "Encode" — no count suffix (we don't
-            // design for encoding a subset; §3.8.7.1 decision 2).
+        },
+        TaskButtonKind::EnabledPrimary { label } => {
+            // Encode / Re-run / Analyze: same click handler
+            // (Msg::UserClickedStart, the reducer's phase-aware
+            // arm dispatches DryRun/StartBatch depending on
+            // current state).
             let tx_s = tx.clone();
             let cfg_s = cfg.clone();
             rsx! {
@@ -876,31 +869,12 @@ fn TaskPageButton(
                     onclick: move |_| {
                         state.with_mut(|s| reduce(s, Msg::UserClickedStart, &tx_s, &cfg_s));
                     },
-                    "Encode"
+                    "{label}"
                 }
             }
         }
-        Some(BatchPhase::Cancelled) => {
-            // v1.2 follow-up #2: post-cancel. Button shows
-            // "Encode" — re-click re-dispatches StartBatch with
-            // the cached dry_run_records. Same reducer arm as
-            // AwaitingConfirm (§3.8.7.1 decision 5).
-            let tx_s = tx.clone();
-            let cfg_s = cfg.clone();
-            rsx! {
-                button {
-                    class: "primary-btn",
-                    onclick: move |_| {
-                        state.with_mut(|s| reduce(s, Msg::UserClickedStart, &tx_s, &cfg_s));
-                    },
-                    "Encode"
-                }
-            }
-        }
-        Some(BatchPhase::Encoding) => {
-            // Enabled "Cancel ✕" — only Encoding-phase Cancel
-            // is wired to the lib's cancel_token (which the
-            // task manager polls between ffmpeg frames).
+        TaskButtonKind::EnabledSecondary { label } => {
+            // Cancel ✕: only fires during Encoding.
             let tx_c = tx.clone();
             let cfg_c = cfg.clone();
             rsx! {
@@ -909,68 +883,64 @@ fn TaskPageButton(
                     onclick: move |_| {
                         state.with_mut(|s| reduce(s, Msg::UserClickedCancel, &tx_c, &cfg_c));
                     },
-                    "Cancel ✕"
+                    "{label}"
                 }
             }
         }
-        Some(BatchPhase::Done) => {
-            // Unreachable: the reducer's BatchCompleted /
-            // BatchCancelled / Error-Encoding arms move Done
-            // tasks to history immediately. Defensive: show a
-            // disabled placeholder rather than nothing so the
-            // bottom bar is never empty.
-            rsx! {
-                button {
-                    class: "primary-btn",
-                    disabled: true,
-                    "Done"
-                }
-            }
-        }
-        // No active task.
+    }
+}
+
+/// Pure decision shape for `TaskPageButton`. Extracted so the
+/// 8-path state machine is testable without a Dioxus runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TaskButtonKind {
+    Disabled { label: &'static str },
+    EnabledPrimary { label: &'static str },
+    EnabledSecondary { label: &'static str },
+}
+
+/// Pure state → button decision. Drives `TaskPageButton`'s label +
+/// enabled/disabled state based on phase + history + input_dir.
+/// No signals, no closures, no IO.
+fn task_button_decision(
+    phase: Option<BatchPhase>,
+    has_history: bool,
+    has_input_dir: bool,
+) -> TaskButtonKind {
+    match phase {
+        // Active task in flight: button reflects the phase.
+        Some(BatchPhase::Analyzing) => TaskButtonKind::Disabled {
+            label: "Analyze…"
+        },
+        // v1.2 follow-up #2: dry-run finished; user reviews the
+        // summary toast, then clicks Encode. Plain "Encode" — no
+        // count suffix (we don't design for encoding a subset;
+        // §3.8.7.1 decision 2).
+        Some(BatchPhase::AwaitingConfirm) => TaskButtonKind::EnabledPrimary { label: "Encode" },
+        // v1.2 follow-up #2: post-cancel reuses the
+        // AwaitingConfirm arm (same Msg::UserClickedStart reducer
+        // path). Same label so the user sees consistent affordance
+        // whether they're starting fresh or resuming after cancel.
+        Some(BatchPhase::Cancelled) => TaskButtonKind::EnabledPrimary { label: "Encode" },
+        Some(BatchPhase::Encoding) => TaskButtonKind::EnabledSecondary {
+            label: "Cancel ✕"
+        },
+        // Defensive — finalize moves Done tasks to history
+        // immediately, so this branch is rarely hit.
+        Some(BatchPhase::Done) => TaskButtonKind::Disabled { label: "Done" },
+        // No active task: pick by history then by dir.
         None => {
-            if !history.is_empty() {
-                // Re-arm: previous task is in history, user can
-                // re-run the dry-run flow. Same Msg as a fresh
-                // "Analyze ▸" (the reducer's None arm).
-                let tx_s = tx.clone();
-                let cfg_s = cfg.clone();
-                rsx! {
-                    button {
-                        class: "primary-btn",
-                        onclick: move |_| {
-                            state.with_mut(|s| reduce(s, Msg::UserClickedStart, &tx_s, &cfg_s));
-                        },
-                        "Re-run ▸"
-                    }
+            if has_history {
+                TaskButtonKind::EnabledPrimary {
+                    label: "Re-run ▸"
                 }
-            } else if input_dir.is_some() {
-                // Fresh first-run: dir picked, no active, no
-                // history. Click dispatches DryRun.
-                let tx_s = tx.clone();
-                let cfg_s = cfg.clone();
-                rsx! {
-                    button {
-                        class: "primary-btn",
-                        onclick: move |_| {
-                            state.with_mut(|s| reduce(s, Msg::UserClickedStart, &tx_s, &cfg_s));
-                        },
-                        "Analyze ▸"
-                    }
+            } else if has_input_dir {
+                TaskButtonKind::EnabledPrimary {
+                    label: "Analyze ▸"
                 }
             } else {
-                // v1.2 (review #133 follow-up): show a
-                // disabled placeholder instead of an empty
-                // span. The bottom bar is always visible — the
-                // button tells the user what they need to do
-                // next ("pick a directory" — see DirPicker
-                // above).
-                rsx! {
-                    button {
-                        class: "primary-btn",
-                        disabled: true,
-                        "Pick a directory first"
-                    }
+                TaskButtonKind::Disabled {
+                    label: "Pick a directory first",
                 }
             }
         }
@@ -1235,4 +1205,138 @@ fn format_log_entry(l: &crate::msg::LogLine) -> (String, String, String) {
         file_label,
         l.line.clone(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::msg::BatchPhase::*;
+
+    /// Helper to keep the per-case assertions short. Asserts the
+    /// decision is `kind`, ignoring label/variant differences that
+    /// are obvious from context.
+    fn assert_kind(got: TaskButtonKind, expected: TaskButtonKind) {
+        // PartialEq derived on the enum compares all variants;
+        // we use that here rather than a hand-written matcher so
+        // adding a new variant (Disabled { label } => "x") doesn't
+        // silently make a "looks the same" test pass.
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn task_button_analyzing_disabled() {
+        // Cancel during Analyzing is review #100 (pending);
+        // lib doesn't honor cancel_token in this phase, so we
+        // disable the button. Locked by §3.8.7.1 limitations.
+        assert_kind(
+            task_button_decision(Some(Analyzing), false, false),
+            TaskButtonKind::Disabled {
+                label: "Analyze…"
+            },
+        );
+    }
+
+    #[test]
+    fn task_button_awaiting_confirm_encodes() {
+        // v1.2 follow-up #2: after dry-run completes, the button
+        // label is plain "Encode" (no count suffix — we don't
+        // design for encoding a subset; §3.8.7.1 decision 2).
+        assert_kind(
+            task_button_decision(Some(AwaitingConfirm), false, false),
+            TaskButtonKind::EnabledPrimary { label: "Encode" },
+        );
+    }
+
+    #[test]
+    fn task_button_cancelled_also_encodes() {
+        // v1.2 follow-up #2: post-cancel arm uses the same
+        // Msg::UserClickedStart reducer path as AwaitingConfirm,
+        // so the label and click handler are identical. This
+        // avoids a special-case in the reducer for Cancelled.
+        assert_kind(
+            task_button_decision(Some(Cancelled), false, false),
+            TaskButtonKind::EnabledPrimary { label: "Encode" },
+        );
+    }
+
+    #[test]
+    fn task_button_encoding_cancels() {
+        // Encoding is the only phase where Cancel ✕ is wired to
+        // the lib's cancel_token (which the task manager polls
+        // between ffmpeg frames).
+        assert_kind(
+            task_button_decision(Some(Encoding), false, false),
+            TaskButtonKind::EnabledSecondary {
+                label: "Cancel ✕"
+            },
+        );
+    }
+
+    #[test]
+    fn task_button_done_disabled_defensive() {
+        // Done is unreachable in practice (finalize moves Done
+        // tasks to history immediately), but the arm is defensive
+        // — show a disabled placeholder rather than nothing so the
+        // bottom bar is never empty.
+        assert_kind(
+            task_button_decision(Some(Done), false, false),
+            TaskButtonKind::Disabled { label: "Done" },
+        );
+    }
+
+    #[test]
+    fn task_button_none_with_history_reruns() {
+        // History present → user can re-run the dry-run flow.
+        // history length > 0 wins over has_input_dir.
+        assert_kind(
+            task_button_decision(None, true, true),
+            TaskButtonKind::EnabledPrimary {
+                label: "Re-run ▸"
+            },
+        );
+        assert_kind(
+            task_button_decision(None, true, false),
+            TaskButtonKind::EnabledPrimary {
+                label: "Re-run ▸"
+            },
+        );
+    }
+
+    #[test]
+    fn task_button_none_no_history_with_dir_analyzes() {
+        // No history + dir picked = "Analyze ▸" — fresh first run.
+        assert_kind(
+            task_button_decision(None, false, true),
+            TaskButtonKind::EnabledPrimary {
+                label: "Analyze ▸"
+            },
+        );
+    }
+
+    #[test]
+    fn task_button_none_nothing_disabled_pick_first() {
+        // No history + no dir = "Pick a directory first" — disabled
+        // placeholder that tells the user what to do next (rather
+        // than an empty button).
+        assert_kind(
+            task_button_decision(None, false, false),
+            TaskButtonKind::Disabled {
+                label: "Pick a directory first",
+            },
+        );
+    }
+
+    #[test]
+    fn task_button_phase_wins_over_history_and_dir() {
+        // Defense in depth: even if a race sets history/dir while
+        // an active task is in flight, the phase arm must take
+        // precedence. Otherwise the bottom button would suddenly
+        // flip from "Cancel ✕" to "Re-run ▸" mid-encode.
+        assert_kind(
+            task_button_decision(Some(Encoding), true, true),
+            TaskButtonKind::EnabledSecondary {
+                label: "Cancel ✕"
+            },
+        );
+    }
 }
