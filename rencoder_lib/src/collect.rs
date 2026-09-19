@@ -24,13 +24,21 @@ use crate::types::{InputPath, Target};
 ///
 /// `extensions` is a case-insensitive allowlist; an empty slice means
 /// "all files".
+///
+/// v1.2 follow-up #5: `max_batch_size` caps the result vec length.
+/// `collect_dir` short-circuits once `max + 1` files are seen so a
+/// misclicked root (`/`, `~`) doesn't allocate a giant Vec before
+/// bailing. `collect_single_file` (target = a single file) ignores
+/// the cap — passing a single path through the same limit would
+/// break the CLI `encode -f foo.mp4` UX.
 pub fn collect_files(
     target: &Target,
     extensions: &[String],
+    max_batch_size: u32,
 ) -> Result<Vec<InputPath>, EncodeError> {
     match target {
         Target::File(p) => Ok(collect_single_file(p, extensions)),
-        Target::Dir(root) => collect_dir(root, extensions),
+        Target::Dir(root) => collect_dir(root, extensions, max_batch_size),
     }
 }
 
@@ -48,7 +56,11 @@ fn collect_single_file(p: &Path, extensions: &[String]) -> Vec<InputPath> {
     }
 }
 
-fn collect_dir(root: &Path, extensions: &[String]) -> Result<Vec<InputPath>, EncodeError> {
+fn collect_dir(
+    root: &Path,
+    extensions: &[String],
+    max_batch_size: u32,
+) -> Result<Vec<InputPath>, EncodeError> {
     let mut results = Vec::new();
     let walker = walkdir::WalkDir::new(root).follow_links(false);
     for entry in walker {
@@ -67,7 +79,20 @@ fn collect_dir(root: &Path, extensions: &[String]) -> Result<Vec<InputPath>, Enc
             // rejection surfaces as a warn-and-skip, matching the
             // v1 collect_dir behavior.
             match InputPath::new(path) {
-                Ok(ip) => results.push(ip),
+                Ok(ip) => {
+                    // v1.2 follow-up #5: cap. Check BEFORE pushing so
+                    // we never allocate beyond `max_batch_size + 1`
+                    // InputPath wrappers. The +1 lets `count` in the
+                    // error carry "you had at least `max + 1`" — the
+                    // user knows they overshot by 1+.
+                    if results.len() as u32 >= max_batch_size {
+                        return Err(EncodeError::BatchTooLarge {
+                            count: results.len() + 1,
+                            max: max_batch_size,
+                        });
+                    }
+                    results.push(ip);
+                }
                 Err(e) => tracing::warn!(path = %path.display(), error = %e, "skipping file"),
             }
         }
@@ -122,7 +147,7 @@ mod tests {
     fn file_target_with_matching_extension_is_collected() {
         let dir = fixture_dir("file_match");
         let f = touch(&dir, "movie.mp4");
-        let files = collect_files(&Target::File(f.clone()), &["mp4".into()]).unwrap();
+        let files = collect_files(&Target::File(f.clone()), &["mp4".into()], u32::MAX).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].as_path(), f);
     }
@@ -131,7 +156,7 @@ mod tests {
     fn file_target_with_non_matching_extension_is_skipped() {
         let dir = fixture_dir("file_miss");
         let f = touch(&dir, "movie.txt");
-        let files = collect_files(&Target::File(f.clone()), &["mp4".into()]).unwrap();
+        let files = collect_files(&Target::File(f.clone()), &["mp4".into()], u32::MAX).unwrap();
         assert!(files.is_empty());
     }
 
@@ -139,7 +164,7 @@ mod tests {
     fn file_target_with_empty_extensions_always_matches() {
         let dir = fixture_dir("file_empty");
         let f = touch(&dir, "anything.xyz");
-        let files = collect_files(&Target::File(f.clone()), &[]).unwrap();
+        let files = collect_files(&Target::File(f.clone()), &[], u32::MAX).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].as_path(), f);
     }
@@ -154,7 +179,7 @@ mod tests {
         let dir = fixture_dir("dir_dash");
         let good = touch(&dir, "movie.mp4");
         let bad = touch(&dir, "-vf_negate.mp4");
-        let files = collect_files(&Target::Dir(dir), &["mp4".into()]).unwrap();
+        let files = collect_files(&Target::Dir(dir), &["mp4".into()], u32::MAX).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].as_path(), good);
         assert!(!files.iter().any(|ip| ip.as_path() == bad));
@@ -165,6 +190,7 @@ mod tests {
         let files = collect_files(
             &Target::File(PathBuf::from("/nonexistent/never.mp4")),
             &["mp4".into()],
+            u32::MAX,
         )
         .unwrap();
         assert!(files.is_empty());
@@ -174,7 +200,7 @@ mod tests {
     fn file_target_extension_match_is_case_insensitive() {
         let dir = fixture_dir("file_case");
         let f = touch(&dir, "movie.MP4");
-        let files = collect_files(&Target::File(f.clone()), &["mp4".into()]).unwrap();
+        let files = collect_files(&Target::File(f.clone()), &["mp4".into()], u32::MAX).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].as_path(), f);
     }
@@ -187,8 +213,12 @@ mod tests {
         touch(&dir, "a.mp4");
         touch(&dir, "b.txt");
         touch(&dir, "c.mkv");
-        let files =
-            collect_files(&Target::Dir(dir.clone()), &["mp4".into(), "mkv".into()]).unwrap();
+        let files = collect_files(
+            &Target::Dir(dir.clone()),
+            &["mp4".into(), "mkv".into()],
+            u32::MAX,
+        )
+        .unwrap();
         assert_eq!(files.len(), 2);
         assert!(files.iter().all(|ip| {
             ip.as_path()
@@ -204,14 +234,14 @@ mod tests {
         touch(&dir, "a.mp4");
         touch(&dir, "b.txt");
         touch(&dir, "c.bin");
-        let files = collect_files(&Target::Dir(dir.clone()), &[]).unwrap();
+        let files = collect_files(&Target::Dir(dir.clone()), &[], u32::MAX).unwrap();
         assert_eq!(files.len(), 3);
     }
 
     #[test]
     fn dir_empty_returns_empty() {
         let dir = fixture_dir("dir_empty");
-        let files = collect_files(&Target::Dir(dir.clone()), &["mp4".into()]).unwrap();
+        let files = collect_files(&Target::Dir(dir.clone()), &["mp4".into()], u32::MAX).unwrap();
         assert!(files.is_empty());
     }
 
@@ -222,7 +252,7 @@ mod tests {
         fs::create_dir_all(&sub).unwrap();
         touch(&dir, "a.mp4");
         touch(&sub, "b.mp4");
-        let files = collect_files(&Target::Dir(dir.clone()), &["mp4".into()]).unwrap();
+        let files = collect_files(&Target::Dir(dir.clone()), &["mp4".into()], u32::MAX).unwrap();
         assert_eq!(files.len(), 2);
     }
 
@@ -242,7 +272,7 @@ mod tests {
             let _ = link;
             return;
         }
-        let files = collect_files(&Target::Dir(dir.clone()), &["mp4".into()]).unwrap();
+        let files = collect_files(&Target::Dir(dir.clone()), &["mp4".into()], u32::MAX).unwrap();
         assert_eq!(files.len(), 1);
         assert!(files.iter().any(|ip| ip.as_path() == real));
         assert!(!files.iter().any(|ip| ip.as_path() == link));
@@ -266,7 +296,7 @@ mod tests {
             let _ = link;
             return;
         }
-        let files = collect_files(&Target::Dir(dir.clone()), &["mp4".into()]).unwrap();
+        let files = collect_files(&Target::Dir(dir.clone()), &["mp4".into()], u32::MAX).unwrap();
         // outer.mp4 + inner.mp4; the symlink should NOT cause the walk to
         // revisit outer.mp4 a second time.
         assert_eq!(files.len(), 2);
@@ -278,7 +308,72 @@ mod tests {
         touch(&dir, "a.MP4");
         touch(&dir, "b.mp4");
         touch(&dir, "c.Mp4");
-        let files = collect_files(&Target::Dir(dir.clone()), &["mp4".into()]).unwrap();
+        let files = collect_files(&Target::Dir(dir.clone()), &["mp4".into()], u32::MAX).unwrap();
         assert_eq!(files.len(), 3);
+    }
+
+    // ---- v1.2 follow-up #5: batch size cap ----
+
+    #[test]
+    fn dir_cap_short_circuits_at_max_plus_one() {
+        // Create `max_batch_size + 5` files but cap at `max_batch_size`.
+        // collect_dir must return Err(BatchTooLarge { count, max })
+        // with count = max_batch_size + 1 (the first one past the cap).
+        let dir = fixture_dir("dir_cap");
+        let max = 5_u32;
+        for i in 0..(max + 5) {
+            touch(&dir, &format!("movie_{i}.mp4"));
+        }
+        let err = collect_files(&Target::Dir(dir.clone()), &["mp4".into()], max)
+            .expect_err("expected BatchTooLarge");
+        match err {
+            EncodeError::BatchTooLarge { count, max: m } => {
+                assert_eq!(m, max);
+                // count is max + 1 — the loop trips on the max+1-th
+                // entry. (We never allocate beyond max+1 because the
+                // check runs before the push.)
+                assert_eq!(count as u32, max + 1);
+            }
+            _ => panic!("expected BatchTooLarge, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn dir_cap_at_exact_boundary_succeeds() {
+        // Exactly `max_batch_size` files should pass through; the
+        // check is `results.len() >= max` so `== max` is still OK.
+        let dir = fixture_dir("dir_cap_exact");
+        let max = 3_u32;
+        for i in 0..max {
+            touch(&dir, &format!("m_{i}.mp4"));
+        }
+        let files = collect_files(&Target::Dir(dir), &["mp4".into()], max).expect("at boundary");
+        assert_eq!(files.len() as u32, max);
+    }
+
+    #[test]
+    fn dir_cap_one_over_boundary_fails() {
+        // `max + 1` files should trip the cap.
+        let dir = fixture_dir("dir_cap_over");
+        let max = 3_u32;
+        for i in 0..(max + 1) {
+            touch(&dir, &format!("m_{i}.mp4"));
+        }
+        let err = collect_files(&Target::Dir(dir), &["mp4".into()], max)
+            .expect_err("expected BatchTooLarge");
+        assert!(matches!(err, EncodeError::BatchTooLarge { .. }));
+    }
+
+    #[test]
+    fn file_target_ignores_cap() {
+        // Single-file target should pass even if `max = 0` — `encode
+        // -f foo.mp4` is a deliberate user choice. (Avoids breaking
+        // the CLI UX for one-off encodes.)
+        let dir = fixture_dir("file_ignore_cap");
+        let f = touch(&dir, "movie.mp4");
+        let files = collect_files(&Target::File(f.clone()), &["mp4".into()], 0)
+            .expect("single file bypasses cap");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].as_path(), f);
     }
 }

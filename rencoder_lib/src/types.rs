@@ -610,6 +610,9 @@ mod tests {
             bitrate: Some(5000),
             nv: Some(false),
             extensions: Some(vec!["mov".into()]),
+            // v1.2 follow-up #5: tests don't exercise the cap; default
+            // is fine (matches the serde default).
+            max_batch_size: crate::config::app::default_max_batch_size(),
             output_dir: None,
             encoders: None,
             ffmpeg_args: Default::default(),

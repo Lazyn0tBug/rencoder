@@ -29,7 +29,7 @@
 //! gating decisions).
 
 use std::collections::{HashMap, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use chrono::{DateTime, Local, Utc};
 use crossbeam_channel::Sender;
@@ -570,6 +570,17 @@ pub fn reduce(
                             );
                             return;
                         }
+                        Err(CollectError::BatchTooLarge { count, max }) => {
+                            push_toast(
+                                state,
+                                format!(
+                                    "batch too large: {} files (max {}). Narrow extensions or split the dir.",
+                                    count, max
+                                ),
+                                ToastKind::Error,
+                            );
+                            return;
+                        }
                     };
                     if files.is_empty() {
                         let dir = state.tasks.active.as_ref().unwrap().dir.display();
@@ -1014,6 +1025,11 @@ enum CollectError {
     /// or other I/O error). The user gets a distinct error message
     /// so they can fix permissions / path.
     UnreadableDir,
+    /// v1.2 follow-up #5: lib's `collect_files` exceeded
+    /// `[encode] max_batch_size`. The user needs to narrow
+    /// extensions or split the directory — surfaced as a toast
+    /// with the count + max so they know by how much they overshot.
+    BatchTooLarge { count: usize, max: u32 },
 }
 
 /// Collect input files from `state.input_dir`, filtered by the
@@ -1036,29 +1052,27 @@ fn collect_input_files(
         .as_ref()
         .and_then(|e| e.extensions.clone())
         .unwrap_or_default();
-    let read_dir = match std::fs::read_dir(dir) {
-        Ok(rd) => rd,
-        Err(_) => return Err(CollectError::UnreadableDir),
-    };
-    let files: Vec<_> = read_dir
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_file())
-        .filter(|p| extension_matches(p, &extensions))
-        // Review #109: each entry must be wrapped in `InputPath::new`,
-        // which rejects dash-prefixed filenames (the lib's runtime
-        // warning already filtered these; this adds the type-level
-        // boundary on the UI side too). Skipped entries log a warning
-        // so the operator sees what was filtered.
-        .filter_map(|p| match rencoder_lib::types::InputPath::new(&p) {
-            Ok(ip) => Some(ip),
-            Err(e) => {
-                tracing::warn!(path = %p.display(), error = %e, "skipping UI file");
-                None
+    // v1.2 follow-up #5: route through lib's recursive `collect_files`
+    // (was a non-recursive `std::fs::read_dir` loop, which diverged
+    // from the lib's `walkdir`-based recursive walk — a dir with
+    // subdirs would show "0 files" in the UI but encode the whole
+    // tree). Now the UI's "files found" count matches what
+    // StartBatch will actually process, AND the batch cap is enforced
+    // uniformly at the same site as the lib.
+    let max_batch_size = config
+        .encode
+        .as_ref()
+        .map(|e| e.max_batch_size)
+        .unwrap_or_else(rencoder_lib::config::app::default_max_batch_size);
+    let target = rencoder_lib::types::Target::Dir(dir.clone());
+    rencoder_lib::collect::collect_files(&target, &extensions, max_batch_size).map_err(
+        |e| match e {
+            rencoder_lib::error::EncodeError::BatchTooLarge { count, max } => {
+                CollectError::BatchTooLarge { count, max }
             }
-        })
-        .collect();
-    Ok(files)
+            _ => CollectError::UnreadableDir,
+        },
+    )
 }
 
 /// Move the active task to history, applying `mutate` to it first.
@@ -1086,23 +1100,6 @@ where
 fn drop_active(state: &mut AppState) {
     let _ = state.tasks.active.take();
     state.viewing_task = None;
-}
-
-/// Check whether a path's extension matches any of the user's
-/// configured extension filters. Empty `extensions` means "all".
-/// Match is case-insensitive and ignores the leading dot.
-fn extension_matches(path: &Path, extensions: &[String]) -> bool {
-    if extensions.is_empty() {
-        return true;
-    }
-    let ext: String = match path.extension().and_then(|e| e.to_str()) {
-        Some(e) => e.to_ascii_lowercase(),
-        None => return false,
-    };
-    extensions.iter().any(|e| {
-        let trimmed = e.trim_start_matches('.').to_ascii_lowercase();
-        trimmed == ext
-    })
 }
 
 /// Dispatch a `Command::DryRun` for a freshly-created task (None or
@@ -1142,6 +1139,17 @@ fn dispatch_dry_run_for_new_task(
                 format!(
                     "cannot read {} (permission denied or path missing)",
                     dir.display()
+                ),
+                ToastKind::Error,
+            );
+            return;
+        }
+        Err(CollectError::BatchTooLarge { count, max }) => {
+            push_toast(
+                state,
+                format!(
+                    "batch too large: {} files (max {}). Narrow extensions or split the dir.",
+                    count, max
                 ),
                 ToastKind::Error,
             );
@@ -2383,39 +2391,8 @@ mod tests {
         assert!(params.is_crf);
         assert_eq!(params.bitrate_or_crf, 45);
     }
-
-    #[test]
-    fn extension_matches_empty_means_all() {
-        assert!(extension_matches(&PathBuf::from("/foo.mp4"), &[]));
-        assert!(extension_matches(&PathBuf::from("/foo.bar"), &[]));
-    }
-
-    #[test]
-    fn extension_matches_case_insensitive() {
-        assert!(extension_matches(
-            &PathBuf::from("/FOO.MP4"),
-            &["mp4".into()]
-        ));
-        assert!(extension_matches(
-            &PathBuf::from("/foo.mp4"),
-            &["MP4".into()]
-        ));
-    }
-
-    #[test]
-    fn extension_matches_strips_leading_dot() {
-        assert!(extension_matches(
-            &PathBuf::from("/foo.mp4"),
-            &[".mp4".into()]
-        ));
-    }
-
-    #[test]
-    fn extension_matches_rejects_non_matching() {
-        assert!(!extension_matches(
-            &PathBuf::from("/foo.txt"),
-            &["mp4".into(), "mkv".into()]
-        ));
-        assert!(!extension_matches(&PathBuf::from("/foo"), &["mp4".into()]));
-    }
+    // extension_matches tests were removed in v1.2 follow-up #5 —
+    // the helper was deleted when the UI started routing through
+    // lib's `collect_files` (which handles extension matching
+    // internally with walkdir).
 }

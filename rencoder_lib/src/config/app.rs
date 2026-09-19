@@ -84,6 +84,14 @@ nv = false
 # Extension filter for `encode -d DIR`. Empty list = all files.
 extensions = ["mp4", "mov", "avi"]
 
+# Cap on number of input files per batch (v1.2 follow-up #5).
+# `collect_files` short-circuits at `max_batch_size + 1` so a
+# misclicked root (`/`, `~`) doesn't allocate a giant Vec of
+# InputPath. Default 5000 covers realistic batches; CI / one-off
+# runs can override via RENENCODER_MAX_BATCH_SIZE. Set to 1+
+# (0 is rejected — use a large number to effectively disable).
+# max_batch_size = 5000
+
 # Optional: directory where encoded outputs land. Not wired yet (output
 # paths are computed per-input); reserved for a future stage where
 # batch output lands in a single project directory.
@@ -134,6 +142,13 @@ fn default_crf() -> u32 {
     45
 }
 
+/// v1.2 follow-up #5: `collect_files` short-circuits at `max + 1` to
+/// protect against misclicked roots. Default 5000; override via
+/// `RENENCODER_MAX_BATCH_SIZE` env var (CI / one-off large runs).
+pub fn default_max_batch_size() -> u32 {
+    5000
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct EncodeConfig {
@@ -153,6 +168,12 @@ pub struct EncodeConfig {
     pub max_fps: Option<u32>,
     pub nv: Option<bool>,
     pub extensions: Option<Vec<String>>,
+    /// v1.2 follow-up #5: hard cap on input files per batch.
+    /// `collect_files` returns `BatchTooLarge` once this is exceeded
+    /// (short-circuits at `max + 1` so memory stays bounded even
+    /// if the user picks `/` or `~`). Default 5000.
+    #[serde(default = "default_max_batch_size")]
+    pub max_batch_size: u32,
     pub output_dir: Option<PathBuf>,
     pub encoders: Option<EncodersConfig>,
     /// ffmpeg argv construction knobs. Most of the previously hardcoded
@@ -219,6 +240,9 @@ impl Default for EncodeConfig {
             max_fps: None,
             nv: None,
             extensions: None,
+            // v1.2 follow-up #5: must match `default_max_batch_size()`
+            // (serde runs that fn when the field is missing in TOML).
+            max_batch_size: default_max_batch_size(),
             output_dir: None,
             encoders: None,
             ffmpeg_args: FfmpegArgsConfig::default(),
@@ -320,6 +344,17 @@ impl AppConfig {
                 return Err(ConfigError::InvalidValue {
                     field: "encode.crf".into(),
                     value: enc.crf.to_string(),
+                });
+            }
+            // v1.2 follow-up #5: `0` would disable the cap entirely,
+            // which contradicts the doc's "0 is rejected" guidance.
+            // We reject 0 outright so users who want "no cap" must
+            // pick an explicit large number (defense in depth against
+            // accidentally picking a root dir).
+            if enc.max_batch_size == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "encode.max_batch_size".into(),
+                    value: "0".into(),
                 });
             }
         }
@@ -672,6 +707,7 @@ mod tests {
                     max_fps: Some(bad),
                     nv: None,
                     extensions: None,
+                    max_batch_size: default_max_batch_size(),
                     output_dir: None,
                     encoders: None,
                     ffmpeg_args: FfmpegArgsConfig::default(),
@@ -700,6 +736,7 @@ mod tests {
                     max_fps: Some(good),
                     nv: None,
                     extensions: None,
+                    max_batch_size: default_max_batch_size(),
                     output_dir: None,
                     encoders: None,
                     ffmpeg_args: FfmpegArgsConfig::default(),
@@ -723,6 +760,7 @@ mod tests {
                 max_fps: None,
                 nv: None,
                 extensions: None,
+                max_batch_size: default_max_batch_size(),
                 output_dir: None,
                 encoders: None,
                 ffmpeg_args: FfmpegArgsConfig::default(),
@@ -746,6 +784,9 @@ mod tests {
                 max_fps: None,
                 nv: None,
                 extensions: None,
+                // v1.2 follow-up #5: cap doesn't trigger at default
+                // 5000 in this test (1 file).
+                max_batch_size: default_max_batch_size(),
                 output_dir: None,
                 encoders: None,
                 ffmpeg_args: FfmpegArgsConfig::default(),

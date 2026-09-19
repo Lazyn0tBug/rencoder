@@ -56,7 +56,19 @@ fn encode_cmd(args: args::EncodeArgs) -> Result<()> {
 
     let extensions = enc.and_then(|e| e.extensions.clone()).unwrap_or_default();
 
-    let files = collect_files(&target, &extensions).with_context(|| {
+    // v1.2 follow-up #5: env override for batch cap. Used by CI
+    // and one-off large-batch runs where 5000 (the TOML default)
+    // isn't enough. `parse::from_str` failure surfaces via anyhow
+    // -- the CLI prints "invalid environment variable" + exits.
+    let max_batch_size = std::env::var("RENENCODER_MAX_BATCH_SIZE")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or_else(|| {
+            enc.map(|e| e.max_batch_size)
+                .unwrap_or_else(rencoder_lib::config::app::default_max_batch_size)
+        });
+
+    let files = collect_files(&target, &extensions, max_batch_size).with_context(|| {
         format!(
             "failed to collect files from {}",
             target_path(&target).display()
@@ -212,7 +224,16 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
 
     let extensions = an.and_then(|a| a.extensions.clone()).unwrap_or_default();
 
-    let files = collect_files(&target, &extensions).with_context(|| {
+    // v1.2 follow-up #5: `analyze` is read-only and per-file
+    // bounded by wall-clock (no ffmpeg). Default cap is the same
+    // 5000 as encode; CI / large corpora override via
+    // RENENCODER_MAX_BATCH_SIZE.
+    let max_batch_size = std::env::var("RENENCODER_MAX_BATCH_SIZE")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or_else(rencoder_lib::config::app::default_max_batch_size);
+
+    let files = collect_files(&target, &extensions, max_batch_size).with_context(|| {
         format!(
             "failed to collect files from {}",
             target_path(&target).display()

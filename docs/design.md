@@ -203,6 +203,26 @@ fs_perms::set_config_file_mode(&tmp)?;
 
 - 颜色化是终端能力，`tracing-subscriber` 的 `fmt` 层默认不染色，且 ANSI 颜色在重定向到文件时会变成噪音；如需彩色输出，让终端通过 `RUST_LOG_STYLE=always` 等环境变量启用，避免库内硬编码。
 
+### 2.5 关于 batch size 上限的决策（v1.2 follow-up #5）
+
+**为什么需要上限**：
+- `walkdir::WalkDir` 遍历目录收集输入——没有上限时，用户误选根目录（`/`、`/Users` 等）会收集 10 万+ 文件，actor 的 `cmd_tx` channel 一次性写入 `Vec<InputPath>` 序列化 payload，actor 端反序列化占用大量内存。
+- 每文件启动 1 个 ffmpeg 子进程（v1.2 batch 处理是顺序的），10000 文件 → 5+ 小时运行；中途 cancel 留大量 partial。
+- 没有上限的 dry-run 也耗资源：每文件 ffprobe 一次，10k probe × ~50ms = 8+ 分钟。
+
+**上限来源**：
+- `[encode] max_batch_size = 5000` 在 `rencoder.toml`，默认 5000。
+- 环境变量 `RENENCODER_MAX_BATCH_SIZE` 覆盖（CI / 临时调大场景）。
+- 验证：`max_batch_size >= 1`（0 禁用上限，但不推荐——明确写一个超大数表示"我不想要上限"）。
+
+**强制位置**：`collect_files`（`rencoder_lib/src/collect.rs`）返回 `Result<Vec<InputPath>, EncodeError::BatchTooLarge { count, max }`。在 walkdir 完成填充前就 short-circuit：已经收满 `max_batch_size + 1` 个文件就停，**不**全量收集再判。
+
+**错误返回**：
+- CLI：打印 `error: batch too large: 5001 files (max 5000); narrow extensions or split the dir` 到 stderr，exit 1。
+- UI：toast `Batch too large: 5001 files (max 5000). Narrow extensions or split the dir.`，**不** dispatch `Command::StartBatch`（defense in depth——在 reducer 也要拒绝）。
+
+**为什么不放到 actor 的 busy-gate**：busy-gate 是"已有 batch 进行中就拒绝下一个"，但 collect_files 的批量收集发生在 dispatch 之前——busy-gate 防不到。cap 必须在 collect_files 层面。
+
 ### 2.4 关于工作记录数据模型与存储的决策
 
 **这是工作分析工具，不是视频分析工具。** 用户问的是「这次跑得怎么样？哪几条慢？哪些失败？」——这是工作流问题，不是媒体属性问题。数据模型按四个维度组织：

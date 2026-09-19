@@ -25,6 +25,14 @@ pub enum EncodeError {
 
     #[error("User cancelled")]
     UserCancel,
+
+    /// v1.2 follow-up #5: `collect_files` exceeded
+    /// `[encode] max_batch_size`. `count` is the partial count
+    /// when the cap tripped (may exceed `max` by 1 — the loop
+    /// checks before pushing). Caller renders as
+    /// "batch too large: {count} files (max {max})".
+    #[error("batch too large: {count} files (max {max})")]
+    BatchTooLarge { count: usize, max: u32 },
 }
 
 impl EncodeError {
@@ -44,6 +52,7 @@ impl EncodeError {
     /// | `EncoderNotFound(_)`| `EncoderSelectionFailed`|
     /// | `FpsParse(_)`       | `ConfigError`           |
     /// | `UserCancel`        | `Cancelled`             |
+    /// | `BatchTooLarge {..}`| `ConfigError`           |
     pub fn category(&self) -> ErrorCategory {
         match self {
             EncodeError::Io(_) => ErrorCategory::IoError,
@@ -53,6 +62,7 @@ impl EncodeError {
             EncodeError::EncoderNotFound(_) => ErrorCategory::EncoderSelectionFailed,
             EncodeError::FpsParse(_) => ErrorCategory::ConfigError,
             EncodeError::UserCancel => ErrorCategory::Cancelled,
+            EncodeError::BatchTooLarge { .. } => ErrorCategory::ConfigError,
         }
     }
 }

@@ -334,7 +334,10 @@ where
         .unwrap_or(false);
 
     if should_skip_encoding(codec, params.format, need_reduce) {
-        tracing::info!(source_codec = codec, "task skipped: source codec matches target");
+        tracing::info!(
+            source_codec = codec,
+            "task skipped: source codec matches target"
+        );
         return Ok(make_skipped_record(
             task,
             params,
