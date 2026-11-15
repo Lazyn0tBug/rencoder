@@ -100,3 +100,7 @@ MIT.
 ### Portable packages and releases
 
 Run `bash scripts/dist.sh` (requires Rust and Python 3.11+). The generated `dist/rencoder_cli-<target>/` contains the executable and `rencoder.toml` side by side; no system application-data directory is used. The final tar.xz or zip includes the same directory and a SHA-256 checksum. Every pushed Git tag triggers a release for macOS, Linux and Windows, plus a macOS disk image. Manual release runs require an existing tag.
+
+### Optional native probe
+
+Default builds use the `ffprobe` executable and do not require pkg-config or FFmpeg development libraries. The native C bridge is opt-in: `cargo build -p rencoder_cli --features rencoder_lib/c-probe`. This mode requires pkg-config plus compatible FFmpeg headers and libraries at build time, and the corresponding shared libraries at runtime. Portable release builds use the default subprocess probe.

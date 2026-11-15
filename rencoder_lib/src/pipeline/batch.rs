@@ -31,7 +31,7 @@ use crate::pipeline::partial_output::PartialOutputHandle;
 use crate::pipeline::task::TaskManager;
 use crate::types::{
     EncodeParams, EncoderCache, EncoderSettings, EncodingOutcome, EncodingRecord, ErrorCategory,
-    ErrorContext, ProcessOutput, SkippedReason, TranscodeTask, VideoMetadata,
+    ErrorContext, ProcessOutput, TranscodeTask, VideoMetadata,
 };
 use crate::utils::fs::output_path_for;
 
@@ -190,6 +190,10 @@ fn transcode_with_argv(
     output: ProcessOutput,
 ) -> Result<EncodingRecord, EncodeError> {
     let src_fps = metadata.best_fps();
+    let need_reduce = src_fps
+        .map(|fps| params.max_fps.enabled() && params.max_fps.need_reduce(fps))
+        .unwrap_or(false);
+
     // Run ffmpeg (capture stderr if ProcessOutput::Piped so we can
     // attach it to the ErrorContext on failure).
     let run_result = run_ffmpeg_with_stderr(&argv, output);
@@ -291,47 +295,6 @@ fn transcode_with_argv(
                 ffmpeg_stderr_tail: stderr_tail,
             }),
         }),
-    }
-}
-
-/// Build the skipped-record skeleton (used for OutputExists and
-/// SameCodec paths).
-fn make_skipped_record(
-    task: &TranscodeTask,
-    params: &EncodeParams,
-    started_at: chrono::DateTime<chrono::Utc>,
-    encoding_duration_secs: Option<f64>,
-    reason: SkippedReason,
-) -> EncodingRecord {
-    let source_size_bytes = std::fs::metadata(&task.input).map(|m| m.len()).unwrap_or(0);
-    let source_meta = probe_video_metadata_quick(task);
-    EncodingRecord {
-        source_path: task.input.to_string_lossy().into_owned(),
-        source_size_bytes,
-        source_codec: source_meta.as_ref().and_then(|m| m.codec.clone()),
-        source_container: source_meta.as_ref().and_then(|m| m.container.clone()),
-        source_width: source_meta.as_ref().and_then(|m| m.width),
-        source_height: source_meta.as_ref().and_then(|m| m.height),
-        source_fps: source_meta.as_ref().and_then(|m| m.best_fps()),
-        source_duration_secs: source_meta.as_ref().and_then(|m| m.duration_secs),
-        source_bit_rate_bps: source_meta.as_ref().and_then(|m| m.bit_rate),
-
-        started_at,
-        ended_at: None,
-        encoding_duration_secs,
-        encoder_selected: None,
-        encoder_settings: encoder_settings_from_params(params),
-        ffmpeg_argv: Vec::new(),
-        ffmpeg_stderr_tail: String::new(),
-
-        output_path: None,
-        output_size_bytes: None,
-        output_duration_secs: None,
-        output_codec: None,
-        compression_ratio: None,
-
-        outcome: EncodingOutcome::Skipped(reason),
-        error: None,
     }
 }
 
@@ -476,13 +439,6 @@ fn encoder_settings_from_params(params: &EncodeParams) -> EncoderSettings {
             None
         },
     }
-}
-
-/// Quick probe used by skipped-record construction -- avoids threading
-/// the full VideoMetadata through the transcode_single early-return for
-/// skipped paths. Tolerates failure (returns None).
-fn probe_video_metadata_quick(task: &TranscodeTask) -> Option<VideoMetadata> {
-    probe_video_metadata_auto(&task.input).ok()
 }
 
 /// Probe helper exposed for the batch caller (U7). Kept here so it lives
