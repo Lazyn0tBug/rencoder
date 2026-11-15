@@ -1,10 +1,10 @@
 //! Single-file and batch transcode orchestration.
 //!
 //! Per-file pipeline (matches origin §3.3):
-//!   1. Skip if output already exists.
+//!   1. Reject identical input/output paths; existing outputs are re-encoded.
 //!   2. Probe metadata (single `ffprobe` call via `probe_video_metadata_auto`).
 //!   3. Decide whether the source fps exceeds the cap.
-//!   4. Skip if codec already matches and no reduce is needed.
+//!   4. Apply current settings even when the source codec matches.
 //!   5. Select an encoder (cache + config).
 //!   6. Build the ffmpeg argv (with `-r` output option placement).
 //!   7. Execute via `Command` with `ProcessOutput`-driven stdio; capture
@@ -23,7 +23,7 @@ use chrono::Utc;
 use crate::config::Config;
 use crate::data::extract::probe_video_metadata_auto;
 use crate::encoder::{
-    command::{build_ffmpeg_command, should_skip_encoding},
+    command::build_ffmpeg_command,
     select::select_encoder,
 };
 use crate::error::EncodeError;
@@ -68,21 +68,13 @@ pub fn transcode_single(
         .as_ref()
         .expect("transcode_single called with TranscodeTask.output = None");
 
-    if output_path.exists() {
-        // Visible scaffold: the task scaffold in TaskManager::run emits
-        // generic start/end lines. Domain-level skips like this one need
-        // their own log so operators can tell "ran and wrote" from
-        // "did nothing because the output was already on disk".
-        log::info!(
-            "    task skipped: output already exists at {}",
-            output_path.display()
-        );
-        return Ok(make_skipped_record(
-            task,
-            params,
-            started_at_meta,
-            None,
-            SkippedReason::OutputExists,
+    // Reapply current settings even when the destination already exists.
+    // Never let ffmpeg overwrite the source when extensions coincide.
+    if crate::utils::fs::normalize(&task.input)
+        == crate::utils::fs::normalize(output_path)
+    {
+        return Err(EncodeError::InvalidParam(
+            "input and output paths must differ".into(),
         ));
     }
 
@@ -181,16 +173,6 @@ fn build_argv(
     metadata: &VideoMetadata,
 ) -> Vec<String> {
     let src_fps = metadata.best_fps();
-    let codec = metadata.codec.as_deref().unwrap_or("");
-    let need_reduce = src_fps
-        .map(|s| params.max_fps.enabled() && params.max_fps.need_reduce(s))
-        .unwrap_or(false);
-    if should_skip_encoding(codec, params.format, need_reduce) {
-        // Return empty to signal skip; `transcode_single` doesn't actually
-        // take this path because the early `OutputExists` check runs first
-        // and the post-probe skip path is handled in `transcode_with_argv`.
-        return Vec::new();
-    }
     let encoder = select_encoder(params.format, cache, config)
         .expect("select_encoder in build_argv should have been filtered");
     build_ffmpeg_command(task, params, &encoder, src_fps)
@@ -208,25 +190,6 @@ fn transcode_with_argv(
     output: ProcessOutput,
 ) -> Result<EncodingRecord, EncodeError> {
     let src_fps = metadata.best_fps();
-    let codec = metadata.codec.as_deref().unwrap_or("");
-    let need_reduce = src_fps
-        .map(|s| params.max_fps.enabled() && params.max_fps.need_reduce(s))
-        .unwrap_or(false);
-
-    if should_skip_encoding(codec, params.format, need_reduce) {
-        // Source codec already matches target format and no fps reduction
-        // needed. Surface this so the operator can distinguish "skipped
-        // because nothing to do" from "ran and re-encoded".
-        log::info!("    task skipped: source codec matches target ({})", codec);
-        return Ok(make_skipped_record(
-            task,
-            params,
-            started_at_meta,
-            Some(started_at_instant.elapsed().as_secs_f64()),
-            SkippedReason::SameCodec,
-        ));
-    }
-
     // Run ffmpeg (capture stderr if ProcessOutput::Piped so we can
     // attach it to the ErrorContext on failure).
     let run_result = run_ffmpeg_with_stderr(&argv, output);
@@ -687,7 +650,7 @@ Encoders:
     }
 
     #[test]
-    fn skips_when_output_exists() {
+    fn existing_output_does_not_bypass_source_probe() {
         let dir = std::env::temp_dir().join("rencoder_skip_exists");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -706,9 +669,9 @@ Encoders:
             .expect("transcode_single should succeed");
         assert_eq!(
             record.outcome,
-            EncodingOutcome::Skipped(SkippedReason::OutputExists)
+            EncodingOutcome::Failed
         );
-        assert!(record.output_path.is_none());
+        assert!(record.error.is_some());
         // Skipped records don't perform work; no encoding_duration.
     }
 

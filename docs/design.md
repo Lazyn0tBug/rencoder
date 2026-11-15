@@ -1366,3 +1366,7 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 ---
 
 如有异议或补充，请指出。无异议则进入编码阶段。
+
+## Configuration on every encode invocation
+
+Reload the selected TOML file on every invocation. Existing outputs and matching source codecs must not bypass the current encoding settings (including CRF, bitrate, encoder and max_fps). Re-encode using the current configuration; reject input/output identity before invoking FFmpeg. Keep the existing allowed max_fps values.
