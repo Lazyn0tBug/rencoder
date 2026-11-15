@@ -97,3 +97,6 @@ workflow.
 ## License
 
 MIT.
+### Portable packages and releases
+
+Run `bash scripts/dist.sh` (requires Rust and Python 3.11+). The generated `dist/rencoder_cli-<target>/` contains the executable and `rencoder.toml` side by side; no system application-data directory is used. The final tar.xz or zip includes the same directory and a SHA-256 checksum. Every pushed Git tag triggers a release for macOS, Linux and Windows, plus a macOS disk image. Manual release runs require an existing tag.

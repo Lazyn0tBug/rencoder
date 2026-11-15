@@ -1370,3 +1370,9 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 ## Configuration on every encode invocation
 
 Reload the selected TOML file on every invocation. Existing outputs and matching source codecs must not bypass the current encoding settings (including CRF, bitrate, encoder and max_fps). Re-encode using the current configuration; reject input/output identity before invoking FFmpeg. Keep the existing allowed max_fps values.
+
+## Portable distribution and tag releases
+
+The application directory means the directory containing the executable, never a system application-data directory. Every Unix archive, Windows zip and macOS disk image includes rencoder.toml adjacent to the binary, with log/ and data/ subdirectories. Explicit --config and RENENCODER_CONFIG remain supported. Each invocation reloads the selected config.
+
+Use scripts/dist.sh to build with Cargo and scripts/package.py to package identically on every platform. Hash final archives after adding configuration. CI checks out and validates the requested tag, builds all three targets, verifies checksums, and publishes a GitHub Release for every pushed tag (including non-SemVer tags). Manual releases require an existing tag.
