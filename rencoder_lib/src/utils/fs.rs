@@ -60,13 +60,49 @@ pub fn output_path_for(input: &Path, format: VideoFormat) -> PathBuf {
     let parent = input.parent().unwrap_or_else(|| Path::new(""));
     let ext = format.default_extension();
     let naive = parent.join(format!("{stem}.{ext}"));
-    if naive == input {
-        // Collision: default extension == input extension.
+    if is_same_file(&naive, input) {
+        // Collision: default extension == input extension (or differs
+        // only in case — macOS / Windows filesystems are case-insensitive
+        // by default, so `movie.MKV` and `movie.mkv` are one file).
         // Append `_encoded` so the output is always distinct.
         parent.join(format!("{stem}_encoded.{ext}"))
     } else {
         naive
     }
+}
+
+/// Do two paths point at the same file?
+///
+/// Compares the **canonicalized parent directories** and the **file
+/// names case-insensitively**:
+///
+/// - canonicalizing the parents resolves `.` / `..` segments and
+///   symlinked directories, so `/d/./movie.mkv` and `/d/movie.mkv`
+///   compare equal;
+/// - the file name comparison ignores ASCII case, because macOS and
+///   Windows filesystems are case-insensitive by default. `movie.MKV`
+///   and `movie.mkv` are the same file there, and ffmpeg's own
+///   "input and output are the same file" check compares the strings,
+///   so it does not catch this either.
+///
+/// The file name itself is not canonicalized: the output usually does
+/// not exist yet, and canonicalizing it would fail anyway.
+pub fn is_same_file(input: &Path, other: &Path) -> bool {
+    let (Some(input_name), Some(other_name)) = (input.file_name(), other.file_name()) else {
+        // No file name (root, trailing separator): only an exact match
+        // can be the same file.
+        return input == other;
+    };
+    if !input_name
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&other_name.to_string_lossy())
+    {
+        return false;
+    }
+    let empty = Path::new("");
+    let input_dir = normalize(input.parent().unwrap_or(empty));
+    let other_dir = normalize(other.parent().unwrap_or(empty));
+    input_dir == other_dir
 }
 
 #[cfg(test)]
@@ -108,6 +144,59 @@ mod tests {
     fn output_path_for_no_extension_input() {
         let p = output_path_for(Path::new("/dir/movie"), VideoFormat::Av1);
         assert_eq!(p, PathBuf::from("/dir/movie.mkv"));
+    }
+
+    // ---- is_same_file ----
+
+    #[test]
+    fn is_same_file_exact_match() {
+        assert!(is_same_file(
+            Path::new("/dir/movie.mkv"),
+            Path::new("/dir/movie.mkv")
+        ));
+    }
+
+    #[test]
+    fn is_same_file_ignores_ascii_case() {
+        // macOS / Windows filesystems are case-insensitive by default:
+        // these two are the same file.
+        assert!(is_same_file(
+            Path::new("/dir/movie.MKV"),
+            Path::new("/dir/movie.mkv")
+        ));
+    }
+
+    #[test]
+    fn is_same_file_ignores_dot_segments() {
+        assert!(is_same_file(
+            Path::new("/dir/./movie.mkv"),
+            Path::new("/dir/movie.mkv")
+        ));
+    }
+
+    #[test]
+    fn is_not_same_file_for_different_names() {
+        assert!(!is_same_file(
+            Path::new("/dir/movie.mkv"),
+            Path::new("/dir/other.mkv")
+        ));
+    }
+
+    #[test]
+    fn is_not_same_file_for_different_directories() {
+        assert!(!is_same_file(
+            Path::new("/dir1/movie.mkv"),
+            Path::new("/dir2/movie.mkv")
+        ));
+    }
+
+    #[test]
+    fn output_path_for_avoids_case_insensitive_collision() {
+        // `movie.MKV` + mkv target would yield `movie.mkv` -- the same
+        // file on a case-insensitive filesystem. The `_encoded` suffix
+        // has to kick in.
+        let p = output_path_for(Path::new("/dir/movie.MKV"), VideoFormat::Av1);
+        assert_eq!(p, PathBuf::from("/dir/movie_encoded.mkv"));
     }
 
     #[test]

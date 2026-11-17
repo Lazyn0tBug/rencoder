@@ -203,6 +203,31 @@ fn encode_prepare(
         .clone()
         .expect("transcode_single called with TranscodeTask.output = None");
 
+    // Same-file guard (design doc §3.3 "同路径保护"). The output must
+    // never point at the input: ffmpeg would truncate the source, and
+    // the cancel cleanup (which removes `argv.last()`) would delete the
+    // input instead of the partial output.
+    //
+    // `output_path_for` already avoids the obvious collision, but it
+    // compares path strings -- on a case-insensitive filesystem
+    // (macOS / Windows by default) `movie.MKV` and `movie.mkv` are the
+    // same file, and neither ffmpeg nor a string comparison catches it.
+    if crate::utils::fs::is_same_file(task.input.as_path(), &output_path) {
+        tracing::error!(
+            input = %task.input,
+            output = %output_path.display(),
+            "input and output paths must differ; skipping file"
+        );
+        return EncodePrepareResult::FailedProbe(make_failed_record(
+            task,
+            params,
+            started_at_meta,
+            None,
+            &EncodeError::InvalidParam("input and output paths must differ".into()),
+            ErrorCategory::ConfigError,
+        ));
+    }
+
     // Probe input FIRST so we have ground truth (source duration) for
     // partial-output detection (§3.3.6 + §8 item 40). SIGTERM/SIGHUP
     // can no longer clean up partial files (see §3.4.5 "注意"), so
@@ -210,12 +235,13 @@ fn encode_prepare(
     let metadata = match probe_video_metadata_auto(task.input.as_path()) {
         Ok(m) => m,
         Err(e) => {
-            return EncodePrepareResult::FailedProbe(make_failed_probe_record(
+            return EncodePrepareResult::FailedProbe(make_failed_record(
                 task,
                 params,
                 started_at_meta,
                 None,
                 &e,
+                ErrorCategory::ProbeFailed,
             ));
         }
     };
@@ -858,12 +884,13 @@ fn make_skipped_record(
 
 /// Build a failed-probe record (used when probe_video_metadata_auto
 /// returns Err inside transcode_single or transcode_batch_with_processor).
-fn make_failed_probe_record(
+fn make_failed_record(
     task: &TranscodeTask,
     params: &EncodeParams,
     started_at: chrono::DateTime<chrono::Utc>,
     encoding_duration_secs: Option<f64>,
     err: &EncodeError,
+    category: ErrorCategory,
 ) -> EncodingRecord {
     let source_size_bytes = std::fs::metadata(task.input.as_path())
         .map(|m| m.len())
@@ -895,7 +922,7 @@ fn make_failed_probe_record(
 
         outcome: EncodingOutcome::Failed,
         error: Some(ErrorContext {
-            category: ErrorCategory::ProbeFailed,
+            category,
             message: err.to_string(),
             ffmpeg_stderr_tail: String::new(),
         }),
@@ -1565,6 +1592,37 @@ Encoders:
         );
         assert!(record.output_path.is_none());
         // Skipped records don't perform work; no encoding_duration.
+    }
+
+    #[test]
+    fn fails_when_input_and_output_are_the_same_file() {
+        // Same-file guard: ffmpeg must never be pointed at the source.
+        let dir = std::env::temp_dir().join("rencoder_same_path");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("movie.mkv");
+        std::fs::write(&input, b"x").unwrap();
+
+        let task = TranscodeTask {
+            input: ip(&input),
+            output: Some(input.clone()),
+        };
+        let params = params_x264_crf();
+        let cache = cache_with_libx264_and_svtav1(false);
+        let config = Config::default();
+
+        let record = transcode_single(&task, &params, &cache, &config, ProcessOutput::Null)
+            .expect("transcode_single should succeed");
+        assert_eq!(record.outcome, EncodingOutcome::Failed);
+        let err = record.error.expect("failed record must carry an error");
+        assert!(
+            err.message.contains("input and output paths must differ"),
+            "unexpected error message: {}",
+            err.message
+        );
+        assert_eq!(err.category, ErrorCategory::ConfigError);
+        // The source file must be left untouched.
+        assert_eq!(std::fs::read(&input).unwrap(), b"x");
     }
 
     #[test]

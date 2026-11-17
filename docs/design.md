@@ -140,6 +140,7 @@ fs_perms::set_config_file_mode(&tmp)?;
 | 转码工作记录 | `EncodingRecord`（4 维度：source / process / result / status） | 工作分析（吞吐、压缩率、失败率），不是视频分析 |
 | 工作记录存储 | `<app_dir>/data/encoding-YYYY-MM-DDTHH-MM-SSZ.parquet`（按运行分文件，U18） | 每跑一次产出一个自包含文件，多批分析用 `read_parquet(['<app_dir>/data/*.parquet'])` glob；`RENENCODER_DATA_DIR` 覆盖 |
 | 工作记录序列化 | 单 DataFrame 中转（`records_to_dataframe`）+ 三种 writer（CSV / JSONL / Parquet） | schema 在 `records_to_dataframe` 一处定义；writer 都是 thin wrapper |
+| 同路径保护 | 三层：`output_path_for` 命名避让 → `utils::fs::is_same_file` 判定 → 转码前拦截 | 输出覆盖输入会销毁源文件；取消清理按 `argv.last()` 删产物，输出等于输入时删的是输入（结构性失败） |
 | 单目录应用部署 | `scripts/dist.sh` 把 target 产物 + LICENSE + README + 配置种子装配成单目录应用（U18） | 跨平台一致；解压即用；放弃 `cargo install` 的共享 `~/.cargo/bin/` 模式 |
 | `rencoder_lib` publish 策略 | `publish = false`（U18） | 内部 lib，不发布到 crates.io；防止内部 API 泄露锁死 schema |
 | 配置路径解析 | `$RENENCODER_CONFIG` > `<app_dir>/rencoder.toml`（U18） | 二级解析；env 覆盖用于 read-only fs / 调试 |
@@ -311,10 +312,10 @@ ffmpeg 不带 `-r` 时并不等于"不干预帧率"——默认 vsync 行为会�
 
 - `data/extract.rs` 拥有 probe 实现 + fps 解析（`probe_video_metadata*`、`parse_fps_value`）
 - `data/store.rs` 拥有 Polars DataFrame writers（`records_to_dataframe`、`records_to_csv/jsonl/parquet`、`dataframe_to_*`）
-- `data/record.rs` 拥有 `EncodingRecord` 组装 helpers（`make_skipped_record`、`make_failed_probe_record`、`encoder_settings_from_params`）
+- `data/record.rs` 拥有 `EncodingRecord` 组装 helpers（`make_skipped_record`、`make_failed_record`、`encoder_settings_from_params`）
 - `encoder/{command,select}.rs` 拥有 `build_ffmpeg_command` + `select_encoder`
 - `pipeline/{batch,cancel,cache}.rs` 拥有 `transcode_batch` + `CancelToken` + `init_encoder_cache`
-- `utils/{fs,time}.rs` 拥有 `output_path_for` + `utc_timestamp_filename`
+- `utils/{fs,time}.rs` 拥有 `output_path_for` + `is_same_file` + `utc_timestamp_filename`
 - `config/mod.rs` 拥有 runtime `Config`（JSON 加载 → `from_value` 转换；U17+ 由 `from_encode_config` 从 `AppConfig` 派生）
 - `config/app.rs` 拥有 user-facing `AppConfig`（U18 重命名自 `project.rs`；TOML 加载在 U17 新增）
 
@@ -347,7 +348,7 @@ rencoder_lib/
 ├── types.rs                     # 跨模块共享类型（VideoFormat、EncodingRecord、MaxFpsConfig 等）
 └── utils/
     ├── mod.rs
-    ├── fs.rs                    # 路径规范化、output_path_for
+    ├── fs.rs                    # 路径规范化、output_path_for、is_same_file
     └── time.rs                  # UTC 时间戳格式化（ISO 8601）
 
 # 仍在 c-probe feature 门控下（独立于上面的分层）：
@@ -961,6 +962,26 @@ impl InputPath {
 上是 output file)。加同款保护只是过度防御;保留 `Option<PathBuf>`
 就够了。
 
+#### 同路径保护
+
+输出路径指向输入文件会**直接销毁用户的源文件**;更糟的是取消清理按
+`argv.last()` 删除半成品,输出等于输入时删掉的是输入本身——结构性失败。
+
+三层防护,层层独立:
+
+1. **命名避让**(`output_path_for`):默认扩展名与输入扩展名相同时加
+   `_encoded` 后缀(既有行为)。
+2. **同一文件判定**(`utils::fs::is_same_file`):规范化父目录 + 文件名
+   大小写不敏感比较。macOS / Windows 默认文件系统大小写不敏感,
+   `movie.MKV` 与 `movie.mkv` 是同一个文件,字符串比较发现不了;
+   ffmpeg 的"输入输出同路径"保护也是字符串比较,同样发现不了。
+3. **转码前拦截**(`encode_prepare`):判定输入与输出是同一文件时,该文件
+   记 `Failed`(错误 `Invalid parameter: input and output paths must differ`),
+   **不调用 ffmpeg**。按 per-file 失败模型处理,批次不中断,其余文件正常转码。
+
+第 3 层是兜底:即使将来新增了一条生成输出路径的路径(用户指定输出名、
+新的容器映射),也不会绕过前两层。
+
 #### 转码跳过判断
 
 ```rust
@@ -984,6 +1005,7 @@ pub fn should_skip_encoding(codec: &str, format: VideoFormat) -> bool;
 
 ```rust
 /// 内部流程（对齐 encode.zsh 的 encode_single_file + partial output 重转）：
+///   0. 同路径检查：输出与输入指向同一个文件?→ 该文件记 Failed（不调 ffmpeg）
 ///   1. probe_video_metadata（一次 ffprobe,源）→ 拿 duration
 ///   2. 输出存在?→ probe output duration 比较:
 ///       a. output + 1s < source → partial → remove + 继续到 7
@@ -3397,6 +3419,7 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 54 | 帧率动作判定收敛为 `MaxFpsConfig::decide` → `FpsDecision`,跳过判定 / argv 映射 / 结果记录三处同源 | ✅ |
 | 55 | 帧率参数显式声明:未超限 `-fps_mode passthrough`,超限 `-r <cap> -fps_mode cfr`,未启用上限不注入 —— 对齐 encode.zsh v10.2.0 | ✅ |
 | 56 | 帧率容差 `eps = 0.01`,判定式 `src > cap + eps`（严格大于,eps 在上限右侧）—— 对齐 encode.zsh `MAX_FPS_EPS` | ✅ |
+| 57 | 同路径保护三层:`output_path_for` 命名避让 → `utils::fs::is_same_file`（父目录规范化 + 文件名大小写不敏感）→ 转码前拦截记 `Failed` 不调 ffmpeg | ✅ |
 
 ---
 
