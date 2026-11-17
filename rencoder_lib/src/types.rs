@@ -35,7 +35,16 @@ impl VideoFormat {
 #[derive(Clone, Debug, Default)]
 pub struct VideoMetadata {
     pub codec: Option<String>,
+    /// 平均帧率（ffprobe 的 `avg_frame_rate`）。
+    ///
+    /// VFR 素材会被大量长间隔拉低，**不能**用它判定帧率上限；
+    /// 只用于展示与统计。
     pub avg_fps: Option<f64>,
+    /// 瞬时帧率上限（ffprobe 的 `r_frame_rate`）。
+    ///
+    /// 由最短帧间隔反推，是素材真实的速度上限，**帧率上限判定用它**。
+    /// 命名沿用 ffprobe 的 "real base frame rate"，语义上等于脚本里的
+    /// "峰值帧率"。
     pub nominal_fps: Option<f64>,
     /// Stream duration in seconds (from ffprobe's `duration` field).
     /// `None` if the probe didn't report a duration.
@@ -53,8 +62,31 @@ pub struct VideoMetadata {
 
 impl VideoMetadata {
     /// Prefer `avg_frame_rate`, fall back to `r_frame_rate`.
+    ///
+    /// 用于**展示与统计**（分析器的 fps 列、记录表的 source_fps）。
+    /// 帧率上限判定不要用它，见 [`VideoMetadata::cap_fps`]。
     pub fn best_fps(&self) -> Option<f64> {
         self.avg_fps.or(self.nominal_fps)
+    }
+
+    /// 帧率上限判定用的帧率（`encode.zsh` v10.2.0 语义）。
+    ///
+    /// 为什么不能直接用 [`VideoMetadata::best_fps`]：VFR 素材的
+    /// `avg_frame_rate` 会被大量长间隔拉低（大部分时间 24fps、局部 60fps
+    /// 的实录，平均值可能只有 30fps）。拿它跟上限比较，会把"局部超速"
+    /// 误判成"未超限"，于是 60fps 段落原样留在产物里。脚本 v10.2.0 正是
+    /// 为此把判定源从平均帧率换成 `r_frame_rate`（由最短帧间隔反推的瞬时
+    /// 上限），平均帧率只留作日志展示。
+    ///
+    /// 兜底顺序与脚本一致：峰值 ?: 平均。
+    ///
+    /// 上限判定的**所有**调用点都必须走这个方法（跳过判定、argv 参数
+    /// 映射、结果记录三处），否则会出现"记录说降了帧但命令里没有 -r"
+    /// 这类自相矛盾。
+    pub fn cap_fps(&self) -> Option<f64> {
+        // Instantaneous ceiling first, average as the fallback — the
+        // order `encode.zsh` v10.2.0 uses (`peak ?: avg`).
+        self.nominal_fps.or(self.avg_fps)
     }
 
     pub fn is_valid(&self) -> bool {
@@ -64,15 +96,16 @@ impl VideoMetadata {
 
 // ===== Max-FPS configuration =====
 //
-// Predicate lives here; parameter mapping (`-r <fps>`) lives in
-// `ffmpeg::command::build_ffmpeg_command`. Single-responsibility split
-// keeps the decision testable without ffmpeg invocation.
+// Predicate lives here; parameter mapping (`-r <fps>` / `-fps_mode`)
+// lives in `ffmpeg::command::build_ffmpeg_command`. Single-responsibility
+// split keeps the decision testable without ffmpeg invocation.
 
 #[derive(Clone, Debug)]
 pub struct MaxFpsConfig {
     pub max_fps: f64,
     /// Tolerance band around `max_fps` (matches `encode.zsh` semantics:
-    /// a 29.97 source at cap=30 is NOT reduced because 29.97 < 30 + 0.05).
+    /// `MAX_FPS_EPS = 0.01`, comparison `src > cap + eps`). A 29.97
+    /// source at cap=30 is NOT reduced because 29.97 < 30 + 0.01.
     pub eps: f64,
 }
 
@@ -80,9 +113,34 @@ impl Default for MaxFpsConfig {
     fn default() -> Self {
         Self {
             max_fps: 0.0,
-            eps: 0.05,
+            eps: 0.01,
         }
     }
+}
+
+/// The frame-rate action decided for one source file.
+///
+/// The decision and the argv mapping must come from the same place:
+/// `should_skip_encoding` (skip?), the ffmpeg argv (`-r` / `-fps_mode`?)
+/// and the result record (`ReducedFps`?) all read this value. Computing
+/// "is it reduced?" independently in three places is how the shell script
+/// ended up with a skip predicate that silently stopped working
+/// (`encode.zsh` v10.2.0: `MAX_FPS_ARGS` became non-empty as soon as
+/// `-fps_mode passthrough` was added).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FpsDecision {
+    /// No cap configured (`max_fps == 0`): no frame-rate options at all.
+    Disabled,
+    /// Cap configured but the source frame rate is unknown: no
+    /// frame-rate options. We'd rather not transcode with a guessed
+    /// frame rate than corrupt the output.
+    Unknown,
+    /// Source is within the cap: `-fps_mode passthrough` (keep source
+    /// timestamps, no duplicated or dropped frames).
+    Passthrough,
+    /// Source exceeds the cap: `-r <target> -fps_mode cfr` (CFR output,
+    /// container frame-rate tag follows the target).
+    Reduce { target: f64 },
 }
 
 impl MaxFpsConfig {
@@ -102,6 +160,29 @@ impl MaxFpsConfig {
     ///   so a 29.97 source at cap=30 stays untouched
     pub fn need_reduce(&self, src_fps: f64) -> bool {
         src_fps > self.max_fps + self.eps
+    }
+
+    /// Decide the frame-rate action for one source.
+    ///
+    /// `src_fps` must come from [`VideoMetadata::cap_fps`] (the source's
+    /// instantaneous frame-rate ceiling), not from
+    /// [`VideoMetadata::best_fps`] (the average): VFR material has an
+    /// average dragged down by long intervals, which hides local
+    /// over-speed — see design doc §2.6.
+    pub fn decide(&self, src_fps: Option<f64>) -> FpsDecision {
+        if !self.enabled() {
+            return FpsDecision::Disabled;
+        }
+        let Some(src) = src_fps else {
+            return FpsDecision::Unknown;
+        };
+        if self.need_reduce(src) {
+            FpsDecision::Reduce {
+                target: self.max_fps,
+            }
+        } else {
+            FpsDecision::Passthrough
+        }
     }
 }
 
@@ -207,7 +288,9 @@ impl EncodeParams {
             extra_args: vec![],
             max_fps: MaxFpsConfig {
                 max_fps: enc.max_fps.unwrap_or(0) as f64,
-                eps: 0.05,
+                // Single source for the tolerance band: don't repeat the
+                // constant here (the config path is the production one).
+                eps: MaxFpsConfig::default().eps,
             },
         }
     }
@@ -653,6 +736,48 @@ mod tests {
         assert_eq!(m.best_fps(), None);
     }
 
+    // ---- cap_fps: 上限判定取值（design doc §2.6） ----
+
+    #[test]
+    fn cap_fps_prefers_instantaneous_ceiling_over_average() {
+        // VFR 素材：平均 24fps，但局部冲到 60fps。上限判定必须看 60。
+        let m = VideoMetadata {
+            codec: Some("h264".into()),
+            avg_fps: Some(24.0),
+            nominal_fps: Some(60.0),
+            ..Default::default()
+        };
+        assert_eq!(m.cap_fps(), Some(60.0));
+    }
+
+    #[test]
+    fn cap_fps_falls_back_to_average_when_ceiling_missing() {
+        let m = VideoMetadata {
+            codec: Some("h264".into()),
+            avg_fps: Some(24.0),
+            nominal_fps: None,
+            ..Default::default()
+        };
+        assert_eq!(m.cap_fps(), Some(24.0));
+    }
+
+    #[test]
+    fn cap_fps_none_when_both_missing() {
+        assert_eq!(VideoMetadata::default().cap_fps(), None);
+    }
+
+    #[test]
+    fn cap_fps_differs_from_best_fps_for_vfr_material() {
+        // 两个取值刻意分开：best_fps 给展示，cap_fps 给判定。
+        let m = VideoMetadata {
+            avg_fps: Some(24.0),
+            nominal_fps: Some(60.0),
+            ..Default::default()
+        };
+        assert_eq!(m.best_fps(), Some(24.0));
+        assert_eq!(m.cap_fps(), Some(60.0));
+    }
+
     #[test]
     fn video_metadata_is_valid_when_empty() {
         assert!(!VideoMetadata::default().is_valid());
@@ -772,7 +897,57 @@ mod tests {
     fn max_fps_config_default_is_disabled() {
         let c = MaxFpsConfig::default();
         assert!(!c.enabled());
-        assert_eq!(c.eps, 0.05);
+        assert_eq!(c.eps, 0.01);
+    }
+
+    // ---- decide: 帧率动作表 ----
+
+    #[test]
+    fn decide_disabled_when_cap_not_configured() {
+        let c = MaxFpsConfig {
+            max_fps: 0.0,
+            eps: 0.01,
+        };
+        assert_eq!(c.decide(Some(60.0)), FpsDecision::Disabled);
+        assert_eq!(c.decide(None), FpsDecision::Disabled);
+    }
+
+    #[test]
+    fn decide_unknown_when_source_fps_missing() {
+        let c = MaxFpsConfig {
+            max_fps: 30.0,
+            eps: 0.01,
+        };
+        assert_eq!(c.decide(None), FpsDecision::Unknown);
+    }
+
+    #[test]
+    fn decide_passthrough_when_source_within_cap() {
+        let c = MaxFpsConfig {
+            max_fps: 30.0,
+            eps: 0.01,
+        };
+        assert_eq!(c.decide(Some(24.0)), FpsDecision::Passthrough);
+        assert_eq!(c.decide(Some(30.0)), FpsDecision::Passthrough);
+        assert_eq!(c.decide(Some(29.97)), FpsDecision::Passthrough);
+    }
+
+    #[test]
+    fn decide_reduce_when_source_above_cap() {
+        let c = MaxFpsConfig {
+            max_fps: 30.0,
+            eps: 0.01,
+        };
+        assert_eq!(c.decide(Some(60.0)), FpsDecision::Reduce { target: 30.0 });
+    }
+
+    #[test]
+    fn decide_reduce_uses_the_configured_cap_as_target() {
+        let c = MaxFpsConfig {
+            max_fps: 24.0,
+            eps: 0.01,
+        };
+        assert_eq!(c.decide(Some(60.0)), FpsDecision::Reduce { target: 24.0 });
     }
 
     #[test]

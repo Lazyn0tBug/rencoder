@@ -94,7 +94,7 @@ cargo fmt --check
 
 ## TODO
 
-- `MaxFpsConfig::need_reduce` in `rencoder_lib/src/types.rs` -- the source-fps > cap predicate. Awaiting design input on epsilon tolerance semantics (strict vs. non-strict, which side of the comparison the eps lives on).
+- (none open)
 
 ## Refactor / rename methodology
 

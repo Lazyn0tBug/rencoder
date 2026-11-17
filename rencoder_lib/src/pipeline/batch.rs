@@ -32,7 +32,7 @@ use crate::pipeline::partial_output::PartialOutputHandle;
 use crate::pipeline::task::TaskManager;
 use crate::types::{
     EncodeParams, EncoderCache, EncoderSettings, EncodingOutcome, EncodingRecord, ErrorCategory,
-    ErrorContext, ProcessOutput, SkippedReason, TranscodeTask, VideoMetadata,
+    ErrorContext, FpsDecision, ProcessOutput, SkippedReason, TranscodeTask, VideoMetadata,
 };
 
 /// Maximum bytes the stderr reader thread will keep in memory for the
@@ -304,7 +304,7 @@ fn encode_prepare(
 /// run-then-build-record boilerplate. This helper extracts the common
 /// shape:
 ///
-/// 1. Compute `need_reduce` from `metadata.best_fps()`.
+/// 1. Compute the frame-rate action from `metadata.cap_fps()`.
 /// 2. If `should_skip_encoding`, return a `Skipped(SameCodec)` record.
 /// 3. Call the caller-provided `run_ffmpeg` (sync vs cancellable
 ///    variant) to get a `Result<(), (ErrorCategory, String, String)>`.
@@ -327,11 +327,11 @@ fn transcode_inner<F>(
 where
     F: FnOnce(Vec<String>) -> Result<(), (ErrorCategory, String, String)>,
 {
-    let src_fps = metadata.best_fps();
     let codec = metadata.codec.as_deref().unwrap_or("");
-    let need_reduce = src_fps
-        .map(|s| params.max_fps.enabled() && params.max_fps.need_reduce(s))
-        .unwrap_or(false);
+    let need_reduce = matches!(
+        params.max_fps.decide(metadata.cap_fps()),
+        FpsDecision::Reduce { .. }
+    );
 
     if should_skip_encoding(codec, params.format, need_reduce) {
         tracing::info!(
@@ -449,10 +449,13 @@ fn build_encode_record(
     let ended_at_meta = Utc::now();
     let encoding_duration = started_at_instant.elapsed().as_secs_f64();
     let encoder_selected = extract_encoder_from_argv(&argv);
+    // `source_fps` in the record keeps the average (display semantics,
+    // see design doc §2.6); the reduction decision uses the cap value.
     let src_fps = metadata.best_fps();
-    let need_reduce = src_fps
-        .map(|s| params.max_fps.enabled() && params.max_fps.need_reduce(s))
-        .unwrap_or(false);
+    let need_reduce = matches!(
+        params.max_fps.decide(metadata.cap_fps()),
+        FpsDecision::Reduce { .. }
+    );
 
     match run_result {
         Ok(()) => {
@@ -796,11 +799,9 @@ fn build_argv(
     config: &Config,
     metadata: &VideoMetadata,
 ) -> Vec<String> {
-    let src_fps = metadata.best_fps();
+    let src_fps = metadata.cap_fps();
     let codec = metadata.codec.as_deref().unwrap_or("");
-    let need_reduce = src_fps
-        .map(|s| params.max_fps.enabled() && params.max_fps.need_reduce(s))
-        .unwrap_or(false);
+    let need_reduce = matches!(params.max_fps.decide(src_fps), FpsDecision::Reduce { .. });
     if should_skip_encoding(codec, params.format, need_reduce) {
         // Return empty to signal skip; `transcode_single` doesn't actually
         // take this path because the early `OutputExists` check runs first

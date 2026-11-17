@@ -1,8 +1,8 @@
 # Rencoder – Rust 重建设计文档
 
-**版本**：v5.1
+**版本**：v5.2
 **状态**：待确认
-**变更基础**：`encode.zsh` v10.0.3 + `video_fps_stats.zsh` v2.3
+**变更基础**：`encode.zsh` v11.0.0（含 v10.2.0 帧率判定修复）+ `video_fps_stats.zsh` v2.3
 
 ---
 
@@ -12,7 +12,7 @@ Rencoder 是一个智能视频转码与分析工具，支持：
 
 - 多种目标格式（AV1、H.264、H.265、VP9）
 - CRF 或固定码率控制
-- **最大帧率限制**（源帧率超标时自动降帧）
+- **最大帧率限制**（源帧率超标时自动降帧；判定依据为瞬时帧率上限 `r_frame_rate`）
 - **一次 `ffprobe` 同时探测 codec 与帧率**（零外部进程解析）
 - **编码器缓存**（运行期间只执行一次 `ffmpeg -encoders`）
 - **NVIDIA 硬件加速**（`--nv` 主动开启 + `nvidia-smi` 检测，双重条件）
@@ -118,7 +118,10 @@ fs_perms::set_config_file_mode(&tmp)?;
 | 元数据探测（可选） | C FFI 桥接层（`c-probe` 特性） | 高性能批量分析；避免 `ffmpeg-next` 版本兼容问题 |
 | 编码器列表 | `ffmpeg -encoders`（缓存一次） | 运行期间不变 |
 | NVIDIA 检测 | `--nv` 参数 + `nvidia-smi` 双重条件 | 不通过 `ffmpeg -encoders` 推断；不用 `nvml-wrapper` |
-| 最大帧率 | `MaxFpsConfig` 数值判断 + `build_ffmpeg_command` 参数映射 | 谓词与参数生成解耦 |
+| 最大帧率 | `MaxFpsConfig::decide` 判定 + `build_ffmpeg_command` 参数映射 | 谓词与参数生成解耦；判定与参数映射同源，杜绝"记录说降了帧、命令里却没有 `-r`"的自相矛盾 |
+| 帧率判定源 | `r_frame_rate`（瞬时上限），`avg_frame_rate` 仅用于展示与统计 | VFR 素材的平均帧率被大量长间隔拉低，用它判上限会漏掉局部超速（对齐 encode.zsh v10.2.0） |
+| 帧率参数 | 未超限 `-fps_mode passthrough`；超限 `-r <cap> -fps_mode cfr` | 不写 `-fps_mode` 时 ffmpeg 会按容器标称帧率补帧/丢帧，VFR 源有损（对齐 encode.zsh v10.2.0） |
+| 帧率容差 | `eps = 0.01`，判定式 `src > cap + eps`（严格大于，eps 在上限右侧） | 直接对齐 encode.zsh 的 `MAX_FPS_EPS` 与 `(( fps > MAX_FPS + MAX_FPS_EPS ))` |
 | FFmpeg 输出 | `ProcessOutput::Inherit` 透传（默认） | 与脚本一致；未来 GUI 用 `Piped` |
 | 文件遍历 | `walkdir` | 纯 Rust，不依赖外部工具；不跟随符号链接 |
 | 线程模型 | 转码：单线程串行；分析：可选并行（`rayon`） | 转码与脚本一致 |
@@ -262,6 +265,35 @@ df_to_csv  df_to_jsonl  df_to_parquet
 > 注：`nvidia-smi` 的 `io::Error`（找不到可执行文件）和"执行成功但无 GPU"都归为同一降级路径，`init_encoder_cache` 不应因此返回 `EncodeError`。
 
 不使用 `nvml-wrapper` crate。`nvidia-smi` 是唯一的外部检测工具，且仅在 `--nv` 时调用。
+
+### 2.6 关于帧率上限判定的决策（对齐 encode.zsh v10.2.0）
+
+**判定源从平均帧率换成瞬时帧率上限**：
+
+ffprobe 一次探测给出两个帧率：`avg_frame_rate`（平均速率）与 `r_frame_rate`（real base frame rate，由最短帧间隔反推的瞬时上限）。两者在 CFR 素材上相等，在 VFR 素材上可能差很远。
+
+原实现用 `best_fps()`（优先 avg）判定是否超限。VFR 素材的平均帧率会被大量长间隔拉低——例如一段实录大部分时间 24fps、局部 60fps，平均值约 30fps，上限 30 时判定为"未超限"，于是 60fps 段落原样保留在产物里，容器帧率标签仍是 59.94。用户看到的是"设了上限却没降帧"。
+
+对齐脚本 v10.2.0：上限判定改用 `r_frame_rate`（`VideoMetadata::nominal_fps`），平均帧率退居展示与统计用途（分析器的 fps 列、记录表的 `source_fps` 仍用 avg，语义不变）。
+
+**判定与参数映射必须同源**：
+
+同一个"是否降帧"的判断散落在三处（跳过判定、argv 参数映射、结果记录）。脚本在这上面栽过两次：v10.2.0 之前用"`MAX_FPS_ARGS` 数组是否为空"当判据，而加入 `-fps_mode passthrough` 后该数组恒非空，判据失效。
+
+因此引入 `FpsDecision` 枚举：判定一次得到动作（`Disabled` / `Unknown` / `Passthrough` / `Reduce`），动作直接决定注入的参数与结果记录里的 `ReducedFps` 标记。三处读同一个动作，不可能自相矛盾。
+
+**必须显式声明 `-fps_mode`**：
+
+ffmpeg 不带 `-r` 时并不等于"不干预帧率"——默认 vsync 行为会按容器标称帧率补帧或丢帧，VFR 源因此有损。脚本 v10.2.0 起显式声明：
+
+- 未超上限：`-fps_mode passthrough`（保留源时间戳，不复制不丢帧，容器帧率标签仍是源 tbr）
+- 超上限：`-r <cap> -fps_mode cfr`（输出转 CFR，容器帧率标签同步降为 cap）
+
+未启用上限（`max_fps == 0`）时不注入任何帧率参数，与脚本一致。
+
+**容差**：`eps = 0.01`，判定式 `src > cap + eps`（严格大于，eps 加在上限右侧）。对齐脚本的 `MAX_FPS_EPS` 与 `(( fps > MAX_FPS + MAX_FPS_EPS ))`。29.97 的源在 cap=30 下不动（29.97 < 30.01）。
+
+**暂不实现的两项脚本能力**：两趟编码（脚本 pass1/pass2 同步帧率参数）——Rust 端当前是单趟编码，无 pass1/pass2 结构可对齐；产物校验层（脚本 v11 转码后回读产物核对编码/帧率/时长/音频）——需要扩展 C 探测层暴露 `nb_frames` 等字段，单独排期。
 
 ---
 
@@ -426,25 +458,50 @@ pub enum VideoFormat {
 #[derive(Clone, Debug, Default)]
 pub struct VideoMetadata {
     pub codec: Option<String>,
+    /// 平均帧率（ffprobe 的 avg_frame_rate）。VFR 素材会被长间隔拉低，
+    /// 不能用于上限判定，只用于展示与统计。
     pub avg_fps: Option<f64>,
+    /// 瞬时帧率上限（ffprobe 的 r_frame_rate）。上限判定用这个。
     pub nominal_fps: Option<f64>,
 }
 
 impl VideoMetadata {
-    /// 优先 avg，fallback 到 nominal
+    /// 优先 avg，fallback 到 nominal。用于展示与统计。
     pub fn best_fps(&self) -> Option<f64> {
         self.avg_fps.or(self.nominal_fps)
+    }
+    /// 帧率上限判定用的帧率：优先瞬时上限（r_frame_rate），回退平均。
+    /// 上限判定的所有调用点都必须走这里。
+    pub fn cap_fps(&self) -> Option<f64> {
+        self.nominal_fps.or(self.avg_fps)
     }
     pub fn is_valid(&self) -> bool {
         self.codec.is_some() || self.avg_fps.is_some() || self.nominal_fps.is_some()
     }
 }
 
+// ===== 帧率上限的处理动作 =====
+///
+/// 判定结果与参数映射同源：判定一次，动作直接决定 argv 与结果记录。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FpsDecision {
+    /// 未启用上限（max_fps == 0）：不注入任何帧率参数。
+    Disabled,
+    /// 启用了上限但探测不到源帧率：不注入任何帧率参数
+    /// （宁可不降帧，也不用错误的帧率假设覆盖输出）。
+    Unknown,
+    /// 源帧率未超上限：注入 `-fps_mode passthrough`，保留源时间戳。
+    Passthrough,
+    /// 源帧率超上限：注入 `-r <target> -fps_mode cfr`，输出转为 CFR。
+    Reduce { target: f64 },
+}
+
 // ===== 最大帧率配置 =====
-/// 只负责数值判断。参数映射由 build_ffmpeg_command 处理。
+/// 只负责数值判断与动作判定。参数映射由 build_ffmpeg_command 处理。
 #[derive(Clone, Debug)]
 pub struct MaxFpsConfig {
     pub max_fps: f64,
+    /// 容差带（对齐 encode.zsh 的 MAX_FPS_EPS = 0.01）。
     pub eps: f64,
 }
 
@@ -456,6 +513,21 @@ impl MaxFpsConfig {
     /// 前置条件：调用方已确认 src_fps 有效、max_fps > 0
     pub fn need_reduce(&self, src_fps: f64) -> bool {
         src_fps > self.max_fps + self.eps
+    }
+    /// 判定一次，得出帧率处理动作。
+    /// src_fps 取自 `VideoMetadata::cap_fps()`（瞬时上限优先）。
+    pub fn decide(&self, src_fps: Option<f64>) -> FpsDecision {
+        if !self.enabled() {
+            return FpsDecision::Disabled;
+        }
+        let Some(src) = src_fps else {
+            return FpsDecision::Unknown;
+        };
+        if self.need_reduce(src) {
+            FpsDecision::Reduce { target: self.max_fps }
+        } else {
+            FpsDecision::Passthrough
+        }
     }
 }
 
@@ -719,18 +791,38 @@ pub fn select_encoder(
 ```rust
 /// 构建 FFmpeg 命令。
 ///
-/// **重要**：`-r <MAX_FPS>` 是**输出选项**，必须放在 `-i <input>` 之后、
-/// 输出文件路径之前。放在 `-i` 之前会强制解释输入帧率，导致音画不同步。
+/// **重要**：帧率参数（`-r` / `-fps_mode`）是**输出选项**，必须放在
+/// `-i <input>` 之后、输出文件路径之前。放在 `-i` 之前会强制解释输入帧率，
+/// 导致音画不同步。
+///
+/// 帧率参数由 `MaxFpsConfig::decide` 的动作决定（src_fps 取自
+/// `VideoMetadata::cap_fps()`，即瞬时帧率上限）：
+///
+/// | 动作 | 注入的参数 | 语义 |
+/// |---|---|---|
+/// | `Disabled` | 无 | 未启用上限 |
+/// | `Unknown` | 无 | 探测不到源帧率，不做任何假设 |
+/// | `Passthrough` | `-fps_mode passthrough` | 未超上限：保留源时间戳，不复制不丢帧 |
+/// | `Reduce { target }` | `-r <target> -fps_mode cfr` | 超上限：输出转 CFR，容器帧率标签同步降为 target |
 ///
 /// `src_fps` 为 `None`（探测未能获取帧率）时，直接忽略 `MaxFpsConfig`，
-/// 不注入 `-r` 参数——宁可不降帧，也不能用错误的帧率假设覆盖输出。
+/// 不注入任何帧率参数——宁可不降帧，也不能用错误的帧率假设覆盖输出。
 ///
-/// 示例（MAX_FPS=30）：
+/// 示例（MAX_FPS=30，源 60fps 超限）：
 /// ```text
 /// ffmpeg -y -i input.mp4 \
 ///   -c:v libsvtav1 -preset 6 -crf 45 \
 ///   -c:a libopus -b:a 32k \
-///   -r 30 \
+///   -r 30 -fps_mode cfr \
+///   output.mkv
+/// ```
+///
+/// 示例（MAX_FPS=30，源 25fps 未超限）：
+/// ```text
+/// ffmpeg -y -i input.mp4 \
+///   -c:v libsvtav1 -preset 6 -crf 45 \
+///   -c:a libopus -b:a 32k \
+///   -fps_mode passthrough \
 ///   output.mkv
 /// ```
 pub fn build_ffmpeg_command(
@@ -898,10 +990,10 @@ pub fn should_skip_encoding(codec: &str, format: VideoFormat) -> bool;
 ///       b. output probe 失败 / 无 duration → 视作 partial → remove + 继续
 ///       c. 其他 → `Skipped(OutputExists)` 提前返回
 ///       d. remove 失败 → `Skipped(PartialOutput)` 提前返回
-///   3. MaxFpsConfig::need_reduce（谓词）
+///   3. MaxFpsConfig::decide（帧率动作判定，源帧率取 cap_fps）
 ///   4. should_skip_encoding（编码匹配 + 帧率判断）
 ///   5. select_encoder（缓存）
-///   6. build_ffmpeg_command（MAX_FPS 参数映射）
+///   6. build_ffmpeg_command（帧率参数映射）
 ///   7. 执行（ProcessOutput 控制输出）
 pub fn transcode_single(
     task: &TranscodeTask,
@@ -1451,10 +1543,10 @@ transcode_batch / transcode_single
 每个文件内部：
     1. 检查输出是否已存在
     2. probe_video_metadata（一次 ffprobe）
-    3. MaxFpsConfig::need_reduce
+    3. MaxFpsConfig::decide（帧率动作）
     4. should_skip_encoding（决策表）
     5. select_encoder（缓存）
-    6. build_ffmpeg_command（-r 输出选项）
+    6. build_ffmpeg_command（-r / -fps_mode 输出选项）
     7. Command 执行（ProcessOutput::Inherit）
     ↓
 回调 → CLI 输出
@@ -3211,7 +3303,7 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 
 | 类型 | 覆盖范围 |
 |---|---|
-| 单元测试 | `parse_fps_value`、`MaxFpsConfig::need_reduce`、`probe_video_metadata`、`FpsStats`、`AnalysisRecord` / Polars 聚合、`collect_files`、`should_skip_encoding` 决策表 |
+| 单元测试 | `parse_fps_value`、`MaxFpsConfig::need_reduce`、`MaxFpsConfig::decide` 动作表、`VideoMetadata::cap_fps` 取值、`probe_video_metadata`、`FpsStats`、`AnalysisRecord` / Polars 聚合、`collect_files`、`should_skip_encoding` 决策表 |
 | 集成测试 | CLI 黑盒：encode 端到端产出 `.mkv`；analyze 默认输出 CSV 到 stdout（一行一文件，列 `path, fps, codec, duration_secs, file_bytes`）；`--format text` 旧汇总；`-o FILE` 写文件 |
 | 最大帧率测试 | 25fps 不降帧、30fps 不降帧、29.97fps 不降帧、60fps 降帧 |
 | 视频分析测试 | `analyze_records` 产出 per-file records；Polars `group_by(fps).agg(count, sum(duration_secs))` 与手写 `FpsStats::summary` 数值一致；`records_to_csv` 输出可被标准 CSV 解析 |
@@ -3301,6 +3393,10 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 50 | Preview / Dry Run (Tier 2 #6):`Command::DryRun { params, files }` 跑 `encode_prepare` 但**不调 ffmpeg**,emit `Event::DryRunFinished { records }`;`dry_run_batch` lib helper 复用 probe + partial + skip 逻辑。UI `Preview` 按钮 → reducer arm → DryRunPanel 渲染 planned outcomes。`encode.nv` 故意忽略——dry-run 不知道也不关心 GPU 是否启用 | ✅ |
 | 51 | Parallel analyze progress (Tier 3 #9):`Command::Analyze { files }` 走 `analyze_records_with_probe_and_progress_parallel` 闭包注入层(不是 c-probe FFI 回调层),emit `Event::AnalyzeStarted { total }` + N × `Event::AnalyzeProgress { done, total, failed, last: Option<AnalyzedFile> }` + `Event::AnalyzeFinished { records, failed_count }`;复合 A+B 显示(进度计数 + per-file log)、failure-only log、AnalyzedFile 新 type(不复用 AnalysisRecord 避免污染 success path)、v1 不响应 `Command::Cancel` 和 SIGINT、v1 走 busy-gate 不与 encode 并发。why 详见 §3.4 "分析进度上报" | ✅ |
 | 52 | UI 事件泵架构:UI 在 `use_hook` 里 `std::thread::spawn` 一个专用 OS 线程做阻塞 `crossbeam::Receiver::recv()`,通过 `use_signal_sync` 暴露的 `SyncSignal` 直接 `state.with_mut()` 改 Dioxus state。不用 `use_coroutine`(阻塞 recv() 会 block Dioxus executor,首帧不渲染);不桥接 `futures::mpsc`(冗余);lib API(`start_controller` 返回 crossbeam ControllerHandle)不动。详见 §3.9;bisect 历史见 `docs/debug-journal/event-pump-blocking.md` | ✅ |
+| 53 | 帧率上限判定源用 `r_frame_rate`（`VideoMetadata::cap_fps`），`avg_frame_rate` 仅展示/统计 —— 对齐 encode.zsh v10.2.0,修 VFR 素材"设了上限却没降帧" | ✅ |
+| 54 | 帧率动作判定收敛为 `MaxFpsConfig::decide` → `FpsDecision`,跳过判定 / argv 映射 / 结果记录三处同源 | ✅ |
+| 55 | 帧率参数显式声明:未超限 `-fps_mode passthrough`,超限 `-r <cap> -fps_mode cfr`,未启用上限不注入 —— 对齐 encode.zsh v10.2.0 | ✅ |
+| 56 | 帧率容差 `eps = 0.01`,判定式 `src > cap + eps`（严格大于,eps 在上限右侧）—— 对齐 encode.zsh `MAX_FPS_EPS` | ✅ |
 
 ---
 
