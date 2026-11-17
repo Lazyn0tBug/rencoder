@@ -31,7 +31,10 @@ polars = { version = "0.53", default-features = false, features = ["csv", "lazy"
 crossbeam-channel = "0.5"
 
 [features]
-default = ["c-probe", "parallel-analyze"]
+# Native FFmpeg probing requires pkg-config + FFmpeg development
+# libraries, so it stays opt-in: portable / default builds use the
+# ffprobe subprocess instead (see docs/design.md §3.4 "C FFI 桥接层").
+default = ["parallel-analyze"]
 parallel-analyze = ["dep:rayon"]
 c-probe = ["dep:cc", "dep:pkg-config"]
 

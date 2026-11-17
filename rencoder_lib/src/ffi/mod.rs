@@ -44,8 +44,13 @@ impl Drop for ProbeGuard {
     }
 }
 
-/// Probe a video file via libavformat. Returns None fields on probe
-/// failure (matching the CLI probe's behavior).
+/// Probe a video file via libavformat.
+///
+/// Returns `Err` when the probe fails (missing / unreadable file, no
+/// video stream). The C bridge reports failure by returning a zeroed
+/// struct, so an all-empty result is translated into an error here --
+/// otherwise the FFI path and the `ffprobe` subprocess path would
+/// disagree about the same broken file (the latter returns `Err`).
 pub fn probe_video_metadata_fast(input: &Path) -> Result<VideoMetadata, EncodeError> {
     let path_c = CString::new(input.to_string_lossy().into_owned())
         .map_err(|e| EncodeError::Probe(format!("path contains NUL: {e}")))?;
@@ -86,7 +91,7 @@ pub fn probe_video_metadata_fast(input: &Path) -> Result<VideoMetadata, EncodeEr
         None
     };
 
-    Ok(VideoMetadata {
+    let metadata = VideoMetadata {
         codec,
         avg_fps: avg_fps.or(r_frame_rate),
         nominal_fps: r_frame_rate,
@@ -95,7 +100,20 @@ pub fn probe_video_metadata_fast(input: &Path) -> Result<VideoMetadata, EncodeEr
         width,
         height,
         bit_rate,
-    })
+    };
+
+    if !metadata.is_valid() {
+        // The bridge returns a zeroed struct when `avformat_open_input`
+        // or `avformat_find_stream_info` fails, and when the container
+        // has no video stream. Treat that as a failed probe rather than
+        // a successful probe of an empty file.
+        return Err(EncodeError::Probe(format!(
+            "c-probe: no video stream in {}",
+            input.display()
+        )));
+    }
+
+    Ok(metadata)
 }
 
 /// Read a malloc'd C string into an owned `String`, returning `None` if the

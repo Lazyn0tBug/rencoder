@@ -210,9 +210,11 @@ fn transcode_batch_skips_when_output_exists() {
     }
     let dir = fixture_dir("skip_exists");
     let input = make_video(&dir, "in.mp4", 30, 1);
-    let output = dir.join("in.mp4");
-    // Pre-create the "output" with some content; transcode should skip.
-    std::fs::write(&output, b"already there").unwrap();
+    // The output is a DIFFERENT path that already holds a complete
+    // video: the transcode must skip it. (Input == output is a
+    // different case -- it is rejected outright, see the
+    // `fails_when_input_and_output_are_the_same_file` unit test.)
+    let output = make_video(&dir, "out.mkv", 30, 1);
 
     let task = TranscodeTask {
         input: rencoder_lib::types::InputPath::new(&input).unwrap(),

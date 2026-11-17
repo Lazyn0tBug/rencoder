@@ -135,6 +135,29 @@ jobs:
           fi
           ls -la dist/
 
+      - name: Verify the binaries do not link libav*
+        shell: bash
+        run: |
+          set -euo pipefail
+          # c-probe is opt-in: the shipped binaries probe through the
+          # ffprobe subprocess, so they must NOT depend on a
+          # version-matched libavformat / libavcodec / libavutil.
+          # Linking them would make the packages break the moment the
+          # user's ffmpeg upgrades (macOS bumps the dylib major version
+          # regularly; the Linux majors differ per distro release).
+          failed=0
+          for bin in target/${{ matrix.target }}/release/rencoder*; do
+            [ -f "$bin" ] || continue
+            if grep -a -q -E "libav(format|codec|util)" "$bin"; then
+              echo "::error::$bin links libav* -- c-probe must stay off for release builds"
+              failed=1
+            fi
+          done
+          if [ "$failed" -ne 0 ]; then
+            exit 1
+          fi
+          echo "no libav* linkage in the release binaries"
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:

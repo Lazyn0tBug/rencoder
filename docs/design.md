@@ -1143,9 +1143,10 @@ FFI 层），per-file 完成后回调发 `Event::AnalyzeProgress`。
 
 #### C FFI 桥接层（可选特性 `c-probe`）
 
-高性能元数据探测：直接调 libavformat，跳过 `ffprobe` 进程 spawn。**默认开启**（在
-`Cargo.toml` 的 `default = ["c-probe", "parallel-analyze"]` 里），无 libavformat 的环境
-可手动关掉（见下文）。
+高性能元数据探测：直接调 libavformat，跳过 `ffprobe` 进程 spawn。**默认关闭**
+（opt-in）：默认构建不依赖 libavformat 开发库，任何机器都能直接 `cargo build`，
+探测走 `ffprobe` 子进程——这与 §2 决策表里"元数据探测（默认）= `std::process::Command`
+调用 `ffprobe`"一致。开发机上想要快路径就显式开启（见下文）。
 
 **Rust 端 API**：
 
@@ -1164,8 +1165,26 @@ pub fn probe_video_metadata_auto(input: &Path) -> Result<VideoMetadata, EncodeEr
 
 ```toml
 [features]
-default = ["c-probe", "parallel-analyze"]    # 默认开启 c-probe
-c-probe = ["dep:cc", "dep:pkg-config"]        # 需要 cc + pkg-config build-deps
+default = ["parallel-analyze"]           # 默认不开 c-probe：免 libavformat 开发库
+c-probe = ["dep:cc", "dep:pkg-config"]   # 需要 cc + pkg-config build-deps
+```
+
+**为什么默认关闭**：
+
+- `build.rs` 在 `c-probe` 开启时调 `pkg-config --cflags --libs libavformat`，找不到就直接
+  **panic**。把它放在默认 feature 里，意味着"clone 下来 cargo build"这件事需要额外的系统
+  包，源码分发与 release 构建都被绑在这一个 host 依赖上。
+- release CI 的 runner（ubuntu-22.04 / macos-14 / windows-2022）默认没有 libavformat 的
+  开发头文件，默认开启会直接构建失败——发布流水线不该依赖 runner 上手工装 ffmpeg-dev。
+- 探测慢的代价可控：单文件 probe 30-100ms 的进程启动开销（§3.4 "分析进度上报" 的讨论里
+  已量化），换来的是"任何机器都能构建"。
+
+**开启 c-probe 的场景**：
+
+```bash
+# host 装了 libavformat 开发库，想要更快的批量探测
+cargo build --features c-probe
+# 探测直接调 libavformat，不 spawn ffprobe
 ```
 
 **依赖（host 系统）**：
@@ -1180,14 +1199,6 @@ c-probe = ["dep:cc", "dep:pkg-config"]        # 需要 cc + pkg-config build-dep
 用 `cc` 编译 `src/ffi/video_probe.c` 成静态库 `librencoder_probe.a` 链进
 `rencoder_lib`。
 
-**关闭 c-probe 的场景**：
-
-```bash
-# host 没有 libavformat（pure-CLI fallback only）
-cargo build --no-default-features --features parallel-analyze
-# 探测走 spawn ffprobe，每次多 30-100ms 进程启动开销（per file）
-```
-
 **Runtime 检查**：
 
 - c-probe 失败时自动 fallback 到 ffprobe CLI，warn 一行后继续：
@@ -1197,7 +1208,7 @@ cargo build --no-default-features --features parallel-analyze
   ```
 
 - pkg-config 找不到 libavformat 时 `build.rs` 直接 panic，提示"pkg-config libavformat
-  failed: <stderr>"。修复：装 ffmpeg-dev / libavformat-dev 包。
+  failed: <stderr>"。修复：装 ffmpeg-dev / libavformat-dev 包，或者不开这个 feature。
 
 ---
 
@@ -1818,6 +1829,10 @@ CI 上不安装 create-dmg）+ ad-hoc codesign（`--sign -`）让 DMG 在 Apple 
    DMG 也产出 `.sha256`。
 3. **文件匹配**：`fail_on_unmatched_files: true` + 上传侧
    `if-no-files-found: error`——产物为空时直接失败，而不是发一个空 release。
+
+另外 build job 断言**产物不链接 `libav*`**：`c-probe` 是 opt-in，发布二进制走 ffprobe
+子进程探测，不依赖版本匹配的 libavformat / libavcodec / libavutil。链接了它们，用户的
+ffmpeg 一升级（macOS 定期抬 dylib major，Linux 各发行版 major 不同）二进制就会起不来。
 
 **权限与并发**：workflow 顶层 `contents: read`，只有 release job 拿
 `contents: write`（最小权限）；concurrency group 按 tag 分组且

@@ -76,6 +76,16 @@ cargo build --release
 cargo build -p rencoder_lib --features parallel-analyze
 ```
 
+`c-probe` (native libavformat probing) is **opt-in**: it needs pkg-config +
+libavformat dev headers, so it is off by default and the default build
+probes via the `ffprobe` subprocess. Enable it on a host that has the
+dev packages:
+
+```bash
+cargo build --features c-probe        # macOS: brew install pkg-config ffmpeg
+                                        # Debian: apt-get install pkg-config libavformat-dev
+```
+
 ## Test
 
 ```bash

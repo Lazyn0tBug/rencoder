@@ -1415,6 +1415,44 @@ mod tests {
         crate::types::InputPath::new(p).expect("test fixture")
     }
 
+    /// Is ffmpeg available on this machine? The probe path needs a real
+    /// (probe-able) video, which we generate with ffmpeg's lavfi source.
+    fn ffmpeg_available() -> bool {
+        Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Generate a tiny real video so the probe has something to read.
+    fn make_video(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        let status = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=160x120:d=1",
+                "-r",
+                "30",
+                "-c:v",
+                "libx264",
+                "-t",
+                "1",
+            ])
+            .arg(&path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("ffmpeg spawn failed");
+        assert!(status.success(), "ffmpeg failed for {name}");
+        path
+    }
+
     fn cache_with_libx264_and_svtav1(has_nvidia: bool) -> EncoderCache {
         EncoderCache {
             encoders_output: "\
@@ -1570,14 +1608,22 @@ Encoders:
 
     #[test]
     fn skips_when_output_exists() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
         let dir = std::env::temp_dir().join("rencoder_skip_exists");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let output = dir.join("out.mkv");
-        std::fs::write(&output, b"").unwrap();
+        // Both sides must be probe-able real videos: the source so the
+        // probe succeeds, the output so the partial-output detector sees
+        // a complete file (an empty / unreadable output would be treated
+        // as partial and re-encoded instead of skipped).
+        let input = make_video(&dir, "input.mp4");
+        let output = make_video(&dir, "out.mkv");
 
         let task = TranscodeTask {
-            input: ip(&dir.join("input.mp4")),
+            input: ip(&input),
             output: Some(output),
         };
         let params = params_x264_crf();
