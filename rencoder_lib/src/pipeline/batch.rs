@@ -385,23 +385,32 @@ where
     let argv_for_run = argv.clone();
     let mut run_result = run_ffmpeg(argv_for_run);
 
-    // NVENC fallback: an NVENC encode that fails means this machine
-    // cannot run that encoder after all (the capability probe was
-    // stale). Fall back to software right here instead of failing the
-    // file — and remember the verdict for the rest of the process, so
-    // the next files do not fail the same way.
+    // NVENC fallback. A failed NVENC encode does NOT prove the encoder
+    // is unusable -- a full disk, a bad passthrough argument or a
+    // missing output directory fails it too, and falling back on those
+    // would double the work and hide the real problem. So check the
+    // capability for real (a 1-frame test encode) before falling back.
+    //
+    // The CLI inherits ffmpeg's stderr, so the failure text is not
+    // available to tell the two cases apart; the probe is the only
+    // decisive check that works on every path.
     let mut argv = argv;
+    let mut fallback_note: Option<FallbackNote> = None;
     if run_result.is_err() {
         if let Some(encoder) = extract_encoder_from_argv(&argv) {
-            if nvenc::is_nvenc_encoder(&encoder) {
+            if nvenc::is_nvenc_encoder(&encoder) && !nvenc::verify_capability(&encoder) {
                 let (_, message, stderr_tail) = run_result.clone().unwrap_err();
                 tracing::warn!(
                     encoder = %encoder,
                     error = %message,
                     stderr = %stderr_tail,
-                    "NVENC encode failed; falling back to software encoding"
+                    "NVENC encoder is not usable on this machine; falling back to software encoding"
                 );
-                nvenc::disable_for_process(&encoder);
+                fallback_note = Some(FallbackNote {
+                    encoder: encoder.clone(),
+                    message: message.clone(),
+                    stderr_tail: stderr_tail.clone(),
+                });
                 if let Some(fallback_argv) = rebuild_argv() {
                     if !fallback_argv.is_empty() {
                         argv = fallback_argv;
@@ -428,7 +437,37 @@ where
         started_at_meta,
         started_at_instant,
         run_result,
+        fallback_note,
     )
+}
+
+/// What the first (NVENC) attempt left behind, when a software retry
+/// replaced it. Carried into the record so the fallback is visible
+/// after the fact, not only in the log.
+struct FallbackNote {
+    /// The encoder that failed.
+    encoder: String,
+    /// Its error message.
+    message: String,
+    /// Its stderr tail.
+    stderr_tail: String,
+}
+
+impl FallbackNote {
+    /// One-line summary, for a record's error message.
+    fn summary(&self) -> String {
+        format!("NVENC {} failed: {}", self.encoder, self.message)
+    }
+
+    /// Multi-line text, for a record's stderr tail.
+    fn detail(&self) -> String {
+        let mut text = format!("[nvenc fallback] {}", self.summary());
+        if !self.stderr_tail.is_empty() {
+            text.push('\n');
+            text.push_str(&self.stderr_tail);
+        }
+        text
+    }
 }
 
 /// Inner helper for [`transcode_single`] (CLI path). Invokes ffmpeg
@@ -536,6 +575,7 @@ fn build_encode_record(
     started_at_meta: chrono::DateTime<chrono::Utc>,
     started_at_instant: Instant,
     run_result: Result<(), (ErrorCategory, String, String)>,
+    fallback_note: Option<FallbackNote>,
 ) -> Result<EncodingRecord, EncodeError> {
     let ended_at_meta = Utc::now();
     let encoding_duration = started_at_instant.elapsed().as_secs_f64();
@@ -650,7 +690,12 @@ fn build_encode_record(
                 encoder_selected: encoder_selected.clone(),
                 encoder_settings: encoder_settings_from_params(params),
                 ffmpeg_argv: argv,
-                ffmpeg_stderr_tail: String::new(),
+                // A fallback leaves a trace here: the file was encoded,
+                // but only after the NVENC attempt failed.
+                ffmpeg_stderr_tail: fallback_note
+                    .as_ref()
+                    .map(|note| note.detail())
+                    .unwrap_or_default(),
 
                 output_path: Some(output_path.to_string_lossy().into_owned()),
                 output_size_bytes: size_bytes,
@@ -662,40 +707,60 @@ fn build_encode_record(
                 error: None,
             })
         }
-        Err((category, message, stderr_tail)) => Ok(EncodingRecord {
-            source_path: task.input.to_string(),
-            source_size_bytes: std::fs::metadata(task.input.as_path())
-                .map(|m| m.len())
-                .unwrap_or(0),
-            source_codec: metadata.codec.clone(),
-            source_container: metadata.container.clone(),
-            source_width: metadata.width,
-            source_height: metadata.height,
-            source_fps: src_fps,
-            source_duration_secs: metadata.duration_secs,
-            source_bit_rate_bps: metadata.bit_rate,
+        Err((category, message, stderr_tail)) => {
+            // When the NVENC attempt was replaced by a software retry,
+            // the record has to carry both failures -- otherwise the
+            // record blames the software encoder for a hardware
+            // problem.
+            let (message, stderr_tail) = match &fallback_note {
+                Some(note) => {
+                    let mut tail = note.detail();
+                    if !stderr_tail.is_empty() {
+                        tail.push('\n');
+                        tail.push_str(&stderr_tail);
+                    }
+                    (
+                        format!("{}; software fallback failed: {message}", note.summary()),
+                        tail,
+                    )
+                }
+                None => (message, stderr_tail),
+            };
+            Ok(EncodingRecord {
+                source_path: task.input.to_string(),
+                source_size_bytes: std::fs::metadata(task.input.as_path())
+                    .map(|m| m.len())
+                    .unwrap_or(0),
+                source_codec: metadata.codec.clone(),
+                source_container: metadata.container.clone(),
+                source_width: metadata.width,
+                source_height: metadata.height,
+                source_fps: src_fps,
+                source_duration_secs: metadata.duration_secs,
+                source_bit_rate_bps: metadata.bit_rate,
 
-            started_at: started_at_meta,
-            ended_at: Some(ended_at_meta),
-            encoding_duration_secs: Some(encoding_duration),
-            encoder_selected,
-            encoder_settings: encoder_settings_from_params(params),
-            ffmpeg_argv: argv,
-            ffmpeg_stderr_tail: stderr_tail.clone(),
+                started_at: started_at_meta,
+                ended_at: Some(ended_at_meta),
+                encoding_duration_secs: Some(encoding_duration),
+                encoder_selected,
+                encoder_settings: encoder_settings_from_params(params),
+                ffmpeg_argv: argv,
+                ffmpeg_stderr_tail: stderr_tail.clone(),
 
-            output_path: None,
-            output_size_bytes: None,
-            output_duration_secs: None,
-            output_codec: None,
-            compression_ratio: None,
+                output_path: None,
+                output_size_bytes: None,
+                output_duration_secs: None,
+                output_codec: None,
+                compression_ratio: None,
 
-            outcome: EncodingOutcome::Failed,
-            error: Some(ErrorContext {
-                category,
-                message,
-                ffmpeg_stderr_tail: stderr_tail,
-            }),
-        }),
+                outcome: EncodingOutcome::Failed,
+                error: Some(ErrorContext {
+                    category,
+                    message,
+                    ffmpeg_stderr_tail: stderr_tail,
+                }),
+            })
+        }
     }
 }
 
@@ -1766,8 +1831,12 @@ Encoders:
         let config = Config::default();
 
         // A fake NVENC encoder name: `is_nvenc_encoder` only looks at
-        // the suffix, and the process-wide "disabled" registry stays
+        // the suffix, and the process-wide capability registry stays
         // out of the real encoder names.
+        //
+        // The verdict is pre-seeded as "unusable" so the fallback path
+        // does not have to spawn a real ffmpeg probe.
+        nvenc::set_capability("test_nvenc", false);
         let nvenc_argv = vec![
             "ffmpeg".to_string(),
             "-c:v".to_string(),
@@ -1814,6 +1883,163 @@ Encoders:
         assert!(nvenc::is_disabled("test_nvenc"));
         // The record carries the argv that actually ran.
         assert_eq!(record.ffmpeg_argv, calls[1]);
+        // ... and the record says the NVENC attempt happened and why.
+        assert!(
+            record.ffmpeg_stderr_tail.contains("[nvenc fallback]"),
+            "fallback must leave a trace in the record: {}",
+            record.ffmpeg_stderr_tail
+        );
+        assert!(record
+            .ffmpeg_stderr_tail
+            .contains("NVENC test_nvenc failed"));
+    }
+
+    #[test]
+    fn nvenc_failure_does_not_fall_back_when_the_encoder_is_usable() {
+        // The encode failed, but the encoder itself works -- so the
+        // failure was something else (disk full, bad arguments). Falling
+        // back would double the work and hide the real problem.
+        nvenc::set_capability("usable_nvenc", true);
+
+        let dir = std::env::temp_dir().join("rencoder_batch_nvenc_usable");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("in.mp4");
+        let output = dir.join("out.mkv");
+        std::fs::write(&input, b"x").unwrap();
+
+        let task = TranscodeTask {
+            input: ip(&input),
+            output: Some(output.clone()),
+        };
+        let params = params_x264_crf();
+        let cache = EncoderCache {
+            encoders_output: "\
+Encoders:
+ V..... libx264              libx264 H.264
+"
+            .to_string(),
+            nvenc: Vec::new(),
+        };
+        let config = Config::default();
+
+        let mut calls: Vec<Vec<String>> = Vec::new();
+        let record = transcode_inner(
+            &task,
+            &params,
+            &VideoMetadata::default(),
+            vec![
+                "ffmpeg".to_string(),
+                "-c:v".to_string(),
+                "usable_nvenc".to_string(),
+            ],
+            output.as_path(),
+            Utc::now(),
+            Instant::now(),
+            |argv| {
+                calls.push(argv);
+                Err((
+                    ErrorCategory::FfmpegNonzeroExit,
+                    "No space left on device".to_string(),
+                    String::new(),
+                ))
+            },
+            || {
+                Some(
+                    rebuild_argv_after_nvenc_failure(
+                        &task,
+                        &params,
+                        &cache,
+                        &config,
+                        &VideoMetadata::default(),
+                    )
+                    .unwrap(),
+                )
+            },
+        )
+        .expect("transcode_inner should return Ok(EncodingRecord)");
+
+        // One attempt only: the encoder works, the failure is unrelated.
+        assert_eq!(calls.len(), 1);
+        assert_eq!(record.outcome, EncodingOutcome::Failed);
+        // The encoder is not blacklisted -- it works.
+        assert!(!nvenc::is_disabled("usable_nvenc"));
+    }
+
+    #[test]
+    fn failed_fallback_reports_both_failures() {
+        // Both attempts fail: the record has to name both, otherwise it
+        // blames the software encoder for a hardware problem.
+        nvenc::set_capability("bothfail_nvenc", false);
+
+        let dir = std::env::temp_dir().join("rencoder_batch_nvenc_both_fail");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("in.mp4");
+        let output = dir.join("out.mkv");
+        std::fs::write(&input, b"x").unwrap();
+
+        let task = TranscodeTask {
+            input: ip(&input),
+            output: Some(output.clone()),
+        };
+        let params = params_x264_crf();
+        let cache = EncoderCache {
+            encoders_output: "\
+Encoders:
+ V..... libx264              libx264 H.264
+"
+            .to_string(),
+            nvenc: Vec::new(),
+        };
+        let config = Config::default();
+
+        let record = transcode_inner(
+            &task,
+            &params,
+            &VideoMetadata::default(),
+            vec![
+                "ffmpeg".to_string(),
+                "-c:v".to_string(),
+                "bothfail_nvenc".to_string(),
+            ],
+            output.as_path(),
+            Utc::now(),
+            Instant::now(),
+            |_argv| {
+                Err((
+                    ErrorCategory::FfmpegNonzeroExit,
+                    "No NVENC capable devices found".to_string(),
+                    String::new(),
+                ))
+            },
+            || {
+                Some(
+                    rebuild_argv_after_nvenc_failure(
+                        &task,
+                        &params,
+                        &cache,
+                        &config,
+                        &VideoMetadata::default(),
+                    )
+                    .unwrap(),
+                )
+            },
+        )
+        .expect("transcode_inner should return Ok(EncodingRecord)");
+
+        assert_eq!(record.outcome, EncodingOutcome::Failed);
+        let err = record.error.expect("failed record must carry an error");
+        assert!(
+            err.message.contains("NVENC bothfail_nvenc failed"),
+            "message must name the NVENC failure: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("software fallback failed"),
+            "message must name the fallback failure: {}",
+            err.message
+        );
     }
 
     #[test]

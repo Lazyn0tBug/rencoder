@@ -18,7 +18,7 @@
 //! user says otherwise. Nobody knows the state of a machine better than
 //! its owner.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -42,26 +42,55 @@ const RECORD_VERSION: u32 = 1;
 /// actually present in `ffmpeg -encoders` get probed.
 const NVENC_CANDIDATES: [&str; 3] = ["h264_nvenc", "hevc_nvenc", "av1_nvenc"];
 
-/// NVENC encoders that failed at runtime in this process.
+/// Per-process capability verdict per NVENC encoder: `true` = this
+/// machine can run it, `false` = it cannot.
 ///
-/// The stored capability can be stale (driver update, ffmpeg swap, GPU
-/// disabled in the BIOS). When an NVENC encode fails anyway, the
-/// machine clearly cannot run that encoder -- so remember it for the
-/// rest of the process instead of failing every file the same way.
-static DISABLED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+/// The stored record can be stale (driver update, ffmpeg swap, GPU
+/// disabled in the BIOS). When an NVENC encode fails, we check the
+/// capability for real; the verdict is kept for the rest of the
+/// process so the same encoder is never probed twice and never used
+/// again once it is known to be unusable.
+static CAPABILITY: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
 
-fn disabled_set() -> &'static Mutex<HashSet<String>> {
-    DISABLED.get_or_init(|| Mutex::new(HashSet::new()))
+fn capability_map() -> &'static Mutex<HashMap<String, bool>> {
+    CAPABILITY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Mark an NVENC encoder as unusable for the rest of this process.
-pub fn disable_for_process(encoder: &str) {
-    disabled_set().lock().unwrap().insert(encoder.to_string());
+/// The verdict we already have for this encoder, if any.
+pub fn known_capability(encoder: &str) -> Option<bool> {
+    capability_map().lock().unwrap().get(encoder).copied()
 }
 
-/// Was this encoder disabled after a runtime failure?
+/// Record a verdict for this encoder.
+pub fn set_capability(encoder: &str, usable: bool) {
+    capability_map()
+        .lock()
+        .unwrap()
+        .insert(encoder.to_string(), usable);
+}
+
+/// Is this encoder known to be unusable? (`select_encoder` skips it.)
 pub fn is_disabled(encoder: &str) -> bool {
-    disabled_set().lock().unwrap().contains(encoder)
+    known_capability(encoder) == Some(false)
+}
+
+/// Can this machine run the NVENC encoder *right now*?
+///
+/// A 1-frame test encode -- the same probe the capability record is
+/// built from. Used when an NVENC encode fails: a failure alone does
+/// not prove the encoder is unusable (a full disk or a bad passthrough
+/// argument fails it too), and the CLI cannot tell them apart because
+/// ffmpeg's stderr is inherited rather than captured.
+///
+/// The verdict is cached per process: the second failure of the same
+/// encoder does not probe again.
+pub fn verify_capability(encoder: &str) -> bool {
+    if let Some(known) = known_capability(encoder) {
+        return known;
+    }
+    let usable = probe_one(encoder).is_ok();
+    set_capability(encoder, usable);
+    usable
 }
 
 /// Is this an NVENC encoder? (`h264_nvenc`, `hevc_nvenc`, `av1_nvenc`)
@@ -233,6 +262,11 @@ where
 
 /// Can this NVENC encoder run here? Encode one frame of a synthetic
 /// source with it.
+pub fn probe_one(encoder: &str) -> Result<(), String> {
+    probe_encoder(&run_ffmpeg, encoder)
+}
+
+/// Same, with an injectable runner (test seam).
 fn probe_encoder<F>(runner: &F, encoder: &str) -> Result<(), String>
 where
     F: Fn(&[&str]) -> Result<String, EncodeError>,
@@ -506,6 +540,43 @@ mod tests {
         assert_ne!(a, b);
         assert_ne!(a, c);
         assert_eq!(a, fingerprint("ffmpeg version 9.0.1", "encoders"));
+    }
+
+    // ---- per-process capability verdicts ----
+
+    #[test]
+    fn capability_verdict_round_trips() {
+        let encoder = "registry_test_nvenc";
+        assert_eq!(known_capability(encoder), None);
+        assert!(!is_disabled(encoder));
+
+        set_capability(encoder, false);
+        assert_eq!(known_capability(encoder), Some(false));
+        assert!(is_disabled(encoder));
+
+        set_capability(encoder, true);
+        assert_eq!(known_capability(encoder), Some(true));
+        assert!(!is_disabled(encoder));
+    }
+
+    #[test]
+    fn verify_capability_uses_the_cached_verdict() {
+        // A cached verdict must not trigger another probe -- the probe
+        // spawns ffmpeg, and the second failure of the same encoder
+        // must not cost another spawn.
+        let encoder = "cached_test_nvenc";
+        set_capability(encoder, false);
+        assert!(!verify_capability(encoder));
+        assert_eq!(known_capability(encoder), Some(false));
+    }
+
+    #[test]
+    fn is_nvenc_encoder_recognises_the_suffix() {
+        assert!(is_nvenc_encoder("h264_nvenc"));
+        assert!(is_nvenc_encoder("hevc_nvenc"));
+        assert!(is_nvenc_encoder("av1_nvenc"));
+        assert!(!is_nvenc_encoder("libx264"));
+        assert!(!is_nvenc_encoder("libsvtav1"));
     }
 
     #[test]
