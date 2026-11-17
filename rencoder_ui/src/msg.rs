@@ -508,7 +508,12 @@ pub fn reduce(
     state: &mut AppState,
     msg: Msg,
     cmd_tx: &Sender<Command>,
-    config: &rencoder_lib::config::app::AppConfig,
+    // The UI's editable copy of the config lives in `state.config_draft`
+    // and is the single source of truth here: the Setup page edits it,
+    // the encode params are built from it, and it is what gets saved.
+    // The shared config (the lib's startup copy) is not consulted --
+    // reading it would ignore the user's edits.
+    _config: &rencoder_lib::config::app::AppConfig,
 ) {
     match msg {
         Msg::UserSelectedDir(path) => {
@@ -535,7 +540,11 @@ pub fn reduce(
             // TOML, safe on every keystroke.
             apply_config_field_edit(state, kind, value);
             state.config_save_status = "Saving…".into();
-            let _ = cmd_tx.try_send(Command::SaveConfig);
+            // The draft is the payload: the lib must persist what the
+            // user just edited, not the copy it loaded at startup.
+            let _ = cmd_tx.try_send(Command::SaveConfig {
+                config: Box::new(state.config_draft.clone()),
+            });
         }
         Msg::UserClickedDetectNv => {
             // Force a fresh probe. The lib stores the result in
@@ -548,7 +557,7 @@ pub fn reduce(
             match phase {
                 None => {
                     // No active task. Start fresh.
-                    dispatch_dry_run_for_new_task(state, cmd_tx, config);
+                    dispatch_dry_run_for_new_task(state, cmd_tx);
                 }
                 Some(BatchPhase::Done) => {
                     // v1.2 follow-up #2: Done requires dir re-pick
@@ -569,7 +578,7 @@ pub fn reduce(
                     // Validate the dir is still readable +
                     // non-empty (review-delta F2), then dispatch.
                     // Same code path — keeps the contract tight.
-                    let files = match collect_input_files(state, config) {
+                    let files = match collect_input_files(state) {
                         Ok(files) => files,
                         Err(CollectError::NoInputDir) => {
                             // Defensive: input_dir is None while
@@ -610,7 +619,7 @@ pub fn reduce(
                         );
                         return;
                     }
-                    let params = build_encode_params_from_config(config);
+                    let params = build_encode_params_from_draft(state);
                     {
                         let t = state.tasks.active.as_mut().unwrap();
                         t.phase = BatchPhase::Encoding;
@@ -1029,10 +1038,8 @@ fn apply_event(state: &mut AppState, evt: Event) {
 /// (`rencoder_lib::types::EncodeParams::from_encode_config`) so
 /// there's a single source of truth for "how a TOML `[encode]`
 /// block becomes an `EncodeParams`".
-fn build_encode_params_from_config(
-    config: &rencoder_lib::config::app::AppConfig,
-) -> rencoder_lib::types::EncodeParams {
-    rencoder_lib::types::EncodeParams::from_app_config(config.encode.as_ref())
+fn build_encode_params_from_draft(state: &AppState) -> rencoder_lib::types::EncodeParams {
+    rencoder_lib::types::EncodeParams::from_app_config(state.config_draft.encode.as_ref())
 }
 
 /// Errors that `collect_input_files` can return. Distinguishes
@@ -1069,8 +1076,8 @@ enum CollectError {
 /// callers handle that as a distinct "no files" condition).
 fn collect_input_files(
     state: &AppState,
-    config: &rencoder_lib::config::AppConfig,
 ) -> Result<Vec<rencoder_lib::types::InputPath>, CollectError> {
+    let config = &state.config_draft;
     let Some(dir) = state.input_dir.as_ref() else {
         return Err(CollectError::NoInputDir);
     };
@@ -1146,9 +1153,8 @@ fn drop_active(state: &mut AppState) {
 fn dispatch_dry_run_for_new_task(
     state: &mut AppState,
     cmd_tx: &crossbeam_channel::Sender<Command>,
-    config: &rencoder_lib::config::app::AppConfig,
 ) {
-    let files = match collect_input_files(state, config) {
+    let files = match collect_input_files(state) {
         Ok(files) => files,
         Err(CollectError::NoInputDir) => {
             // v1.2 (review #133 follow-up): user-action feedback
@@ -1186,7 +1192,8 @@ fn dispatch_dry_run_for_new_task(
         }
     };
     if files.is_empty() {
-        let extensions = config
+        let extensions = state
+            .config_draft
             .encode
             .as_ref()
             .and_then(|e| e.extensions.clone())
@@ -1208,7 +1215,7 @@ fn dispatch_dry_run_for_new_task(
         push_toast(state, detail, ToastKind::Warning);
         return;
     }
-    let params = build_encode_params_from_config(config);
+    let params = build_encode_params_from_draft(state);
     state.last_error = None;
     state.progress.clear();
     state.log.clear();
@@ -2297,9 +2304,44 @@ mod tests {
         assert_eq!(enc.crf, 28);
         // (b) save status set.
         assert_eq!(state.config_save_status, "Saving…");
-        // (c) SaveConfig dispatched.
+        // (c) SaveConfig dispatched -- carrying the edited draft, not
+        // the lib's startup copy. Without the payload the lib would
+        // write back the config it loaded and the edit would be lost.
         let cmd = rx.try_recv().expect("expected a SaveConfig command");
-        assert!(matches!(cmd, Command::SaveConfig), "expected SaveConfig");
+        match cmd {
+            Command::SaveConfig { config } => {
+                assert_eq!(
+                    config.encode.as_ref().map(|e| e.crf),
+                    Some(28),
+                    "the payload must carry the edit"
+                );
+            }
+            _ => panic!("expected SaveConfig"),
+        }
+    }
+
+    #[test]
+    fn nv_edit_reaches_the_save_payload() {
+        // The NVENC switch has to reach the lib, otherwise the toggle
+        // is cosmetic.
+        use crossbeam_channel::unbounded;
+        let (tx, rx) = unbounded::<Command>();
+        let mut state = fresh_state();
+        reduce(
+            &mut state,
+            Msg::UserEditedConfigField {
+                kind: ConfigFieldKind::Nv,
+                value: ConfigFieldValue::Nv(true),
+            },
+            &tx,
+            &default_config(),
+        );
+        match rx.try_recv().expect("expected a SaveConfig command") {
+            Command::SaveConfig { config } => {
+                assert_eq!(config.encode.as_ref().and_then(|e| e.nv), Some(true));
+            }
+            _ => panic!("expected SaveConfig"),
+        }
     }
 
     #[test]
@@ -2474,7 +2516,9 @@ mod tests {
             }),
             ..Default::default()
         };
-        let params = build_encode_params_from_config(&cfg);
+        let mut state = fresh_state();
+        state.config_draft = cfg.clone();
+        let params = build_encode_params_from_draft(&state);
         assert_eq!(params.format, rencoder_lib::types::VideoFormat::Hevc);
         assert!(params.is_crf);
         assert_eq!(params.bitrate_or_crf, 28);
@@ -2483,7 +2527,9 @@ mod tests {
     #[test]
     fn build_encode_params_defaults_when_section_missing() {
         let cfg = AppConfig::default();
-        let params = build_encode_params_from_config(&cfg);
+        let mut state = fresh_state();
+        state.config_draft = cfg.clone();
+        let params = build_encode_params_from_draft(&state);
         assert_eq!(params.format, rencoder_lib::types::VideoFormat::Av1);
         assert!(params.is_crf);
         assert_eq!(params.bitrate_or_crf, 45);

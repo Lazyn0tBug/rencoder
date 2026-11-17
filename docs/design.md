@@ -184,6 +184,15 @@ fs_perms::set_config_file_mode(&tmp)?;
 `nv` 是**机器相关**的旋钮：同一份 `rencoder.toml` 拿到另一台机器上就该能改，所以它是
 U17 "旋钮全进配置" 的刻意例外。
 
+GUI 侧同样有开关（Setup 页 on/off，写进 `[encode].nv`）。编码器缓存在 actor 启动时
+解析一次，所以开关变化后**下一个批次**会用新值——为此 `Command::SaveConfig` 在
+`[encode].nv` 变化时会在后台线程重新解析能力并替换缓存（解析要 spawn ffmpeg，不能
+堵在 actor 线程上：那样 `Command::Cancel` 会被拖住）。
+
+UI 里配置只有一份事实来源：`state.config_draft`。Setup 页编辑它，编码参数从它
+构建（`build_encode_params_from_draft`），保存时它就是 `Command::SaveConfig` 的载荷。
+lib 启动时加载的那份只用于启动时的初值。
+
 **启用时的检测：能力实测，不是存在性检查**：
 
 对 `ffmpeg -encoders` 里出现的每个 NVENC 编码器各跑一次 1 帧试编码：
@@ -2081,10 +2090,13 @@ pub enum Command {
     /// failed, last }` → `AnalyzeFinished { records, failed_count }`。
     /// 协议 shape 与"为什么这样"见 §3.4 "分析进度上报"。
     Analyze { files: Vec<PathBuf> },
-    /// 把当前加载的 `AppConfig` 写回原路径（U21 / Tier 2 #8）—— Save 按钮
-    /// 走这条；lib 内部 `AppConfig::save(&config_path)`，发 `Event::ConfigSaved`
-    /// 或 `Event::Error`。
-    SaveConfig,
+    /// 把 `AppConfig` 写回原路径（U21 / Tier 2 #8）—— Setup 页每次改动都
+    /// 走这条。**载荷是 UI 编辑后的那份**（`Box<AppConfig>`）：UI 编辑的是自己
+    /// 的 draft（一份 clone），没有载荷的话 lib 只会把它启动时加载的那份写回去
+    /// ——编辑被静默丢掉，文件被改写成原值，而 UI 显示"已保存"。
+    /// lib 内部 `AppConfig::save(&config_path)`，发 `Event::ConfigSaved` 或
+    /// `Event::Error`。`[encode].nv` 变化时顺带刷新编码器缓存（见下）。
+    SaveConfig { config: Box<AppConfig> },
     /// 探测这台机器的 NVENC 能力并回报。逻辑与 CLI 的 `rencoder detect` 相同：
     /// 结果存进 `<app_dir>/nvenc-capability.json`，与 CLI 共用同一份记录。
     /// - `force = true`：总是重新探测（UI 的"重新检测"按钮）

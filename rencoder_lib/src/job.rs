@@ -26,7 +26,9 @@ use crossbeam_channel::unbounded;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+
+use parking_lot::RwLock;
 
 use chrono::{DateTime, Utc};
 
@@ -99,12 +101,21 @@ pub enum Command {
         /// `started_at >= t`.
         after: Option<DateTime<Utc>>,
     },
-    /// Save the currently-loaded `AppConfig` back to its original
-    /// path (`ControllerHandle::config_path`). Used by the UI
-    /// "Save" button after editing. No payload — the lib reads the
-    /// in-memory config it has. Emits `Event::ConfigSaved` on
-    /// success / `Event::Error` on failure.
-    SaveConfig,
+    /// Save an `AppConfig` back to the original path
+    /// (`ControllerHandle::config_path`). Used by the UI after
+    /// editing a Setup-page field.
+    ///
+    /// The edited config rides along as the payload: the UI edits
+    /// its own draft (a clone), so without the payload the lib would
+    /// write back the config *it* holds and the edit would be lost --
+    /// the file would be rewritten with the original values while
+    /// the UI showed "Saved".
+    ///
+    /// Emits `Event::ConfigSaved` on success / `Event::Error` on
+    /// failure. A change to `[encode].nv` also refreshes the encoder
+    /// cache, so the switch takes effect for the next batch instead
+    /// of the next application start.
+    SaveConfig { config: Box<AppConfig> },
     /// Detect this machine's NVENC capability and report it back.
     ///
     /// Same logic as the CLI's `rencoder detect`: the result is stored
@@ -756,6 +767,52 @@ fn load_and_share_config(evt_tx: &Sender<Event>) -> Option<(Arc<Config>, Arc<App
     Some((Arc::new(config), Arc::new(app_config), config_path))
 }
 
+/// Re-resolve the encoder cache after the NVENC switch changed.
+///
+/// The resolution spawns ffmpeg subprocesses, so it runs on its own
+/// thread -- the actor must stay responsive (a `Command::Cancel` may
+/// be waiting behind it).
+///
+/// A failed resolution leaves the previous cache in place: the old one
+/// still works (it just may not match the new setting), while an
+/// error cache would fail every batch.
+fn refresh_encoder_cache(
+    cache_cell: Arc<RwLock<Option<Result<EncoderCache, EncodeError>>>>,
+    enable_nv: bool,
+    evt_tx: Sender<Event>,
+    dropped_counter: Arc<std::sync::atomic::AtomicU64>,
+) {
+    std::thread::Builder::new()
+        .name("rencoder-cache-refresh".into())
+        .spawn(move || {
+            let (cache, capability) =
+                crate::pipeline::cache::init_encoder_cache_with_capability(enable_nv);
+            match cache {
+                Ok(cache) => {
+                    *cache_cell.write() = Some(Ok(cache));
+                    if let Some(capability) = capability {
+                        send_evt_lossy(
+                            &evt_tx,
+                            Event::NvencCapability(capability),
+                            &dropped_counter,
+                        );
+                    }
+                }
+                Err(e) => {
+                    send_evt_lossy(
+                        &evt_tx,
+                        Event::Error {
+                            category: e.category(),
+                            message: format!("encoder cache refresh failed: {e}"),
+                        },
+                        &dropped_counter,
+                    );
+                }
+            }
+        })
+        .expect("spawn cache-refresh thread");
+}
+
 /// Summarize a capability resolution for the UI.
 fn nvenc_capability_of(
     resolution: &crate::encoder::nvenc::Resolution,
@@ -798,7 +855,13 @@ fn run_actor(
     // returns None only if NO `set` has happened yet, not on
     // Err — so storing `Result` directly is what makes the
     // failure visible.)
-    let cache_cell: Arc<OnceLock<Result<EncoderCache, EncodeError>>> = Arc::new(OnceLock::new());
+    // The cache is refreshable: the UI can flip `[encode].nv` at
+    // runtime, and the NVENC capability has to be re-resolved for the
+    // next batch. A `OnceLock` could not be replaced, hence the
+    // `RwLock` (read per file, written only when the setting
+    // changes).
+    let cache_cell: Arc<RwLock<Option<Result<EncoderCache, EncodeError>>>> =
+        Arc::new(RwLock::new(None));
     let cache_cell_for_closure = Arc::clone(&cache_cell);
     let cache_cell_for_dry_run = Arc::clone(&cache_cell);
     // Drive the OnceLock from the background init thread.
@@ -832,7 +895,7 @@ fn run_actor(
                 &dropped_for_init,
             );
         }
-        let _ = cache_cell_for_thread.set(init.cache);
+        *cache_cell_for_thread.write() = Some(init.cache);
         if let Some((category, message)) = err_event {
             send_evt_lossy(
                 &evt_tx_for_init,
@@ -960,7 +1023,8 @@ fn run_actor(
                     // `Result<EncoderCache, EncodeError>` so a
                     // FAILED init surfaces the underlying error each
                     // time, not a generic fallback.
-                    let cache = match cache_cell_for_closure.get() {
+                    let cache_guard = cache_cell_for_closure.read();
+                    let cache = match cache_guard.as_ref() {
                         Some(Ok(c)) => c,
                         Some(Err(e)) => {
                             send_evt_lossy(
@@ -1093,7 +1157,8 @@ fn run_actor(
                 // StartBatch. A failed cache init surfaces the error
                 // and skips the dry run; an unset cell means the
                 // init thread hasn't finished yet.
-                let cache_ref = match cache_cell_for_dry_run.get() {
+                let cache_guard = cache_cell_for_dry_run.read();
+                let cache_ref = match cache_guard.as_ref() {
                     Some(Ok(c)) => c,
                     Some(Err(e)) => {
                         send_evt_lossy(
@@ -1143,38 +1208,24 @@ fn run_actor(
                 send_evt_lossy(&evt_tx, Event::HistoryLoaded { records }, &dropped_counter);
             }
 
-            Command::SaveConfig => match app_config.save(&config_path) {
-                Ok(()) => {
-                    send_evt_lossy(
-                        &evt_tx,
-                        Event::ConfigSaved {
-                            path: config_path.clone(),
-                        },
-                        &dropped_counter,
-                    );
-                }
-                Err(e) => {
-                    send_evt_lossy(
-                        &evt_tx,
-                        Event::Error {
-                            category: ErrorCategory::ConfigError,
-                            message: format!("save failed: {e}"),
-                        },
-                        &dropped_counter,
-                    );
-                }
-            },
-
-            Command::Detect { force } => {
-                // Same path as the CLI's `rencoder detect`: resolve
-                // through the on-disk record, store a fresh probe, and
-                // report what this machine can actually run.
-                let cache_path = crate::config::path::resolve_nvenc_cache();
-                match crate::encoder::nvenc::resolve_and_store(cache_path.as_deref(), force) {
-                    Ok(resolution) => {
+            Command::SaveConfig { config } => {
+                // The payload is the UI's edited draft. Persisting our
+                // own copy would silently drop the edit: the file
+                // would be rewritten with the original values while
+                // the UI showed "Saved".
+                let new_nv = config.encode.as_ref().and_then(|e| e.nv).unwrap_or(false);
+                let old_nv = app_config
+                    .encode
+                    .as_ref()
+                    .and_then(|e| e.nv)
+                    .unwrap_or(false);
+                match config.save(&config_path) {
+                    Ok(()) => {
                         send_evt_lossy(
                             &evt_tx,
-                            Event::NvencCapability(nvenc_capability_of(&resolution)),
+                            Event::ConfigSaved {
+                                path: config_path.clone(),
+                            },
                             &dropped_counter,
                         );
                     }
@@ -1182,13 +1233,63 @@ fn run_actor(
                         send_evt_lossy(
                             &evt_tx,
                             Event::Error {
-                                category: ErrorCategory::ProbeFailed,
-                                message: format!("NVENC detection failed: {e}"),
+                                category: ErrorCategory::ConfigError,
+                                message: format!("save failed: {e}"),
                             },
                             &dropped_counter,
                         );
                     }
                 }
+                if new_nv != old_nv {
+                    // The NVENC switch changed: re-resolve the
+                    // capability so the NEXT BATCH honours it -- the
+                    // cache is otherwise fixed for the whole session.
+                    refresh_encoder_cache(
+                        Arc::clone(&cache_cell),
+                        new_nv,
+                        evt_tx.clone(),
+                        Arc::clone(&dropped_counter),
+                    );
+                }
+            }
+
+            Command::Detect { force } => {
+                // Same path as the CLI's `rencoder detect`: resolve
+                // through the on-disk record, store a fresh probe, and
+                // report what this machine can actually run.
+                //
+                // The probe spawns ffmpeg subprocesses (up to ~1.5s),
+                // so it runs on its own thread: doing it here would
+                // stall every other command -- `Command::Cancel`
+                // included -- for the duration.
+                let evt_tx_detect = evt_tx.clone();
+                let dropped_detect = Arc::clone(&dropped_counter);
+                std::thread::Builder::new()
+                    .name("rencoder-detect".into())
+                    .spawn(move || {
+                        let cache_path = crate::config::path::resolve_nvenc_cache();
+                        match crate::encoder::nvenc::resolve_and_store(cache_path.as_deref(), force)
+                        {
+                            Ok(resolution) => {
+                                send_evt_lossy(
+                                    &evt_tx_detect,
+                                    Event::NvencCapability(nvenc_capability_of(&resolution)),
+                                    &dropped_detect,
+                                );
+                            }
+                            Err(e) => {
+                                send_evt_lossy(
+                                    &evt_tx_detect,
+                                    Event::Error {
+                                        category: ErrorCategory::ProbeFailed,
+                                        message: format!("NVENC detection failed: {e}"),
+                                    },
+                                    &dropped_detect,
+                                );
+                            }
+                        }
+                    })
+                    .expect("spawn detect thread");
             }
 
             Command::Analyze { files } => {
@@ -1409,7 +1510,8 @@ mod mock_tests {
         // so the mock processor closure can read it without an
         // init thread. Production wires this through the async
         // init (see `init_encoder_cache_async`).
-        let cache_cell: Arc<OnceLock<EncoderCache>> = Arc::new(OnceLock::new());
+        let cache_cell: Arc<std::sync::OnceLock<EncoderCache>> =
+            Arc::new(std::sync::OnceLock::new());
         cache_cell
             .set(EncoderCache {
                 encoders_output: String::new(),
@@ -1585,10 +1687,32 @@ mod mock_tests {
                         let records = load_history(data_dir.clone(), limit, after);
                         send_evt_lossy(&evt_tx, Event::HistoryLoaded { records }, &dropped_counter);
                     }
-                    // SaveConfig is exercised by the UI flow (which
-                    // talks to the production actor). The mock actor
-                    // has no app_config to save — no-op here.
-                    Command::SaveConfig => {}
+                    // SaveConfig: the mock has no app_config of its
+                    // own -- the point of the payload is that the
+                    // *caller's* config gets persisted. Write it to
+                    // the test-supplied data_dir so the test can read
+                    // it back (parallel-safe: no env vars).
+                    Command::SaveConfig { config } => {
+                        let path = data_dir
+                            .clone()
+                            .unwrap_or_else(|| PathBuf::from("."))
+                            .join("saved-config.toml");
+                        match config.save(&path) {
+                            Ok(()) => send_evt_lossy(
+                                &evt_tx,
+                                Event::ConfigSaved { path },
+                                &dropped_counter,
+                            ),
+                            Err(e) => send_evt_lossy(
+                                &evt_tx,
+                                Event::Error {
+                                    category: ErrorCategory::ConfigError,
+                                    message: format!("save failed: {e}"),
+                                },
+                                &dropped_counter,
+                            ),
+                        }
+                    }
                     // The mock actor does not probe; report an empty
                     // capability so the UI arm stays exercised.
                     Command::Detect { force: _ } => {
@@ -2014,6 +2138,44 @@ mod mock_tests {
     }
 
     #[cfg(feature = "parallel-analyze")]
+    #[test]
+    fn save_config_persists_the_caller_s_config() {
+        // The payload is the user's edited draft. If the actor
+        // persisted its own copy instead, the edit would be lost --
+        // the file would be rewritten with the original values.
+        let dir = unique_tmp("save_config");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (cmd_tx, evt_rx) = run_actor_inline(make_succeeding_mock().0, Some(dir.clone()));
+        let edited = AppConfig {
+            encode: Some(crate::config::app::EncodeConfig {
+                crf: 28,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        cmd_tx
+            .send(Command::SaveConfig {
+                config: Box::new(edited),
+            })
+            .unwrap();
+        drop(cmd_tx);
+
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::ConfigSaved { .. })),
+            "expected a ConfigSaved event, got {events:?}"
+        );
+
+        let written = std::fs::read_to_string(dir.join("saved-config.toml")).unwrap();
+        assert!(
+            written.contains("crf = 28"),
+            "the edited value must reach the file: {written}"
+        );
+    }
+
     #[test]
     fn detect_command_emits_a_capability_event() {
         // The actor's Command::Detect arm: the capability comes back
