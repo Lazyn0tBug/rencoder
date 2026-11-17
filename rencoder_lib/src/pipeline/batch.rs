@@ -20,21 +20,20 @@ use std::time::Instant;
 
 use chrono::Utc;
 
-use crate::config::Config;
 use crate::data::extract::probe_video_metadata_auto;
 use crate::encoder::{
     command::{build_ffmpeg_command, should_skip_encoding},
     nvenc,
-    nvenc::CapabilityVerdicts,
     select::select_encoder,
 };
 use crate::error::EncodeError;
 use crate::pipeline::cancel::CancelToken;
+use crate::pipeline::context::{BatchContext, FilePlan};
 use crate::pipeline::partial_output::PartialOutputHandle;
 use crate::pipeline::task::TaskManager;
 use crate::types::{
-    EncodeParams, EncoderCache, EncoderSettings, EncodingOutcome, EncodingRecord, ErrorCategory,
-    ErrorContext, FpsDecision, ProcessOutput, SkippedReason, TranscodeTask, VideoMetadata,
+    EncodeParams, EncoderSettings, EncodingOutcome, EncodingRecord, ErrorCategory, ErrorContext,
+    FpsDecision, ProcessOutput, SkippedReason, TranscodeTask, VideoMetadata,
 };
 
 /// Maximum bytes the stderr reader thread will keep in memory for the
@@ -80,44 +79,17 @@ type ResultCallback = dyn Fn(&EncodingRecord);
 /// `TaskManager` when they need scaffold logs and Guard registration.
 pub fn transcode_single(
     task: &TranscodeTask,
-    params: &EncodeParams,
-    cache: &EncoderCache,
-    config: &Config,
-    verdicts: &mut CapabilityVerdicts,
+    ctx: &mut BatchContext,
     output: ProcessOutput,
 ) -> Result<EncodingRecord, EncodeError> {
     let started_at_meta = Utc::now();
     let started_at_instant = Instant::now();
 
     // CLI path. Shared prepare logic + sync ffmpeg execution.
-    let prepare = encode_prepare(
-        task,
-        params,
-        cache,
-        config,
-        verdicts,
-        started_at_meta,
-        started_at_instant,
-    );
+    let prepare = encode_prepare(task, ctx, started_at_meta, started_at_instant);
     match prepare {
         EncodePrepareResult::Skipped(r) | EncodePrepareResult::FailedProbe(r) => Ok(r),
-        EncodePrepareResult::Ready {
-            metadata,
-            argv,
-            output_path,
-        } => transcode_with_argv(
-            task,
-            params,
-            &metadata,
-            argv,
-            &output_path,
-            started_at_meta,
-            started_at_instant,
-            output,
-            cache,
-            config,
-            verdicts,
-        ),
+        EncodePrepareResult::Ready(plan) => transcode_with_argv(task, plan, ctx, output),
     }
 }
 
@@ -135,45 +107,19 @@ pub fn transcode_single(
 /// `progress=continue` / `progress=end` block from ffmpeg.
 pub fn transcode_single_with_progress(
     task: &TranscodeTask,
-    params: &EncodeParams,
-    cache: &EncoderCache,
-    config: &Config,
-    verdicts: &mut CapabilityVerdicts,
+    ctx: &mut BatchContext,
     cancel: &CancelToken,
     on_progress: &mut dyn FnMut(FfmpegProgress),
 ) -> Result<EncodingRecord, EncodeError> {
     let started_at_meta = Utc::now();
     let started_at_instant = Instant::now();
 
-    let prepare = encode_prepare(
-        task,
-        params,
-        cache,
-        config,
-        verdicts,
-        started_at_meta,
-        started_at_instant,
-    );
+    let prepare = encode_prepare(task, ctx, started_at_meta, started_at_instant);
     match prepare {
         EncodePrepareResult::Skipped(r) | EncodePrepareResult::FailedProbe(r) => Ok(r),
-        EncodePrepareResult::Ready {
-            metadata,
-            argv,
-            output_path,
-        } => transcode_with_progress(
-            task,
-            params,
-            &metadata,
-            argv,
-            &output_path,
-            started_at_meta,
-            started_at_instant,
-            cancel,
-            on_progress,
-            cache,
-            config,
-            verdicts,
-        ),
+        EncodePrepareResult::Ready(plan) => {
+            transcode_with_progress(task, plan, ctx, cancel, on_progress)
+        }
     }
 }
 
@@ -181,11 +127,9 @@ pub fn transcode_single_with_progress(
 /// skip decision + argv build). Either ready to invoke ffmpeg, or a
 /// terminal record (skipped / failed-probe) the caller returns as-is.
 enum EncodePrepareResult {
-    Ready {
-        metadata: VideoMetadata,
-        argv: Vec<String>,
-        output_path: PathBuf,
-    },
+    /// Ready to encode: the plan carries the probe result, the argv,
+    /// the output path and the start times.
+    Ready(FilePlan),
     Skipped(EncodingRecord),
     FailedProbe(EncodingRecord),
 }
@@ -200,13 +144,11 @@ enum EncodePrepareResult {
 /// failed-probe) or proceed to invoke ffmpeg.
 fn encode_prepare(
     task: &TranscodeTask,
-    params: &EncodeParams,
-    cache: &EncoderCache,
-    config: &Config,
-    verdicts: &CapabilityVerdicts,
+    ctx: &BatchContext,
     started_at_meta: chrono::DateTime<chrono::Utc>,
-    _started_at_instant: Instant,
+    started_at_instant: Instant,
 ) -> EncodePrepareResult {
+    let params = ctx.params();
     // transcode_single(_with_progress) is only invoked via task graphs
     // that build `TranscodeTask { output: Some(...) }`. Treat `None`
     // as a programming error rather than a soft "skip" -- there's no
@@ -328,12 +270,14 @@ fn encode_prepare(
         }
     }
 
-    let argv = build_argv(task, params, cache, config, &metadata, verdicts);
-    EncodePrepareResult::Ready {
+    let argv = build_argv(task, ctx, &metadata);
+    EncodePrepareResult::Ready(FilePlan::new(
         metadata,
         argv,
         output_path,
-    }
+        started_at_meta,
+        started_at_instant,
+    ))
 }
 
 /// Shared body for the CLI + GUI transcode inner helpers (review #119).
@@ -352,26 +296,22 @@ fn encode_prepare(
 /// Caller-specific behavior (sync ffmpeg.run vs cancellable
 /// ffmpeg.run + on_progress streaming) lives in the `run_ffmpeg`
 /// closure. The shared record construction + skip policy live here.
-#[allow(clippy::too_many_arguments)]
 fn transcode_inner<F, R>(
     task: &TranscodeTask,
-    params: &EncodeParams,
-    metadata: &VideoMetadata,
-    argv: Vec<String>,
-    output_path: &Path,
-    started_at_meta: chrono::DateTime<chrono::Utc>,
-    started_at_instant: Instant,
-    verdicts: &mut CapabilityVerdicts,
+    mut plan: FilePlan,
+    ctx: &mut BatchContext,
     mut run_ffmpeg: F,
     rebuild_argv: R,
 ) -> Result<EncodingRecord, EncodeError>
 where
     F: FnMut(Vec<String>) -> Result<(), (ErrorCategory, String, String)>,
     // The rebuild closure re-selects the encoder, so it needs the
-    // verdicts; it gets them from here (a shared reborrow of the
+    // batch context; it gets it from here (a shared reborrow of the
     // `&mut` this function already owns).
-    R: FnOnce(&CapabilityVerdicts) -> Option<Vec<String>>,
+    R: FnOnce(&BatchContext) -> Option<Vec<String>>,
 {
+    let params = ctx.params();
+    let metadata = plan.metadata();
     let codec = metadata.codec.as_deref().unwrap_or("");
     let need_reduce = matches!(
         params.max_fps.decide(metadata.cap_fps()),
@@ -386,15 +326,15 @@ where
         return Ok(make_skipped_record(
             task,
             params,
-            started_at_meta,
-            Some(started_at_instant.elapsed().as_secs_f64()),
+            plan.started_at_meta(),
+            Some(plan.started_at_instant().elapsed().as_secs_f64()),
             SkippedReason::SameCodec,
         ));
     }
 
     // Clone argv for the closure — build_encode_record needs it too.
     // Per-batch this is one ~20-element Vec<String> clone; trivial.
-    let argv_for_run = argv.clone();
+    let argv_for_run = plan.argv().to_vec();
     let mut run_result = run_ffmpeg(argv_for_run);
 
     // NVENC fallback. A failed NVENC encode does NOT prove the encoder
@@ -406,11 +346,12 @@ where
     // The CLI inherits ffmpeg's stderr, so the failure text is not
     // available to tell the two cases apart; the probe is the only
     // decisive check that works on every path.
-    let mut argv = argv;
     let mut fallback_note: Option<FallbackNote> = None;
     if run_result.is_err() {
-        if let Some(encoder) = extract_encoder_from_argv(&argv) {
-            if nvenc::is_nvenc_encoder(&encoder) && !nvenc::verify_capability(verdicts, &encoder) {
+        if let Some(encoder) = extract_encoder_from_argv(plan.argv()) {
+            if nvenc::is_nvenc_encoder(&encoder)
+                && !nvenc::verify_capability(ctx.verdicts_mut(), &encoder)
+            {
                 let (_, message, stderr_tail) = run_result.clone().unwrap_err();
                 tracing::warn!(
                     encoder = %encoder,
@@ -423,10 +364,10 @@ where
                     message: message.clone(),
                     stderr_tail: stderr_tail.clone(),
                 });
-                if let Some(fallback_argv) = rebuild_argv(verdicts) {
+                if let Some(fallback_argv) = rebuild_argv(&*ctx) {
                     if !fallback_argv.is_empty() {
-                        argv = fallback_argv;
-                        run_result = run_ffmpeg(argv.clone());
+                        plan.set_argv(fallback_argv);
+                        run_result = run_ffmpeg(plan.argv().to_vec());
                         if let Err((_, message, _)) = &run_result {
                             tracing::warn!(
                                 encoder = %encoder,
@@ -440,17 +381,7 @@ where
         }
     }
 
-    build_encode_record(
-        task,
-        params,
-        metadata,
-        argv,
-        output_path,
-        started_at_meta,
-        started_at_instant,
-        run_result,
-        fallback_note,
-    )
+    build_encode_record(task, plan, ctx, run_result, fallback_note)
 }
 
 /// What the first (NVENC) attempt left behind, when a software retry
@@ -489,34 +420,19 @@ impl FallbackNote {
 ///
 /// Review #119: thin wrapper around `transcode_inner` that supplies
 /// the sync ffmpeg runner.
-#[allow(clippy::too_many_arguments)]
 fn transcode_with_argv(
     task: &TranscodeTask,
-    params: &EncodeParams,
-    metadata: &VideoMetadata,
-    argv: Vec<String>,
-    output_path: &Path,
-    started_at_meta: chrono::DateTime<chrono::Utc>,
-    started_at_instant: Instant,
+    plan: FilePlan,
+    ctx: &mut BatchContext,
     output: ProcessOutput,
-    cache: &EncoderCache,
-    config: &Config,
-    verdicts: &mut CapabilityVerdicts,
 ) -> Result<EncodingRecord, EncodeError> {
-    let _ = output_path; // currently unused inside; reserved for symmetry with progress variant
+    let metadata = plan.metadata().clone();
     transcode_inner(
         task,
-        params,
-        metadata,
-        argv,
-        output_path,
-        started_at_meta,
-        started_at_instant,
-        verdicts,
+        plan,
+        ctx,
         |argv| run_ffmpeg_with_stderr(&argv, output),
-        |verdicts| {
-            rebuild_argv_after_nvenc_failure(task, params, cache, config, metadata, verdicts)
-        },
+        |ctx| rebuild_argv_after_nvenc_failure(task, ctx, &metadata),
     )
 }
 
@@ -524,13 +440,10 @@ fn transcode_with_argv(
 /// skips the encoder that just failed, so this picks the software one.
 fn rebuild_argv_after_nvenc_failure(
     task: &TranscodeTask,
-    params: &EncodeParams,
-    cache: &EncoderCache,
-    config: &Config,
+    ctx: &BatchContext,
     metadata: &VideoMetadata,
-    verdicts: &CapabilityVerdicts,
 ) -> Option<Vec<String>> {
-    let argv = build_argv(task, params, cache, config, metadata, verdicts);
+    let argv = build_argv(task, ctx, metadata);
     if argv.is_empty() {
         None
     } else {
@@ -552,34 +465,20 @@ fn rebuild_argv_after_nvenc_failure(
 ///
 /// Review #119: thin wrapper around `transcode_inner` that supplies
 /// the cancellable ffmpeg runner with on_progress streaming.
-#[allow(clippy::too_many_arguments)]
 fn transcode_with_progress(
     task: &TranscodeTask,
-    params: &EncodeParams,
-    metadata: &VideoMetadata,
-    argv: Vec<String>,
-    output_path: &Path,
-    started_at_meta: chrono::DateTime<chrono::Utc>,
-    started_at_instant: Instant,
+    plan: FilePlan,
+    ctx: &mut BatchContext,
     cancel: &CancelToken,
     on_progress: &mut dyn FnMut(FfmpegProgress),
-    cache: &EncoderCache,
-    config: &Config,
-    verdicts: &mut CapabilityVerdicts,
 ) -> Result<EncodingRecord, EncodeError> {
+    let metadata = plan.metadata().clone();
     transcode_inner(
         task,
-        params,
-        metadata,
-        argv,
-        output_path,
-        started_at_meta,
-        started_at_instant,
-        verdicts,
+        plan,
+        ctx,
         |argv| run_ffmpeg_with_progress(&argv, cancel, metadata.duration_secs, on_progress),
-        |verdicts| {
-            rebuild_argv_after_nvenc_failure(task, params, cache, config, metadata, verdicts)
-        },
+        |ctx| rebuild_argv_after_nvenc_failure(task, ctx, &metadata),
     )
 }
 
@@ -589,17 +488,20 @@ fn transcode_with_progress(
 #[allow(clippy::too_many_arguments)]
 fn build_encode_record(
     task: &TranscodeTask,
-    params: &EncodeParams,
-    metadata: &VideoMetadata,
-    argv: Vec<String>,
-    output_path: &Path,
-    started_at_meta: chrono::DateTime<chrono::Utc>,
-    started_at_instant: Instant,
+    mut plan: FilePlan,
+    ctx: &BatchContext,
     run_result: Result<(), (ErrorCategory, String, String)>,
     fallback_note: Option<FallbackNote>,
 ) -> Result<EncodingRecord, EncodeError> {
+    let params = ctx.params();
+    // The argv is moved out first (the record keeps it); the rest of
+    // the plan is only read from here on.
+    let argv = plan.take_argv();
+    let metadata = plan.metadata();
+    let output_path = plan.output_path();
+    let started_at_meta = plan.started_at_meta();
     let ended_at_meta = Utc::now();
-    let encoding_duration = started_at_instant.elapsed().as_secs_f64();
+    let encoding_duration = plan.started_at_instant().elapsed().as_secs_f64();
     let encoder_selected = extract_encoder_from_argv(&argv);
     // `source_fps` in the record keeps the average (display semantics,
     // see design doc §2.6); the reduction decision uses the cap value.
@@ -798,11 +700,8 @@ fn build_encode_record(
 /// cell. One batch in flight at a time.
 #[allow(clippy::too_many_arguments)]
 pub fn transcode_batch(
-    params: &EncodeParams,
     files: &[crate::types::InputPath],
-    cache: &EncoderCache,
-    config: &Config,
-    verdicts: &mut CapabilityVerdicts,
+    ctx: &mut BatchContext,
     output: ProcessOutput,
     current_output: Option<&PartialOutputHandle>,
     result_callback: Option<&ResultCallback>,
@@ -812,6 +711,7 @@ pub fn transcode_batch(
     // per-task loop. The extension doesn't change across tasks;
     // computing it once saves one match per file. For a 1000-file
     // batch this is 1000 saved lookups.
+    let params = ctx.params();
     let _ext = params.format.default_extension();
     let tasks: Vec<TranscodeTask> = files
         .iter()
@@ -843,7 +743,7 @@ pub fn transcode_batch(
     // We log + return what we have so the caller still gets the
     // partial records.
     let run_result = manager.run(&tasks, "encoding", &batch_path, |task, _ctx| {
-        transcode_single(task, params, cache, config, verdicts, output)
+        transcode_single(task, ctx, output)
     });
     let records: Vec<EncodingRecord> = match run_result {
         Ok(records) => records,
@@ -879,17 +779,12 @@ pub fn transcode_batch(
 ///
 /// `encode.nv` (GPU enable) is ignored — it's only consulted when
 /// actually running ffmpeg, which dry-run skips.
-pub fn dry_run_batch<'a, I>(
-    params: &EncodeParams,
-    _cache: &EncoderCache,
-    config: &Config,
-    verdicts: &CapabilityVerdicts,
-    files: I,
-) -> Vec<EncodingRecord>
+pub fn dry_run_batch<'a, I>(ctx: &BatchContext, files: I) -> Vec<EncodingRecord>
 where
     I: IntoIterator<Item = &'a crate::types::InputPath>,
 {
     // Review #122: hoist extension out of the per-file loop.
+    let params = ctx.params();
     let _ext = params.format.default_extension();
     let mut records = Vec::new();
     for file in files {
@@ -900,15 +795,7 @@ where
             input: file.clone(),
             output: Some(output_path),
         };
-        let prepare = encode_prepare(
-            &task,
-            params,
-            _cache,
-            config,
-            verdicts,
-            Utc::now(),
-            Instant::now(),
-        );
+        let prepare = encode_prepare(&task, ctx, Utc::now(), Instant::now());
         match prepare {
             EncodePrepareResult::Ready { .. } => {
                 // Plan: encode would actually run. Build a fresh
@@ -980,14 +867,8 @@ pub fn batch_target_path_for_files(files: &[crate::types::InputPath]) -> std::pa
 /// Build the ffmpeg argv (used by `transcode_single`). Probes the source
 /// and decides whether to skip; the actual execution is handled by
 /// `transcode_with_argv` (which `transcode_single` calls).
-fn build_argv(
-    task: &TranscodeTask,
-    params: &EncodeParams,
-    cache: &EncoderCache,
-    config: &Config,
-    metadata: &VideoMetadata,
-    verdicts: &CapabilityVerdicts,
-) -> Vec<String> {
+fn build_argv(task: &TranscodeTask, ctx: &BatchContext, metadata: &VideoMetadata) -> Vec<String> {
+    let params = ctx.params();
     let src_fps = metadata.cap_fps();
     let codec = metadata.codec.as_deref().unwrap_or("");
     let need_reduce = matches!(params.max_fps.decide(src_fps), FpsDecision::Reduce { .. });
@@ -997,9 +878,12 @@ fn build_argv(
         // and the post-probe skip path is handled in `transcode_with_argv`.
         return Vec::new();
     }
-    let encoder = select_encoder(params.format, cache, config, verdicts)
+    // The context is unpacked here: the leaf selector keeps flat
+    // parameters (design doc §3.10.4) so `encoder` does not depend on
+    // `pipeline`.
+    let encoder = select_encoder(params.format, ctx.cache(), ctx.config(), ctx.verdicts())
         .expect("select_encoder in build_argv should have been filtered");
-    build_ffmpeg_command(task, params, &encoder, src_fps, &config.ffmpeg_args)
+    build_ffmpeg_command(task, params, &encoder, src_fps, &ctx.config().ffmpeg_args)
 }
 
 /// Build the skipped-record skeleton (used for OutputExists and
@@ -1568,7 +1452,11 @@ pub fn probe_input(path: &Path) -> Result<crate::types::VideoMetadata, EncodeErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::encoder::nvenc::CapabilityVerdicts;
+    use crate::types::EncoderCache;
     use crate::types::VideoFormat;
+    use std::sync::Arc;
 
     /// Test helper: wrap a path literal in `InputPath`. Used at every
     /// site that constructs a `TranscodeTask` literal in tests.
@@ -1793,16 +1681,10 @@ Encoders:
         let cache = cache_with_libx264_and_svtav1();
         let config = Config::default();
 
-        let mut verdicts = CapabilityVerdicts::default();
-        let record = transcode_single(
-            &task,
-            &params,
-            &cache,
-            &config,
-            &mut verdicts,
-            ProcessOutput::Null,
-        )
-        .expect("transcode_single should succeed");
+        let verdicts = CapabilityVerdicts::default();
+        let mut ctx = BatchContext::new(params, Arc::new(cache), Arc::new(config), verdicts);
+        let record = transcode_single(&task, &mut ctx, ProcessOutput::Null)
+            .expect("transcode_single should succeed");
         assert_eq!(
             record.outcome,
             EncodingOutcome::Skipped(SkippedReason::OutputExists)
@@ -1828,16 +1710,10 @@ Encoders:
         let cache = cache_with_libx264_and_svtav1();
         let config = Config::default();
 
-        let mut verdicts = CapabilityVerdicts::default();
-        let record = transcode_single(
-            &task,
-            &params,
-            &cache,
-            &config,
-            &mut verdicts,
-            ProcessOutput::Null,
-        )
-        .expect("transcode_single should succeed");
+        let verdicts = CapabilityVerdicts::default();
+        let mut ctx = BatchContext::new(params, Arc::new(cache), Arc::new(config), verdicts);
+        let record = transcode_single(&task, &mut ctx, ProcessOutput::Null)
+            .expect("transcode_single should succeed");
         assert_eq!(record.outcome, EncodingOutcome::Failed);
         let err = record.error.expect("failed record must carry an error");
         assert!(
@@ -1893,16 +1769,20 @@ Encoders:
             "test_nvenc".to_string(),
         ];
 
+        let mut ctx = BatchContext::new(params, Arc::new(cache), Arc::new(config), verdicts);
+        let plan = FilePlan::new(
+            VideoMetadata::default(),
+            nvenc_argv,
+            output.clone(),
+            Utc::now(),
+            Instant::now(),
+        );
+
         let mut calls: Vec<Vec<String>> = Vec::new();
         let record = transcode_inner(
             &task,
-            &params,
-            &VideoMetadata::default(),
-            nvenc_argv,
-            output.as_path(),
-            Utc::now(),
-            Instant::now(),
-            &mut verdicts,
+            plan,
+            &mut ctx,
             |argv| {
                 calls.push(argv);
                 Err((
@@ -1911,17 +1791,10 @@ Encoders:
                     String::new(),
                 ))
             },
-            |verdicts| {
+            |ctx| {
                 Some(
-                    rebuild_argv_after_nvenc_failure(
-                        &task,
-                        &params,
-                        &cache,
-                        &config,
-                        &VideoMetadata::default(),
-                        verdicts,
-                    )
-                    .unwrap(),
+                    rebuild_argv_after_nvenc_failure(&task, ctx, &VideoMetadata::default())
+                        .unwrap(),
                 )
             },
         )
@@ -1932,7 +1805,7 @@ Encoders:
         assert!(calls[0].contains(&"test_nvenc".to_string()));
         assert!(calls[1].contains(&"libx264".to_string()));
         // The encoder that failed is remembered for this run.
-        assert!(verdicts.is_disabled("test_nvenc"));
+        assert!(ctx.verdicts().is_disabled("test_nvenc"));
         // The record carries the argv that actually ran.
         assert_eq!(record.ffmpeg_argv, calls[1]);
         // ... and the record says the NVENC attempt happened and why.
@@ -1976,20 +1849,24 @@ Encoders:
         };
         let config = Config::default();
 
-        let mut calls: Vec<Vec<String>> = Vec::new();
-        let record = transcode_inner(
-            &task,
-            &params,
-            &VideoMetadata::default(),
+        let mut ctx = BatchContext::new(params, Arc::new(cache), Arc::new(config), verdicts);
+        let plan = FilePlan::new(
+            VideoMetadata::default(),
             vec![
                 "ffmpeg".to_string(),
                 "-c:v".to_string(),
                 "usable_nvenc".to_string(),
             ],
-            output.as_path(),
+            output.clone(),
             Utc::now(),
             Instant::now(),
-            &mut verdicts,
+        );
+
+        let mut calls: Vec<Vec<String>> = Vec::new();
+        let record = transcode_inner(
+            &task,
+            plan,
+            &mut ctx,
             |argv| {
                 calls.push(argv);
                 Err((
@@ -1998,17 +1875,10 @@ Encoders:
                     String::new(),
                 ))
             },
-            |verdicts| {
+            |ctx| {
                 Some(
-                    rebuild_argv_after_nvenc_failure(
-                        &task,
-                        &params,
-                        &cache,
-                        &config,
-                        &VideoMetadata::default(),
-                        verdicts,
-                    )
-                    .unwrap(),
+                    rebuild_argv_after_nvenc_failure(&task, ctx, &VideoMetadata::default())
+                        .unwrap(),
                 )
             },
         )
@@ -2018,7 +1888,7 @@ Encoders:
         assert_eq!(calls.len(), 1);
         assert_eq!(record.outcome, EncodingOutcome::Failed);
         // The encoder is not blacklisted -- it works.
-        assert!(!verdicts.is_disabled("usable_nvenc"));
+        assert!(!ctx.verdicts().is_disabled("usable_nvenc"));
     }
 
     #[test]
@@ -2050,19 +1920,22 @@ Encoders:
         };
         let config = Config::default();
 
-        let record = transcode_inner(
-            &task,
-            &params,
-            &VideoMetadata::default(),
+        let mut ctx = BatchContext::new(params, Arc::new(cache), Arc::new(config), verdicts);
+        let plan = FilePlan::new(
+            VideoMetadata::default(),
             vec![
                 "ffmpeg".to_string(),
                 "-c:v".to_string(),
                 "bothfail_nvenc".to_string(),
             ],
-            output.as_path(),
+            output.clone(),
             Utc::now(),
             Instant::now(),
-            &mut verdicts,
+        );
+        let record = transcode_inner(
+            &task,
+            plan,
+            &mut ctx,
             |_argv| {
                 Err((
                     ErrorCategory::FfmpegNonzeroExit,
@@ -2070,17 +1943,10 @@ Encoders:
                     String::new(),
                 ))
             },
-            |verdicts| {
+            |ctx| {
                 Some(
-                    rebuild_argv_after_nvenc_failure(
-                        &task,
-                        &params,
-                        &cache,
-                        &config,
-                        &VideoMetadata::default(),
-                        verdicts,
-                    )
-                    .unwrap(),
+                    rebuild_argv_after_nvenc_failure(&task, ctx, &VideoMetadata::default())
+                        .unwrap(),
                 )
             },
         )
@@ -2126,21 +1992,21 @@ Encoders:
             "-i".into(),
             "x".into(),
         ];
-        let mut verdicts = CapabilityVerdicts::default();
-        let record = transcode_with_argv(
-            &task,
-            &params,
-            &VideoMetadata::default(),
+        let mut ctx = BatchContext::new(
+            params,
+            Arc::new(_cache),
+            Arc::new(_config),
+            CapabilityVerdicts::default(),
+        );
+        let plan = FilePlan::new(
+            VideoMetadata::default(),
             argv,
-            task.output.as_ref().unwrap().as_path(),
+            task.output.as_ref().unwrap().clone(),
             Utc::now(),
             Instant::now(),
-            ProcessOutput::Null,
-            &_cache,
-            &_config,
-            &mut verdicts,
-        )
-        .expect("transcode_with_argv should return Ok(EncodingRecord)");
+        );
+        let record = transcode_with_argv(&task, plan, &mut ctx, ProcessOutput::Null)
+            .expect("transcode_with_argv should return Ok(EncodingRecord)");
 
         assert_eq!(record.outcome, EncodingOutcome::Failed);
         let err = record.error.expect("error should be set on Failed");

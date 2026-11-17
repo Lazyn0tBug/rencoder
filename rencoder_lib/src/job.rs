@@ -38,6 +38,7 @@ use crate::encoder::nvenc::CapabilityVerdicts;
 use crate::error::EncodeError;
 use crate::pipeline::batch::{transcode_single_with_progress, FfmpegProgress};
 use crate::pipeline::cancel::CancelToken;
+use crate::pipeline::context::BatchContext;
 use crate::pipeline::task::TaskManager;
 use crate::types::{EncodeParams, EncoderCache, ErrorCategory, TranscodeTask};
 
@@ -1040,17 +1041,16 @@ fn spawn_task_batch<P, F>(
 /// Build the per-file processor for an encode batch.
 ///
 /// The processor owns everything it needs — no borrows — because it
-/// runs on the batch worker thread: the cache snapshot, the config,
-/// the params, the cancel token and the event sender.
-#[allow(clippy::too_many_arguments)]
+/// runs on the batch worker thread: the batch context (params, cache
+/// snapshot, config, verdicts), the cancel token and the event sender.
+///
+/// The context is built *in the worker* (after the cache lands), so
+/// the actor never waits for the cache init (§3.10.1.1 rule 5).
 fn make_encode_processor(
-    params: EncodeParams,
-    config: Arc<Config>,
-    cache: Arc<EncoderCache>,
+    mut batch_ctx: BatchContext,
     cancel: CancelToken,
     evt_tx: Sender<Event>,
     dropped_counter: DropCounter,
-    mut verdicts: CapabilityVerdicts,
     update_tx: Sender<(String, bool)>,
 ) -> impl FnMut(
     &TranscodeTask,
@@ -1060,7 +1060,7 @@ fn make_encode_processor(
        + 'static {
     // What the actor already knows: the verdicts this batch started
     // with. The comparison tells us what the encode changed.
-    let mut reported = verdicts.clone();
+    let mut reported = batch_ctx.verdicts().clone();
     move |task: &TranscodeTask, ctx: &crate::pipeline::task::TaskContext| {
         // FileStarted uses 0-indexed (matches the v1 UI contract).
         // TaskManager passes 1-indexed in `ctx.index`; convert.
@@ -1104,24 +1104,16 @@ fn make_encode_processor(
             );
         };
 
-        let res = transcode_single_with_progress(
-            task,
-            &params,
-            &cache,
-            &config,
-            &mut verdicts,
-            &cancel,
-            &mut on_progress,
-        );
+        let res = transcode_single_with_progress(task, &mut batch_ctx, &cancel, &mut on_progress);
 
         // Report the verdicts this file changed (rare: only when an
         // NVENC encode failed and the encoder turned out to be
         // unusable). The actor merges them into its authoritative copy
         // so the next batch inherits them.
-        for change in verdicts.changes_since(&reported) {
+        for change in batch_ctx.verdicts().changes_since(&reported) {
             let _ = update_tx.send(change);
         }
-        reported.clone_from(&verdicts);
+        reported.clone_from(batch_ctx.verdicts());
 
         match res {
             Ok(record) => {
@@ -1158,7 +1150,11 @@ fn make_encode_processor(
                 // Map a per-file failure to Ok(Failed record) so
                 // TaskManager doesn't abort the batch on the first
                 // failure — matches v1 inline behavior.
-                Ok(crate::pipeline::task::build_failed_record(task, e, &params))
+                Ok(crate::pipeline::task::build_failed_record(
+                    task,
+                    e,
+                    batch_ctx.params(),
+                ))
             }
         }
     }
@@ -1431,19 +1427,25 @@ fn run_actor(
                 // through the update channel.
                 let verdicts_for_worker = verdicts.clone();
                 let make_processor = move |update_tx: Sender<(String, bool)>| {
+                    // The context is built here, in the worker: the
+                    // cache may still be initializing, and waiting for
+                    // it must not block the actor (§3.10.1.1 rule 5).
                     let slot = take_cache(&cache_cell_for_worker, CACHE_WAIT_TIMEOUT).ok_or((
                         ErrorCategory::ConfigError,
                         "encoder cache init timed out".into(),
                     ))?;
                     let cache = cache_from_slot(slot)?;
-                    Ok(make_encode_processor(
+                    let batch_ctx = BatchContext::new(
                         params_for_worker,
-                        config_for_worker,
                         cache,
+                        config_for_worker,
+                        verdicts_for_worker,
+                    );
+                    Ok(make_encode_processor(
+                        batch_ctx,
                         cancel_for_worker,
                         evt_tx_for_worker,
                         dropped_for_worker,
-                        verdicts_for_worker,
                         update_tx,
                     ))
                 };
@@ -1507,13 +1509,14 @@ fn run_actor(
                                 return;
                             }
                         };
-                        let records = crate::pipeline::batch::dry_run_batch(
-                            &params,
-                            &cache,
-                            &config_for_worker,
-                            &verdicts_for_worker,
-                            files.iter(),
+                        let batch_ctx = BatchContext::new(
+                            params,
+                            cache,
+                            config_for_worker,
+                            verdicts_for_worker,
                         );
+                        let records =
+                            crate::pipeline::batch::dry_run_batch(&batch_ctx, files.iter());
                         send_evt_lossy(
                             &evt_tx_for_worker,
                             Event::DryRunFinished { records },
@@ -2105,13 +2108,14 @@ mod mock_tests {
                         batch_running = true;
                         spawn_batch_job(
                             move || {
-                                let records = crate::pipeline::batch::dry_run_batch(
-                                    &params,
-                                    &dummy_cache,
-                                    &Config::default(),
-                                    &CapabilityVerdicts::default(),
-                                    files.iter(),
+                                let batch_ctx = BatchContext::new(
+                                    params,
+                                    Arc::new(dummy_cache),
+                                    Arc::new(Config::default()),
+                                    CapabilityVerdicts::default(),
                                 );
+                                let records =
+                                    crate::pipeline::batch::dry_run_batch(&batch_ctx, files.iter());
                                 send_evt_lossy(
                                     &evt_tx_for_worker,
                                     Event::DryRunFinished { records },

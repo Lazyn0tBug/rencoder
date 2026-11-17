@@ -166,17 +166,13 @@ fn transcode_batch_end_to_end_produces_output_files() {
         max_fps: rencoder_lib::types::MaxFpsConfig::default(),
     };
 
-    let mut verdicts = rencoder_lib::encoder::nvenc::CapabilityVerdicts::default();
-    let results = transcode_batch(
-        &params,
-        &files,
-        &cache,
-        &config,
-        &mut verdicts,
-        ProcessOutput::Null,
-        None,
-        None,
+    let mut ctx = rencoder_lib::pipeline::context::BatchContext::new(
+        params,
+        std::sync::Arc::new(cache),
+        std::sync::Arc::new(config),
+        rencoder_lib::encoder::nvenc::CapabilityVerdicts::default(),
     );
+    let results = transcode_batch(&files, &mut ctx, ProcessOutput::Null, None, None);
 
     assert_eq!(results.len(), 2);
     for record in &results {
@@ -237,16 +233,14 @@ fn transcode_batch_skips_when_output_exists() {
         max_fps: rencoder_lib::types::MaxFpsConfig::default(),
     };
 
-    let mut verdicts = rencoder_lib::encoder::nvenc::CapabilityVerdicts::default();
-    let result = transcode_single(
-        &task,
-        &params,
-        &cache,
-        &config,
-        &mut verdicts,
-        ProcessOutput::Null,
-    )
-    .expect("transcode_single should succeed");
+    let mut ctx = rencoder_lib::pipeline::context::BatchContext::new(
+        params,
+        std::sync::Arc::new(cache),
+        std::sync::Arc::new(config),
+        rencoder_lib::encoder::nvenc::CapabilityVerdicts::default(),
+    );
+    let result = transcode_single(&task, &mut ctx, ProcessOutput::Null)
+        .expect("transcode_single should succeed");
     assert!(matches!(
         result.outcome,
         rencoder_lib::types::EncodingOutcome::Skipped(
