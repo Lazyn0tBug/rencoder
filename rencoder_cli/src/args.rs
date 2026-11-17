@@ -28,6 +28,13 @@ use std::path::PathBuf;
     about = "Smart video transcoder and analyzer"
 )]
 pub struct Cli {
+    /// Force a fresh NVENC capability detection for this run and update
+    /// the stored result. Global: it works before or after the
+    /// subcommand (`rencoder --detect encode ...` ==
+    /// `rencoder encode --detect ...`).
+    #[arg(long, global = true)]
+    pub detect: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -38,7 +45,15 @@ pub enum Command {
     Encode(EncodeArgs),
     /// Analyze video frame-rate distribution.
     Analyze(AnalyzeArgs),
+    /// Detect this machine's NVENC capability, store the result and
+    /// print a report.
+    Detect(DetectArgs),
 }
+
+/// `rencoder detect` -- no options of its own; the global `--detect`
+/// flag is what forces a refresh elsewhere.
+#[derive(Args, Debug)]
+pub struct DetectArgs {}
 
 #[derive(Args, Debug)]
 pub struct EncodeArgs {
@@ -289,6 +304,30 @@ mod tests {
     }
 
     // ---- analyze ----
+
+    // ---- detect ----
+
+    #[test]
+    fn detect_subcommand_parses() {
+        let cli = parse_ok(&["rencoder", "detect"]);
+        assert!(matches!(cli.command, Command::Detect(_)));
+    }
+
+    #[test]
+    fn detect_flag_is_global() {
+        // Before the subcommand ...
+        let cli = parse_ok(&["rencoder", "--detect", "encode", "-f", "in.mp4"]);
+        assert!(cli.detect);
+        // ... and after it.
+        let cli = parse_ok(&["rencoder", "encode", "--detect", "-f", "in.mp4"]);
+        assert!(cli.detect);
+    }
+
+    #[test]
+    fn detect_flag_defaults_to_false() {
+        let cli = parse_ok(&["rencoder", "encode", "-f", "in.mp4"]);
+        assert!(!cli.detect);
+    }
 
     #[test]
     fn analyze_defaults() {

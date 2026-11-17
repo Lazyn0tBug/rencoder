@@ -92,6 +92,28 @@ pub fn resolve_data_dir() -> Option<PathBuf> {
     app_dir().map(|d| d.join("data"))
 }
 
+/// Resolves the NVENC capability record (`nvenc-capability.json`).
+///
+/// The record lives next to the config in the app dir: it is machine
+/// state, like the config, not a log or a work record.
+///
+/// Priority:
+///
+/// 1. `$RENENCODER_NVENC_CACHE` if set and non-empty (explicit override
+///    for debugging / CI / read-only systems)
+/// 2. `<app_dir>/nvenc-capability.json`
+///
+/// Returns `None` only when the env var is unset *and* `app_dir()` is
+/// unavailable. Empty-string env var is treated as unset.
+pub fn resolve_nvenc_cache() -> Option<PathBuf> {
+    if let Some(raw) = env::var_os("RENENCODER_NVENC_CACHE") {
+        if !raw.is_empty() {
+            return Some(PathBuf::from(raw));
+        }
+    }
+    app_dir().map(|d| d.join(crate::encoder::nvenc::CAPABILITY_FILE_NAME))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

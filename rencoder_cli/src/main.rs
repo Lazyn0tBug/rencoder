@@ -21,9 +21,14 @@ use rencoder_lib::{
     collect::collect_files,
     config::{AnalyzeFormatArg, AppConfig, Config},
     data::extract::probe_video_metadata,
-    pipeline::{batch::transcode_batch, cache::init_encoder_cache},
+    encoder::nvenc,
+    pipeline::{
+        batch::transcode_batch,
+        cache::{cache_from_resolution, init_encoder_cache},
+    },
     types::{EncodeParams, EncodingOutcome, ProcessOutput, SkippedReason, Target, VideoFormat},
 };
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use tracing::{info, instrument, warn};
 
@@ -31,9 +36,74 @@ fn main() -> Result<()> {
     tracing_init::init().context("initialize tracing")?;
     let cli = args::Cli::parse();
     match cli.command {
-        args::Command::Encode(encode_args) => encode_cmd(encode_args),
+        args::Command::Encode(encode_args) => encode_cmd(encode_args, cli.detect),
         args::Command::Analyze(analyze_args) => analyze_cmd(analyze_args),
+        args::Command::Detect(_) => detect_cmd(),
     }
+}
+
+/// `rencoder detect` -- probe this machine's NVENC capability, store the
+/// result next to the config, and print a report.
+///
+/// The report is the point: "which hardware encoders can this machine
+/// actually run" becomes something the user can ask, instead of
+/// something they only learn from a fallback warning.
+fn detect_cmd() -> Result<()> {
+    let cache_path = rencoder_lib::config::path::resolve_nvenc_cache();
+    let resolution =
+        nvenc::resolve(cache_path.as_deref(), true).context("NVENC detection failed")?;
+    let record = resolution
+        .to_save
+        .ok_or_else(|| anyhow::anyhow!("detection produced no record"))?;
+
+    if let Some(path) = &cache_path {
+        if let Err(e) = nvenc::save(path, &record) {
+            warn!(
+                error = %e,
+                path = %path.display(),
+                "could not store the NVENC capability record"
+            );
+        }
+    }
+    print!("{}", nvenc::report(&record));
+    Ok(())
+}
+
+/// What the user answered when advised that the stored capability is
+/// past its review date.
+enum Refresh {
+    /// Re-probe now.
+    Yes,
+    /// Keep the stored result; do not ask again for 30 days.
+    No,
+    /// Not interactive -- keep the stored result, ask nothing.
+    Skip,
+}
+
+/// Advise the user that the stored NVENC capability may be stale.
+///
+/// The record stays valid until the user says otherwise -- nobody knows
+/// the state of a machine better than its owner. A decline pushes the
+/// next advice 30 days out so we never nag on every run.
+fn advise_refresh() -> Result<Refresh> {
+    if !std::io::stdin().is_terminal() {
+        println!(
+            "NVENC 检测结果已超过 {} 天，如需更新请运行 `rencoder detect`。",
+            nvenc::REVIEW_INTERVAL_DAYS
+        );
+        return Ok(Refresh::Skip);
+    }
+    print!(
+        "NVENC 检测结果已超过 {} 天，可能已过期。是否重新检测？[y/N] ",
+        nvenc::REVIEW_INTERVAL_DAYS
+    );
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer)?;
+    Ok(match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Refresh::Yes,
+        _ => Refresh::No,
+    })
 }
 
 /// `rencoder encode ...` -- full pipeline: load config, init encoder
@@ -41,7 +111,7 @@ fn main() -> Result<()> {
 /// write per-file records to `<app_dir>/data/encoding-*.parquet`
 /// (U18; honors `$RENENCODER_DATA_DIR`).
 #[instrument(skip_all, fields(files = tracing::field::Empty))]
-fn encode_cmd(args: args::EncodeArgs) -> Result<()> {
+fn encode_cmd(args: args::EncodeArgs, force_detect: bool) -> Result<()> {
     let app_config = load_app_config(args.config.as_deref())?;
 
     let enc = app_config.encode.as_ref();
@@ -136,8 +206,53 @@ fn encode_cmd(args: args::EncodeArgs) -> Result<()> {
         format
     );
 
-    let cache =
-        init_encoder_cache(enable_nv).with_context(|| "failed to initialize encoder cache")?;
+    // NVENC capability: prefer the stored record (probing costs
+    // ~200-500ms per encoder, and the answer barely changes). `--detect`
+    // forces a fresh probe; a record past its review date only gets the
+    // user asked about it.
+    let cache = if enable_nv {
+        let cache_path = rencoder_lib::config::path::resolve_nvenc_cache();
+        let mut resolution = nvenc::resolve(cache_path.as_deref(), force_detect)
+            .context("NVENC detection failed")?;
+
+        if resolution.review_due && !force_detect {
+            match advise_refresh()? {
+                Refresh::Yes => {
+                    resolution = nvenc::resolve(cache_path.as_deref(), true)
+                        .context("NVENC detection failed")?;
+                }
+                Refresh::No => {
+                    // Push the next advice 30 days out -- we must not
+                    // nag on every run.
+                    if let Some(path) = &cache_path {
+                        if let Some(mut record) = nvenc::load(path) {
+                            record.defer_review(chrono::Utc::now());
+                            if let Err(e) = nvenc::save(path, &record) {
+                                warn!(
+                                    error = %e,
+                                    "could not update the NVENC capability record"
+                                );
+                            }
+                        }
+                    }
+                }
+                Refresh::Skip => {}
+            }
+        }
+
+        if let (Some(path), Some(record)) = (&cache_path, resolution.to_save.as_ref()) {
+            if let Err(e) = nvenc::save(path, record) {
+                warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "could not store the NVENC capability record"
+                );
+            }
+        }
+        cache_from_resolution(&resolution)
+    } else {
+        init_encoder_cache(false).with_context(|| "failed to initialize encoder cache")?
+    };
 
     // Install signal handler; the per-batch loop registers/unregisters
     // the current output path so a SIGINT cleans up the partial file.

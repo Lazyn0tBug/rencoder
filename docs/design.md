@@ -214,6 +214,65 @@ CC 门槛这一条规则。
 你指定的 `av1_nvenc` 不可用，改用 `libsvtav1`）。静默替换是这里最坏的行为——用户以为
 在用硬件，其实在用软件。
 
+**NVENC 编码失败 = 当场 fallback（不重探）**：
+
+探测结论可能过期（驱动升级、ffmpeg 换版本、GPU 被禁用），于是"探测说可用、实际跑
+不起来"。这时**不重新探测**——一次失败的 NVENC 编码本身就说明这台机器不具备该能力，
+直接当场降级：
+
+```
+用了 NVENC 编码器的这次 ffmpeg 调用失败了？
+├─ 是 → 该编码器在本进程内标记为不可用 → 用软件编码器重建命令 → 重跑这个文件
+└─ 否 → 按原路径记录失败
+```
+
+降级对本进程后续文件同样生效（避免每个文件都先失败一次）。
+
+**检测结果跨进程保存**：
+
+硬件不会天天变，探测结论没必要每次运行都重做。结论存到
+`<app_dir>/nvenc-capability.json`（应用目录根部，见 §3.6）：
+
+```json
+{
+  "version": 1,
+  "ffmpeg_version": "ffmpeg version 9.0.1 ...",
+  "ffmpeg_fingerprint": "<版本串 + 编码器列表的哈希>",
+  "probed_at": "2026-11-17T14:23:01Z",
+  "next_review_at": "2026-12-17T14:23:01Z",
+  "encoders": [
+    { "encoder": "h264_nvenc", "usable": true,  "reason": null },
+    { "encoder": "av1_nvenc",  "usable": false, "reason": "No NVENC capable devices found" }
+  ]
+}
+```
+
+- **指纹必须绑定 ffmpeg 构建**：探测回答的是"**这个 ffmpeg** 能不能在这里跑
+  av1_nvenc"。用户换了 ffmpeg（brew 升级、另一个环境的二进制）答案就变了。指纹 =
+  `ffmpeg -version` 版本串 + 编码器列表的哈希；加载时对不上就当没有缓存。
+- **过期只是建议**：30 天后（`next_review_at`）提示用户"检测结果可能过期，是否重新
+  检测？"，**用户选 yes 才重测**——没有人比用户更清楚这台机器的状态。选 no 就把
+  `next_review_at` 往后推 30 天，不再打扰。非交互环境（stdin 不是 TTY）只提示不追问。
+- **懒首次**：没有可用缓存时，普通运行顺带探测一次并写入，用户不需要先跑 `detect`。
+
+**detect 命令**：
+
+```
+rencoder detect              # 独立使用：探测 + 写入 + 打印报告
+rencoder --detect encode ... # 作为命令行选项：本次强制探测（并更新缓存）
+```
+
+`--detect` 是全局选项，出现在子命令前后都认。`detect` 的报告本身就是这项设计的
+主要价值——把"这台机器能用哪些硬件编码器"变成用户能主动查的事实：
+
+```
+NVENC capability (probed 2026-11-17T14:23:01Z)
+  ffmpeg      : ffmpeg version 9.0.1 (homebrew)
+  h264_nvenc  : usable
+  hevc_nvenc  : usable
+  av1_nvenc   : UNUSABLE — No NVENC capable devices found
+```
+
 **码控按编码器家族区分**：
 
 NVENC 用的是恒定质量（`-cq N -b:v 0`），不是 x265 的 CRF（`-crf N`）。对齐
@@ -1289,6 +1348,28 @@ rencoder encode [选项] [--] [额外FFmpeg参数]
 single-directory app。
 ```
 
+#### 全局选项与 detect 子命令
+
+```
+rencoder [全局选项] <子命令> [子命令选项]
+
+全局选项（子命令前后都可以写）：
+  --detect                  强制重新检测 NVENC 能力并更新本地结果
+
+子命令：
+  encode                    转码
+  analyze                   分析帧率分布
+  detect                    探测 NVENC 能力：写入本地结果并打印报告
+```
+
+- `--detect` 是**全局**选项：`rencoder --detect encode ...` 与
+  `rencoder encode --detect ...` 等价。
+- `rencoder detect` 独立使用：不依赖任何目标文件，只做探测 + 存盘 + 报告。
+- 检测结果落在 `<app_dir>/nvenc-capability.json`（应用目录根部）。普通运行时
+  优先读它；没有、指纹对不上、或者用户给了 `--detect`，才现场探测。
+  超过 30 天（`next_review_at`）只**提示**用户是否重新检测，用户选 yes 才重测，
+  选 no 就把 `next_review_at` 往后推 30 天（§2.2）。
+
 #### 分析模式参数（U17：CLI / config split 后）
 
 ```
@@ -1788,9 +1869,14 @@ rencoder-cli-<triple>/
 <user-chosen-install-dir>/     # = app_dir = current_exe().parent()
 ├── rencoder                   # 用户调用的入口
 ├── rencoder.toml              # 用户编辑的偏好（auto-create 后存在）
+├── nvenc-capability.json      # NVENC 能力检测结果（`rencoder detect` 写入）
 ├── log/                       # 日志：rencoder.YYYY-MM-DD.NN.log
 └── data/                      # 工作记录：encoding-<ISO8601>Z.parquet
 ```
+
+小工具的定位：应用目录就是"应用当前目录"，所有状态都跟应用放在一起——配置与
+NVENC 检测结果同级，只有日志分 `log/` 子目录（日志是唯一会不断增长、需要跟
+状态文件分开存放的东西）。
 
 **scripts/dist.sh 职责**：
 
@@ -3518,6 +3604,9 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 56 | 帧率容差 `eps = 0.01`,判定式 `src > cap + eps`（严格大于,eps 在上限右侧）—— 对齐 encode.zsh `MAX_FPS_EPS` | ✅ |
 | 57 | NVENC 选择：CLI `--nv`/`--no-nv` > 配置 `[encode].nv`；启用时做能力实测（1 帧试编码）并进程内缓存；不可用则 fallback + warn（带 stderr 原文） | ✅ |
 | 58 | NVENC 码控走 `-cq N -b:v 0`（恒定质量），其余编码器仍是 `-crf N` —— 对齐 encode.zsh `ENC_SPEC` | ✅ |
+| 59 | NVENC 检测结果跨进程保存到 `<app_dir>/nvenc-capability.json`；指纹绑定 ffmpeg 构建；30 天过期只是建议，用户选 yes 才重测，拒绝则再等 30 天 | ✅ |
+| 60 | `rencoder detect` 独立子命令 + 全局 `--detect` 选项（子命令前后都认） | ✅ |
+| 61 | NVENC 编码失败即当场 fallback（软件编码器重跑该文件），不重新探测；降级对本进程后续文件生效 | ✅ |
 | 57 | 同路径保护三层:`output_path_for` 命名避让 → `utils::fs::is_same_file`（父目录规范化 + 文件名大小写不敏感）→ 转码前拦截记 `Failed` 不调 ffmpeg | ✅ |
 
 ---

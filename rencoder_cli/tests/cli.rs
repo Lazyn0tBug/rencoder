@@ -132,6 +132,30 @@ fn encode_help_prints_options() {
 }
 
 #[test]
+fn detect_subcommand_prints_a_report() {
+    // Writes the capability record next to the binary (the app dir);
+    // that is the point of the command.
+    let out = run(&["detect"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("NVENC capability"), "got: {stdout}");
+    assert!(stdout.contains("ffmpeg"), "got: {stdout}");
+}
+
+#[test]
+fn detect_flag_appears_in_the_help() {
+    let out = run(&["--help"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("--detect"), "expected --detect in help");
+    assert!(stdout.contains("detect"), "expected the detect subcommand");
+}
+
+#[test]
 fn analyze_help_prints_options() {
     let out = run(&["analyze", "--help"]);
     assert!(out.status.success());

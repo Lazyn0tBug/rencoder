@@ -208,7 +208,7 @@ pub enum ProcessOutput {
 /// capability >= 8.0, and a mismatched driver or an exhausted NVENC
 /// session quota fails the same way. The probe is the only answer that
 /// covers the whole stack.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct NvencSupport {
     /// Encoder name, e.g. `"av1_nvenc"`.
     pub encoder: String,
