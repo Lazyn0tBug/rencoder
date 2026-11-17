@@ -21,7 +21,7 @@ use rencoder_lib::{
     collect::collect_files,
     config::{AnalyzeFormatArg, AppConfig, Config},
     data::extract::probe_video_metadata,
-    encoder::nvenc,
+    encoder::nvenc::{self, CapabilityVerdicts},
     pipeline::{
         batch::transcode_batch,
         cache::{cache_from_resolution, init_encoder_cache},
@@ -209,11 +209,16 @@ fn encode_cmd(args: args::EncodeArgs, force_detect: bool) -> Result<()> {
     // the current output path so a SIGINT cleans up the partial file.
     let current_output = signal::install_handler();
 
+    // The run's NVENC verdicts: an encoder that fails at runtime is
+    // not tried again for the rest of this command.
+    let mut verdicts = CapabilityVerdicts::default();
+
     let records = transcode_batch(
         &params,
         &files,
         &cache,
         &config,
+        &mut verdicts,
         ProcessOutput::Inherit,
         Some(&current_output),
         None,

@@ -21,9 +21,7 @@
 //! A second `StartBatch` while one is running returns
 //! `Event::Error(ConfigError)` rather than queueing.
 
-#[cfg(test)]
-use crossbeam_channel::unbounded;
-use crossbeam_channel::{bounded, select, Receiver, Sender};
+use crossbeam_channel::{bounded, select, unbounded, Receiver, Sender};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -36,6 +34,7 @@ use crate::config::app::AppConfig;
 use crate::config::path::resolve_data_dir;
 use crate::config::{path::resolve_config, Config};
 use crate::data::extract::probe_video_metadata_auto;
+use crate::encoder::nvenc::CapabilityVerdicts;
 use crate::error::EncodeError;
 use crate::pipeline::batch::{transcode_single_with_progress, FfmpegProgress};
 use crate::pipeline::cancel::CancelToken;
@@ -390,8 +389,6 @@ mod tests {
 
     // ---- send_evt_lossy / bounded channel policy (review #111) ----
 
-    use std::sync::atomic::AtomicU64;
-
     /// Helper: build a synthetic Event::Progress for tests.
     fn progress_event(i: usize) -> Event {
         Event::Progress {
@@ -408,7 +405,7 @@ mod tests {
     fn send_evt_lossy_drops_progress_events_when_full() {
         // cap 2: first two events land, rest are dropped (droppable class).
         let (tx, rx) = crossbeam_channel::bounded::<Event>(2);
-        let counter = AtomicU64::new(0);
+        let counter = DropCounter::default();
         for i in 0..5 {
             send_evt_lossy(&tx, progress_event(i), &counter);
         }
@@ -416,7 +413,7 @@ mod tests {
         let received: Vec<Event> = rx.try_iter().collect();
         assert_eq!(received.len(), 2);
         // 3 of the 5 dropped; counter incremented 3 times.
-        assert_eq!(counter.load(Ordering::Relaxed), 3);
+        assert_eq!(counter.0.load(Ordering::Relaxed), 3);
     }
 
     #[test]
@@ -451,7 +448,7 @@ mod tests {
         // so we test the drop path by closing the channel and
         // confirming the function returns without panic.
         let (tx, rx) = crossbeam_channel::bounded::<Event>(1);
-        let counter = AtomicU64::new(0);
+        let counter = DropCounter::default();
         send_evt_lossy(
             &tx,
             Event::BatchStarted {
@@ -469,7 +466,7 @@ mod tests {
         send_evt_lossy(&tx, Event::BatchCompleted { records: vec![] }, &counter);
         // Droppable counter must NOT have ticked (structural events
         // never increment).
-        assert_eq!(counter.load(Ordering::Relaxed), 0);
+        assert_eq!(counter.0.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -547,19 +544,40 @@ fn is_droppable_event(event: &Event) -> bool {
     )
 }
 
+/// Per-sender count of dropped events.
+///
+/// Each sender owns one — the shared `Arc<AtomicU64>` this replaced
+/// was written by five senders and read by nobody. The counter is
+/// never shared *between* senders; the analyze path does share one
+/// across its rayon workers (they are one sender), which is why the
+/// inside is an atomic.
+#[derive(Default)]
+struct DropCounter(std::sync::atomic::AtomicU64);
+
+impl DropCounter {
+    /// Record a drop. The first one warns — that is the signal the UI
+    /// is behind — and every hundredth after it keeps the count
+    /// visible without flooding the log.
+    fn record_drop(&self) {
+        let count = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if count == 1 || count.is_multiple_of(100) {
+            tracing::warn!(
+                dropped = count,
+                "evt_tx full; dropping progress events (the UI is behind)"
+            );
+        }
+    }
+}
+
 /// Send an `Event` to the UI with per-variant policy (review
 /// #111). Progress-class events drop on full; structural events
 /// block. Disconnected UI is logged + ignored.
-fn send_evt_lossy(
-    tx: &Sender<Event>,
-    event: Event,
-    dropped_counter: &std::sync::atomic::AtomicU64,
-) {
+fn send_evt_lossy(tx: &Sender<Event>, event: Event, dropped: &DropCounter) {
     match tx.try_send(event) {
         Ok(()) => {}
         Err(crossbeam_channel::TrySendError::Full(event)) => {
             if is_droppable_event(&event) {
-                dropped_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                dropped.record_drop();
             } else {
                 // Structural event: block until the UI drains. This
                 // stalls the actor thread briefly, but structural
@@ -695,12 +713,9 @@ pub fn start_controller() -> ControllerHandle {
     let config_for_thread = Arc::clone(&config);
     let app_config_for_thread = Arc::clone(&app_config);
     let config_path_for_thread = config_path.clone();
-    // Review #111: dropped-event counter lives on the actor thread
-    // (only it sends to evt_tx). `Arc<AtomicU64>` would let the
-    // handle read it later, but v1 doesn't expose the count; the
-    // thread-local counter is enough.
-    let dropped_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let dropped_for_thread = Arc::clone(&dropped_counter);
+    // Review #111: dropped-event counter. Each sender owns one, so
+    // the actor's counter is not the init thread's counter.
+    let dropped_for_actor = DropCounter::default();
 
     // Review #126: async cache init. The cache init spawns its own
     // thread and returns a one-shot receiver; the actor can drain
@@ -727,7 +742,7 @@ pub fn start_controller() -> ControllerHandle {
                 config_for_thread,
                 app_config_for_thread,
                 config_path_for_thread,
-                dropped_for_thread,
+                dropped_for_actor,
                 cache_rx,
             )
         })
@@ -797,7 +812,7 @@ fn refresh_encoder_cache(
     cache_cell: CacheCell,
     enable_nv: bool,
     evt_tx: Sender<Event>,
-    dropped_counter: Arc<std::sync::atomic::AtomicU64>,
+    dropped_counter: DropCounter,
 ) {
     std::thread::Builder::new()
         .name("rencoder-cache-refresh".into())
@@ -850,20 +865,30 @@ fn nvenc_capability_of(
 ///
 /// The actor reopens the busy gate when it reads the signal. A channel
 /// is the right tool: the signal is a message, not shared state.
-struct BatchDone;
+///
+/// `updates` carries the NVENC verdicts the worker found (an encoder
+/// that failed at runtime). The actor merges them into its authoritative
+/// copy, so the next batch inherits them.
+struct BatchDone {
+    /// Encoder name → usable?
+    updates: Vec<(String, bool)>,
+}
 
 /// Drain the pending "batch done" signals.
 ///
-/// Returns true if at least one batch has finished. The actor calls
-/// this right before it consults the busy gate: a worker can report
-/// "done" while the actor is handling a command, and a batch that has
-/// finished must not be mistaken for a running one.
-fn drain_batch_done(done_rx: &Receiver<BatchDone>) -> bool {
+/// Returns whether a batch has finished, plus the verdict updates it
+/// reported. The actor calls this right before it consults the busy
+/// gate: a worker can report "done" while the actor is handling a
+/// command, and a batch that has finished must not be mistaken for a
+/// running one.
+fn drain_batch_done(done_rx: &Receiver<BatchDone>) -> (bool, Vec<(String, bool)>) {
     let mut finished = false;
-    while done_rx.try_recv().is_ok() {
+    let mut updates = Vec::new();
+    while let Ok(BatchDone { updates: u }) = done_rx.try_recv() {
         finished = true;
+        updates.extend(u);
     }
-    finished
+    (finished, updates)
 }
 
 /// Sends the done signal when dropped.
@@ -872,11 +897,21 @@ fn drain_batch_done(done_rx: &Receiver<BatchDone>) -> bool {
 /// panics, the worker thread unwinds and the guard still reports
 /// "done". Without it a panic would leave the busy gate closed and
 /// strand the UI (no batch could ever start again).
-struct DoneGuard(Sender<BatchDone>);
+struct DoneGuard {
+    done_tx: Sender<BatchDone>,
+    /// Verdict updates the worker reported (drained on drop).
+    updates: Option<Receiver<(String, bool)>>,
+}
 
 impl Drop for DoneGuard {
     fn drop(&mut self) {
-        let _ = self.0.send(BatchDone);
+        let mut updates = Vec::new();
+        if let Some(rx) = &self.updates {
+            while let Ok(u) = rx.try_recv() {
+                updates.push(u);
+            }
+        }
+        let _ = self.done_tx.send(BatchDone { updates });
     }
 }
 
@@ -888,37 +923,62 @@ impl Drop for DoneGuard {
 /// The body owns the batch's event sender, so every event of the batch
 /// comes from one sender: the channel's FIFO order is the order the UI
 /// sees.
-fn spawn_batch_job<F>(body: F, done_tx: Sender<BatchDone>)
-where
+fn spawn_batch_job<F>(
+    body: F,
+    done_tx: Sender<BatchDone>,
+    updates: Option<Receiver<(String, bool)>>,
+) where
     F: FnOnce() + Send + 'static,
 {
     std::thread::Builder::new()
         .name("rencoder-batch".into())
         .spawn(move || {
             // Dropped when the body returns — or unwinds.
-            let _done = DoneGuard(done_tx);
+            let _done = DoneGuard { done_tx, updates };
             body();
         })
         .expect("spawn batch worker");
+}
+
+/// The channel a batch worker uses to report the encoders it found to
+/// be unusable.
+///
+/// Created by the actor and split: the sender goes to the processor
+/// (which writes into its verdict snapshot), the receiver is drained
+/// when the batch ends and handed to the actor with the done signal.
+struct BatchUpdates {
+    tx: Sender<(String, bool)>,
+    rx: Receiver<(String, bool)>,
+}
+
+impl BatchUpdates {
+    fn new() -> Self {
+        let (tx, rx) = unbounded();
+        Self { tx, rx }
+    }
 }
 
 /// Run one batch of tasks on a worker thread and report the outcome.
 ///
 /// `make_processor` is called *in the worker* — that is where the
 /// encoder cache is resolved (the one-time init may still be running,
-/// and waiting for it must not block the actor). The processor it
-/// returns is called once per task by [`TaskManager`], which also owns
-/// the batch/task scaffold logs.
+/// and waiting for it must not block the actor). It receives the
+/// sender of the verdict-update channel; the processor it returns
+/// reports the encoders it found to be unusable through it. The
+/// processor is called once per task by [`TaskManager`], which also
+/// owns the batch/task scaffold logs.
 ///
 /// The terminal event (`BatchCompleted` / `BatchCancelled`) is sent by
 /// the worker, so the whole batch reads as one ordered stream.
+#[allow(clippy::too_many_arguments)]
 fn spawn_task_batch<P, F>(
     tasks: Vec<TranscodeTask>,
     label: &'static str,
     batch_path: PathBuf,
     make_processor: F,
+    updates: BatchUpdates,
     evt_tx: Sender<Event>,
-    dropped_counter: Arc<std::sync::atomic::AtomicU64>,
+    dropped_counter: DropCounter,
     done_tx: Sender<BatchDone>,
 ) where
     P: FnMut(
@@ -927,11 +987,20 @@ fn spawn_task_batch<P, F>(
         ) -> Result<EncodingRecord, EncodeError>
         + Send
         + 'static,
-    F: FnOnce() -> Result<P, (ErrorCategory, String)> + Send + 'static,
+    F: FnOnce(Sender<(String, bool)>) -> Result<P, (ErrorCategory, String)> + Send + 'static,
 {
-    spawn_batch_job(
-        move || {
-            let mut processor = match make_processor() {
+    let BatchUpdates { tx, rx } = updates;
+    std::thread::Builder::new()
+        .name("rencoder-batch".into())
+        .spawn(move || {
+            // Dropped when the body returns — or unwinds. The guard
+            // reports "done" (and hands the verdict updates to the
+            // actor) even if the batch panicked.
+            let _done = DoneGuard {
+                done_tx,
+                updates: Some(rx),
+            };
+            let mut processor = match make_processor(tx) {
                 Ok(processor) => processor,
                 Err((category, message)) => {
                     // The batch could not start (no encoder cache).
@@ -964,9 +1033,8 @@ fn spawn_task_batch<P, F>(
                     &dropped_counter,
                 ),
             }
-        },
-        done_tx,
-    );
+        })
+        .expect("spawn batch worker");
 }
 
 /// Build the per-file processor for an encode batch.
@@ -974,19 +1042,25 @@ fn spawn_task_batch<P, F>(
 /// The processor owns everything it needs — no borrows — because it
 /// runs on the batch worker thread: the cache snapshot, the config,
 /// the params, the cancel token and the event sender.
+#[allow(clippy::too_many_arguments)]
 fn make_encode_processor(
     params: EncodeParams,
     config: Arc<Config>,
     cache: Arc<EncoderCache>,
     cancel: CancelToken,
     evt_tx: Sender<Event>,
-    dropped_counter: Arc<std::sync::atomic::AtomicU64>,
+    dropped_counter: DropCounter,
+    mut verdicts: CapabilityVerdicts,
+    update_tx: Sender<(String, bool)>,
 ) -> impl FnMut(
     &TranscodeTask,
     &crate::pipeline::task::TaskContext,
 ) -> Result<EncodingRecord, EncodeError>
        + Send
        + 'static {
+    // What the actor already knows: the verdicts this batch started
+    // with. The comparison tells us what the encode changed.
+    let mut reported = verdicts.clone();
     move |task: &TranscodeTask, ctx: &crate::pipeline::task::TaskContext| {
         // FileStarted uses 0-indexed (matches the v1 UI contract).
         // TaskManager passes 1-indexed in `ctx.index`; convert.
@@ -1013,8 +1087,9 @@ fn make_encode_processor(
         // The progress closure owns its own sender clone: it is built
         // per file and must not borrow the processor's captures.
         let evt_tx_progress = evt_tx.clone();
-        let dropped_progress = Arc::clone(&dropped_counter);
-        let mut on_progress = move |p: FfmpegProgress| {
+        // The progress closure borrows the processor's counter: it is
+        // the same sender, so the count keeps adding up.
+        let mut on_progress = |p: FfmpegProgress| {
             send_evt_lossy(
                 &evt_tx_progress,
                 Event::Progress {
@@ -1025,7 +1100,7 @@ fn make_encode_processor(
                     time_secs: p.time_secs,
                     eta_secs: p.eta_secs,
                 },
-                &dropped_progress,
+                &dropped_counter,
             );
         };
 
@@ -1034,9 +1109,19 @@ fn make_encode_processor(
             &params,
             &cache,
             &config,
+            &mut verdicts,
             &cancel,
             &mut on_progress,
         );
+
+        // Report the verdicts this file changed (rare: only when an
+        // NVENC encode failed and the encoder turned out to be
+        // unusable). The actor merges them into its authoritative copy
+        // so the next batch inherits them.
+        for change in verdicts.changes_since(&reported) {
+            let _ = update_tx.send(change);
+        }
+        reported.clone_from(&verdicts);
 
         match res {
             Ok(record) => {
@@ -1112,6 +1197,13 @@ fn take_cache(cell: &CacheCell, timeout: std::time::Duration) -> Option<CacheSlo
     }
 }
 
+/// Fold the verdicts a worker reported into the actor's copy.
+fn apply_verdict_updates(verdicts: &mut CapabilityVerdicts, updates: Vec<(String, bool)>) {
+    for (encoder, usable) in updates {
+        verdicts.set(&encoder, usable);
+    }
+}
+
 /// Turn a cache slot into the cache a batch needs, or into the error
 /// to report.
 fn cache_from_slot(slot: CacheSlot) -> Result<Arc<EncoderCache>, (ErrorCategory, String)> {
@@ -1131,7 +1223,7 @@ fn run_actor(
     // thread owns it; v1 doesn't surface the count, but it's
     // logged here on each drop so the warning includes a running
     // total.
-    dropped_counter: Arc<std::sync::atomic::AtomicU64>,
+    dropped_counter: DropCounter,
     // Review #126: cache init runs on a background thread; this
     // receiver yields the result when ready. The cmd_rx loop can
     // process other commands (Cancel / LoadHistory / SaveConfig)
@@ -1169,7 +1261,7 @@ fn run_actor(
     // Drive the OnceLock from the background init thread.
     let cache_cell_for_thread = Arc::clone(&cache_cell);
     let evt_tx_for_init = evt_tx.clone();
-    let dropped_for_init = Arc::clone(&dropped_counter);
+    let dropped_for_init = DropCounter::default();
     std::thread::spawn(move || {
         // The receiver delivers exactly one `Result`. Use
         // `unwrap_or_else` to surface a channel-disconnect as
@@ -1226,6 +1318,10 @@ fn run_actor(
     // "This batch is done" signals. The worker sends one when it
     // finishes; the actor reopens the busy gate when it reads one.
     let (done_tx, done_rx) = bounded::<BatchDone>(1);
+    // The authoritative NVENC verdicts: which encoders this session
+    // already found to be unusable. Each batch worker gets a snapshot
+    // and reports its changes back (the done signal carries them).
+    let mut verdicts = CapabilityVerdicts::default();
 
     loop {
         // Wait for the next command OR for a worker to report "done".
@@ -1233,7 +1329,8 @@ fn run_actor(
         let cmd = select! {
             recv(cmd_rx) -> cmd => cmd,
             recv(done_rx) -> done => {
-                if done.is_ok() {
+                if let Ok(BatchDone { updates }) = done {
+                    apply_verdict_updates(&mut verdicts, updates);
                     batch_running = false;
                 }
                 continue;
@@ -1258,7 +1355,9 @@ fn run_actor(
             &cmd,
             Command::StartBatch { .. } | Command::DryRun { .. } | Command::Analyze { .. }
         ) {
-            if drain_batch_done(&done_rx) {
+            let (finished, updates) = drain_batch_done(&done_rx);
+            apply_verdict_updates(&mut verdicts, updates);
+            if finished {
                 batch_running = false;
             }
             if batch_running {
@@ -1326,8 +1425,12 @@ fn run_actor(
                 let config_for_worker = Arc::clone(&config);
                 let cancel_for_worker = cancel_token.clone();
                 let evt_tx_for_worker = evt_tx.clone();
-                let dropped_for_worker = Arc::clone(&dropped_counter);
-                let make_processor = move || {
+                let dropped_for_worker = DropCounter::default();
+                // The worker gets a snapshot of the authoritative
+                // verdicts; whatever it changes is reported back
+                // through the update channel.
+                let verdicts_for_worker = verdicts.clone();
+                let make_processor = move |update_tx: Sender<(String, bool)>| {
                     let slot = take_cache(&cache_cell_for_worker, CACHE_WAIT_TIMEOUT).ok_or((
                         ErrorCategory::ConfigError,
                         "encoder cache init timed out".into(),
@@ -1340,6 +1443,8 @@ fn run_actor(
                         cancel_for_worker,
                         evt_tx_for_worker,
                         dropped_for_worker,
+                        verdicts_for_worker,
+                        update_tx,
                     ))
                 };
 
@@ -1352,8 +1457,9 @@ fn run_actor(
                     "encoding",
                     batch_path,
                     make_processor,
+                    BatchUpdates::new(),
                     evt_tx.clone(),
-                    Arc::clone(&dropped_counter),
+                    DropCounter::default(),
                     done_tx.clone(),
                 );
             }
@@ -1365,8 +1471,11 @@ fn run_actor(
                 // in during dry-run.
                 let cache_cell_for_worker = Arc::clone(&cache_cell);
                 let evt_tx_for_worker = evt_tx.clone();
-                let dropped_for_worker = Arc::clone(&dropped_counter);
+                let dropped_for_worker = DropCounter::default();
                 let config_for_worker = Arc::clone(&config);
+                // A dry run never encodes, so it cannot change a
+                // verdict -- it only reads them.
+                let verdicts_for_worker = verdicts.clone();
                 batch_running = true;
                 spawn_batch_job(
                     move || {
@@ -1402,6 +1511,7 @@ fn run_actor(
                             &params,
                             &cache,
                             &config_for_worker,
+                            &verdicts_for_worker,
                             files.iter(),
                         );
                         send_evt_lossy(
@@ -1411,6 +1521,7 @@ fn run_actor(
                         );
                     },
                     done_tx.clone(),
+                    None,
                 );
             }
 
@@ -1467,7 +1578,7 @@ fn run_actor(
                         Arc::clone(&cache_cell),
                         new_nv,
                         evt_tx.clone(),
-                        Arc::clone(&dropped_counter),
+                        DropCounter::default(),
                     );
                 }
             }
@@ -1482,7 +1593,7 @@ fn run_actor(
                 // stall every other command -- `Command::Cancel`
                 // included -- for the duration.
                 let evt_tx_detect = evt_tx.clone();
-                let dropped_detect = Arc::clone(&dropped_counter);
+                let dropped_detect = DropCounter::default();
                 std::thread::Builder::new()
                     .name("rencoder-detect".into())
                     .spawn(move || {
@@ -1523,7 +1634,7 @@ fn run_actor(
                 send_evt_lossy(&evt_tx, Event::AnalyzeStarted { total }, &dropped_counter);
 
                 let evt_tx_for_worker = evt_tx.clone();
-                let dropped_for_worker = Arc::clone(&dropped_counter);
+                let dropped_for_worker = DropCounter::default();
                 batch_running = true;
                 spawn_batch_job(
                     move || {
@@ -1567,6 +1678,7 @@ fn run_actor(
                         );
                     },
                     done_tx.clone(),
+                    None,
                 );
             }
         }
@@ -1723,7 +1835,7 @@ mod mock_tests {
         // Review #111: tests keep unbounded channels (synchronous
         // drain, the bound is irrelevant), but the event senders take
         // a dropped-event counter. Use a local one.
-        let dropped_counter = Arc::new(AtomicU64::new(0));
+        let dropped_counter = DropCounter::default();
         // Review #126: pre-populate the cache cell synchronously
         // so the mock processor closure can read it without an
         // init thread. Production wires this through the async
@@ -1769,7 +1881,8 @@ mod mock_tests {
                     &cmd,
                     Command::StartBatch { .. } | Command::DryRun { .. } | Command::Analyze { .. }
                 ) {
-                    if drain_batch_done(&done_rx) {
+                    let (finished, _updates) = drain_batch_done(&done_rx);
+                    if finished {
                         batch_running = false;
                     }
                     if batch_running {
@@ -1823,7 +1936,7 @@ mod mock_tests {
                             crate::pipeline::batch::batch_target_path_for_files(&files);
 
                         let evt_tx_for_closure = evt_tx.clone();
-                        let dropped_for_closure = Arc::clone(&dropped_counter);
+                        let dropped_for_closure = DropCounter::default();
                         let cancel_for_closure = cancel_token.clone();
                         // Review #126: clone the cache cell for the
                         // mock processor. Mock tests pre-populate it
@@ -1835,7 +1948,7 @@ mod mock_tests {
                         // closure takes ownership of its captures.
                         let params_for_batch = params.clone();
 
-                        let processor_factory = move || {
+                        let processor_factory = move |_update_tx: Sender<(String, bool)>| {
                             Ok(move |task: &TranscodeTask,
                                   ctx: &crate::pipeline::task::TaskContext|
                                   -> Result<EncodingRecord, EncodeError> {
@@ -1853,7 +1966,7 @@ mod mock_tests {
                                     return Err(EncodeError::UserCancel);
                                 }
                                 let evt_tx_progress = evt_tx_for_closure.clone();
-                                let dropped_progress = Arc::clone(&dropped_for_closure);
+                                let dropped_progress = DropCounter::default();
                                 let mut on_progress = move |p: FfmpegProgress| {
                                     send_evt_lossy(
                                         &evt_tx_progress,
@@ -1921,8 +2034,9 @@ mod mock_tests {
                             "encoding",
                             batch_path,
                             processor_factory,
+                            BatchUpdates::new(),
                             evt_tx.clone(),
-                            Arc::clone(&dropped_counter),
+                            DropCounter::default(),
                             done_tx.clone(),
                         );
                     }
@@ -1987,7 +2101,7 @@ mod mock_tests {
                             nvenc: Vec::new(),
                         };
                         let evt_tx_for_worker = evt_tx.clone();
-                        let dropped_for_worker = Arc::clone(&dropped_counter);
+                        let dropped_for_worker = DropCounter::default();
                         batch_running = true;
                         spawn_batch_job(
                             move || {
@@ -1995,6 +2109,7 @@ mod mock_tests {
                                     &params,
                                     &dummy_cache,
                                     &Config::default(),
+                                    &CapabilityVerdicts::default(),
                                     files.iter(),
                                 );
                                 send_evt_lossy(
@@ -2004,6 +2119,7 @@ mod mock_tests {
                                 );
                             },
                             done_tx.clone(),
+                            None,
                         );
                     }
                     // Analyze is exercised here with a lite version
@@ -2020,7 +2136,7 @@ mod mock_tests {
                         let total = files.len();
                         send_evt_lossy(&evt_tx, Event::AnalyzeStarted { total }, &dropped_counter);
                         let evt_tx_for_worker = evt_tx.clone();
-                        let dropped_for_worker = Arc::clone(&dropped_counter);
+                        let dropped_for_worker = DropCounter::default();
                         batch_running = true;
                         spawn_batch_job(
                             move || {
@@ -2053,6 +2169,7 @@ mod mock_tests {
                                 );
                             },
                             done_tx.clone(),
+                            None,
                         );
                     }
                 }

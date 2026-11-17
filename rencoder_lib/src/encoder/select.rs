@@ -18,22 +18,27 @@
 //! avoiding a per-file file read.
 
 use crate::config::Config;
-use crate::encoder::nvenc;
+use crate::encoder::nvenc::CapabilityVerdicts;
 use crate::error::EncodeError;
 use crate::types::{EncoderCache, VideoFormat};
 
 /// Choose an encoder for `format`. Never spawns subprocesses -- consults
-/// the pre-built cache and the supplied config only.
+/// the pre-built cache, the supplied config and the run's capability
+/// verdicts only.
+///
+/// `verdicts` carries what this run already learned: an encoder that
+/// failed at runtime is not tried again.
 pub fn select_encoder(
     format: VideoFormat,
     cache: &EncoderCache,
     config: &Config,
+    verdicts: &CapabilityVerdicts,
 ) -> Result<String, EncodeError> {
     // 1. Config override: the user's explicit choice. If this ffmpeg
     //    build doesn't have it (or it failed at runtime earlier in this
     //    process), fall back -- but say so.
     if let Some(override_enc) = config.encoders.for_format(format) {
-        if nvenc::is_disabled(override_enc) {
+        if verdicts.is_disabled(override_enc) {
             tracing::warn!(
                 encoder = override_enc,
                 format = format_name(format),
@@ -53,7 +58,7 @@ pub fn select_encoder(
     // 2. NVENC variant: only when the capability probe passed for it
     //    and it has not failed at runtime.
     if let Some(nvenc_enc) = nvenc_for(format) {
-        if nvenc::is_disabled(nvenc_enc) {
+        if verdicts.is_disabled(nvenc_enc) {
             tracing::warn!(
                 encoder = nvenc_enc,
                 format = format_name(format),
@@ -163,24 +168,29 @@ Encoders:
         Config::default()
     }
 
+    /// Empty verdicts: nothing is known to be unusable yet.
+    fn verdicts() -> CapabilityVerdicts {
+        CapabilityVerdicts::default()
+    }
+
     #[test]
     fn select_software_defaults_without_nvidia() {
         let cache = cache_with_usable_nvenc(&[]);
         let cfg = defaults();
         assert_eq!(
-            select_encoder(VideoFormat::Av1, &cache, &cfg).unwrap(),
+            select_encoder(VideoFormat::Av1, &cache, &cfg, &verdicts()).unwrap(),
             "libsvtav1"
         );
         assert_eq!(
-            select_encoder(VideoFormat::X264, &cache, &cfg).unwrap(),
+            select_encoder(VideoFormat::X264, &cache, &cfg, &verdicts()).unwrap(),
             "libx264"
         );
         assert_eq!(
-            select_encoder(VideoFormat::Hevc, &cache, &cfg).unwrap(),
+            select_encoder(VideoFormat::Hevc, &cache, &cfg, &verdicts()).unwrap(),
             "libx265"
         );
         assert_eq!(
-            select_encoder(VideoFormat::Vp9, &cache, &cfg).unwrap(),
+            select_encoder(VideoFormat::Vp9, &cache, &cfg, &verdicts()).unwrap(),
             "libvpx-vp9"
         );
     }
@@ -190,20 +200,20 @@ Encoders:
         let cache = cache_with_usable_nvenc(&["h264_nvenc", "hevc_nvenc", "av1_nvenc"]);
         let cfg = defaults();
         assert_eq!(
-            select_encoder(VideoFormat::Av1, &cache, &cfg).unwrap(),
+            select_encoder(VideoFormat::Av1, &cache, &cfg, &verdicts()).unwrap(),
             "av1_nvenc"
         );
         assert_eq!(
-            select_encoder(VideoFormat::X264, &cache, &cfg).unwrap(),
+            select_encoder(VideoFormat::X264, &cache, &cfg, &verdicts()).unwrap(),
             "h264_nvenc"
         );
         assert_eq!(
-            select_encoder(VideoFormat::Hevc, &cache, &cfg).unwrap(),
+            select_encoder(VideoFormat::Hevc, &cache, &cfg, &verdicts()).unwrap(),
             "hevc_nvenc"
         );
         // VP9 has no NVENC variant; falls through to software.
         assert_eq!(
-            select_encoder(VideoFormat::Vp9, &cache, &cfg).unwrap(),
+            select_encoder(VideoFormat::Vp9, &cache, &cfg, &verdicts()).unwrap(),
             "libvpx-vp9"
         );
     }
@@ -221,7 +231,7 @@ Encoders:
         };
         let cfg = defaults();
         assert_eq!(
-            select_encoder(VideoFormat::Av1, &cache, &cfg).unwrap(),
+            select_encoder(VideoFormat::Av1, &cache, &cfg, &verdicts()).unwrap(),
             "libsvtav1"
         );
     }
@@ -233,7 +243,7 @@ Encoders:
         let cache = cache_with_failed_nvenc(&["av1_nvenc"]);
         let cfg = defaults();
         assert_eq!(
-            select_encoder(VideoFormat::Av1, &cache, &cfg).unwrap(),
+            select_encoder(VideoFormat::Av1, &cache, &cfg, &verdicts()).unwrap(),
             "libsvtav1"
         );
     }
@@ -256,7 +266,7 @@ Encoders:
             nvenc: Vec::new(),
         };
         let cfg = defaults();
-        let result = select_encoder(VideoFormat::Av1, &cache, &cfg);
+        let result = select_encoder(VideoFormat::Av1, &cache, &cfg, &verdicts());
         assert!(matches!(result, Err(EncodeError::EncoderNotFound(_))));
     }
 
@@ -279,7 +289,7 @@ Encoders:
             ..Default::default()
         };
         assert_eq!(
-            select_encoder(VideoFormat::Av1, &cache, &cfg).unwrap(),
+            select_encoder(VideoFormat::Av1, &cache, &cfg, &verdicts()).unwrap(),
             "libaom-av1"
         );
     }
@@ -297,7 +307,7 @@ Encoders:
         };
         // libdav1d not in cache, so the chain falls through to default.
         assert_eq!(
-            select_encoder(VideoFormat::Av1, &cache, &cfg).unwrap(),
+            select_encoder(VideoFormat::Av1, &cache, &cfg, &verdicts()).unwrap(),
             "libsvtav1"
         );
     }
@@ -326,7 +336,7 @@ Encoders:
             ..Default::default()
         };
         assert_eq!(
-            select_encoder(VideoFormat::Av1, &cache, &cfg).unwrap(),
+            select_encoder(VideoFormat::Av1, &cache, &cfg, &verdicts()).unwrap(),
             "libaom-av1"
         );
     }

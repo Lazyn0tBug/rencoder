@@ -20,7 +20,6 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -42,36 +41,62 @@ const RECORD_VERSION: u32 = 1;
 /// actually present in `ffmpeg -encoders` get probed.
 const NVENC_CANDIDATES: [&str; 3] = ["h264_nvenc", "hevc_nvenc", "av1_nvenc"];
 
-/// Per-process capability verdict per NVENC encoder: `true` = this
-/// machine can run it, `false` = it cannot.
+/// NVENC verdicts for one run: which encoders are known to be unusable.
 ///
-/// The stored record can be stale (driver update, ffmpeg swap, GPU
-/// disabled in the BIOS). When an NVENC encode fails, we check the
-/// capability for real; the verdict is kept for the rest of the
-/// process so the same encoder is never probed twice and never used
-/// again once it is known to be unusable.
-static CAPABILITY: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
-
-fn capability_map() -> &'static Mutex<HashMap<String, bool>> {
-    CAPABILITY.get_or_init(|| Mutex::new(HashMap::new()))
+/// The scope is "one run" — the CLI's process, or the GUI session. The
+/// owner is explicit: whoever runs the batch holds the value and
+/// passes it down (`select_encoder` reads it, the NVENC fallback
+/// writes it). No lock, no process-global table: the write happens in
+/// exactly one place (the moment an NVENC encode fails) and the read
+/// in exactly one (encoder selection).
+///
+/// The GUI's actor keeps the authoritative copy: each batch worker
+/// gets a snapshot, and downgrades the worker finds are reported back
+/// so the next batch inherits them.
+#[derive(Clone, Debug, Default)]
+pub struct CapabilityVerdicts {
+    /// Encoder name → usable?
+    map: HashMap<String, bool>,
 }
 
-/// The verdict we already have for this encoder, if any.
-pub fn known_capability(encoder: &str) -> Option<bool> {
-    capability_map().lock().unwrap().get(encoder).copied()
-}
+impl CapabilityVerdicts {
+    /// The verdict we already have for this encoder, if any.
+    pub fn known(&self, encoder: &str) -> Option<bool> {
+        self.map.get(encoder).copied()
+    }
 
-/// Record a verdict for this encoder.
-pub fn set_capability(encoder: &str, usable: bool) {
-    capability_map()
-        .lock()
-        .unwrap()
-        .insert(encoder.to_string(), usable);
-}
+    /// Record a verdict for this encoder.
+    pub fn set(&mut self, encoder: &str, usable: bool) {
+        self.map.insert(encoder.to_string(), usable);
+    }
 
-/// Is this encoder known to be unusable? (`select_encoder` skips it.)
-pub fn is_disabled(encoder: &str) -> bool {
-    known_capability(encoder) == Some(false)
+    /// Is this encoder known to be unusable? (`select_encoder` skips it.)
+    pub fn is_disabled(&self, encoder: &str) -> bool {
+        self.known(encoder) == Some(false)
+    }
+
+    /// Fold another set of verdicts into this one.
+    ///
+    /// Used by the actor to merge a worker's findings back into the
+    /// authoritative copy.
+    pub fn merge(&mut self, other: &CapabilityVerdicts) {
+        for (encoder, usable) in &other.map {
+            self.map.insert(encoder.clone(), *usable);
+        }
+    }
+
+    /// The verdicts that differ from `base`.
+    ///
+    /// A batch worker starts from a snapshot of the authoritative copy
+    /// and reports what it changed; this is how the difference is
+    /// computed.
+    pub fn changes_since(&self, base: &CapabilityVerdicts) -> Vec<(String, bool)> {
+        self.map
+            .iter()
+            .filter(|(encoder, usable)| base.map.get(*encoder) != Some(*usable))
+            .map(|(encoder, usable)| (encoder.clone(), *usable))
+            .collect()
+    }
 }
 
 /// Can this machine run the NVENC encoder *right now*?
@@ -82,14 +107,14 @@ pub fn is_disabled(encoder: &str) -> bool {
 /// argument fails it too), and the CLI cannot tell them apart because
 /// ffmpeg's stderr is inherited rather than captured.
 ///
-/// The verdict is cached per process: the second failure of the same
-/// encoder does not probe again.
-pub fn verify_capability(encoder: &str) -> bool {
-    if let Some(known) = known_capability(encoder) {
+/// The verdict is recorded in `verdicts`: the second failure of the
+/// same encoder does not probe again.
+pub fn verify_capability(verdicts: &mut CapabilityVerdicts, encoder: &str) -> bool {
+    if let Some(known) = verdicts.known(encoder) {
         return known;
     }
     let usable = probe_one(encoder).is_ok();
-    set_capability(encoder, usable);
+    verdicts.set(encoder, usable);
     usable
 }
 
@@ -601,21 +626,64 @@ mod tests {
         assert_eq!(a, fingerprint("ffmpeg version 9.0.1", "encoders"));
     }
 
-    // ---- per-process capability verdicts ----
+    // ---- capability verdicts ----
 
     #[test]
     fn capability_verdict_round_trips() {
         let encoder = "registry_test_nvenc";
-        assert_eq!(known_capability(encoder), None);
-        assert!(!is_disabled(encoder));
+        let mut verdicts = CapabilityVerdicts::default();
+        assert_eq!(verdicts.known(encoder), None);
+        assert!(!verdicts.is_disabled(encoder));
 
-        set_capability(encoder, false);
-        assert_eq!(known_capability(encoder), Some(false));
-        assert!(is_disabled(encoder));
+        verdicts.set(encoder, false);
+        assert_eq!(verdicts.known(encoder), Some(false));
+        assert!(verdicts.is_disabled(encoder));
 
-        set_capability(encoder, true);
-        assert_eq!(known_capability(encoder), Some(true));
-        assert!(!is_disabled(encoder));
+        verdicts.set(encoder, true);
+        assert_eq!(verdicts.known(encoder), Some(true));
+        assert!(!verdicts.is_disabled(encoder));
+    }
+
+    #[test]
+    fn verdicts_merge_folds_the_other_side_in() {
+        // The actor merges a worker's findings back into the
+        // authoritative copy.
+        let mut authoritative = CapabilityVerdicts::default();
+        authoritative.set("a_nvenc", false);
+
+        let mut worker = authoritative.clone();
+        worker.set("b_nvenc", false);
+
+        authoritative.merge(&worker);
+        assert!(authoritative.is_disabled("a_nvenc"));
+        assert!(authoritative.is_disabled("b_nvenc"));
+    }
+
+    #[test]
+    fn changes_since_reports_only_the_differences() {
+        // The batch worker starts from a snapshot and reports what it
+        // changed — the actor merges those into its copy.
+        let base = CapabilityVerdicts::default();
+
+        let mut worker = base.clone();
+        worker.set("a_nvenc", false);
+        assert_eq!(
+            worker.changes_since(&base),
+            vec![("a_nvenc".to_string(), false)]
+        );
+
+        // Nothing changed since the base: no report.
+        assert!(worker.changes_since(&worker).is_empty());
+
+        // A verdict that came back (the encoder works after all) is a
+        // change too.
+        let mut worker = base.clone();
+        worker.set("b_nvenc", false);
+        worker.set("b_nvenc", true);
+        assert_eq!(
+            worker.changes_since(&base),
+            vec![("b_nvenc".to_string(), true)]
+        );
     }
 
     #[test]
@@ -624,9 +692,10 @@ mod tests {
         // spawns ffmpeg, and the second failure of the same encoder
         // must not cost another spawn.
         let encoder = "cached_test_nvenc";
-        set_capability(encoder, false);
-        assert!(!verify_capability(encoder));
-        assert_eq!(known_capability(encoder), Some(false));
+        let mut verdicts = CapabilityVerdicts::default();
+        verdicts.set(encoder, false);
+        assert!(!verify_capability(&mut verdicts, encoder));
+        assert_eq!(verdicts.known(encoder), Some(false));
     }
 
     #[test]

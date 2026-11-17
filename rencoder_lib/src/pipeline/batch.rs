@@ -25,6 +25,7 @@ use crate::data::extract::probe_video_metadata_auto;
 use crate::encoder::{
     command::{build_ffmpeg_command, should_skip_encoding},
     nvenc,
+    nvenc::CapabilityVerdicts,
     select::select_encoder,
 };
 use crate::error::EncodeError;
@@ -82,6 +83,7 @@ pub fn transcode_single(
     params: &EncodeParams,
     cache: &EncoderCache,
     config: &Config,
+    verdicts: &mut CapabilityVerdicts,
     output: ProcessOutput,
 ) -> Result<EncodingRecord, EncodeError> {
     let started_at_meta = Utc::now();
@@ -93,6 +95,7 @@ pub fn transcode_single(
         params,
         cache,
         config,
+        verdicts,
         started_at_meta,
         started_at_instant,
     );
@@ -113,6 +116,7 @@ pub fn transcode_single(
             output,
             cache,
             config,
+            verdicts,
         ),
     }
 }
@@ -134,6 +138,7 @@ pub fn transcode_single_with_progress(
     params: &EncodeParams,
     cache: &EncoderCache,
     config: &Config,
+    verdicts: &mut CapabilityVerdicts,
     cancel: &CancelToken,
     on_progress: &mut dyn FnMut(FfmpegProgress),
 ) -> Result<EncodingRecord, EncodeError> {
@@ -145,6 +150,7 @@ pub fn transcode_single_with_progress(
         params,
         cache,
         config,
+        verdicts,
         started_at_meta,
         started_at_instant,
     );
@@ -166,6 +172,7 @@ pub fn transcode_single_with_progress(
             on_progress,
             cache,
             config,
+            verdicts,
         ),
     }
 }
@@ -196,6 +203,7 @@ fn encode_prepare(
     params: &EncodeParams,
     cache: &EncoderCache,
     config: &Config,
+    verdicts: &CapabilityVerdicts,
     started_at_meta: chrono::DateTime<chrono::Utc>,
     _started_at_instant: Instant,
 ) -> EncodePrepareResult {
@@ -320,7 +328,7 @@ fn encode_prepare(
         }
     }
 
-    let argv = build_argv(task, params, cache, config, &metadata);
+    let argv = build_argv(task, params, cache, config, &metadata, verdicts);
     EncodePrepareResult::Ready {
         metadata,
         argv,
@@ -353,12 +361,16 @@ fn transcode_inner<F, R>(
     output_path: &Path,
     started_at_meta: chrono::DateTime<chrono::Utc>,
     started_at_instant: Instant,
+    verdicts: &mut CapabilityVerdicts,
     mut run_ffmpeg: F,
     rebuild_argv: R,
 ) -> Result<EncodingRecord, EncodeError>
 where
     F: FnMut(Vec<String>) -> Result<(), (ErrorCategory, String, String)>,
-    R: FnOnce() -> Option<Vec<String>>,
+    // The rebuild closure re-selects the encoder, so it needs the
+    // verdicts; it gets them from here (a shared reborrow of the
+    // `&mut` this function already owns).
+    R: FnOnce(&CapabilityVerdicts) -> Option<Vec<String>>,
 {
     let codec = metadata.codec.as_deref().unwrap_or("");
     let need_reduce = matches!(
@@ -398,7 +410,7 @@ where
     let mut fallback_note: Option<FallbackNote> = None;
     if run_result.is_err() {
         if let Some(encoder) = extract_encoder_from_argv(&argv) {
-            if nvenc::is_nvenc_encoder(&encoder) && !nvenc::verify_capability(&encoder) {
+            if nvenc::is_nvenc_encoder(&encoder) && !nvenc::verify_capability(verdicts, &encoder) {
                 let (_, message, stderr_tail) = run_result.clone().unwrap_err();
                 tracing::warn!(
                     encoder = %encoder,
@@ -411,7 +423,7 @@ where
                     message: message.clone(),
                     stderr_tail: stderr_tail.clone(),
                 });
-                if let Some(fallback_argv) = rebuild_argv() {
+                if let Some(fallback_argv) = rebuild_argv(verdicts) {
                     if !fallback_argv.is_empty() {
                         argv = fallback_argv;
                         run_result = run_ffmpeg(argv.clone());
@@ -489,6 +501,7 @@ fn transcode_with_argv(
     output: ProcessOutput,
     cache: &EncoderCache,
     config: &Config,
+    verdicts: &mut CapabilityVerdicts,
 ) -> Result<EncodingRecord, EncodeError> {
     let _ = output_path; // currently unused inside; reserved for symmetry with progress variant
     transcode_inner(
@@ -499,8 +512,11 @@ fn transcode_with_argv(
         output_path,
         started_at_meta,
         started_at_instant,
+        verdicts,
         |argv| run_ffmpeg_with_stderr(&argv, output),
-        || rebuild_argv_after_nvenc_failure(task, params, cache, config, metadata),
+        |verdicts| {
+            rebuild_argv_after_nvenc_failure(task, params, cache, config, metadata, verdicts)
+        },
     )
 }
 
@@ -512,8 +528,9 @@ fn rebuild_argv_after_nvenc_failure(
     cache: &EncoderCache,
     config: &Config,
     metadata: &VideoMetadata,
+    verdicts: &CapabilityVerdicts,
 ) -> Option<Vec<String>> {
-    let argv = build_argv(task, params, cache, config, metadata);
+    let argv = build_argv(task, params, cache, config, metadata, verdicts);
     if argv.is_empty() {
         None
     } else {
@@ -548,6 +565,7 @@ fn transcode_with_progress(
     on_progress: &mut dyn FnMut(FfmpegProgress),
     cache: &EncoderCache,
     config: &Config,
+    verdicts: &mut CapabilityVerdicts,
 ) -> Result<EncodingRecord, EncodeError> {
     transcode_inner(
         task,
@@ -557,8 +575,11 @@ fn transcode_with_progress(
         output_path,
         started_at_meta,
         started_at_instant,
+        verdicts,
         |argv| run_ffmpeg_with_progress(&argv, cancel, metadata.duration_secs, on_progress),
-        || rebuild_argv_after_nvenc_failure(task, params, cache, config, metadata),
+        |verdicts| {
+            rebuild_argv_after_nvenc_failure(task, params, cache, config, metadata, verdicts)
+        },
     )
 }
 
@@ -775,11 +796,13 @@ fn build_encode_record(
 /// listener spawned in `install_handler()`. Concurrent calls to
 /// `transcode_batch` from multiple threads would race on the same
 /// cell. One batch in flight at a time.
+#[allow(clippy::too_many_arguments)]
 pub fn transcode_batch(
     params: &EncodeParams,
     files: &[crate::types::InputPath],
     cache: &EncoderCache,
     config: &Config,
+    verdicts: &mut CapabilityVerdicts,
     output: ProcessOutput,
     current_output: Option<&PartialOutputHandle>,
     result_callback: Option<&ResultCallback>,
@@ -820,7 +843,7 @@ pub fn transcode_batch(
     // We log + return what we have so the caller still gets the
     // partial records.
     let run_result = manager.run(&tasks, "encoding", &batch_path, |task, _ctx| {
-        transcode_single(task, params, cache, config, output)
+        transcode_single(task, params, cache, config, verdicts, output)
     });
     let records: Vec<EncodingRecord> = match run_result {
         Ok(records) => records,
@@ -860,6 +883,7 @@ pub fn dry_run_batch<'a, I>(
     params: &EncodeParams,
     _cache: &EncoderCache,
     config: &Config,
+    verdicts: &CapabilityVerdicts,
     files: I,
 ) -> Vec<EncodingRecord>
 where
@@ -876,7 +900,15 @@ where
             input: file.clone(),
             output: Some(output_path),
         };
-        let prepare = encode_prepare(&task, params, _cache, config, Utc::now(), Instant::now());
+        let prepare = encode_prepare(
+            &task,
+            params,
+            _cache,
+            config,
+            verdicts,
+            Utc::now(),
+            Instant::now(),
+        );
         match prepare {
             EncodePrepareResult::Ready { .. } => {
                 // Plan: encode would actually run. Build a fresh
@@ -954,6 +986,7 @@ fn build_argv(
     cache: &EncoderCache,
     config: &Config,
     metadata: &VideoMetadata,
+    verdicts: &CapabilityVerdicts,
 ) -> Vec<String> {
     let src_fps = metadata.cap_fps();
     let codec = metadata.codec.as_deref().unwrap_or("");
@@ -964,7 +997,7 @@ fn build_argv(
         // and the post-probe skip path is handled in `transcode_with_argv`.
         return Vec::new();
     }
-    let encoder = select_encoder(params.format, cache, config)
+    let encoder = select_encoder(params.format, cache, config, verdicts)
         .expect("select_encoder in build_argv should have been filtered");
     build_ffmpeg_command(task, params, &encoder, src_fps, &config.ffmpeg_args)
 }
@@ -1760,8 +1793,16 @@ Encoders:
         let cache = cache_with_libx264_and_svtav1();
         let config = Config::default();
 
-        let record = transcode_single(&task, &params, &cache, &config, ProcessOutput::Null)
-            .expect("transcode_single should succeed");
+        let mut verdicts = CapabilityVerdicts::default();
+        let record = transcode_single(
+            &task,
+            &params,
+            &cache,
+            &config,
+            &mut verdicts,
+            ProcessOutput::Null,
+        )
+        .expect("transcode_single should succeed");
         assert_eq!(
             record.outcome,
             EncodingOutcome::Skipped(SkippedReason::OutputExists)
@@ -1787,8 +1828,16 @@ Encoders:
         let cache = cache_with_libx264_and_svtav1();
         let config = Config::default();
 
-        let record = transcode_single(&task, &params, &cache, &config, ProcessOutput::Null)
-            .expect("transcode_single should succeed");
+        let mut verdicts = CapabilityVerdicts::default();
+        let record = transcode_single(
+            &task,
+            &params,
+            &cache,
+            &config,
+            &mut verdicts,
+            ProcessOutput::Null,
+        )
+        .expect("transcode_single should succeed");
         assert_eq!(record.outcome, EncodingOutcome::Failed);
         let err = record.error.expect("failed record must carry an error");
         assert!(
@@ -1831,12 +1880,13 @@ Encoders:
         let config = Config::default();
 
         // A fake NVENC encoder name: `is_nvenc_encoder` only looks at
-        // the suffix, and the process-wide capability registry stays
-        // out of the real encoder names.
+        // the suffix, and the run's verdict table stays out of the
+        // real encoder names.
         //
         // The verdict is pre-seeded as "unusable" so the fallback path
         // does not have to spawn a real ffmpeg probe.
-        nvenc::set_capability("test_nvenc", false);
+        let mut verdicts = CapabilityVerdicts::default();
+        verdicts.set("test_nvenc", false);
         let nvenc_argv = vec![
             "ffmpeg".to_string(),
             "-c:v".to_string(),
@@ -1852,6 +1902,7 @@ Encoders:
             output.as_path(),
             Utc::now(),
             Instant::now(),
+            &mut verdicts,
             |argv| {
                 calls.push(argv);
                 Err((
@@ -1860,7 +1911,7 @@ Encoders:
                     String::new(),
                 ))
             },
-            || {
+            |verdicts| {
                 Some(
                     rebuild_argv_after_nvenc_failure(
                         &task,
@@ -1868,6 +1919,7 @@ Encoders:
                         &cache,
                         &config,
                         &VideoMetadata::default(),
+                        verdicts,
                     )
                     .unwrap(),
                 )
@@ -1879,8 +1931,8 @@ Encoders:
         assert_eq!(calls.len(), 2);
         assert!(calls[0].contains(&"test_nvenc".to_string()));
         assert!(calls[1].contains(&"libx264".to_string()));
-        // The encoder that failed is remembered for this process.
-        assert!(nvenc::is_disabled("test_nvenc"));
+        // The encoder that failed is remembered for this run.
+        assert!(verdicts.is_disabled("test_nvenc"));
         // The record carries the argv that actually ran.
         assert_eq!(record.ffmpeg_argv, calls[1]);
         // ... and the record says the NVENC attempt happened and why.
@@ -1899,7 +1951,8 @@ Encoders:
         // The encode failed, but the encoder itself works -- so the
         // failure was something else (disk full, bad arguments). Falling
         // back would double the work and hide the real problem.
-        nvenc::set_capability("usable_nvenc", true);
+        let mut verdicts = CapabilityVerdicts::default();
+        verdicts.set("usable_nvenc", true);
 
         let dir = std::env::temp_dir().join("rencoder_batch_nvenc_usable");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1936,6 +1989,7 @@ Encoders:
             output.as_path(),
             Utc::now(),
             Instant::now(),
+            &mut verdicts,
             |argv| {
                 calls.push(argv);
                 Err((
@@ -1944,7 +1998,7 @@ Encoders:
                     String::new(),
                 ))
             },
-            || {
+            |verdicts| {
                 Some(
                     rebuild_argv_after_nvenc_failure(
                         &task,
@@ -1952,6 +2006,7 @@ Encoders:
                         &cache,
                         &config,
                         &VideoMetadata::default(),
+                        verdicts,
                     )
                     .unwrap(),
                 )
@@ -1963,14 +2018,15 @@ Encoders:
         assert_eq!(calls.len(), 1);
         assert_eq!(record.outcome, EncodingOutcome::Failed);
         // The encoder is not blacklisted -- it works.
-        assert!(!nvenc::is_disabled("usable_nvenc"));
+        assert!(!verdicts.is_disabled("usable_nvenc"));
     }
 
     #[test]
     fn failed_fallback_reports_both_failures() {
         // Both attempts fail: the record has to name both, otherwise it
         // blames the software encoder for a hardware problem.
-        nvenc::set_capability("bothfail_nvenc", false);
+        let mut verdicts = CapabilityVerdicts::default();
+        verdicts.set("bothfail_nvenc", false);
 
         let dir = std::env::temp_dir().join("rencoder_batch_nvenc_both_fail");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2006,6 +2062,7 @@ Encoders:
             output.as_path(),
             Utc::now(),
             Instant::now(),
+            &mut verdicts,
             |_argv| {
                 Err((
                     ErrorCategory::FfmpegNonzeroExit,
@@ -2013,7 +2070,7 @@ Encoders:
                     String::new(),
                 ))
             },
-            || {
+            |verdicts| {
                 Some(
                     rebuild_argv_after_nvenc_failure(
                         &task,
@@ -2021,6 +2078,7 @@ Encoders:
                         &cache,
                         &config,
                         &VideoMetadata::default(),
+                        verdicts,
                     )
                     .unwrap(),
                 )
@@ -2068,6 +2126,7 @@ Encoders:
             "-i".into(),
             "x".into(),
         ];
+        let mut verdicts = CapabilityVerdicts::default();
         let record = transcode_with_argv(
             &task,
             &params,
@@ -2079,6 +2138,7 @@ Encoders:
             ProcessOutput::Null,
             &_cache,
             &_config,
+            &mut verdicts,
         )
         .expect("transcode_with_argv should return Ok(EncodingRecord)");
 
