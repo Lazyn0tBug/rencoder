@@ -13,3 +13,5 @@ rencoder_cli/data/
 .context/
 Cargo.lock
 __pycache__/
+# Added by code-review-graph
+.code-review-graph/
