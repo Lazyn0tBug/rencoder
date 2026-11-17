@@ -2262,11 +2262,15 @@ UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `int
 
 **不修改**（CLI 路径零回归）：
 
-- `transcode_batch` 签名;`EncodingRecord` / `EncodingOutcome` / `ErrorContext`(见 §3.2)
+- `EncodingRecord` / `EncodingOutcome` / `ErrorContext`(见 §3.2)
 - `TaskManager` / `PartialOutputHandle` / signal handler(CLI 端)
 - `EncodeError`(保持 `thiserror` 原样,不加 `Serialize`);`ProcessOutput` 枚举(见 §3.2)
 - `AppConfig` 加载/校验
 - CLI 路径的 ffmpeg 编排(含 stderr 收集 + partial output 清理)——保留 `cmd.output()` 同步路径
+
+> `transcode_batch` 签名**已作废**（§3.10.4 段 A：参数包收成 `BatchContext`）。
+> `process_one_file` 签名同理——它早已不存在，现在由 `BatchContext` + `FileEncoder`
+> 缝承担（§3.10.4）。
 
 **新增**(U21):
 
@@ -3738,6 +3742,105 @@ AppConfig ──EncodeConfig──┬─ EncodeParams::from_app_config ──→
 反面教材：能力清单的每一行，CLI 拼成 `av1_nvenc   : UNUSABLE — 原因`，GUI 拼成
 `av1_nvenc  unusable — 原因`——同一件事两种措辞，隔几轮就漂移。
 
+#### 3.10.4 上下文用对象传：别让参数包长成影子实现
+
+**症状（数据）**：函数签名越来越长——`transcode_with_progress` 12 个参数、
+`transcode_with_argv` 11 个、`transcode_batch` / `make_encode_processor` 8 个、
+`transcode_inner` 10 个、`build_encode_record` 9 个、`run_actor` 7 个
+（`cargo clippy` 的 `too_many_arguments` 已经在其中五处被 `#[allow]` 压掉——
+那是信号，不是许可）。同时 `job.rs` 里**整个 actor 被实现了两遍**：生产版
+`run_actor` 和测试版 `run_actor_inline`（366 行），后者把闸门、worker 起停、
+事件序列、cancel 接线全部重写了一遍。
+
+**病根**：不是"参数多"，是**没有上下文对象**。同一批东西（params / cache /
+config / verdicts）被拆成散参数，在每一层重新组装一遍；每加一个需求（比如
+NVENC 判定表），就要给八个函数各加一个参数。因为上下文是隐式的，任何想复用
+这段逻辑的人——包括测试替身——只能把参数重新拼一遍，拼出来的还是**一份副本**。
+
+**分层**（每层只有一种该共享的东西）：
+
+| 层 | 共享什么 | 不共享什么 |
+|---|---|---|
+| 机制 | worker 起停、busy 闸门、done 信号、cancel bit（§3.10.1.1） | —— |
+| 上下文 | 一批要带的东西 | 每个文件的现场 |
+| 协议 | —— | 每个作业发哪些事件 |
+
+**两个上下文对象**（第三个被否，见下）：
+
+- **`BatchContext`（批级）**：这一批要带的东西——参数、解析好的编码器缓存、
+  运行时配置、本次运行的 NVENC 判定。一批一份，**在 worker 里构造**
+  （缓存就绪之后，见 §3.10.1.1 规则 5），随 worker 一起跑完这一批。
+  编码链往下传的是**这个对象**，不是它的零件。
+  - 只装**两端都要用**的东西：CLI 特有的 `PartialOutputHandle` +
+    `ProcessOutput`、GUI 特有的 `CancelToken` + 进度 sink，都由调用方在缝的
+    那一层单独传，不进上下文。
+  - 只有编码与预演两条路径用它；分析作业不用（它不碰编码链）。
+  - 叶子函数（`select_encoder`）保持平铺参数——上下文在 `build_argv` 边界
+    解包一次。否则 `encoder` 模块会反过来依赖 `pipeline`。
+- **`FilePlan`（文件级）**：一个文件的现场——探测结果、算好的 argv、解析后的
+  输出路径、两个时间基准。它**取代** `EncodePrepareResult::Ready`（现在那三个
+  字段就是它的前身），不是并存的新类型。计时是 prepare 的**输入**（调用方
+  建的），prepare 把它带进 plan 里。
+
+**否掉的一个**：~~`ActorState`~~ —— 它不是任何函数的参数，**一个参数也省不掉**；
+而 busy 闸门在生产 actor 里本来就是集中的一处（§3.10.1.1 规则 5），再包一层
+只是把一个 `bool` 变成两个方法。actor 的运行期状态留在 actor 的局部变量里。
+
+**缝只有一条**：`FileEncoder`——"编一个文件"这一步（**包含 prepare**）。
+生产实现走真 ffmpeg，测试实现走 mock；**事件由共享代码发**，替身只提供这一步，
+于是**协议只有一份实现**。
+
+- 它是一个**单方法 trait**（`fn encode(&mut self, …)`），不是 `FnMut` 套在锁里：
+  后者会把锁持到整个编码结束（几秒到几分钟），违反 §3.10.1 规则 2。
+- 它坐在 **prepare 之上**（替身整个替换"编一个文件"这一步），否则 mock 会先
+  去 probe 不存在的素材文件，永远走不到缝。
+- 缝只服务 GUI 路径；CLI 路径直接调 `transcode_single`（共享 `BatchContext`，
+  不共享缝）——两条路径的 ffmpeg 调用方式本来就不同（同步 vs 可取消）。
+- NVENC 探测**不另开缝**：lib 已经有 `nvenc::resolve_with(path, force, runner)`
+  这个 runner 缝（§3.8.6 的"新增"表里已列），注入路径与 runner 就够。
+- 编码器缓存**不需要缝**：`run_actor` 本来就收一条 `cache_rx`，而 `CacheInit`
+  的字段全是 `pub`——测试往通道里发一条预置的缓存即可。
+
+**规则**：
+
+1. **上下文用对象传，不用参数包**：同一批东西在层与层之间传的是对象，不是零件。
+   什么时候该抽成对象？三个条件都满足：(a) 同一组东西出现在 ≥3 个签名里；
+   (b) 它只有一个拥有者（一批 / 一个文件 / 一个 actor）；(c) 它不在多处被改。
+   ——"参数超过 N 个就抽对象"是坏判据：它分不清"四个总是一起走的参数"和
+   "四个恰好挨着的参数"，而且会不停地生类型。
+2. **测试替身走同一条路**：mock 不复制 actor——它造一个 mock 编码器，驱动
+   **同一个** actor。复制 actor = 协议有两份实现 = 迟早漂移。
+   （step 1 的 cancel 修复就是这样被遮住的：生产 actor 堵着不处理 Cancel，
+   而 mock 那份 actor 是另一套代码——测试全绿，线上不生效。见 §3.10.1.1。）
+   替身不是第二份实现，是同一条路上可替换的一段——所以它的接口只有一个实现
+   也是合法的。
+3. **注入的依赖集中写明**：`ActorEnv` 里放"从哪来"的东西（配置、历史数据
+   目录、NVENC 记录路径、编码器、探测 runner），不藏在函数体深处
+   （`resolve_data_dir()` 这种 env 读取不该藏在 actor 里——它让测试没法并行）。
+   `ActorEnv` 构造后不变；运行期会变的东西（闸门、批 id、判定、cancel token）
+   留在 actor 的局部变量里。
+
+**本节取代 §3.8.6 "不修改" 清单中的两条**：`transcode_batch` 签名与
+`process_one_file` 签名（§3.8.6 那两行标注"见 §3.10.4，已作废"）。
+其余"不修改"条目（`EncodingRecord` / `EncodeError` / `TaskManager` /
+`PartialOutputHandle` / AppConfig 加载 / CLI 的行为面）不受影响。
+
+**已知副作用（记录，不在本次解决）**：闸门拒绝复用 `Event::Error`，而 §3.8.3
+把 `Event::Error` 定义为 fatal-only——UI 在 Encoding 阶段收到它会把正在跑的
+那批 finalize 成 Done。一次良性的"重复 StartBatch 被拒"因此会被当成"这批失败
+了"。共享 actor 之后这条行为会被测试钉住，届时需要单独决定：给闸门拒绝一个
+独立的 event variant，还是在 reducer 里区分。
+
+**迁移顺序**：
+
+| 段 | 改什么 | 怎么验证 |
+|---|---|---|
+| A | 编码链引入 `BatchContext` 与 `FilePlan`（后者取代 `EncodePrepareResult::Ready`），参数包收成对象 | 全量测试 + 真 ffmpeg 集成测试（CLI 与 GUI 共用的热路径） |
+| B' | actor 的依赖可注入（`ActorEnv` + 编码器缝 + 探测 runner + 缓存走已有的 `cache_rx`）**并**删掉 mock actor，19 处调用改跑生产 actor | 原有协议测试保留并改跑在生产 actor 上；**四条断言含义会变**（mock 忽略命令里的 params、Analyze 的闸门、预演用默认配置、Detect 返回假能力） |
+
+B' 必须一次落地：缝先于第二个实现出现，就是"只有一个实现的接口"——
+本项目自己反对这种形状。
+
 ---
 
 ## 5. 错误处理策略
@@ -3885,6 +3988,9 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 68 | busy 闸门从 `Arc<AtomicBool>` 降为 actor 本地 `bool`；跨线程可变状态只剩 cancel 的 1 bit + done 通道 | ✅ |
 | 69 | NVENC 降级判定从进程级全局表改为显式持有者（actor 持权威副本，worker 拿快照，降级经 done 通道回报；CLI 持本地副本）——全局可变状态消失 | ✅ |
 | 70 | 丢弃事件计数从跨发送方共享的 `Arc<AtomicU64>` 改为每个发送方一份 `DropCounter` + 首丢告警——原来只加不读 | ✅ |
+| 71 | 编码链用上下文对象传参：`BatchContext`（批级）+ `FilePlan`（文件级，取代 `EncodePrepareResult::Ready`）；`select_encoder` 保持平铺参数（边界解包） | ✅ |
+| 72 | 测试替身走同一条路：mock 不复制 actor，改为注入 mock 编码器驱动**同一个** actor；缝是单方法 trait（不套锁），且只在"编一个文件"这一步（prepare 之上） | ✅ |
+| 73 | 抽对象的判据是"≥3 个签名 + 唯一拥有者 + 不在多处被改"，不是"参数超过 N 个"——后者会不停生类型（`ActorState` / `FileClock` 因此被否） | ✅ |
 
 ---
 
