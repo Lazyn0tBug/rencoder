@@ -34,11 +34,9 @@
 use dioxus::desktop;
 use dioxus::prelude::*;
 
-use std::sync::Arc;
-
 use crossbeam_channel::Sender;
 
-use rencoder_lib::config::app::{AppConfig, FormatArg};
+use rencoder_lib::config::app::FormatArg;
 use rencoder_lib::job::{start_controller, Command};
 
 use crate::msg::{
@@ -55,8 +53,6 @@ const CSS: &str = include_str!("../assets/style.css");
 #[component]
 pub fn App() -> Element {
     let state: Signal<AppState, SyncStorage> = use_signal_sync(AppState::default);
-    let mut config: Signal<Arc<AppConfig>, SyncStorage> =
-        use_signal_sync(|| Arc::new(AppConfig::default()));
     let mut cmd_tx: Signal<Option<Sender<Command>>, SyncStorage> = use_signal_sync(|| None);
 
     // One-shot setup: start the controller, wire the channels,
@@ -65,7 +61,6 @@ pub fn App() -> Element {
         let handle = start_controller();
         let cfg = handle.config();
         let (tx, evt_rx) = handle.into_split();
-        config.set(cfg);
         cmd_tx.set(Some(tx.clone()));
 
         // v1.2 review #133: seed the Setup-page editor's
@@ -74,9 +69,8 @@ pub fn App() -> Element {
         // `apply_config_field_edit` (msg.rs) mutates `config_draft`
         // on every edit; the form dispatches `UserEditedConfigField`
         // which fires `Command::SaveConfig` for atomic TOML write.
-        let cfg_seed = config.read().clone();
         let mut state_thread = state;
-        state_thread.with_mut(|s| s.config_draft = (*cfg_seed).clone());
+        state_thread.with_mut(|s| s.config_draft = (*cfg).clone());
         // v1.2 (review #133 follow-up): seed the log with a
         // "controller ready" line so the user sees the log is
         // wired up before any ffmpeg activity. Purely cosmetic —
@@ -105,14 +99,13 @@ pub fn App() -> Element {
         // cmd_tx are set once at startup (v1: no Save button, no
         // runtime config reload) so caching is safe. Saves one
         // SyncStorage read-lock + Arc clone per lib event.
-        let cfg_cached = config.read().clone();
         let cmd_tx_cached = cmd_tx.read().clone();
         std::thread::Builder::new()
             .name("rencoder-ui-drain".to_string())
             .spawn(move || {
                 if let Some(tx) = cmd_tx_cached.as_ref() {
                     while let Ok(evt) = evt_rx.recv() {
-                        state_thread.with_mut(|s| reduce(s, Msg::Lib(evt), tx, &cfg_cached));
+                        state_thread.with_mut(|s| reduce(s, Msg::Lib(evt), tx));
                     }
                 }
             })
@@ -135,7 +128,6 @@ pub fn App() -> Element {
             // thread, so we re-read once (cheap — single read +
             // Arc clone). This is the only re-read; the log drain
             // thread itself caches these values for its loop.
-            let cfg_for_log = config.read().clone();
             let cmd_tx_for_log = cmd_tx.read().clone();
             std::thread::Builder::new()
                 .name("rencoder-ui-log-drain".to_string())
@@ -146,8 +138,7 @@ pub fn App() -> Element {
                         .as_ref()
                         .expect("cmd_tx must be set by use_hook before log drain runs");
                     while let Ok(line) = log_rx.recv() {
-                        state_for_log
-                            .with_mut(|s| reduce(s, Msg::LibLogLine(line), tx, &cfg_for_log));
+                        state_for_log.with_mut(|s| reduce(s, Msg::LibLogLine(line), tx));
                     }
                 })
                 .expect("rencoder-ui-log-drain: failed to spawn log drain thread");
@@ -179,15 +170,15 @@ pub fn App() -> Element {
     rsx! {
         style { dangerous_inner_html: "{CSS}" }
         div { class: "app",
-            TopBar { state: state, cmd_tx: cmd_tx, config: config }
+            TopBar { state: state, cmd_tx: cmd_tx }
             if let Some(ref err) = last_error {
                 div { class: "global-error", "{err}" }
             }
             div { class: "page",
                 match active_page {
-                    Page::Setup => rsx! { SetupPage { state: state, cmd_tx: cmd_tx, config: config } },
-                    Page::Task => rsx! { TaskPage { state: state, cmd_tx: cmd_tx, config: config } },
-                    Page::History => rsx! { HistoryPage { state: state, cmd_tx: cmd_tx, config: config } },
+                    Page::Setup => rsx! { SetupPage { state: state, cmd_tx: cmd_tx } },
+                    Page::Task => rsx! { TaskPage { state: state, cmd_tx: cmd_tx } },
+                    Page::History => rsx! { HistoryPage { state: state, cmd_tx: cmd_tx } },
                     Page::Log => rsx! { LogPage { state: state } },
                 }
             }
@@ -313,7 +304,6 @@ fn ToastCard(toast: Toast, state: Signal<AppState, SyncStorage>) -> Element {
 fn TopBar(
     state: Signal<AppState, SyncStorage>,
     cmd_tx: Signal<Option<Sender<Command>>, SyncStorage>,
-    config: Signal<Arc<AppConfig>, SyncStorage>,
 ) -> Element {
     let active = state.read().active_page;
     let tx_exit = cmd_tx.read().clone();
@@ -322,10 +312,10 @@ fn TopBar(
         header { class: "top-bar",
             span { class: "brand", "RENENCODER" }
             nav { class: "tabs",
-                tab_button { state: state, cmd_tx: cmd_tx, config: config, page: Page::Setup, active: active, label: "SETUP" }
-                tab_button { state: state, cmd_tx: cmd_tx, config: config, page: Page::Task, active: active, label: "TASK" }
-                tab_button { state: state, cmd_tx: cmd_tx, config: config, page: Page::History, active: active, label: "HISTORY" }
-                tab_button { state: state, cmd_tx: cmd_tx, config: config, page: Page::Log, active: active, label: "LOG" }
+                tab_button { state: state, cmd_tx: cmd_tx, page: Page::Setup, active: active, label: "SETUP" }
+                tab_button { state: state, cmd_tx: cmd_tx, page: Page::Task, active: active, label: "TASK" }
+                tab_button { state: state, cmd_tx: cmd_tx, page: Page::History, active: active, label: "HISTORY" }
+                tab_button { state: state, cmd_tx: cmd_tx, page: Page::Log, active: active, label: "LOG" }
             }
             div { class: "top-bar-right",
                 if let Some(tx) = tx_exit {
@@ -362,7 +352,6 @@ fn TopBar(
 fn tab_button(
     state: Signal<AppState, SyncStorage>,
     cmd_tx: Signal<Option<Sender<Command>>, SyncStorage>,
-    config: Signal<Arc<AppConfig>, SyncStorage>,
     page: Page,
     active: Page,
     label: &'static str,
@@ -371,9 +360,8 @@ fn tab_button(
         button {
             class: if active == page { "tab tab-active" } else { "tab" },
             onclick: move |_| {
-                let cfg = config.read().clone();
                 if let Some(tx) = cmd_tx.read().clone() {
-                    state.with_mut(|s| reduce(s, Msg::UserClickedTab(page), &tx, &cfg));
+                    state.with_mut(|s| reduce(s, Msg::UserClickedTab(page), &tx));
                 }
             },
             "{label}"
@@ -397,7 +385,6 @@ fn tab_button(
 fn SetupPage(
     state: Signal<AppState, SyncStorage>,
     cmd_tx: Signal<Option<Sender<Command>>, SyncStorage>,
-    config: Signal<Arc<AppConfig>, SyncStorage>,
 ) -> Element {
     // Snapshot the values needed to render the form. The form
     // is fully controlled — every input reads from `draft` and
@@ -429,7 +416,6 @@ fn SetupPage(
                                 // is cloneable; the verbosity is worth it
                                 // for the ownership clarity.
                                 let mut state_c = state;
-                                let config_c = config;
                                 let tx_c = tx_opt.clone();
                                 rsx! {
                                     label { class: "radio",
@@ -439,8 +425,7 @@ fn SetupPage(
                                             value: "{fmt:?}",
                                             checked: "{checked}",
                                             onchange: move |_| {
-                                                let cfg = config_c.read().clone();
-                                                if let Some(tx) = tx_c.clone() {
+                                                        if let Some(tx) = tx_c.clone() {
                                                     state_c.with_mut(|s| {
                                                         reduce(
                                                             s,
@@ -449,7 +434,6 @@ fn SetupPage(
                                                                 value: value.clone(),
                                                             },
                                                             &tx,
-                                                            &cfg,
                                                         )
                                                     });
                                                 }
@@ -480,8 +464,7 @@ fn SetupPage(
                                     let Ok(v) = evt.value().parse::<u32>() else {
                                         return;
                                     };
-                                    let cfg = config.read().clone();
-                                    if let Some(tx) = tx_for_crf.clone() {
+                                                        if let Some(tx) = tx_for_crf.clone() {
                                         state.with_mut(|s| {
                                             reduce(
                                                 s,
@@ -490,7 +473,6 @@ fn SetupPage(
                                                     value: ConfigFieldValue::Crf(v),
                                                 },
                                                 &tx,
-                                                &cfg,
                                             )
                                         });
                                     }
@@ -515,7 +497,6 @@ fn SetupPage(
                                 let kind = ConfigFieldKind::MaxFps;
                                 let value = ConfigFieldValue::MaxFps(cap);
                                 let mut state_c = state;
-                                let config_c = config;
                                 let tx_c = tx_opt.clone();
                                 rsx! {
                                     label { class: "radio",
@@ -525,8 +506,7 @@ fn SetupPage(
                                             value: "{label}",
                                             checked: "{checked}",
                                             onchange: move |_| {
-                                                let cfg = config_c.read().clone();
-                                                if let Some(tx) = tx_c.clone() {
+                                                        if let Some(tx) = tx_c.clone() {
                                                     state_c.with_mut(|s| {
                                                         reduce(
                                                             s,
@@ -535,7 +515,6 @@ fn SetupPage(
                                                                 value: value.clone(),
                                                             },
                                                             &tx,
-                                                            &cfg,
                                                         )
                                                     });
                                                 }
@@ -558,7 +537,6 @@ fn SetupPage(
                                 let checked = draft.nv.unwrap_or(false) == value;
                                 let kind = ConfigFieldKind::Nv;
                                 let mut state_c = state;
-                                let config_c = config;
                                 let tx_c = tx_opt.clone();
                                 rsx! {
                                     label { class: "radio",
@@ -568,8 +546,7 @@ fn SetupPage(
                                             value: "{label}",
                                             checked: "{checked}",
                                             onchange: move |_| {
-                                                let cfg = config_c.read().clone();
-                                                if let Some(tx) = tx_c.clone() {
+                                                        if let Some(tx) = tx_c.clone() {
                                                     state_c.with_mut(|s| {
                                                         reduce(
                                                             s,
@@ -578,7 +555,6 @@ fn SetupPage(
                                                                 value: ConfigFieldValue::Nv(value),
                                                             },
                                                             &tx,
-                                                            &cfg,
                                                         )
                                                     });
                                                 }
@@ -616,7 +592,6 @@ fn SetupPage(
                     };
                     let review_due = capability.map(|c| c.review_due).unwrap_or(false);
                     let mut state_c = state;
-                    let config_c = config;
                     let tx_c = tx_opt.clone();
                     rsx! {
                         div { class: "form-row",
@@ -639,10 +614,9 @@ fn SetupPage(
                                 button {
                                     class: "secondary-btn",
                                     onclick: move |_| {
-                                        let cfg = config_c.read().clone();
                                         if let Some(tx) = tx_c.clone() {
                                             state_c.with_mut(|s| {
-                                                reduce(s, Msg::UserClickedDetectNv, &tx, &cfg)
+                                                reduce(s, Msg::UserClickedDetectNv, &tx)
                                             });
                                         }
                                     },
@@ -665,8 +639,7 @@ fn SetupPage(
                                 placeholder: "mp4, mkk, mov (empty = all)",
                                 value: draft.extensions.clone().map(|v| v.join(", ")).unwrap_or_default(),
                                 oninput: move |evt| {
-                                    let cfg = config.read().clone();
-                                    if let Some(tx) = tx_for_ext.clone() {
+                                                        if let Some(tx) = tx_for_ext.clone() {
                                         state.with_mut(|s| {
                                             reduce(
                                                 s,
@@ -675,7 +648,6 @@ fn SetupPage(
                                                     value: ConfigFieldValue::Extensions(evt.value()),
                                                 },
                                                 &tx,
-                                                &cfg,
                                             )
                                         });
                                     }
@@ -713,7 +685,6 @@ fn SetupPage(
 fn DirPicker(
     state: Signal<AppState, SyncStorage>,
     cmd_tx: Signal<Option<Sender<Command>>, SyncStorage>,
-    config: Signal<Arc<AppConfig>, SyncStorage>,
 ) -> Element {
     let input_dir = state.read().input_dir.clone();
     let active_phase = state.read().tasks.active.as_ref().map(|t| t.phase);
@@ -748,7 +719,6 @@ fn DirPicker(
                     // picker (no re-renders, no Exit click).
                     let mut state_async = state;
                     let cmd_tx_async = cmd_tx;
-                    let config_async = config;
                     tokio::spawn(async move {
                         let result = rfd::AsyncFileDialog::new()
                             .set_title("Choose input directory")
@@ -757,9 +727,8 @@ fn DirPicker(
                         if let Some(handle) = result {
                             let path = handle.path().to_path_buf();
                             if let Some(tx) = cmd_tx_async.read().clone() {
-                                let cfg = config_async.read().clone();
                                 state_async.with_mut(|st| {
-                                    reduce(st, Msg::UserSelectedDir(path), &tx, &cfg)
+                                    reduce(st, Msg::UserSelectedDir(path), &tx)
                                 });
                             }
                         }
@@ -775,7 +744,6 @@ fn DirPicker(
 fn TaskPage(
     state: Signal<AppState, SyncStorage>,
     cmd_tx: Signal<Option<Sender<Command>>, SyncStorage>,
-    config: Signal<Arc<AppConfig>, SyncStorage>,
 ) -> Element {
     let active = state.read().tasks.active.clone();
     let history = state.read().task_history.clone();
@@ -843,7 +811,7 @@ fn TaskPage(
             // Body order: DirPicker -> count summary -> badge
             // -> file list -> progress -> bottom button bar.
 
-            DirPicker { state: state, cmd_tx: cmd_tx, config: config }
+            DirPicker { state: state, cmd_tx: cmd_tx }
 
             // Count summary — only when at least one phase has run
             // a dry-run (to_encode/to_skip > 0 means the dry-run is
@@ -902,7 +870,7 @@ fn TaskPage(
             // TaskPageButton internally decides hidden vs visible
             // (per §3.8.7.2 state table).
             div { class: "task-button-bar",
-                TaskPageButton { state: state, cmd_tx: cmd_tx, config: config }
+                TaskPageButton { state: state, cmd_tx: cmd_tx }
             }
         }
     }
@@ -939,13 +907,11 @@ fn TaskPage(
 fn TaskPageButton(
     state: Signal<AppState, SyncStorage>,
     cmd_tx: Signal<Option<Sender<Command>>, SyncStorage>,
-    config: Signal<Arc<AppConfig>, SyncStorage>,
 ) -> Element {
     let active = state.read().tasks.active.clone();
     let history = state.read().task_history.clone();
     let input_dir = state.read().input_dir.clone();
     let phase = active.as_ref().map(|t| t.phase);
-    let cfg = config.read().clone();
     let tx_opt = cmd_tx.read().clone();
     let Some(tx) = tx_opt else {
         return rsx! { span {} };
@@ -966,12 +932,11 @@ fn TaskPageButton(
             // arm dispatches DryRun/StartBatch depending on
             // current state).
             let tx_s = tx.clone();
-            let cfg_s = cfg.clone();
             rsx! {
                 button {
                     class: "primary-btn",
                     onclick: move |_| {
-                        state.with_mut(|s| reduce(s, Msg::UserClickedStart, &tx_s, &cfg_s));
+                        state.with_mut(|s| reduce(s, Msg::UserClickedStart, &tx_s));
                     },
                     "{label}"
                 }
@@ -980,12 +945,11 @@ fn TaskPageButton(
         TaskButtonKind::EnabledSecondary { label } => {
             // Cancel ✕: only fires during Encoding.
             let tx_c = tx.clone();
-            let cfg_c = cfg.clone();
             rsx! {
                 button {
                     class: "secondary-btn",
                     onclick: move |_| {
-                        state.with_mut(|s| reduce(s, Msg::UserClickedCancel, &tx_c, &cfg_c));
+                        state.with_mut(|s| reduce(s, Msg::UserClickedCancel, &tx_c));
                     },
                     "{label}"
                 }
@@ -1142,7 +1106,6 @@ fn ProgressPanel(state: Signal<AppState, SyncStorage>) -> Element {
 fn HistoryPage(
     state: Signal<AppState, SyncStorage>,
     cmd_tx: Signal<Option<Sender<Command>>, SyncStorage>,
-    config: Signal<Arc<AppConfig>, SyncStorage>,
 ) -> Element {
     let history = state.read().history.clone();
     let tx_opt = cmd_tx.read().clone();
@@ -1158,8 +1121,7 @@ fn HistoryPage(
                     button {
                         class: "secondary-btn",
                         onclick: move |_| {
-                            let cfg = config.read().clone();
-                            state.with_mut(|s| reduce(s, Msg::UserClickedLoadHistory, &tx, &cfg));
+                                        state.with_mut(|s| reduce(s, Msg::UserClickedLoadHistory, &tx));
                         },
                         "Refresh ⟳"
                     }

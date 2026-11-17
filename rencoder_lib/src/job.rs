@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use parking_lot::Mutex;
 
 use chrono::{DateTime, Utc};
 
@@ -767,6 +767,12 @@ fn load_and_share_config(evt_tx: &Sender<Event>) -> Option<(Arc<Config>, Arc<App
     Some((Arc::new(config), Arc::new(app_config), config_path))
 }
 
+/// The encoder cache cell: a replaceable handle.
+///
+/// `Arc` inside so the read path is a pointer clone -- the reader
+/// drops the lock before encoding (an encode can run for minutes).
+type CacheCell = Arc<Mutex<Option<Arc<Result<EncoderCache, EncodeError>>>>>;
+
 /// Re-resolve the encoder cache after the NVENC switch changed.
 ///
 /// The resolution spawns ffmpeg subprocesses, so it runs on its own
@@ -777,7 +783,7 @@ fn load_and_share_config(evt_tx: &Sender<Event>) -> Option<(Arc<Config>, Arc<App
 /// still works (it just may not match the new setting), while an
 /// error cache would fail every batch.
 fn refresh_encoder_cache(
-    cache_cell: Arc<RwLock<Option<Result<EncoderCache, EncodeError>>>>,
+    cache_cell: CacheCell,
     enable_nv: bool,
     evt_tx: Sender<Event>,
     dropped_counter: Arc<std::sync::atomic::AtomicU64>,
@@ -789,7 +795,8 @@ fn refresh_encoder_cache(
                 crate::pipeline::cache::init_encoder_cache_with_capability(enable_nv);
             match cache {
                 Ok(cache) => {
-                    *cache_cell.write() = Some(Ok(cache));
+                    let mut guard = cache_cell.lock();
+                    *guard = Some(Arc::new(Ok(cache)));
                     if let Some(capability) = capability {
                         send_evt_lossy(
                             &evt_tx,
@@ -857,11 +864,17 @@ fn run_actor(
     // failure visible.)
     // The cache is refreshable: the UI can flip `[encode].nv` at
     // runtime, and the NVENC capability has to be re-resolved for the
-    // next batch. A `OnceLock` could not be replaced, hence the
-    // `RwLock` (read per file, written only when the setting
-    // changes).
-    let cache_cell: Arc<RwLock<Option<Result<EncoderCache, EncodeError>>>> =
-        Arc::new(RwLock::new(None));
+    // next batch. A `OnceLock` could not be replaced.
+    //
+    // The cell holds an `Arc` so the read path is a pointer clone:
+    // the reader drops the lock immediately and then encodes without
+    // holding it. Holding a lock across an encode (minutes) would
+    // block the refresh thread for the whole file.
+    //
+    // A plain `Mutex` is the right primitive -- there is exactly one
+    // reader (the actor thread) and one writer (the refresh thread),
+    // so a read/write split would buy nothing.
+    let cache_cell: CacheCell = Arc::new(Mutex::new(None));
     let cache_cell_for_closure = Arc::clone(&cache_cell);
     let cache_cell_for_dry_run = Arc::clone(&cache_cell);
     // Drive the OnceLock from the background init thread.
@@ -895,7 +908,10 @@ fn run_actor(
                 &dropped_for_init,
             );
         }
-        *cache_cell_for_thread.write() = Some(init.cache);
+        {
+            let mut guard = cache_cell_for_thread.lock();
+            *guard = Some(Arc::new(init.cache));
+        }
         if let Some((category, message)) = err_event {
             send_evt_lossy(
                 &evt_tx_for_init,
@@ -1023,8 +1039,14 @@ fn run_actor(
                     // `Result<EncoderCache, EncodeError>` so a
                     // FAILED init surfaces the underlying error each
                     // time, not a generic fallback.
-                    let cache_guard = cache_cell_for_closure.read();
-                    let cache = match cache_guard.as_ref() {
+                    // Clone the handle out of the cell and drop the
+                    // lock: the encode below can run for minutes and
+                    // must not block a concurrent refresh.
+                    let cache_snapshot = {
+                        let guard = cache_cell_for_closure.lock();
+                        guard.clone()
+                    };
+                    let cache = match cache_snapshot.as_deref() {
                         Some(Ok(c)) => c,
                         Some(Err(e)) => {
                             send_evt_lossy(
@@ -1157,8 +1179,11 @@ fn run_actor(
                 // StartBatch. A failed cache init surfaces the error
                 // and skips the dry run; an unset cell means the
                 // init thread hasn't finished yet.
-                let cache_guard = cache_cell_for_dry_run.read();
-                let cache_ref = match cache_guard.as_ref() {
+                let cache_snapshot = {
+                    let guard = cache_cell_for_dry_run.lock();
+                    guard.clone()
+                };
+                let cache_ref = match cache_snapshot.as_deref() {
                     Some(Ok(c)) => c,
                     Some(Err(e)) => {
                         send_evt_lossy(

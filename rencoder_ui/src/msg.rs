@@ -504,17 +504,7 @@ pub enum Msg {
 ///     `Command::Cancel`. The lib respects cancel_token only
 ///     during encoding (Analyze is best-effort).
 ///   - `None` / `Done`: ignored
-pub fn reduce(
-    state: &mut AppState,
-    msg: Msg,
-    cmd_tx: &Sender<Command>,
-    // The UI's editable copy of the config lives in `state.config_draft`
-    // and is the single source of truth here: the Setup page edits it,
-    // the encode params are built from it, and it is what gets saved.
-    // The shared config (the lib's startup copy) is not consulted --
-    // reading it would ignore the user's edits.
-    _config: &rencoder_lib::config::app::AppConfig,
-) {
+pub fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>) {
     match msg {
         Msg::UserSelectedDir(path) => {
             if let Some(t) = &state.tasks.active {
@@ -1294,10 +1284,6 @@ mod tests {
     use rencoder_lib::config::app::AppConfig;
     use rencoder_lib::types::{EncoderSettings, EncodingOutcome};
 
-    fn default_config() -> AppConfig {
-        AppConfig::default()
-    }
-
     fn sample_record(path: &str, outcome: EncodingOutcome) -> EncodingRecord {
         EncodingRecord {
             source_path: path.into(),
@@ -1352,7 +1338,7 @@ mod tests {
         use crossbeam_channel::unbounded;
         let (tx, rx) = unbounded::<Command>();
         let mut state = fresh_state();
-        reduce(&mut state, Msg::UserClickedDetectNv, &tx, &default_config());
+        reduce(&mut state, Msg::UserClickedDetectNv, &tx);
         match rx
             .try_recv()
             .expect("a command should have been dispatched")
@@ -1381,7 +1367,6 @@ mod tests {
             &mut state,
             Msg::Lib(Event::NvencCapability(capability.clone())),
             &tx,
-            &default_config(),
         );
         let stored = state.nvenc_capability.expect("capability should be stored");
         assert_eq!(stored.support.len(), 1);
@@ -1401,7 +1386,6 @@ mod tests {
                 value: ConfigFieldValue::Nv(true),
             },
             &tx,
-            &default_config(),
         );
         assert_eq!(
             state.config_draft.encode.as_ref().and_then(|e| e.nv),
@@ -1415,12 +1399,7 @@ mod tests {
         let mut state = fresh_state();
         let tx = cmd_tx();
         let p = PathBuf::from("/some/dir");
-        reduce(
-            &mut state,
-            Msg::UserSelectedDir(p.clone()),
-            &tx,
-            &default_config(),
-        );
+        reduce(&mut state, Msg::UserSelectedDir(p.clone()), &tx);
         assert_eq!(state.input_dir, Some(p));
     }
 
@@ -1443,12 +1422,7 @@ mod tests {
             records: vec![],
             dry_run_records: vec![],
         });
-        reduce(
-            &mut state,
-            Msg::UserSelectedDir(PathBuf::from("/y")),
-            &tx,
-            &default_config(),
-        );
+        reduce(&mut state, Msg::UserSelectedDir(PathBuf::from("/y")), &tx);
         assert!(state.input_dir.is_none());
     }
 
@@ -1458,7 +1432,7 @@ mod tests {
         // the toast channel (not last_error).
         let mut state = fresh_state();
         let tx = cmd_tx();
-        reduce(&mut state, Msg::UserClickedStart, &tx, &default_config());
+        reduce(&mut state, Msg::UserClickedStart, &tx);
         assert!(state.tasks.active.is_none());
         assert_eq!(state.toasts.len(), 1);
         let toast = &state.toasts[0];
@@ -1488,7 +1462,7 @@ mod tests {
             dry_run_records: vec![],
         });
         state.input_dir = Some(PathBuf::from("/y"));
-        reduce(&mut state, Msg::UserClickedStart, &tx, &default_config());
+        reduce(&mut state, Msg::UserClickedStart, &tx);
         assert_eq!(state.toasts.len(), 1);
         let toast = &state.toasts[0];
         assert_eq!(toast.kind, ToastKind::Warning);
@@ -1523,7 +1497,7 @@ mod tests {
             dry_run_records: vec![],
         });
         state.input_dir = Some(std::path::PathBuf::from("/tmp"));
-        reduce(&mut state, Msg::UserClickedStart, &tx, &default_config());
+        reduce(&mut state, Msg::UserClickedStart, &tx);
 
         // No re-arm: the same task remains active, no new
         // DryRun dispatched, no command sent to the lib.
@@ -1567,12 +1541,7 @@ mod tests {
             dry_run_records: vec![],
         });
         state.last_error = Some("previous unrelated error".into());
-        reduce(
-            &mut state,
-            Msg::UserSelectedDir(PathBuf::from("/y")),
-            &tx,
-            &default_config(),
-        );
+        reduce(&mut state, Msg::UserSelectedDir(PathBuf::from("/y")), &tx);
         // Picker was rejected; stale error should be cleared.
         assert!(state.last_error.is_none());
         assert_eq!(state.input_dir, None);
@@ -1605,7 +1574,6 @@ mod tests {
             &mut state,
             Msg::Lib(Event::BatchCompleted { records: vec![] }),
             &tx,
-            &default_config(),
         );
         assert!(state.tasks.active.is_none());
         assert_eq!(state.viewing_task, None);
@@ -1643,7 +1611,6 @@ mod tests {
                 total_files: 5,
             }),
             &cmd_tx(),
-            &default_config(),
         );
         let t = state.tasks.active.as_ref().unwrap();
         assert_eq!(t.batch_id, Some(7));
@@ -1680,7 +1647,6 @@ mod tests {
                 eta_secs: None,
             }),
             &tx,
-            &default_config(),
         );
         assert!(state.progress.is_empty());
     }
@@ -1697,7 +1663,6 @@ mod tests {
                     line: format!("line {i}"),
                 }),
                 &tx,
-                &default_config(),
             );
         }
         assert_eq!(state.log.len(), 1000);
@@ -1716,7 +1681,6 @@ mod tests {
                 records: vec![rec.clone()],
             }),
             &tx,
-            &default_config(),
         );
         assert_eq!(state.history.len(), 1);
         assert_eq!(state.history[0].source_path, "/a.mp4");
@@ -1745,7 +1709,7 @@ mod tests {
             records: vec![],
             dry_run_records: vec![],
         });
-        reduce(&mut state, Msg::UserClickedCancel, &tx, &default_config());
+        reduce(&mut state, Msg::UserClickedCancel, &tx);
 
         // Phase flips to Cancelled synchronously (no wait for
         // lib's late Event::BatchCancelled).
@@ -1805,7 +1769,6 @@ mod tests {
                 total: 5,
             }),
             &tx,
-            &default_config(),
         );
         assert_eq!(
             state.tasks.active.as_ref().unwrap().phase,
@@ -1836,7 +1799,6 @@ mod tests {
                 record: sample_record("/late.mp4", EncodingOutcome::Succeeded),
             }),
             &tx,
-            &default_config(),
         );
         assert_eq!(
             state.tasks.active.as_ref().unwrap().records.len(),
@@ -1871,7 +1833,6 @@ mod tests {
                 record: rec.clone(),
             }),
             &tx,
-            &default_config(),
         );
         let t = state.tasks.active.as_ref().unwrap();
         assert_eq!(t.records.len(), 1);
@@ -1890,7 +1851,6 @@ mod tests {
                 message: "ffmpeg not found".into(),
             }),
             &tx,
-            &default_config(),
         );
         assert_eq!(state.last_error.as_deref(), Some("ffmpeg not found"));
     }
@@ -1922,7 +1882,6 @@ mod tests {
                 message: "encode failed".into(),
             }),
             &tx,
-            &default_config(),
         );
         assert!(state.tasks.active.is_none());
         assert_eq!(state.task_history.len(), 1);
@@ -1958,7 +1917,6 @@ mod tests {
                 message: "another batch is already running".into(),
             }),
             &tx,
-            &default_config(),
         );
         assert!(state.tasks.active.is_none());
         assert!(state.task_history.is_empty());
@@ -1994,12 +1952,7 @@ mod tests {
             sample_skipped("/b.mp4"),
             sample_record("/c.mp4", EncodingOutcome::Failed),
         ];
-        reduce(
-            &mut state,
-            Msg::Lib(Event::DryRunFinished { records }),
-            &tx,
-            &default_config(),
-        );
+        reduce(&mut state, Msg::Lib(Event::DryRunFinished { records }), &tx);
         // AwaitingConfirm path: phase transitioned, no StartBatch
         // dispatched (the reducer doesn't touch cmd_tx in this
         // branch). dry_run_records populated for the UI.
@@ -2053,19 +2006,14 @@ mod tests {
         // Step 1: DryRunFinished with a Succeeded record — moves
         // phase to AwaitingConfirm.
         let records = vec![sample_record("/dummy.mp4", EncodingOutcome::Succeeded)];
-        reduce(
-            &mut state,
-            Msg::Lib(Event::DryRunFinished { records }),
-            &tx,
-            &default_config(),
-        );
+        reduce(&mut state, Msg::Lib(Event::DryRunFinished { records }), &tx);
         assert_eq!(
             state.tasks.active.as_ref().unwrap().phase,
             BatchPhase::AwaitingConfirm
         );
         // Step 2: user clicks Encode — but the dir is empty
         // (we never created files). The guard fires.
-        reduce(&mut state, Msg::UserClickedStart, &tx, &default_config());
+        reduce(&mut state, Msg::UserClickedStart, &tx);
         let _ = std::fs::remove_dir_all(&tmp);
         assert_eq!(
             state.tasks.active.as_ref().unwrap().phase,
@@ -2136,12 +2084,7 @@ mod tests {
             sample_skipped("/b.mp4"),
             sample_skipped("/c.mp4"),
         ];
-        reduce(
-            &mut state,
-            Msg::Lib(Event::DryRunFinished { records }),
-            &tx,
-            &default_config(),
-        );
+        reduce(&mut state, Msg::Lib(Event::DryRunFinished { records }), &tx);
         // to_encode = 1, to_skip = saturating_sub(0, 1) = 0.
         // Phase: AwaitingConfirm (positive count).
         let t = state.tasks.active.as_ref().unwrap();
@@ -2174,12 +2117,7 @@ mod tests {
             dry_run_records: vec![],
         });
         let records = vec![sample_skipped("/a.mp4"), sample_skipped("/b.mp4")];
-        reduce(
-            &mut state,
-            Msg::Lib(Event::DryRunFinished { records }),
-            &tx,
-            &default_config(),
-        );
+        reduce(&mut state, Msg::Lib(Event::DryRunFinished { records }), &tx);
         assert!(state.tasks.active.is_none());
         assert_eq!(state.task_history.len(), 1);
         let h = &state.task_history[0];
@@ -2224,7 +2162,6 @@ mod tests {
                 records: vec![sample_record("/a.mp4", EncodingOutcome::Succeeded)],
             }),
             &tx,
-            &default_config(),
         );
         assert!(state.tasks.active.is_none());
         assert!(state.task_history.is_empty());
@@ -2259,7 +2196,7 @@ mod tests {
         // User cancels (Cancel sends Command::Cancel + sets
         // cancelled = true per §3.8.7.1 cancel-during-Analyzing
         // race fix).
-        reduce(&mut state, Msg::UserClickedCancel, &tx, &default_config());
+        reduce(&mut state, Msg::UserClickedCancel, &tx);
         assert!(state.tasks.active.as_ref().unwrap().cancelled);
         // DryRun still arrives — should drop without auto-encoding.
         reduce(
@@ -2268,7 +2205,6 @@ mod tests {
                 records: vec![sample_record("/a.mp4", EncodingOutcome::Succeeded)],
             }),
             &tx,
-            &default_config(),
         );
         assert!(state.tasks.active.is_none());
         assert!(state.task_history.is_empty());
@@ -2293,7 +2229,6 @@ mod tests {
                 value: ConfigFieldValue::Crf(28),
             },
             &tx,
-            &default_config(),
         );
         // (a) config_draft updated.
         let enc = state
@@ -2334,7 +2269,6 @@ mod tests {
                 value: ConfigFieldValue::Nv(true),
             },
             &tx,
-            &default_config(),
         );
         match rx.try_recv().expect("expected a SaveConfig command") {
             Command::SaveConfig { config } => {
@@ -2359,7 +2293,6 @@ mod tests {
                 value: ConfigFieldValue::Extensions("mp4, mkv , mov".into()),
             },
             &tx,
-            &default_config(),
         );
         let enc = state.config_draft.encode.as_ref().unwrap();
         assert_eq!(
@@ -2374,7 +2307,6 @@ mod tests {
                 value: ConfigFieldValue::Extensions(String::new()),
             },
             &tx,
-            &default_config(),
         );
         let enc = state.config_draft.encode.as_ref().unwrap();
         assert_eq!(enc.extensions, None, "empty csv should clear filter");
@@ -2397,7 +2329,6 @@ mod tests {
                 path: std::path::PathBuf::from("/tmp/rencoder.toml"),
             }),
             &tx,
-            &default_config(),
         );
         let status = &state.config_save_status;
         // Format: "Saved at HH:MM:SS" — assert prefix + 8 chars
@@ -2432,7 +2363,6 @@ mod tests {
                 message: "save failed: permission denied".into(),
             }),
             &tx,
-            &default_config(),
         );
         assert_eq!(
             state.config_save_status, "Save failed: permission denied",
@@ -2449,19 +2379,9 @@ mod tests {
     fn user_clicked_tab_updates_active_page() {
         let mut state = fresh_state();
         let tx = cmd_tx();
-        reduce(
-            &mut state,
-            Msg::UserClickedTab(Page::History),
-            &tx,
-            &default_config(),
-        );
+        reduce(&mut state, Msg::UserClickedTab(Page::History), &tx);
         assert_eq!(state.active_page, Page::History);
-        reduce(
-            &mut state,
-            Msg::UserClickedTab(Page::Task),
-            &tx,
-            &default_config(),
-        );
+        reduce(&mut state, Msg::UserClickedTab(Page::Task), &tx);
         assert_eq!(state.active_page, Page::Task);
     }
 
