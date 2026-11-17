@@ -3512,13 +3512,116 @@ c-probe = ["cc", "pkg-config"]
 rencoder_lib = { path = "../rencoder_lib", features = ["parallel-analyze"] }
 clap = { version = "4", features = ["derive"] }
 dialoguer = "0.11"
-ctrlc = "3.4"
 parking_lot = "0.12"
+
+# 信号处理按平台分层（§3.4.5）：Unix 走 signal-hook，Windows 走 windows-sys
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 anyhow = "1"
 ```
+
+---
+
+### 3.10 并发模型、参数流与公共功能归属
+
+> **TL;DR** — 三条硬性要求：**(1) 选同步原语之前先写清"几个读者、几个写者、锁要持有多久"；
+> (2) 一个配置字段只能有一个地方把它变成运行时值；(3) 两个前端都要用的东西放 lib。**
+> 这三条是踩过坑之后补写的，不是事后总结。
+
+#### 3.10.1 并发：先写需求，再选原语
+
+**为什么要有这一节**：编码器缓存原来用 `RwLock`，理由是"让它可替换"。但读写锁的收益来自
+"多读者并行读同一份数据"，而这里只有一个读者（actor 线程）——原语选错了，而**需求从没被写
+下来**，于是没人能判断它对不对。副作用是读锁被持到整个文件编码结束（几分钟），刷新线程要等
+当前文件跑完才能写进去。
+
+**选原语之前必须先回答三个问题**：
+
+| 问题 | 答不上来就别动手 |
+|---|---|
+| 几个读者？几个写者？ | 单一写者 → `Mutex`。读写之分只在"多读者并发读同一份不可变数据"时才有意义 |
+| 锁要持有多久？期间会做 IO 吗？ | 会做 IO（spawn 进程、跑 ffmpeg、读写文件）→ 锁内只取 `Arc`，锁外用 |
+| 状态会被替换吗，还是只写一次？ | 只写一次 → `OnceLock`；会被替换 → 可替换的 `Arc` 句柄 |
+
+**本项目的四条规则**：
+
+1. **单一写者**：每个共享状态只有一个写者 → 用 `Mutex`，不用 `RwLock`。
+2. **锁内不做 IO**：持锁期间不得 spawn 进程、不得跑 ffmpeg、不得读写文件。需要长时间持有的
+   共享数据就放进 `Arc`，读者克隆指针后立刻放锁。
+3. **可替换的共享状态用 Arc 句柄**：`Arc<Mutex<Option<Arc<T>>>>` —— 替换整个句柄，读路径
+   是指针克隆。
+4. **跨线程只走通道**：命令 / 事件走 channel，不共享可变状态；只写一次的状态用 `OnceLock`。
+
+**共享状态清单**（谁写、谁读、怎么保护）：
+
+| 状态 | 写者 | 读者 | 保护 |
+|---|---|---|---|
+| `PartialOutputHandle`（当前输出路径） | 每轮转码登记 / 清除 | signal handler | `Arc<Mutex<Option<TaskContext>>>`（parking_lot） |
+| `CancelToken` | actor / UI 的 Cancel | 每轮转码之间轮询 | `Arc<AtomicBool>` |
+| `busy`（单批次闸门） | actor | actor | `Arc<AtomicBool>` + swap |
+| 编码器缓存（**可替换**） | 初始化线程 / nv 变化时的刷新线程 | actor（每文件读一次） | `Arc<Mutex<Option<Arc<Result<EncoderCache, EncodeError>>>>>` |
+| NVENC 能力判定（进程内） | 降级时写入 | `select_encoder` | `OnceLock<Mutex<HashMap<String, bool>>>` |
+| 丢弃事件计数 | 发送失败时 | 日志 | `Arc<AtomicU64>` |
+
+**线程清单**（谁起、干什么、活多久）：
+
+| 线程 | 起于 | 职责 | 生命周期 |
+|---|---|---|---|
+| actor | `start_controller` | 处理 Command、发 Event | 进程 |
+| 缓存初始化 | `start_controller` | `ffmpeg -encoders` + NVENC 能力解析 | 一次，结束即退 |
+| NVENC 探测 | `Command::Detect` / nv 变化 | 能力实测 + 写记录 | 一次，结束即退 |
+| stderr 读取 | 每次 ffmpeg | 收集 stderr 尾部（有上限） | 随 ffmpeg 子进程 |
+| signal 监听 | `install_handler` | 收 SIGINT/TERM/HUP → 清理半成品 | 进程 |
+| UI 事件泵 | `App()` 的 use_hook | 阻塞 `recv()` → `state.with_mut` | 进程 |
+| UI 日志泵 | `App()` 的 use_hook | lib 日志行 → UI 日志条 | 进程 |
+
+**"锁内不做 IO"** 在 stderr 读取线程上尤其要紧：它跟 ffmpeg 子进程同时活着，此时持有任何
+共享锁都会把编码拖慢。
+
+#### 3.10.2 参数流：一个字段只有一个转换入口
+
+**要求**：一个配置字段只能有**一个**地方把它变成运行时值。
+
+之前有三条路径：
+
+```text
+AppConfig ─┬─ CLI 手写映射 ─────────────────────────→ EncodeParams
+            ├─ EncodeParams::from_app_config ───────→ EncodeParams   （UI 用）
+            └─ Config::from_encode_config → Config → max_fps_config() → EncodeParams.max_fps
+```
+
+第三条里的 `max_fps_eps` 是硬编码的 `0.05`，第二条用的是 `MaxFpsConfig::default().eps`
+（`0.01`）——**同一个帧率容差在 CLI 和 UI 上不一样**，而且没人发现。
+
+**现在的规则**：
+
+- `EncodeParams::from_app_config()` 是**唯一**的"配置 → 每轮参数"映射入口。CLI 和 UI 都用它，
+  各自只补自己特有的部分（CLI 补 target 与 extra_args）。
+- lib 的运行时 `Config` 只保留 AppConfig 之外的东西（encoder 覆盖、ffmpeg_args），**不再重复**
+  `max_fps` / `max_fps_eps`。
+- 常量（容差带、默认 crf、默认码率）只有一处定义，别处引用。
+
+#### 3.10.3 公共功能归属：两个前端都要用的放 lib
+
+**要求**：同一份事实的**措辞 / 格式 / 映射**放 lib；**交互方式**（怎么问、怎么显示）各前端
+自己实现。
+
+| 内容 | 归属 | 例子 |
+|---|---|---|
+| 同一份事实的措辞 | lib | NVENC 能力清单的每一行（`NvencCapability::lines()`） |
+| 同一份映射 | lib | 配置 → 每轮参数（`EncodeParams::from_app_config`） |
+| 同一份判定 | lib | 能力是否过期（`review_due`） |
+| 怎么问用户 | 前端 | CLI 在终端问 y/N；GUI 给一个"重新检测"按钮 |
+| 怎么显示 | 前端 | CLI 打印报告；GUI 渲染成行 |
+
+反面教材：能力清单的每一行，CLI 拼成 `av1_nvenc   : UNUSABLE — 原因`，GUI 拼成
+`av1_nvenc  unusable — 原因`——同一件事两种措辞，隔几轮就漂移。
 
 ---
 
@@ -3658,6 +3761,9 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 59 | NVENC 检测结果跨进程保存到 `<app_dir>/nvenc-capability.json`；指纹绑定 ffmpeg 构建；30 天过期只是建议，CLI 问 y/N、GUI 由 lib 推后日期，提示一次后 30 天内不再提示 | ✅ |
 | 60 | `rencoder detect` 独立子命令 + 全局 `--detect` 选项（子命令前后都认） | ✅ |
 | 61 | NVENC 编码失败即当场 fallback（软件编码器重跑该文件），不重新探测；降级对本进程后续文件生效 | ✅ |
+| 62 | 选同步原语前先写清"几个读者 / 几个写者 / 锁持有多久"：单一写者用 `Mutex`，锁内不做 IO，可替换状态用 `Arc` 句柄（§3.10.1） | ✅ |
+| 63 | 一个配置字段只有一个转换入口：`EncodeParams::from_app_config`；运行时 `Config` 不再重复 `max_fps` / `max_fps_eps`（§3.10.2） | ✅ |
+| 64 | 同一份事实的措辞 / 映射 / 判定放 lib，交互方式各前端自己实现（§3.10.3） | ✅ |
 | 57 | 同路径保护三层:`output_path_for` 命名避让 → `utils::fs::is_same_file`（父目录规范化 + 文件名大小写不敏感）→ 转码前拦截记 `Failed` 不调 ffmpeg | ✅ |
 
 ---
