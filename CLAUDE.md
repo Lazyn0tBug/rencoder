@@ -5,7 +5,7 @@ Rust rewrite of `encode.zsh` and `video_fps_stats.zsh`: smart video transcoding 
 ## Workspace
 
 - `rencoder_lib` -- core library (`thiserror`, `walkdir`, `rayon`, `toml`); `publish = false` (U18, internal lib not on crates.io)
-- `rencoder_cli` -- CLI frontend (`clap`, `dialoguer`, `ctrlc`, `parking_lot`)
+- `rencoder_cli` -- CLI frontend (`clap`, `dialoguer`, `parking_lot`; `signal-hook` on Unix, `windows-sys` on Windows)
 
 Design source of truth: `docs/design.md`. Update the doc first when behavior changes.
 
@@ -60,6 +60,13 @@ signature at call"** principle:
 Concrete: `rencoder_lib::config::fs_perms` exposes
 `set_config_file_mode` (Unix: `0o644`) and `set_app_dir_mode` (Unix:
 `0o755`); non-Unix is a no-op placeholder.
+
+Exception (CLI only): `rencoder_cli::signal` has a Windows branch --
+Unix uses `signal-hook` (SIGINT/SIGTERM/SIGHUP), Windows uses
+`SetConsoleCtrlHandler` (console events). The divergence stays in that
+one file; `install_handler()` keeps one signature everywhere. The
+Windows path is written but **not compiler-verified here** (this
+machine's toolchain has no Windows std) -- verify it on a Windows host.
 
 ## Build
 

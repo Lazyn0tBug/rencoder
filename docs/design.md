@@ -82,19 +82,23 @@ Rencoder 是一个独立的第三方应用，不是发布到 crates.io 的通用
 |------|----------------------|---------|------|
 | config 文件 mode bits | `0o644` | no-op（TBD future work） | `rencoder_lib::config::fs_perms::set_config_file_mode` |
 | log / data 目录 mode bits | `0o755` | no-op（TBD future work） | `rencoder_lib::config::fs_perms::set_app_dir_mode` |
-| SIGINT → 清理半成品文件（§3.4.5） | 跨平台（`ctrlc` crate 抽象） | 跨平台（同） | `rencoder_cli::signal` + `rencoder_lib::pipeline::partial_output` |
+| SIGINT/TERM/HUP → 清理半成品文件（§3.4.5） | `signal-hook`（INT / TERM / HUP） | console event（`SetConsoleCtrlHandler`，本仓实现） | `rencoder_cli::signal` + `rencoder_lib::pipeline::partial_output` |
 
-**信号处理为什么不需要 `#[cfg]`**：本节列出的 fs_perms 调用的是 Unix-only Rust stdlib
-API（`PermissionsExt::from_mode`），所以需要 `#[cfg(unix)]` 切到 no-op 分支。信号处理不同：
-`ctrlc::set_handler` 在内部统一处理 Unix signal 和 Windows console event；`Arc<Mutex<PathBuf>>`、
-`std::fs::remove_file`、`std::process::exit`、`eprintln!` 都是 stdlib 跨平台 API。源码里
-**没有任何 platform-specific 调用**——不需要 `#[cfg]`。
+**信号处理的 platform divergence 在定义处**：本节列出的 fs_perms 调用的是 Unix-only Rust stdlib
+API（`PermissionsExt::from_mode`），所以需要 `#[cfg(unix)]` 切到 no-op 分支。信号处理同样有
+platform divergence，但**只存在于 `rencoder_cli::signal` 一个文件里**：Unix 侧用 `signal-hook`
+收 SIGINT / SIGTERM / SIGHUP，Windows 侧用 `windows-sys` 的 `SetConsoleCtrlHandler` 收 console
+event。调用方（`main.rs`）看到的签名不变——`install_handler() -> CurrentOutput`。
 
-**为什么不预先加防御性 `#[cfg]`**：加 `#[cfg(unix)]` + `#[cfg(not(unix))]` 重复 no-op 模式是
-cargo-cult —— 真正的 platform divergence 在 `ctrlc` 内部已经被它处理。如果未来加 GUI/Tauri
-build，**不复用** `rencoder_cli::signal`（webview 有自己的 beforeunload / IPC 机制），
-会单独写。**所以这个 module 的 cross-platform story 是 "lib 内置 + CLI-only 作用域 + 不复用"，不是
-"加 `#[cfg]` 防御"**。
+**为什么这次换了方案**：2026-09 曾从 `signal-hook` revert 回 `ctrlc`，理由是 `ctrlc` 一个 crate
+同时覆盖 Unix signal 与 Windows console event，源码里一处 platform-specific 调用都没有。代价是
+**Unix 侧只剩 SIGINT**：`encode.zsh` 的 `trap _cleanup INT TERM HUP` 覆盖三个信号，
+`kill <pid>`（SIGTERM，容器编排器的默认停止方式）与 SSH 断连（SIGHUP）直接杀进程，半成品留在
+磁盘上。现在改为"Unix 用 signal-hook + Windows 用自己的 console handler"：两个平台各自覆盖
+完整的信号集合，divergence 仍然关在定义处。
+
+**GUI 不复用**：`rencoder_ui`（webview）有自己的 beforeunload / IPC 机制，不复用
+`rencoder_cli::signal`，会单独写。
 
 #### 调用范式
 
@@ -125,7 +129,7 @@ fs_perms::set_config_file_mode(&tmp)?;
 | FFmpeg 输出 | `ProcessOutput::Inherit` 透传（默认） | 与脚本一致；未来 GUI 用 `Piped` |
 | 文件遍历 | `walkdir` | 纯 Rust，不依赖外部工具；不跟随符号链接 |
 | 线程模型 | 转码：单线程串行；分析：可选并行（`rayon`） | 转码与脚本一致 |
-| 信号处理 | `ctrlc` + `parking_lot::Mutex` | 无中毒语义 |
+| 信号处理 | Unix `signal-hook`（INT/TERM/HUP）+ Windows `SetConsoleCtrlHandler` + `parking_lot::Mutex` | 无中毒语义；两个平台都覆盖完整信号集合，divergence 关在定义处 |
 | 命令行解析 | `clap`（derive） | 仅 CLI 前端 |
 | 交互模式 | `dialoguer` | 仅 CLI 前端 |
 | 错误处理 | `anyhow`（CLI）+ `thiserror`（核心库） | 分层清晰 |
@@ -417,7 +421,7 @@ rencoder_cli/
 ├── main.rs
 ├── args.rs               # clap 参数（含 --nv）
 ├── interact.rs           # dialoguer 交互
-├── signal.rs             # ctrlc + parking_lot::Mutex
+├── signal.rs             # signal-hook (Unix) / console handler (Windows) + parking_lot::Mutex
 ├── tracing_init.rs       # tracing-subscriber 初始化 + 双 sink
 └── file_sink.rs          # 自定义 MakeWriter：日/大小双轴滚动
 ```
@@ -1273,24 +1277,29 @@ Summary:
 
 #### 信号处理（U18 + U18.1）
 
-**意图**：用户按 Ctrl-C 中断转码时，handler 读取当前正在写入的 output path，删除半成品
-文件，避免留下损坏的 `.mkv`/`.mp4`。`ctrlc` crate 跨平台处理 SIGINT（Unix signal + Windows
-console event）。这跟 `encode.zsh` 里的 `trap _cleanup INT` 行为对应。
+**意图**：用户中断转码时，handler 读取当前正在写入的 output path，删除半成品文件，避免留下
+损坏的 `.mkv`/`.mp4`。这跟 `encode.zsh` 里的 `trap _cleanup INT TERM HUP` 行为对应。
 
 **信号覆盖**：
-- `SIGINT`（Ctrl-C / 中断键）
 
-**注意**：`encode.zsh` 还 trap 了 TERM/HUP；`ctrlc` 只覆盖 SIGINT。TERM/HUP 路径下当前
-直接 kill 进程、不清半成品文件——这是 `ctrlc` 选择的已知 tradeoff（保留 Windows 跨平台
-支持；U18.1.1 的 `signal-hook` 路径曾覆盖这三个信号，2026-09 revert 回 `ctrlc` 以保留
-Windows extension）。如需回到 TERM/HUP cleanup，需要 `libc::signal` 的 C-style handler
-（不能访问 `Arc<Mutex>`，与当前 `TaskContext` 设计不兼容）——future work。
+| 平台 | 覆盖 | 实现 |
+|------|------|------|
+| Unix（macOS / Linux） | `SIGINT` / `SIGTERM` / `SIGHUP` | `signal-hook` 的 `Signals::forever()` |
+| Windows | `CTRL_C` / `CTRL_BREAK` / `CTRL_CLOSE` / `CTRL_LOGOFF` / `CTRL_SHUTDOWN` | `windows-sys` 的 `SetConsoleCtrlHandler` |
 
-**Cross-platform story**：源码无 platform-specific 调用 —— `ctrlc` 内部统一处理
-Unix signal / Windows console event，`Arc<Mutex<TaskContext>>` + `std::fs::remove_file` +
-`std::process::exit` + `tracing::warn!` 都是 stdlib 跨平台 API。所以本节代码**不需要 `#[cfg]` 分支**，
-跟 §1.3 表里 `fs_perms`（有 `#[cfg(unix)]`）不同。详细原因见 §1.3 末尾的"为什么信号处理不需要
-`#[cfg]`"小节。GUI build（§3.8）**不复用** `rencoder_cli::signal`（webview 有自己的
+**为什么 2026-09 的 `ctrlc` 方案被换掉**：`ctrlc` 一个 crate 覆盖两个平台、源码零
+platform-specific 调用，代价是 Unix 侧只剩 `SIGINT`——`kill <pid>`（SIGTERM，容器编排器
+的默认停止方式）与 SSH 断连（SIGHUP）直接杀进程，半成品留在磁盘上。现在的方案两边都覆盖
+完整集合，platform divergence 关在 `rencoder_cli::signal` 一个文件里（§1.3 的
+"cfg at definition, uniform signature at call"）。
+
+**已知限制**：Windows 的 console handler 路径无法在 macOS / Linux 上验证（没有 Windows
+runner 参与日常开发）；`windows-sys` 只在 `cfg(windows)` 下编译，Unix 侧完全不感知这个依赖。
+
+**Cross-platform story**：`install_handler() -> CurrentOutput` 的签名跨平台一致，调用方
+（`main.rs`）零 cfg。`Arc<Mutex<TaskContext>>` + `std::fs::remove_file` +
+`std::process::exit` + `tracing::warn!` 都是 stdlib 跨平台 API，两侧共用同一段清理逻辑
+（`cleanup_and_exit`）。GUI build（§3.8）**不复用** `rencoder_cli::signal`（webview 有自己的
 beforeunload / IPC 机制），会单独写。
 
 **完整 lifecycle**（U18 wiring fix + U18.1 TaskContext 增强）：
