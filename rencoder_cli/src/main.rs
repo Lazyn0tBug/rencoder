@@ -92,7 +92,18 @@ fn encode_cmd(args: args::EncodeArgs) -> Result<()> {
         (true, crf_value)
     };
 
-    let enable_nv = enc.and_then(|e| e.nv).unwrap_or(false);
+    // CLI > config: `--nv` / `--no-nv` override `[encode].nv`. NVENC is
+    // the most machine-dependent knob there is -- the same config file
+    // has to work on a workstation with an RTX and on a laptop without
+    // one, so the CLI has to be able to flip it per run.
+    let config_nv = enc.and_then(|e| e.nv).unwrap_or(false);
+    let enable_nv = if args.nv {
+        true
+    } else if args.no_nv {
+        false
+    } else {
+        config_nv
+    };
 
     let config = Config::from_encode_config(app_config.encode.as_ref());
 

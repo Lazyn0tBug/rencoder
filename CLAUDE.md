@@ -100,7 +100,7 @@ cargo fmt --check
 |--------------|----------|-------|
 | `ffmpeg`     | yes      | always |
 | `ffprobe`    | yes      | always |
-| `nvidia-smi` | optional | only consulted when `[encode].nv = true` in `rencoder.toml`; missing or no GPUs = silent fallback to software encoding |
+| `nvidia-smi` | not needed | NVENC capability is probed with ffmpeg itself (1-frame test encode); `nvidia-smi` is never called |
 
 ## Conventions
 

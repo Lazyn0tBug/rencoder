@@ -1349,7 +1349,7 @@ mod mock_tests {
         cache_cell
             .set(EncoderCache {
                 encoders_output: String::new(),
-                has_nvidia: false,
+                nvenc: Vec::new(),
             })
             .expect("fresh OnceLock");
         let config = Config::default();
@@ -1535,7 +1535,7 @@ mod mock_tests {
                         // consult NV for dry-run), so we pass a dummy.
                         let dummy_cache = EncoderCache {
                             encoders_output: String::new(),
-                            has_nvidia: false,
+                            nvenc: Vec::new(),
                         };
                         let records = crate::pipeline::batch::dry_run_batch(
                             &params,

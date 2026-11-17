@@ -46,6 +46,14 @@ fn codec_matches_format(codec: &str, format: VideoFormat) -> bool {
     }
 }
 
+/// Is this an NVIDIA hardware encoder?
+///
+/// NVENC's rate control is constant quality (`-cq`), not the CRF scale
+/// the software encoders use -- the two are not interchangeable.
+fn is_nvenc(encoder: &str) -> bool {
+    encoder.ends_with("_nvenc")
+}
+
 /// Build the argv for an `ffmpeg` invocation.
 ///
 /// Layout:
@@ -106,8 +114,20 @@ pub fn build_ffmpeg_command(
             argv.push("-preset".to_string());
             argv.push(preset.to_string());
         }
-        argv.push("-crf".to_string());
-        argv.push(params.bitrate_or_crf.to_string());
+        if is_nvenc(encoder) {
+            // NVENC is constant quality (`-cq`), not the x264/x265 CRF
+            // scale -- same numbers, different meaning. Matches
+            // `encode.zsh`'s ENC_SPEC, where the nvenc rows are "cq"
+            // mode (`-cq N -b:v 0`).
+            argv.push("-cq".to_string());
+            argv.push(params.bitrate_or_crf.to_string());
+            // `-b:v 0` pairs with `-cq`: constant quality, no rate cap.
+            argv.push("-b:v".to_string());
+            argv.push("0".to_string());
+        } else {
+            argv.push("-crf".to_string());
+            argv.push(params.bitrate_or_crf.to_string());
+        }
     } else {
         argv.push("-b:v".to_string());
         argv.push(format!("{}k", params.bitrate_or_crf));
@@ -509,7 +529,45 @@ mod tests {
             &FfmpegArgsConfig::default(),
         );
         assert!(!argv.contains(&"-preset".to_string()));
+    }
+
+    #[test]
+    fn nvenc_uses_constant_quality_instead_of_crf() {
+        // NVENC's rate control is `-cq` (constant quality), not the
+        // x264/x265 CRF scale -- the two numbers mean different things.
+        // Matches encode.zsh's ENC_SPEC, where the nvenc rows are "cq"
+        // mode: `-cq N -b:v 0`.
+        let mut params = params_disabled();
+        params.format = VideoFormat::Av1;
+        params.bitrate_or_crf = 45;
+        let argv = build_ffmpeg_command(
+            &task("/in.mp4", "/out.mkv"),
+            &params,
+            "av1_nvenc",
+            None,
+            &FfmpegArgsConfig::default(),
+        );
+        assert!(!argv.contains(&"-crf".to_string()));
+        let cq_pos = argv.iter().position(|s| s == "-cq").expect("-cq present");
+        assert_eq!(argv[cq_pos + 1], "45");
+        let bv_pos = argv.iter().position(|s| s == "-b:v").expect("-b:v present");
+        assert_eq!(argv[bv_pos + 1], "0");
+    }
+
+    #[test]
+    fn software_encoder_keeps_crf() {
+        let mut params = params_disabled();
+        params.format = VideoFormat::Av1;
+        params.bitrate_or_crf = 45;
+        let argv = build_ffmpeg_command(
+            &task("/in.mp4", "/out.mkv"),
+            &params,
+            "libsvtav1",
+            None,
+            &FfmpegArgsConfig::default(),
+        );
         assert!(argv.contains(&"-crf".to_string()));
+        assert!(!argv.contains(&"-cq".to_string()));
     }
 
     #[test]

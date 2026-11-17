@@ -76,8 +76,10 @@ crf = 45
 # Default: 0.
 max_fps = 30
 
-# Enable NVIDIA hardware acceleration via NVENC. Falls back silently
-# to software encoding when nvidia-smi is missing or no GPU is detected.
+# Enable NVIDIA hardware acceleration via NVENC. When enabled, the NVENC
+# encoders this machine can actually run are detected by a capability probe
+# (a 1-frame test encode); unavailable ones fall back to software encoding
+# with a warning. The CLI's --nv / --no-nv overrides this setting.
 # Default: false.
 nv = false
 
@@ -207,6 +209,11 @@ pub struct EncodeConfig {
     /// or one of the documented set (24, 25, 30, 60). Other values are
     /// rejected at config-load time.
     pub max_fps: Option<u32>,
+    /// Enable NVIDIA hardware acceleration. When true, the NVENC
+    /// encoders this machine can actually run are determined by a
+    /// capability probe; unavailable ones fall back to software
+    /// encoding with a warning. The CLI's `--nv` / `--no-nv` overrides
+    /// this setting.
     pub nv: Option<bool>,
     pub extensions: Option<Vec<String>>,
     /// v1.2 follow-up #5: hard cap on input files per batch.

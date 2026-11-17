@@ -1453,7 +1453,7 @@ mod tests {
         path
     }
 
-    fn cache_with_libx264_and_svtav1(has_nvidia: bool) -> EncoderCache {
+    fn cache_with_libx264_and_svtav1() -> EncoderCache {
         EncoderCache {
             encoders_output: "\
 Encoders:
@@ -1461,7 +1461,7 @@ Encoders:
  V..... libsvtav1            libsvtav1 SVT-AV1
 "
             .to_string(),
-            has_nvidia,
+            nvenc: Vec::new(),
         }
     }
 
@@ -1531,7 +1531,7 @@ Encoders:
             output: Some(output.clone()),
         };
         let params = params_x264_crf();
-        let _cache = cache_with_libx264_and_svtav1(false);
+        let _cache = cache_with_libx264_and_svtav1();
         let _config = Config::default();
 
         // We can't actually run ffmpeg on a fake webm file -- so use
@@ -1627,7 +1627,7 @@ Encoders:
             output: Some(output),
         };
         let params = params_x264_crf();
-        let cache = cache_with_libx264_and_svtav1(false);
+        let cache = cache_with_libx264_and_svtav1();
         let config = Config::default();
 
         let record = transcode_single(&task, &params, &cache, &config, ProcessOutput::Null)
@@ -1654,7 +1654,7 @@ Encoders:
             output: Some(input.clone()),
         };
         let params = params_x264_crf();
-        let cache = cache_with_libx264_and_svtav1(false);
+        let cache = cache_with_libx264_and_svtav1();
         let config = Config::default();
 
         let record = transcode_single(&task, &params, &cache, &config, ProcessOutput::Null)
@@ -1688,7 +1688,7 @@ Encoders:
             output: Some(output),
         };
         let params = params_x264_crf();
-        let _cache = cache_with_libx264_and_svtav1(false);
+        let _cache = cache_with_libx264_and_svtav1();
         let _config = Config::default();
 
         // Run with a stub ffmpeg-like program that doesn't exist.

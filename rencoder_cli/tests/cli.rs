@@ -115,21 +115,15 @@ fn top_level_help_prints_subcommands() {
 fn encode_help_prints_options() {
     // U17 CLI surface: target (-f/-d), interactive, config path,
     // output path, passthrough. Format / bitrate / max-fps / crf /
-    // nv / ext have moved to the config file.
+    // ext have moved to the config file. `nv` is the deliberate
+    // exception -- the CLI can override it per run.
     let out = run(&["encode", "--help"]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for opt in ["--file", "--dir", "--config", "--output"] {
+    for opt in ["--file", "--dir", "--config", "--output", "--nv", "--no-nv"] {
         assert!(stdout.contains(opt), "expected {opt} in encode help");
     }
-    for removed in [
-        "--format",
-        "--bitrate",
-        "--max-fps",
-        "--nv",
-        "--crf",
-        "--ext",
-    ] {
+    for removed in ["--format", "--bitrate", "--max-fps", "--crf", "--ext"] {
         assert!(
             !stdout.contains(removed),
             "{removed} should have moved to config"

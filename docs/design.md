@@ -15,7 +15,7 @@ Rencoder 是一个智能视频转码与分析工具，支持：
 - **最大帧率限制**（源帧率超标时自动降帧；判定依据为瞬时帧率上限 `r_frame_rate`）
 - **一次 `ffprobe` 同时探测 codec 与帧率**（零外部进程解析）
 - **编码器缓存**（运行期间只执行一次 `ffmpeg -encoders`）
-- **NVIDIA 硬件加速**（`--nv` 主动开启 + `nvidia-smi` 检测，双重条件）
+- **NVIDIA 硬件加速**（`--nv` / 配置 `nv` 主动开启 + 能力实测，可用则用、不用则降级并告警）
 - 单文件或批量目录处理（递归、扩展名过滤）
 - 交互式配置（向导模式）
 - 信号中断自动清理不完整输出文件
@@ -35,13 +35,12 @@ Rencoder 是一个智能视频转码与分析工具，支持：
 |---|---|---|
 | `ffmpeg` | 转码 | ✅ 必需 |
 | `ffprobe` | 元数据探测 | ✅ 必需 |
-| `nvidia-smi` | GPU 检测 | ⚠️ 可选（仅 `--nv` 时；未安装或执行失败一律降级为软件编码，不报错；macOS 上通常不存在，会静默走软件编码路径） |
+| ~~`nvidia-smi`~~ | ~~GPU 检测~~ | ❌ 不再需要：NVENC 能力改用 ffmpeg 的 1 帧试编码实测（§2.2） |
 | ~~`jq`~~ | ~~读取配置~~ | ❌ 用 `serde_json` 替代 |
 | ~~`fd`~~ | ~~文件遍历~~ | ❌ 用 `walkdir` 替代 |
 | ~~`xargs`~~ | ~~并行~~ | ❌ 用 `rayon` 替代 |
 | ~~`grep`/`cut`/`awk`~~ | ~~解析~~ | ❌ 用 Rust 字符串操作替代 |
 | ~~`nproc`~~ | ~~CPU 核心数~~ | ❌ 用 `num_cpus` crate 替代 |
-| ~~`nvidia-smi`~~ | ~~推断编码能力~~ | ❌ 不再通过 `ffmpeg -encoders` 推断硬件 |
 
 ---
 
@@ -121,7 +120,7 @@ fs_perms::set_config_file_mode(&tmp)?;
 | 元数据探测（默认） | `std::process::Command` 调用 `ffprobe` | 编译简单，无额外依赖 |
 | 元数据探测（可选） | C FFI 桥接层（`c-probe` 特性） | 高性能批量分析；避免 `ffmpeg-next` 版本兼容问题 |
 | 编码器列表 | `ffmpeg -encoders`（缓存一次） | 运行期间不变 |
-| NVIDIA 检测 | `--nv` 参数 + `nvidia-smi` 双重条件 | 不通过 `ffmpeg -encoders` 推断；不用 `nvml-wrapper` |
+| NVIDIA 检测 | CLI `--nv`/`--no-nv` > 配置 `[encode].nv`；启用时做**能力实测**（1 帧试编码）并进程内缓存 | `ffmpeg -encoders` + `nvidia-smi -L` 都不足以证明"这张卡能跑这个编码器"（AV1 NVENC 需 CC≥8.0）；不用 `nvml-wrapper` |
 | 最大帧率 | `MaxFpsConfig::decide` 判定 + `build_ffmpeg_command` 参数映射 | 谓词与参数生成解耦；判定与参数映射同源，杜绝"记录说降了帧、命令里却没有 `-r`"的自相矛盾 |
 | 帧率判定源 | `r_frame_rate`（瞬时上限），`avg_frame_rate` 仅用于展示与统计 | VFR 素材的平均帧率被大量长间隔拉低，用它判上限会漏掉局部超速（对齐 encode.zsh v10.2.0） |
 | 帧率参数 | 未超限 `-fps_mode passthrough`；超限 `-r <cap> -fps_mode cfr` | 不写 `-fps_mode` 时 ffmpeg 会按容器标称帧率补帧/丢帧，VFR 源有损（对齐 encode.zsh v10.2.0） |
@@ -170,16 +169,63 @@ fs_perms::set_config_file_mode(&tmp)?;
 
 **不通过 `ffmpeg -encoders` 输出推断硬件能力**：
 - `ffmpeg -encoders` 包含 `h264_nvenc` 只说明编译时启用了该编码器，不代表当前机器有 GPU 或驱动可用
+- 进一步，`ffmpeg -encoders` 里有 + `nvidia-smi -L` 非空也**不代表这张卡能跑这个编码器**：
+  `av1_nvenc` 需要 compute capability ≥ 8.0（RTX 30 系 / Ada / Hopper），GTX 16xx（CC 7.5）
+  上编码器在、卡也在，一跑就失败；驱动与 ffmpeg 版本不匹配、NVENC 会话额度耗尽同理
 
-**选择方案：`--nv` + `nvidia-smi` 双重条件**：
+**优先级：命令行 > 配置项**：
+
+```
+--nv / --no-nv 给了吗？
+├─ 给了 → 用它（--nv = 启用，--no-nv = 禁用）
+└─ 没给 → [encode].nv（rencoder.toml），再没给就是禁用
+```
+
+`nv` 是**机器相关**的旋钮：同一份 `rencoder.toml` 拿到另一台机器上就该能改，所以它是
+U17 "旋钮全进配置" 的刻意例外。
+
+**启用时的检测：能力实测，不是存在性检查**：
+
+对 `ffmpeg -encoders` 里出现的每个 NVENC 编码器各跑一次 1 帧试编码：
+
+```
+ffmpeg -hide_banner -loglevel error -f lavfi -i color=s=64x64:d=0.1 \
+       -frames:v 1 -c:v <enc> -f null -
+```
+
+成功即"这台机器能用这个编码器"。这一条命令同时验证了驱动、ffmpeg build、NVENC 会话
+额度与卡的计算能力——`nvidia-smi -L` 只证明"有卡"，`--query-gpu=compute_cap` 只覆盖
+CC 门槛这一条规则。
+
+- **结果进程内缓存**：同进程内多次批次复用（检测要 ~200-500ms × 编码器数，只付一次）
+- **只在启用时付这个成本**：`nv` 关闭时路径与从前完全一致（零额外开销）
+- **失败原因不分类**：ffmpeg 的报错文本不结构化，稳妥做法是把 stderr 原文带进 warn，
+  维护"错误文本 → 原因"的映射表容易和 ffmpeg 版本脱节
+
+**不可用则 fallback，且必须出声**：
+
+```
+选中格式的 NVENC 编码器不在可用集合？
+├─ 是 → 回退软件编码 + warn（带探测时的 stderr 原文）+ 记录里照实写实际编码器
+└─ 否 → 用 NVENC
+```
+
+`[encode.encoders]` 里显式指定的编码器同样按"不可用则 fallback"，但也出声（warn：
+你指定的 `av1_nvenc` 不可用，改用 `libsvtav1`）。静默替换是这里最坏的行为——用户以为
+在用硬件，其实在用软件。
+
+**码控按编码器家族区分**：
+
+NVENC 用的是恒定质量（`-cq N -b:v 0`），不是 x265 的 CRF（`-crf N`）。对齐
+`encode.zsh` 的 `ENC_SPEC`：选中 NVENC 编码器时推 `-cq N -b:v 0`，其余编码器仍是
+`-crf N` / `-b:v Nk`。两条量纲不能混用——混用等于悄悄换掉用户画质参数的含义。
 
 ```
 用户传了 --nv？
 ├─ 否 → 软件编码
-└─ 是 → nvidia-smi 可执行且检测到 GPU？
-        ├─ 未安装 / spawn 失败 → 软件编码（日志提示，不视为错误）
-        ├─ 已执行但未检测到 GPU → 软件编码（日志提示）
-        └─ 检测到 GPU → ffmpeg 编译了对应编码器？（内部隐式检查）
+└─ 是 → 能力实测（进程内缓存）
+        ├─ 探测不可用 → 软件编码（warn，不视为错误）
+        └─ 探测可用 → ffmpeg 编译了对应编码器？
                 ├─ 否 → 软件编码
                 └─ 是 → nvenc ✓
 ```
@@ -267,9 +313,12 @@ df_to_csv  df_to_jsonl  df_to_parquet
 - 多批分析用 glob：`read_parquet(['./data/*.parquet'])`
 - 进程 ID 后缀（`a3f`）避免同一秒内并发冲突
 
-> 注：`nvidia-smi` 的 `io::Error`（找不到可执行文件）和"执行成功但无 GPU"都归为同一降级路径，`init_encoder_cache` 不应因此返回 `EncodeError`。
+> 注：NVENC 探测失败（驱动缺失、卡不支持该编码器、会话额度耗尽）一律归为降级路径，
+> `init_encoder_cache` 不因此返回 `EncodeError`——不可用就是不可用，不是错误。
 
-不使用 `nvml-wrapper` crate。`nvidia-smi` 是唯一的外部检测工具，且仅在 `--nv` 时调用。
+不使用 `nvml-wrapper` crate，也不再调用 `nvidia-smi`：NVENC 能力由 ffmpeg 的 1 帧试编码
+实测得出（§2.2），它同时覆盖驱动、ffmpeg build、会话额度与卡的计算能力，比"查一张卡
+在不在"更准。
 
 ### 2.6 关于帧率上限判定的决策（对齐 encode.zsh v10.2.0）
 
@@ -347,7 +396,7 @@ rencoder_lib/
 ├── pipeline/
 │   ├── mod.rs
 │   ├── batch.rs                 # 编排：collect_files → transcode_batch（按文件循环，写记录+日志）
-│   ├── cache.rs                 # init_encoder_cache（ffmpeg -encoders + nvidia-smi）
+│   ├── cache.rs                 # init_encoder_cache（ffmpeg -encoders + NVENC 能力实测）
 │   └── cancel.rs                # CancelToken（§3.8；Arc<AtomicBool> + cancel()/is_cancelled()）
 ├── types.rs                     # 跨模块共享类型（VideoFormat、EncodingRecord、MaxFpsConfig 等）
 └── utils/
@@ -554,7 +603,9 @@ pub enum ProcessOutput {
 #[derive(Debug)]
 pub struct EncoderCache {
     pub encoders_output: String,
-    pub has_nvidia: bool,
+    /// 通过能力实测的 NVENC 编码器（1 帧试编码成功才算）。
+    /// 空 = 本机没有可用的 NVENC 硬件编码。
+    pub nvenc_encoders: Vec<String>,
 }
 
 impl EncoderCache {
@@ -775,14 +826,17 @@ pub fn collect_files(
 
 ```rust
 /// 初始化编码器缓存（一次）
-/// enable_nv = true 时调用 nvidia-smi -L 检测；
-/// nvidia-smi 不存在或执行失败均视为"无 GPU"降级到软件编码，
-/// 不作为 EncodeError 向上传播。
+/// enable_nv = true 时做 NVENC 能力实测：对 ffmpeg -encoders 里出现的每个
+/// NVENC 编码器跑一次 1 帧试编码，成功即"这台机器能用"。
+/// 结果进程内缓存，同进程内多次批次复用。
+/// 探测失败 / 不可用一律降级到软件编码（warn，不作为 EncodeError 传播）。
 /// 对齐 encode.zsh 的 init_encoder_cache()
 pub fn init_encoder_cache(enable_nv: bool) -> Result<EncoderCache, EncodeError>;
 
 /// 选择编码器
-/// 对齐 encode.zsh 的 select_encoder()
+/// 优先级：配置覆盖 > 可用的 NVENC 变体 > 软件默认。
+/// NVENC 变体只有在该编码器通过能力实测时才可用；不可用则回退软件
+/// 并 warn（带探测时的 stderr 原文）。
 /// 配置读取使用 serde_json（不依赖 jq）
 pub fn select_encoder(
     format: VideoFormat,
@@ -1225,10 +1279,14 @@ rencoder encode [选项] [--] [额外FFmpeg参数]
   -i, --interactive       启动交互模式
   --config PATH           TOML 配置路径（默认 `<app_dir>/rencoder.toml`；`$RENENCODER_CONFIG` 覆盖）
   -o, --output FILE       详细输出文件路径（默认 `<app_dir>/data/encoding-<UTC-ISO8601>Z.parquet`；`$RENENCODER_DATA_DIR` 覆盖）
+  --nv                    强制启用 NVIDIA 硬件编码（覆盖配置项；启用时做能力实测）
+  --no-nv                 强制禁用 NVIDIA 硬件编码（覆盖配置项）
   --                      之后的所有参数作为FFmpeg原生参数透传
 
-剩余的 format / bitrate / max-fps / crf / nv / extensions / encoders 全部在
-`rencoder.toml` 的 `[encode]` 段。详见 §3.4.5 App-level config + single-directory app。
+剩余的 format / bitrate / max-fps / crf / extensions / encoders 全部在
+`rencoder.toml` 的 `[encode]` 段。`nv` 默认也在配置里，但 CLI 可以覆盖
+（命令行 > 配置项）——它是最"机器相关"的旋钮。详见 §3.4.5 App-level config +
+single-directory app。
 ```
 
 #### 分析模式参数（U17：CLI / config split 后）
@@ -1576,7 +1634,7 @@ collect_files → 文件列表（walkdir）
     ↓
 init_encoder_cache(enable_nv) → EncoderCache（一次）
     ├─ ffmpeg -encoders（始终）
-    └─ nvidia-smi -L（仅 --nv 时）
+    └─ NVENC 能力实测（仅 nv 启用时；1 帧试编码 / 进程内缓存）
     ↓
 设置信号处理（parking_lot::Mutex）
     ↓
@@ -3364,12 +3422,12 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 
 | 类型 | 覆盖范围 |
 |---|---|
-| 单元测试 | `parse_fps_value`、`MaxFpsConfig::need_reduce`、`MaxFpsConfig::decide` 动作表、`VideoMetadata::cap_fps` 取值、`probe_video_metadata`、`FpsStats`、`AnalysisRecord` / Polars 聚合、`collect_files`、`should_skip_encoding` 决策表 |
+| 单元测试 | `parse_fps_value`、`MaxFpsConfig::need_reduce`、`MaxFpsConfig::decide` 动作表、`VideoMetadata::cap_fps` 取值、`probe_video_metadata`、`FpsStats`、`AnalysisRecord` / Polars 聚合、`collect_files`、`should_skip_encoding` 决策表、NVENC 能力探测（探测次数 / 可用标记 / 失败原因）、NVENC 码控走 `-cq` |
 | 集成测试 | CLI 黑盒：encode 端到端产出 `.mkv`；analyze 默认输出 CSV 到 stdout（一行一文件，列 `path, fps, codec, duration_secs, file_bytes`）；`--format text` 旧汇总；`-o FILE` 写文件 |
 | 最大帧率测试 | 25fps 不降帧、30fps 不降帧、29.97fps 不降帧、60fps 降帧 |
 | 视频分析测试 | `analyze_records` 产出 per-file records；Polars `group_by(fps).agg(count, sum(duration_secs))` 与手写 `FpsStats::summary` 数值一致；`records_to_csv` 输出可被标准 CSV 解析 |
 | 编码器缓存测试 | 验证只执行一次 `ffmpeg -encoders` |
-| NVIDIA 测试 | `--nv` + `nvidia-smi` 双重条件验证 |
+| NVIDIA 测试 | NVENC 能力探测：探测只对 ffmpeg 里存在的编码器跑、探测失败标记为不可用并带原因、不可用时回退软件编码 |
 | 并发安全测试 | `c-probe` + `parallel-analyze` 同时启用，100+ 文件并行探测 |
 
 ---
@@ -3381,7 +3439,7 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 1 | 创建两个 crate，设置 workspace |
 | 2 | 实现核心库基础功能（错误类型、路径工具、数据结构） |
 | 3 | 实现元数据探测 + 帧率解析 |
-| 4 | 实现编码器缓存 + 编码器选择（含 `--nv` + `nvidia-smi`） |
+| 4 | 实现编码器缓存 + 编码器选择（含 NVENC 能力探测） |
 | 5 | 实现最大帧率控制（`MaxFpsConfig`） |
 | 6 | 实现命令构建（含 `-r` 输出选项 + MAX_FPS 参数映射） |
 | 7 | 实现单文件转码（`ProcessOutput::Inherit`） |
@@ -3402,7 +3460,7 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 
 | # | 确认点 | 状态 |
 |---|---|---|
-| 1 | 外部依赖仅 `ffmpeg` + `ffprobe`（`nvidia-smi` 仅 `--nv` 时） | ✅ |
+| 1 | 外部依赖仅 `ffmpeg` + `ffprobe`（NVENC 探测也只用 ffmpeg，不再需要 `nvidia-smi`） | ✅ |
 | 2 | 不采用 `ffmpeg-next`，C FFI 作为可选高性能路径 | ✅ |
 | 3 | `MaxFpsConfig` 只做数值判断，参数映射在 `build_ffmpeg_command` | ✅ |
 | 4 | `-r` 是输出选项，放在 `-i` 之后、输出文件之前 | ✅ |
@@ -3413,7 +3471,7 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 9 | `probe_video_metadata_auto` 返回 `Result` | ✅ |
 | 10 | `collect_files` 用 `walkdir`，不跟随符号链接，不用 `fd` | ✅ |
 | 11 | 并行分析用 `rayon`，不用 `xargs` | ✅ |
-| 12 | NVIDIA 检测：`--nv` + `nvidia-smi` 双重条件，不用 `ffmpeg -encoders` 推断 | ✅ |
+| 12 | NVIDIA 检测：CLI `--nv`/`--no-nv` > 配置；启用时做能力实测（1 帧试编码），不用 `ffmpeg -encoders` 推断硬件 | ✅ |
 | 13 | `ProcessOutput::Inherit` 透传，未来 GUI 用 `Piped` | ✅ |
 | 14 | 信号处理用 `parking_lot::Mutex`（无中毒） | ✅ |
 | 15 | `EncodeError` 加 `#[non_exhaustive]` | ✅ |
@@ -3421,7 +3479,7 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 17 | `c-probe` 桥接层无状态、可重入，支持 `rayon` 并发 | ✅ |
 | 18 | 视频分析模块支持串行和可选并行 | ✅ |
 | 19 | CLI 提供 `encode` 和 `analyze` 两个子命令 | ✅ |
-| 20 | `nvidia-smi` 未安装/spawn 失败视为"无 GPU"降级，不作为 `EncodeError` 传播 | ✅ |
+| 20 | NVENC 探测失败视为"该编码器不可用"降级，不作为 `EncodeError` 传播 | ✅ |
 | 21 | `build_ffmpeg_command` 在 `src_fps = None` 时忽略 `MaxFpsConfig`，不注入 `-r` | ✅ |
 | 22 | GUI 框架：Dioxus desktop (0.6)，纯 Rust + wry 后端，避免 IPC 序列化税 | ✅ |
 | 23 | 单 batch per process：UI 不支持多任务，`current_output` 单例约束保持 | ✅ |
@@ -3458,6 +3516,8 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 54 | 帧率动作判定收敛为 `MaxFpsConfig::decide` → `FpsDecision`,跳过判定 / argv 映射 / 结果记录三处同源 | ✅ |
 | 55 | 帧率参数显式声明:未超限 `-fps_mode passthrough`,超限 `-r <cap> -fps_mode cfr`,未启用上限不注入 —— 对齐 encode.zsh v10.2.0 | ✅ |
 | 56 | 帧率容差 `eps = 0.01`,判定式 `src > cap + eps`（严格大于,eps 在上限右侧）—— 对齐 encode.zsh `MAX_FPS_EPS` | ✅ |
+| 57 | NVENC 选择：CLI `--nv`/`--no-nv` > 配置 `[encode].nv`；启用时做能力实测（1 帧试编码）并进程内缓存；不可用则 fallback + warn（带 stderr 原文） | ✅ |
+| 58 | NVENC 码控走 `-cq N -b:v 0`（恒定质量），其余编码器仍是 `-crf N` —— 对齐 encode.zsh `ENC_SPEC` | ✅ |
 | 57 | 同路径保护三层:`output_path_for` 命名避让 → `utils::fs::is_same_file`（父目录规范化 + 文件名大小写不敏感）→ 转码前拦截记 `Failed` 不调 ffmpeg | ✅ |
 
 ---

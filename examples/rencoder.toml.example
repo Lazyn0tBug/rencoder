@@ -32,8 +32,10 @@ crf = 45
 # Default: 0.
 max_fps = 30
 
-# Enable NVIDIA hardware acceleration via NVENC. Falls back silently
-# to software encoding when nvidia-smi is missing or no GPU is detected.
+# Enable NVIDIA hardware acceleration via NVENC. When enabled, the NVENC
+# encoders this machine can actually run are detected by a capability probe
+# (a 1-frame test encode); unavailable ones fall back to software encoding
+# with a warning. The CLI's --nv / --no-nv overrides this setting.
 # Default: false.
 nv = false
 

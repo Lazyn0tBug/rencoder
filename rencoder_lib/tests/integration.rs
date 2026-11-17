@@ -153,7 +153,7 @@ fn transcode_batch_end_to_end_produces_output_files() {
     // doesn't trip the existence-skip check.
     let cache = EncoderCache {
         encoders_output: "V..... libsvtav1            libsvtav1 SVT-AV1\n".to_string(),
-        has_nvidia: false,
+        nvenc: Vec::new(),
     };
     let config = Config::default();
     let params = EncodeParams {
@@ -222,7 +222,7 @@ fn transcode_batch_skips_when_output_exists() {
     };
     let cache = EncoderCache {
         encoders_output: String::new(),
-        has_nvidia: false,
+        nvenc: Vec::new(),
     };
     let config = Config::default();
     let params = EncodeParams {

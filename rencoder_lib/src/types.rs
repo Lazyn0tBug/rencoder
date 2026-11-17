@@ -201,10 +201,30 @@ pub enum ProcessOutput {
 
 // ===== Encoder cache =====
 
+/// Result of the NVENC capability probe for one encoder.
+///
+/// "The ffmpeg build has `av1_nvenc`" and "this machine has an NVIDIA
+/// GPU" are both necessary but not sufficient: `av1_nvenc` needs compute
+/// capability >= 8.0, and a mismatched driver or an exhausted NVENC
+/// session quota fails the same way. The probe is the only answer that
+/// covers the whole stack.
+#[derive(Clone, Debug)]
+pub struct NvencSupport {
+    /// Encoder name, e.g. `"av1_nvenc"`.
+    pub encoder: String,
+    /// Did the 1-frame test encode succeed on this machine?
+    pub usable: bool,
+    /// Why it failed (an excerpt of ffmpeg's stderr). `None` when usable.
+    pub reason: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct EncoderCache {
+    /// Raw `ffmpeg -encoders` output.
     pub encoders_output: String,
-    pub has_nvidia: bool,
+    /// NVENC capability probe results, one entry per NVENC encoder that
+    /// this ffmpeg build has. Empty when NVENC is disabled.
+    pub nvenc: Vec<NvencSupport>,
 }
 
 impl EncoderCache {
@@ -214,6 +234,19 @@ impl EncoderCache {
     /// could yield a false positive. Accepted to stay aligned with the script.
     pub fn has_encoder(&self, name: &str) -> bool {
         self.encoders_output.contains(name)
+    }
+
+    /// Can this NVENC encoder actually run on this machine?
+    pub fn nvenc_usable(&self, name: &str) -> bool {
+        self.nvenc.iter().any(|s| s.encoder == name && s.usable)
+    }
+
+    /// Why the capability probe rejected this NVENC encoder.
+    pub fn nvenc_failure_reason(&self, name: &str) -> Option<&str> {
+        self.nvenc
+            .iter()
+            .find(|s| s.encoder == name && !s.usable)
+            .and_then(|s| s.reason.as_deref())
     }
 }
 
@@ -234,8 +267,8 @@ pub struct EncodeParams {
     /// any runtime check.
     pub extra_args: Vec<crate::encoder::ffmpeg_arg::ExtraArg>,
     pub max_fps: MaxFpsConfig,
-    // Note: NVIDIA enablement lives on `EncoderCache.has_nvidia` after
-    // `init_encoder_cache(enable_nv)` consumes the `--nv` flag. Keeping a
+    // Note: NVIDIA enablement lives on `EncoderCache.nvenc` after
+    // `init_encoder_cache(enable_nv)` runs the capability probe. Keeping a
     // separate `enable_nv` field here would be dead state.
 }
 
@@ -1092,7 +1125,7 @@ mod tests {
     fn encoder_cache_has_encoder_substring() {
         let cache = EncoderCache {
             encoders_output: "libx264 libsvtav1".to_string(),
-            has_nvidia: false,
+            nvenc: Vec::new(),
         };
         assert!(cache.has_encoder("libx264"));
         assert!(cache.has_encoder("libsvtav1"));
@@ -1100,7 +1133,7 @@ mod tests {
         // Empty cache returns false for any non-empty needle.
         let empty = EncoderCache {
             encoders_output: String::new(),
-            has_nvidia: false,
+            nvenc: Vec::new(),
         };
         assert!(!empty.has_encoder("libx264"));
         // Empty needle matches even empty cache (str::contains("") == true).

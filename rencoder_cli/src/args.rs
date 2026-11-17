@@ -2,10 +2,16 @@
 //!
 //! Two subcommands: `encode` and `analyze`. U17 split: only `target`
 //! (`-f`/`-d`) and the action (`encode`/`analyze`) plus a few per-run
-//! overrides (`-i`, `--config`, `-o`, passthrough args) remain on the
-//! CLI. Every other knob (format, bitrate, max-fps, crf, nv, extensions,
-//! analyze format, parallel, ...) lives in `rencoder.toml`. See
-//! `rencoder_lib::config::project` for the schema.
+//! overrides (`-i`, `--config`, `-o`, `--nv`/`--no-nv`, passthrough args)
+//! remain on the CLI. Every other knob (format, bitrate, max-fps, crf,
+//! extensions, analyze format, parallel, ...) lives in `rencoder.toml`.
+//! See `rencoder_lib::config::project` for the schema.
+//!
+//! `nv` is the deliberate exception to "everything else lives in the
+//! config": it is the most machine-dependent knob there is (the same
+//! config file has to work on a workstation with an RTX and on a laptop
+//! without one), so the CLI can override it per run. CLI wins over the
+//! config file.
 //!
 //! `main.rs` loads the config, merges CLI overrides, and converts the
 //! parsed args into library types (`EncodeParams`, `AnalyzeParams`,
@@ -60,6 +66,18 @@ pub struct EncodeArgs {
     /// (U18; honors `$RENENCODER_DATA_DIR`).
     #[arg(short = 'o', long = "output")]
     pub output: Option<PathBuf>,
+
+    /// Force NVIDIA hardware encoding on. Overrides `[encode].nv` in
+    /// `rencoder.toml`. When enabled, the NVENC encoders this machine
+    /// can actually run are detected by a capability probe; unavailable
+    /// ones fall back to software encoding (with a warning).
+    #[arg(long = "nv", conflicts_with = "no_nv")]
+    pub nv: bool,
+
+    /// Force NVIDIA hardware encoding off. Overrides `[encode].nv` in
+    /// `rencoder.toml`.
+    #[arg(long = "no-nv")]
+    pub no_nv: bool,
 
     /// Pass-through args to ffmpeg (everything after `--`).
     #[arg(last = true)]
@@ -236,7 +254,33 @@ mod tests {
 
     #[test]
     fn encode_rejects_removed_nv_flag() {
-        parse_err(&["rencoder", "encode", "-f", "in.mp4", "--nv"]);
+        // `--nv` is back: it is the most machine-dependent knob there
+        // is, so the CLI has to be able to override the config file.
+        let cli = parse_ok(&["rencoder", "encode", "-f", "in.mp4", "--nv"]);
+        match cli.command {
+            Command::Encode(args) => {
+                assert!(args.nv);
+                assert!(!args.no_nv);
+            }
+            _ => panic!("expected Encode"),
+        }
+    }
+
+    #[test]
+    fn encode_accepts_no_nv_flag() {
+        let cli = parse_ok(&["rencoder", "encode", "-f", "in.mp4", "--no-nv"]);
+        match cli.command {
+            Command::Encode(args) => {
+                assert!(!args.nv);
+                assert!(args.no_nv);
+            }
+            _ => panic!("expected Encode"),
+        }
+    }
+
+    #[test]
+    fn encode_rejects_nv_and_no_nv_together() {
+        parse_err(&["rencoder", "encode", "-f", "in.mp4", "--nv", "--no-nv"]);
     }
 
     #[test]
