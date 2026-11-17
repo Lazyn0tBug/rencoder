@@ -110,6 +110,35 @@ pub struct NvencCapability {
     pub review_due: bool,
 }
 
+impl NvencCapability {
+    /// One line per encoder, same wording for every frontend.
+    ///
+    /// The CLI's report and the UI's capability list describe the same
+    /// facts; when both formatted them separately they drifted (different
+    /// separators, different wording for the same verdict). The wording
+    /// lives here so there is one of it.
+    pub fn lines(&self) -> Vec<String> {
+        if self.support.is_empty() {
+            return vec!["this ffmpeg build has no NVENC encoders".to_string()];
+        }
+        self.support
+            .iter()
+            .map(|entry| match (&entry.usable, &entry.reason) {
+                (true, _) => format!("{}: usable", entry.encoder),
+                (false, Some(reason)) => format!("{}: unusable — {reason}", entry.encoder),
+                (false, None) => format!("{}: unusable", entry.encoder),
+            })
+            .collect()
+    }
+
+    /// The advisory shown when the stored result is past its review
+    /// date. `None` when it is still fresh.
+    pub fn review_advisory(&self) -> Option<String> {
+        self.review_due
+            .then(|| "detected over 30 days ago — recommend re-detecting".to_string())
+    }
+}
+
 // ===== Max-FPS configuration =====
 //
 // Predicate lives here; parameter mapping (`-r <fps>` / `-fps_mode`)
@@ -940,6 +969,50 @@ mod tests {
         };
         assert!(!c.need_reduce(30.0));
         assert!(c.need_reduce(30.01));
+    }
+
+    // ---- NvencCapability: the shared wording (design doc §3.10.3) ----
+
+    #[test]
+    fn capability_lines_describe_every_encoder() {
+        let cap = NvencCapability {
+            support: vec![
+                NvencSupport {
+                    encoder: "h264_nvenc".into(),
+                    usable: true,
+                    reason: None,
+                },
+                NvencSupport {
+                    encoder: "av1_nvenc".into(),
+                    usable: false,
+                    reason: Some("No NVENC capable devices found".into()),
+                },
+            ],
+            probed_at: None,
+            review_due: false,
+        };
+        assert_eq!(
+            cap.lines(),
+            vec![
+                "h264_nvenc: usable".to_string(),
+                "av1_nvenc: unusable — No NVENC capable devices found".to_string(),
+            ]
+        );
+        assert!(cap.review_advisory().is_none());
+    }
+
+    #[test]
+    fn capability_lines_say_when_the_build_has_no_nvenc() {
+        let cap = NvencCapability {
+            support: Vec::new(),
+            probed_at: None,
+            review_due: true,
+        };
+        assert_eq!(
+            cap.lines(),
+            vec!["this ffmpeg build has no NVENC encoders".to_string()]
+        );
+        assert!(cap.review_advisory().is_some());
     }
 
     #[test]

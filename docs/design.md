@@ -3604,8 +3604,18 @@ AppConfig ─┬─ CLI 手写映射 ──────────────�
 - `EncodeParams::from_app_config()` 是**唯一**的"配置 → 每轮参数"映射入口。CLI 和 UI 都用它，
   各自只补自己特有的部分（CLI 补 target 与 extra_args）。
 - lib 的运行时 `Config` 只保留 AppConfig 之外的东西（encoder 覆盖、ffmpeg_args），**不再重复**
-  `max_fps` / `max_fps_eps`。
+  `max_fps` / `max_fps_eps`；JSON 那条老路径也随之不再带帧率字段（规范值校验在 AppConfig，
+  那里才是这个字段真正所在的地方）。
 - 常量（容差带、默认 crf、默认码率）只有一处定义，别处引用。
+
+```text
+现在：
+
+AppConfig ──EncodeConfig──┬─ EncodeParams::from_app_config ──→ EncodeParams
+                           │      （CLI 与 UI 共用这一条）
+                           └─ Config::from_encode_config ────→ Config
+                                  （只有 encoder 覆盖 + ffmpeg_args）
+```
 
 #### 3.10.3 公共功能归属：两个前端都要用的放 lib
 

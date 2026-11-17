@@ -573,24 +573,15 @@ fn SetupPage(
                     let capability = state.read().nvenc_capability.clone();
                     // Rendered as plain lines: rsx! has no `match` arm
                     // with a block in child position.
+                    // The wording comes from the lib so the UI and the
+                    // CLI describe the same capability the same way.
                     let lines: Vec<String> = match &capability {
                         None => vec!["not detected yet".to_string()],
-                        Some(cap) if cap.support.is_empty() => {
-                            vec!["this ffmpeg build has no NVENC encoder".to_string()]
-                        }
-                        Some(cap) => cap
-                            .support
-                            .iter()
-                            .map(|entry| match (&entry.usable, &entry.reason) {
-                                (true, _) => format!("{}  usable", entry.encoder),
-                                (false, Some(reason)) => {
-                                    format!("{}  unusable — {reason}", entry.encoder)
-                                }
-                                (false, None) => format!("{}  unusable", entry.encoder),
-                            })
-                            .collect(),
+                        Some(cap) => cap.lines(),
                     };
-                    let review_due = capability.map(|c| c.review_due).unwrap_or(false);
+                    let review_advisory = capability
+                        .as_ref()
+                        .and_then(|cap| cap.review_advisory());
                     let mut state_c = state;
                     let tx_c = tx_opt.clone();
                     rsx! {
@@ -603,9 +594,9 @@ fn SetupPage(
                                     }
                                 }
                                 {
-                                    if review_due {
+                                    if let Some(advisory) = review_advisory {
                                         rsx! {
-                                            span { class: "muted", "detected over 30 days ago — recommend re-detecting" }
+                                            span { class: "muted", "{advisory}" }
                                         }
                                     } else {
                                         rsx! {}

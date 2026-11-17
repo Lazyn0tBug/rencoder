@@ -26,7 +26,7 @@ use rencoder_lib::{
         batch::transcode_batch,
         cache::{cache_from_resolution, init_encoder_cache},
     },
-    types::{EncodeParams, EncodingOutcome, ProcessOutput, SkippedReason, Target, VideoFormat},
+    types::{EncodeParams, EncodingOutcome, ProcessOutput, SkippedReason, Target},
 };
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -111,7 +111,14 @@ fn encode_cmd(args: args::EncodeArgs, force_detect: bool) -> Result<()> {
         anyhow::bail!("either --file or --dir must be provided (or use --interactive)");
     };
 
-    let extensions = enc.and_then(|e| e.extensions.clone()).unwrap_or_default();
+    // One mapping from the config to the per-run params:
+    // `EncodeParams::from_app_config` is the single entry point (design
+    // doc §3.10.2) -- the UI uses the same one. Hand-rolling it here is
+    // how the two frontends drifted apart (the frame-rate tolerance
+    // ended up 0.05 in the CLI and 0.01 in the UI).
+    let mut params = EncodeParams::from_app_config(app_config.encode.as_ref());
+    params.target = target.clone();
+    let extensions = params.extensions.clone();
 
     // v1.2 follow-up #5: batch cap. env > TOML > default.
     // `resolve_max_batch_size` handles `RENENCODER_MAX_BATCH_SIZE=0`
@@ -131,23 +138,6 @@ fn encode_cmd(args: args::EncodeArgs, force_detect: bool) -> Result<()> {
         warn!("no files matched; nothing to do");
         return Ok(());
     }
-
-    let format: VideoFormat = enc
-        .and_then(|e| e.format)
-        .map(Into::into)
-        .unwrap_or(VideoFormat::Av1);
-
-    // CRF field semantics (U18 step 6): `u32` aligned with ffmpeg's `-crf N`.
-    // Sentinel `0` switches to bitrate mode; any other value is the CRF
-    // quality. Default is 45 (libsvtav1 medium) when no [encode] section
-    // is present at all.
-    let crf_value = enc.map(|e| e.crf).unwrap_or(45);
-    let (is_crf, bitrate_or_crf) = if crf_value == 0 {
-        let bitrate = enc.and_then(|e| e.bitrate).unwrap_or(5000);
-        (false, bitrate)
-    } else {
-        (true, crf_value)
-    };
 
     // CLI > config: `--nv` / `--no-nv` override `[encode].nv`. NVENC is
     // the most machine-dependent knob there is -- the same config file
@@ -177,20 +167,12 @@ fn encode_cmd(args: args::EncodeArgs, force_detect: bool) -> Result<()> {
         })
         .collect::<Result<_, _>>()?;
 
-    let params = EncodeParams {
-        format,
-        bitrate_or_crf,
-        is_crf,
-        target: target.clone(),
-        extensions: extensions.clone(),
-        extra_args,
-        max_fps: config.max_fps_config(),
-    };
+    params.extra_args = extra_args;
 
     info!(
         "collected {} file(s), target format: {:?}",
         files.len(),
-        format
+        params.format
     );
 
     // NVENC capability: prefer the stored record (probing costs
@@ -569,15 +551,12 @@ mod tests {
     #[test]
     fn config_from_encode_config_uses_defaults_when_no_encode_section() {
         let cfg = Config::from_encode_config(None);
-        assert_eq!(cfg.max_fps, 0.0);
-        assert_eq!(cfg.max_fps_eps, 0.05);
         assert!(cfg.encoders.av1.is_none());
     }
 
     #[test]
-    fn config_from_encode_config_picks_up_max_fps_and_encoders() {
+    fn config_from_encode_config_picks_up_encoders() {
         let enc = EncodeConfig {
-            max_fps: Some(30),
             encoders: Some(EncodersConfig {
                 av1: Some("libaom-av1".into()),
                 vp9: Some("libvpx-vp9".into()),
@@ -586,10 +565,36 @@ mod tests {
             ..Default::default()
         };
         let cfg = Config::from_encode_config(Some(&enc));
-        assert_eq!(cfg.max_fps, 30.0);
         assert_eq!(cfg.encoders.av1.as_deref(), Some("libaom-av1"));
         assert_eq!(cfg.encoders.vp9.as_deref(), Some("libvpx-vp9"));
         assert!(cfg.encoders.x264.is_none());
+    }
+
+    /// The CLI and the UI must agree on the run parameters for the same
+    /// config -- design doc §3.10.2 ("one field, one conversion entry
+    /// point"). The CLI builds its params through
+    /// `EncodeParams::from_app_config`; this pins that it keeps doing so
+    /// (the frame-rate tolerance used to differ: 0.05 here, 0.01 in the
+    /// UI).
+    #[test]
+    fn cli_params_match_the_shared_mapping() {
+        let enc = EncodeConfig {
+            format: Some(FormatArg::Hevc),
+            crf: 28,
+            max_fps: Some(30),
+            extensions: Some(vec!["mp4".into()]),
+            ..Default::default()
+        };
+        let params = EncodeParams::from_app_config(Some(&enc));
+        assert_eq!(params.format, rencoder_lib::types::VideoFormat::Hevc);
+        assert!(params.is_crf);
+        assert_eq!(params.bitrate_or_crf, 28);
+        assert_eq!(params.extensions, vec!["mp4".to_string()]);
+        assert_eq!(params.max_fps.max_fps, 30.0);
+        assert_eq!(
+            params.max_fps.eps,
+            rencoder_lib::types::MaxFpsConfig::default().eps
+        );
     }
 
     #[test]

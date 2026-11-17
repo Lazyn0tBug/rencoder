@@ -436,21 +436,21 @@ pub fn report(record: &CapabilityRecord) -> String {
         record.probed_at.to_rfc3339()
     ));
     out.push_str(&format!("  ffmpeg      : {}\n", record.ffmpeg_version));
-    if record.encoders.is_empty() {
-        out.push_str("  (this ffmpeg build has no NVENC encoders)\n");
-        return out;
-    }
-    for support in &record.encoders {
-        match (&support.usable, &support.reason) {
-            (true, _) => out.push_str(&format!("  {:<12} : usable\n", support.encoder)),
-            (false, Some(reason)) => out.push_str(&format!(
-                "  {:<12} : UNUSABLE — {}\n",
-                support.encoder, reason
-            )),
-            (false, None) => out.push_str(&format!("  {:<12} : UNUSABLE\n", support.encoder)),
-        }
+    // Same wording as the UI's capability list -- both render
+    // `NvencCapability::lines()`.
+    for line in capability_of(record).lines() {
+        out.push_str(&format!("  {line}\n"));
     }
     out
+}
+
+/// The capability of this machine, in the shape the frontends render.
+pub fn capability_of(record: &CapabilityRecord) -> crate::types::NvencCapability {
+    crate::types::NvencCapability {
+        support: record.encoders.clone(),
+        probed_at: Some(record.probed_at),
+        review_due: record.review_due(Utc::now()),
+    }
 }
 
 /// Run ffmpeg and return its stdout.
@@ -844,9 +844,11 @@ Encoders:
 
     #[test]
     fn report_lists_usable_and_unusable_encoders() {
+        // The wording is the shared one (`NvencCapability::lines`) --
+        // the CLI report and the UI list must not drift apart.
         let text = report(&sample_record());
-        assert!(text.contains("h264_nvenc   : usable"), "{text}");
-        assert!(text.contains("av1_nvenc    : UNUSABLE"), "{text}");
+        assert!(text.contains("h264_nvenc: usable"), "{text}");
+        assert!(text.contains("av1_nvenc: unusable — "), "{text}");
         assert!(text.contains("No NVENC capable devices found"));
     }
 }
