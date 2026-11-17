@@ -23,9 +23,8 @@
 
 #[cfg(test)]
 use crossbeam_channel::unbounded;
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, select, Receiver, Sender};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -301,6 +300,7 @@ pub enum Event {
 mod tests {
     use super::*;
     use crate::types::{EncoderSettings, EncodingOutcome};
+    use std::sync::atomic::Ordering;
 
     fn sample_record() -> EncodingRecord {
         EncodingRecord {
@@ -771,7 +771,18 @@ fn load_and_share_config(evt_tx: &Sender<Event>) -> Option<(Arc<Config>, Arc<App
 ///
 /// `Arc` inside so the read path is a pointer clone -- the reader
 /// drops the lock before encoding (an encode can run for minutes).
-type CacheCell = Arc<Mutex<Option<Arc<Result<EncoderCache, EncodeError>>>>>;
+///
+/// The slot holds the `Arc`s *inside* the `Result`, so a snapshot is a
+/// pointer clone of both the cache and the error: neither
+/// `EncoderCache` nor `EncodeError` has to be `Clone`.
+type CacheSlot = Result<Arc<EncoderCache>, Arc<EncodeError>>;
+
+/// The encoder cache cell: a replaceable handle.
+///
+/// `None` means "the cache has not landed yet" (the init thread is
+/// still running); `Some(Err(..))` means the init failed and every
+/// batch must see that error.
+type CacheCell = Arc<Mutex<Option<CacheSlot>>>;
 
 /// Re-resolve the encoder cache after the NVENC switch changed.
 ///
@@ -796,7 +807,7 @@ fn refresh_encoder_cache(
             match cache {
                 Ok(cache) => {
                     let mut guard = cache_cell.lock();
-                    *guard = Some(Arc::new(Ok(cache)));
+                    *guard = Some(Ok(Arc::new(cache)));
                     if let Some(capability) = capability {
                         send_evt_lossy(
                             &evt_tx,
@@ -828,6 +839,234 @@ fn nvenc_capability_of(
         support: resolution.support.clone(),
         probed_at: Some(resolution.record.probed_at),
         review_due: resolution.review_due,
+    }
+}
+
+// =====================================================================
+// Batch workers — the actor never runs a batch itself (§3.10.1.1)
+// =====================================================================
+
+/// "This batch is done" signal, sent by a worker to the actor.
+///
+/// The actor reopens the busy gate when it reads the signal. A channel
+/// is the right tool: the signal is a message, not shared state.
+struct BatchDone;
+
+/// Drain the pending "batch done" signals.
+///
+/// Returns true if at least one batch has finished. The actor calls
+/// this right before it consults the busy gate: a worker can report
+/// "done" while the actor is handling a command, and a batch that has
+/// finished must not be mistaken for a running one.
+fn drain_batch_done(done_rx: &Receiver<BatchDone>) -> bool {
+    let mut finished = false;
+    while done_rx.try_recv().is_ok() {
+        finished = true;
+    }
+    finished
+}
+
+/// Sends the done signal when dropped.
+///
+/// A guard, not a plain `send` at the end of the body: if the body
+/// panics, the worker thread unwinds and the guard still reports
+/// "done". Without it a panic would leave the busy gate closed and
+/// strand the UI (no batch could ever start again).
+struct DoneGuard(Sender<BatchDone>);
+
+impl Drop for DoneGuard {
+    fn drop(&mut self) {
+        let _ = self.0.send(BatchDone);
+    }
+}
+
+/// Run `body` on a dedicated batch-worker thread.
+///
+/// The actor keeps serving commands while the body runs — that is what
+/// lets `Command::Cancel` reach an in-flight ffmpeg (§3.10.1.1).
+///
+/// The body owns the batch's event sender, so every event of the batch
+/// comes from one sender: the channel's FIFO order is the order the UI
+/// sees.
+fn spawn_batch_job<F>(body: F, done_tx: Sender<BatchDone>)
+where
+    F: FnOnce() + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name("rencoder-batch".into())
+        .spawn(move || {
+            // Dropped when the body returns — or unwinds.
+            let _done = DoneGuard(done_tx);
+            body();
+        })
+        .expect("spawn batch worker");
+}
+
+/// Run one batch of tasks on a worker thread and report the outcome.
+///
+/// `processor` is called once per task by [`TaskManager`], which also
+/// owns the batch/task scaffold logs. The terminal event
+/// (`BatchCompleted` / `BatchCancelled`) is sent by the worker, so the
+/// whole batch reads as one ordered stream.
+fn spawn_task_batch<P>(
+    tasks: Vec<TranscodeTask>,
+    label: &'static str,
+    batch_path: PathBuf,
+    mut processor: P,
+    evt_tx: Sender<Event>,
+    dropped_counter: Arc<std::sync::atomic::AtomicU64>,
+    done_tx: Sender<BatchDone>,
+) where
+    P: FnMut(
+            &TranscodeTask,
+            &crate::pipeline::task::TaskContext,
+        ) -> Result<EncodingRecord, EncodeError>
+        + Send
+        + 'static,
+{
+    spawn_batch_job(
+        move || {
+            let total = tasks.len();
+            // `TaskManager::new(None)`: the actor path has no signal
+            // handler — the cancel branch of `run_ffmpeg_with_progress`
+            // deletes the partial output itself.
+            let run_result = TaskManager::new(None).run(&tasks, label, &batch_path, &mut processor);
+            match run_result {
+                Ok(records) => {
+                    send_evt_lossy(&evt_tx, Event::BatchCompleted { records }, &dropped_counter)
+                }
+                // The processor asked to abort (cancel). `idx` is the
+                // 0-based index of the task the batch stopped at.
+                Err((idx, _)) => send_evt_lossy(
+                    &evt_tx,
+                    Event::BatchCancelled {
+                        completed: idx,
+                        total,
+                    },
+                    &dropped_counter,
+                ),
+            }
+        },
+        done_tx,
+    );
+}
+
+/// Build the per-file processor for an encode batch.
+///
+/// The processor owns everything it needs — no borrows — because it
+/// runs on the batch worker thread: the cache snapshot, the config,
+/// the params, the cancel token and the event sender.
+fn make_encode_processor(
+    params: EncodeParams,
+    config: Arc<Config>,
+    cache: Arc<EncoderCache>,
+    cancel: CancelToken,
+    evt_tx: Sender<Event>,
+    dropped_counter: Arc<std::sync::atomic::AtomicU64>,
+) -> impl FnMut(
+    &TranscodeTask,
+    &crate::pipeline::task::TaskContext,
+) -> Result<EncodingRecord, EncodeError>
+       + Send
+       + 'static {
+    move |task: &TranscodeTask, ctx: &crate::pipeline::task::TaskContext| {
+        // FileStarted uses 0-indexed (matches the v1 UI contract).
+        // TaskManager passes 1-indexed in `ctx.index`; convert.
+        let idx = ctx.index - 1;
+
+        send_evt_lossy(
+            &evt_tx,
+            Event::FileStarted {
+                index: idx,
+                total: ctx.total,
+                source: task.input.clone(),
+            },
+            &dropped_counter,
+        );
+
+        // Cancel check between files. The in-flight ffmpeg polls the
+        // same token, so a cancel during an encode kills the child
+        // (and removes the partial output) — this check ends the batch
+        // after the current file.
+        if cancel.is_cancelled() {
+            return Err(EncodeError::UserCancel);
+        }
+
+        // The progress closure owns its own sender clone: it is built
+        // per file and must not borrow the processor's captures.
+        let evt_tx_progress = evt_tx.clone();
+        let dropped_progress = Arc::clone(&dropped_counter);
+        let mut on_progress = move |p: FfmpegProgress| {
+            send_evt_lossy(
+                &evt_tx_progress,
+                Event::Progress {
+                    file_index: idx,
+                    frame: p.frame,
+                    fps: p.fps,
+                    speed: p.speed,
+                    time_secs: p.time_secs,
+                    eta_secs: p.eta_secs,
+                },
+                &dropped_progress,
+            );
+        };
+
+        let res = transcode_single_with_progress(
+            task,
+            &params,
+            &cache,
+            &config,
+            &cancel,
+            &mut on_progress,
+        );
+
+        match res {
+            Ok(record) => {
+                send_evt_lossy(
+                    &evt_tx,
+                    Event::FileCompleted {
+                        index: idx,
+                        record: record.clone(),
+                    },
+                    &dropped_counter,
+                );
+                Ok(record)
+            }
+            Err(e) => {
+                send_evt_lossy(
+                    &evt_tx,
+                    Event::Error {
+                        category: e.category(),
+                        message: format!("encode error: {e}"),
+                    },
+                    &dropped_counter,
+                );
+                // Map a per-file failure to Ok(Failed record) so
+                // TaskManager doesn't abort the batch on the first
+                // failure — matches v1 inline behavior.
+                Ok(crate::pipeline::task::build_failed_record(task, e, &params))
+            }
+        }
+    }
+}
+
+/// Take a snapshot of the encoder cache for a batch.
+///
+/// The lock is held only for the pointer clone — no IO inside
+/// (§3.10.1 rule 2). The snapshot is immutable, so the batch worker
+/// never needs the cell again.
+///
+/// A batch uses ONE snapshot: a batch is a unit, the encoder must not
+/// change under it.
+fn cache_snapshot(cell: &CacheCell) -> Result<Arc<EncoderCache>, (ErrorCategory, String)> {
+    let snapshot = { cell.lock().clone() };
+    match snapshot {
+        Some(Ok(cache)) => Ok(cache),
+        Some(Err(e)) => Err((e.category(), format!("encoder cache init failed: {e}"))),
+        None => Err((
+            ErrorCategory::ConfigError,
+            "encoder cache init in progress".into(),
+        )),
     }
 }
 
@@ -872,11 +1111,10 @@ fn run_actor(
     // block the refresh thread for the whole file.
     //
     // A plain `Mutex` is the right primitive -- there is exactly one
-    // reader (the actor thread) and one writer (the refresh thread),
-    // so a read/write split would buy nothing.
+    // reader (the actor thread, which takes a snapshot per batch) and
+    // two writers (the init thread and the refresh thread), so a
+    // read/write split would buy nothing.
     let cache_cell: CacheCell = Arc::new(Mutex::new(None));
-    let cache_cell_for_closure = Arc::clone(&cache_cell);
-    let cache_cell_for_dry_run = Arc::clone(&cache_cell);
     // Drive the OnceLock from the background init thread.
     let cache_cell_for_thread = Arc::clone(&cache_cell);
     let evt_tx_for_init = evt_tx.clone();
@@ -910,7 +1148,7 @@ fn run_actor(
         }
         {
             let mut guard = cache_cell_for_thread.lock();
-            *guard = Some(Arc::new(init.cache));
+            *guard = Some(init.cache.map(Arc::new).map_err(Arc::new));
         }
         if let Some((category, message)) = err_event {
             send_evt_lossy(
@@ -924,12 +1162,67 @@ fn run_actor(
     // for the SaveConfig handler). Don't drop yet.
 
     let mut next_batch_id: BatchId = 0;
-    // Set when a batch is running; gates StartBatch to one at a time.
-    let busy = Arc::new(AtomicBool::new(false));
-    // Per-batch cancel token. Reset between batches.
+    // Busy gate: one batch in flight at a time (§3.4 / §3.8.1).
+    //
+    // A plain `bool` in the actor — no lock, no atomic. The batch
+    // itself runs on a worker thread (§3.10.1.1), so the actor is the
+    // only reader and the only writer.
+    let mut batch_running = false;
+    // Per-batch cancel token. Reset between batches. Shared with the
+    // worker: the actor sets it on `Command::Cancel`, the worker polls
+    // it (between files, and inside the ffmpeg progress loop).
     let mut cancel_token = CancelToken::new();
+    // "This batch is done" signals. The worker sends one when it
+    // finishes; the actor reopens the busy gate when it reads one.
+    let (done_tx, done_rx) = bounded::<BatchDone>(1);
 
-    while let Ok(cmd) = cmd_rx.recv() {
+    loop {
+        // Wait for the next command OR for a worker to report "done".
+        // The done branch re-opens the gate and goes back to waiting.
+        let cmd = select! {
+            recv(cmd_rx) -> cmd => cmd,
+            recv(done_rx) -> done => {
+                if done.is_ok() {
+                    batch_running = false;
+                }
+                continue;
+            }
+        };
+        let Ok(cmd) = cmd else {
+            // The UI dropped the command sender: nobody left to
+            // serve. Leave the loop. A worker that is still running
+            // finishes on its own — its events go nowhere, but nothing
+            // here waits for them.
+            break;
+        };
+
+        // The busy gate covers StartBatch / DryRun / Analyze (§3.4:
+        // one batch in flight at a time). It is checked in one place
+        // for all three.
+        //
+        // The drain comes first: a worker can report "done" while the
+        // actor was handling a command, and a batch that has finished
+        // must not be mistaken for a running one.
+        if matches!(
+            &cmd,
+            Command::StartBatch { .. } | Command::DryRun { .. } | Command::Analyze { .. }
+        ) {
+            if drain_batch_done(&done_rx) {
+                batch_running = false;
+            }
+            if batch_running {
+                send_evt_lossy(
+                    &evt_tx,
+                    Event::Error {
+                        category: ErrorCategory::ConfigError,
+                        message: "another batch is already running".into(),
+                    },
+                    &dropped_counter,
+                );
+                continue;
+            }
+        }
+
         match cmd {
             Command::StartBatch { params, files } => {
                 // Review #120: delegate per-file iteration to
@@ -937,18 +1230,6 @@ fn run_actor(
                 // protocol (FileStarted / FileCompleted / Progress /
                 // Error); TaskManager owns batch/task scaffold logs +
                 // partial_output::Guard registration.
-                if busy.swap(true, Ordering::SeqCst) {
-                    send_evt_lossy(
-                        &evt_tx,
-                        Event::Error {
-                            category: ErrorCategory::ConfigError,
-                            message: "another batch is already running".into(),
-                        },
-                        &dropped_counter,
-                    );
-                    continue;
-                }
-
                 let id = next_batch_id;
                 next_batch_id += 1;
                 cancel_token = CancelToken::new();
@@ -961,6 +1242,22 @@ fn run_actor(
                     },
                     &dropped_counter,
                 );
+
+                // One cache snapshot per batch (a batch is a unit —
+                // the encoder must not change under it). The actor
+                // takes it here, so the worker never touches the
+                // cache cell.
+                let cache = match cache_snapshot(&cache_cell) {
+                    Ok(cache) => cache,
+                    Err((category, message)) => {
+                        send_evt_lossy(
+                            &evt_tx,
+                            Event::Error { category, message },
+                            &dropped_counter,
+                        );
+                        continue;
+                    }
+                };
 
                 // Review #122: extension still hoisted (unused now — kept for
                 // the hoist comment / future use).
@@ -983,248 +1280,78 @@ fn run_actor(
 
                 let batch_path = crate::pipeline::batch::batch_target_path_for_files(&files);
 
-                // Capture for the processor closure (FnMut needs
-                // owned captures — Send + Sync not required because
-                // run() is fully sync on this thread). The closure
-                // borrows `cache` / `config` for its lifetime — both
-                // outlive the closure because they live for the
-                // entire `run_actor` body.
-                let evt_tx_for_closure = evt_tx.clone();
-                let dropped_for_closure = dropped_counter.clone();
-                let cancel_for_closure = cancel_token.clone();
-                let evt_tx_progress = evt_tx_for_closure.clone();
-                let dropped_progress = dropped_for_closure.clone();
+                let processor = make_encode_processor(
+                    params.clone(),
+                    Arc::clone(&config),
+                    cache,
+                    cancel_token.clone(),
+                    evt_tx.clone(),
+                    Arc::clone(&dropped_counter),
+                );
 
-                let processor = |task: &TranscodeTask,
-                                 ctx: &crate::pipeline::task::TaskContext|
-                 -> Result<EncodingRecord, EncodeError> {
-                    // FileStarted uses 0-indexed (matches v1 UI
-                    // contract). TaskManager passes 1-indexed in
-                    // `ctx.index`; convert.
-                    let idx = ctx.index - 1;
-
-                    send_evt_lossy(
-                        &evt_tx_for_closure,
-                        Event::FileStarted {
-                            index: idx,
-                            total: ctx.total,
-                            source: task.input.clone(),
-                        },
-                        &dropped_for_closure,
-                    );
-
-                    // Honor cancel between files (cancel-for-loop
-                    // removed in #120; this is the only check).
-                    if cancel_for_closure.is_cancelled() {
-                        return Err(EncodeError::UserCancel);
-                    }
-
-                    let mut on_progress = |p: FfmpegProgress| {
-                        send_evt_lossy(
-                            &evt_tx_progress,
-                            Event::Progress {
-                                file_index: idx,
-                                frame: p.frame,
-                                fps: p.fps,
-                                speed: p.speed,
-                                time_secs: p.time_secs,
-                                eta_secs: p.eta_secs,
-                            },
-                            &dropped_progress,
-                        );
-                    };
-
-                    // Review #126 (delta-review fix): wait for the
-                    // cache-init thread. The cell stores
-                    // `Result<EncoderCache, EncodeError>` so a
-                    // FAILED init surfaces the underlying error each
-                    // time, not a generic fallback.
-                    // Clone the handle out of the cell and drop the
-                    // lock: the encode below can run for minutes and
-                    // must not block a concurrent refresh.
-                    let cache_snapshot = {
-                        let guard = cache_cell_for_closure.lock();
-                        guard.clone()
-                    };
-                    let cache = match cache_snapshot.as_deref() {
-                        Some(Ok(c)) => c,
-                        Some(Err(e)) => {
-                            send_evt_lossy(
-                                &evt_tx_for_closure,
-                                Event::Error {
-                                    category: e.category(),
-                                    message: format!("{e}"),
-                                },
-                                &dropped_for_closure,
-                            );
-                            return Ok(crate::pipeline::task::build_failed_record(
-                                task,
-                                crate::error::EncodeError::Probe(format!(
-                                    "encoder cache init failed: {e}"
-                                )),
-                                &params,
-                            ));
-                        }
-                        None => {
-                            // Init thread hasn't finished yet (race
-                            // unlikely since we spawned it before
-                            // entering the cmd_rx loop). Surface as
-                            // a transient error and skip this task.
-                            send_evt_lossy(
-                                &evt_tx_for_closure,
-                                Event::Error {
-                                    category: ErrorCategory::ConfigError,
-                                    message: "encoder cache init in progress".into(),
-                                },
-                                &dropped_for_closure,
-                            );
-                            return Ok(crate::pipeline::task::build_failed_record(
-                                task,
-                                crate::error::EncodeError::Probe(
-                                    "encoder cache init not yet complete".into(),
-                                ),
-                                &params,
-                            ));
-                        }
-                    };
-                    let res = transcode_single_with_progress(
-                        task,
-                        &params,
-                        cache,
-                        &config,
-                        &cancel_for_closure,
-                        &mut on_progress,
-                    );
-
-                    match res {
-                        Ok(record) => {
-                            send_evt_lossy(
-                                &evt_tx_for_closure,
-                                Event::FileCompleted {
-                                    index: idx,
-                                    record: record.clone(),
-                                },
-                                &dropped_for_closure,
-                            );
-                            Ok(record)
-                        }
-                        Err(e) => {
-                            send_evt_lossy(
-                                &evt_tx_for_closure,
-                                Event::Error {
-                                    category: e.category(),
-                                    message: format!("encode error: {e}"),
-                                },
-                                &dropped_for_closure,
-                            );
-                            // Map per-file failure to Ok(Failed
-                            // record) so TaskManager doesn't abort
-                            // the batch on the first failure —
-                            // matches v1 inline behavior.
-                            Ok(crate::pipeline::task::build_failed_record(task, e, &params))
-                        }
-                    }
-                };
-
-                let run_result =
-                    TaskManager::new(None).run(&tasks, "encoding", &batch_path, processor);
-
-                busy.store(false, Ordering::SeqCst);
-
-                match run_result {
-                    Ok(records) => {
-                        send_evt_lossy(
-                            &evt_tx,
-                            Event::BatchCompleted { records },
-                            &dropped_counter,
-                        );
-                    }
-                    Err((idx, _e)) => {
-                        // Review #120: TaskManager aborts when the
-                        // processor returns Err. The only Err the
-                        // closure produces is `EncodeError::Cancelled`
-                        // (cancel poll at the top). Map to
-                        // BatchCancelled with the correct completed
-                        // count (idx = 0-based task index where the
-                        // batch stopped).
-                        send_evt_lossy(
-                            &evt_tx,
-                            Event::BatchCancelled {
-                                completed: idx,
-                                total: tasks.len(),
-                            },
-                            &dropped_counter,
-                        );
-                    }
-                }
+                // The batch runs on its own thread: the actor stays
+                // responsive, so `Command::Cancel` reaches the
+                // in-flight ffmpeg.
+                batch_running = true;
+                spawn_task_batch(
+                    tasks,
+                    "encoding",
+                    batch_path,
+                    processor,
+                    evt_tx.clone(),
+                    Arc::clone(&dropped_counter),
+                    done_tx.clone(),
+                );
             }
 
             Command::DryRun { params, files } => {
                 // Dry-run: same per-file probe + partial + skip as
-                // StartBatch, but no ffmpeg invocation. busy-gate
-                // applies so a real batch can't sneak in during dry-run.
-                if busy.swap(true, Ordering::SeqCst) {
-                    send_evt_lossy(
-                        &evt_tx,
-                        Event::Error {
-                            category: ErrorCategory::ConfigError,
-                            message: "another batch is already running".into(),
-                        },
-                        &dropped_counter,
-                    );
-                    continue;
-                }
+                // StartBatch, but no ffmpeg invocation. The busy gate
+                // (checked above) applies so a real batch can't sneak
+                // in during dry-run.
+                //
+                // Same Result shape as StartBatch: a failed cache init
+                // surfaces the error; an unset cell means the init
+                // thread hasn't finished yet.
+                let cache = match cache_snapshot(&cache_cell) {
+                    Ok(cache) => cache,
+                    Err((category, message)) => {
+                        send_evt_lossy(
+                            &evt_tx,
+                            Event::Error { category, message },
+                            &dropped_counter,
+                        );
+                        continue;
+                    }
+                };
 
-                // Review #126 (delta-review fix): same Result shape as
-                // StartBatch. A failed cache init surfaces the error
-                // and skips the dry run; an unset cell means the
-                // init thread hasn't finished yet.
-                let cache_snapshot = {
-                    let guard = cache_cell_for_dry_run.lock();
-                    guard.clone()
-                };
-                let cache_ref = match cache_snapshot.as_deref() {
-                    Some(Ok(c)) => c,
-                    Some(Err(e)) => {
-                        send_evt_lossy(
-                            &evt_tx,
-                            Event::Error {
-                                category: e.category(),
-                                message: format!("{e}"),
-                            },
-                            &dropped_counter,
+                let evt_tx_for_worker = evt_tx.clone();
+                let dropped_for_worker = Arc::clone(&dropped_counter);
+                let config_for_worker = Arc::clone(&config);
+                batch_running = true;
+                spawn_batch_job(
+                    move || {
+                        let records = crate::pipeline::batch::dry_run_batch(
+                            &params,
+                            &cache,
+                            &config_for_worker,
+                            files.iter(),
                         );
-                        busy.store(false, Ordering::SeqCst);
-                        continue;
-                    }
-                    None => {
                         send_evt_lossy(
-                            &evt_tx,
-                            Event::Error {
-                                category: ErrorCategory::ConfigError,
-                                message: "encoder cache init in progress".into(),
-                            },
-                            &dropped_counter,
+                            &evt_tx_for_worker,
+                            Event::DryRunFinished { records },
+                            &dropped_for_worker,
                         );
-                        busy.store(false, Ordering::SeqCst);
-                        continue;
-                    }
-                };
-                let records = crate::pipeline::batch::dry_run_batch(
-                    &params,
-                    cache_ref,
-                    &config,
-                    files.iter(),
+                    },
+                    done_tx.clone(),
                 );
-                busy.store(false, Ordering::SeqCst);
-                send_evt_lossy(&evt_tx, Event::DryRunFinished { records }, &dropped_counter);
             }
 
             Command::Cancel => {
-                // Marks the per-batch token; checked between files in
-                // the StartBatch loop above. Per-ffmpeg-process
-                // cancellation requires plumbing the token into
-                // transcode_single → run_ffmpeg_with_progress.
+                // Marks the per-batch token. The worker polls it: the
+                // in-flight ffmpeg is killed (and its partial output
+                // removed), and the batch stops at the next file
+                // boundary.
                 cancel_token.cancel();
             }
 
@@ -1319,65 +1446,60 @@ fn run_actor(
 
             Command::Analyze { files } => {
                 // U22 / Tier 3 #9: parallel analyze with per-file
-                // progress events. Busy-gate so we don't overlap with
-                // StartBatch / DryRun — operator can only have one
-                // kind of batch in flight. v1 doesn't support
-                // Command::Cancel abort; the rayon par_iter runs to
-                // completion and AnalyzeFinished fires cleanly.
-                if busy.swap(true, Ordering::SeqCst) {
-                    send_evt_lossy(
-                        &evt_tx,
-                        Event::Error {
-                            category: ErrorCategory::ConfigError,
-                            message: "another batch is already running".into(),
-                        },
-                        &dropped_counter,
-                    );
-                    continue;
-                }
-
+                // progress events. The busy gate (checked above) keeps
+                // it from overlapping with StartBatch / DryRun — the
+                // operator can only have one kind of batch in flight.
+                // v1 doesn't support Command::Cancel abort; the rayon
+                // par_iter runs to completion and AnalyzeFinished fires
+                // cleanly.
                 let total = files.len();
                 send_evt_lossy(&evt_tx, Event::AnalyzeStarted { total }, &dropped_counter);
 
-                // Progress closure: convert each rayon worker tick
-                // into an Event on the lib→UI channel. The closure
-                // captures `evt_tx` by reference; `Sender<Event>` is
-                // Sync, so the `Fn + Sync + Send` bound required by
-                // rayon is satisfied.
-                let progress = |p: AnalyzeProgress| {
-                    send_evt_lossy(
-                        &evt_tx,
-                        Event::AnalyzeProgress {
-                            done: p.done,
-                            total: p.total,
-                            failed: p.failed,
-                            last: p.last,
-                        },
-                        &dropped_counter,
-                    );
-                };
+                let evt_tx_for_worker = evt_tx.clone();
+                let dropped_for_worker = Arc::clone(&dropped_counter);
+                batch_running = true;
+                spawn_batch_job(
+                    move || {
+                        // Progress closure: convert each rayon worker
+                        // tick into an Event on the lib→UI channel.
+                        // `Sender<Event>` is Sync, so the `Fn + Sync +
+                        // Send` bound required by rayon is satisfied.
+                        let progress = |p: AnalyzeProgress| {
+                            send_evt_lossy(
+                                &evt_tx_for_worker,
+                                Event::AnalyzeProgress {
+                                    done: p.done,
+                                    total: p.total,
+                                    failed: p.failed,
+                                    last: p.last,
+                                },
+                                &dropped_for_worker,
+                            );
+                        };
 
-                let records = analyze_records_with_probe_and_progress_parallel(
-                    &files,
-                    probe_video_metadata_auto,
-                    progress,
-                );
+                        let records = analyze_records_with_probe_and_progress_parallel(
+                            &files,
+                            probe_video_metadata_auto,
+                            progress,
+                        );
 
-                // failed_count invariant: equals
-                // records.iter().filter(|r| r.fps.is_none()).count().
-                // The probe-progress closure already counted
-                // failures (atomic increment), so we re-derive from
-                // the final records to keep the contract testable.
-                let failed_count = records.iter().filter(|r| r.fps.is_none()).count();
+                        // failed_count invariant: equals
+                        // records.iter().filter(|r| r.fps.is_none()).count().
+                        // The probe-progress closure already counted
+                        // failures (atomic increment), so we re-derive from
+                        // the final records to keep the contract testable.
+                        let failed_count = records.iter().filter(|r| r.fps.is_none()).count();
 
-                busy.store(false, Ordering::SeqCst);
-                send_evt_lossy(
-                    &evt_tx,
-                    Event::AnalyzeFinished {
-                        records,
-                        failed_count,
+                        send_evt_lossy(
+                            &evt_tx_for_worker,
+                            Event::AnalyzeFinished {
+                                records,
+                                failed_count,
+                            },
+                            &dropped_for_worker,
+                        );
                     },
-                    &dropped_counter,
+                    done_tx.clone(),
                 );
             }
         }
@@ -1501,10 +1623,15 @@ mod mock_tests {
         crate::types::InputPath::new(std::path::Path::new(p)).expect("test fixture")
     }
 
-    /// Run the actor inline (no thread spawn) with a mock encoder.
+    /// Run a mock actor with a mock encoder.
+    ///
     /// `mock_fn` is called once per file and returns the EncodingRecord
     /// for that file. `data_dir` is the path passed to `load_history`
     /// (not via env var — parallel-safe).
+    ///
+    /// The mock mirrors the production actor's structure: batches run
+    /// on a worker thread and the command loop stays responsive. The
+    /// tests therefore exercise the real mechanism (§3.10.1.1).
     #[allow(clippy::needless_pass_by_value)]
     fn run_actor_inline<F>(
         mock_fn: F,
@@ -1525,11 +1652,10 @@ mod mock_tests {
         let (cmd_tx, cmd_rx) = unbounded::<Command>();
         let (evt_tx, evt_rx) = unbounded::<Event>();
 
-        let busy = Arc::new(AtomicBool::new(false));
         let cancel_token = CancelToken::new();
         // Review #111: tests keep unbounded channels (synchronous
-        // drain, the bound is irrelevant), but process_one_file
-        // now takes a dropped-event counter. Use a local one.
+        // drain, the bound is irrelevant), but the event senders take
+        // a dropped-event counter. Use a local one.
         let dropped_counter = Arc::new(AtomicU64::new(0));
         // Review #126: pre-populate the cache cell synchronously
         // so the mock processor closure can read it without an
@@ -1543,27 +1669,56 @@ mod mock_tests {
                 nvenc: Vec::new(),
             })
             .expect("fresh OnceLock");
-        let config = Config::default();
+        let config = Arc::new(Config::default());
         let params = EncodeParams::default();
+        // The mock encoder is called from the batch worker thread, so
+        // it lives behind a lock: one batch at a time, but the closure
+        // has to be movable into the worker.
+        let encode_fn = Arc::new(Mutex::new(mock_fn));
 
         std::thread::spawn(move || {
             let mut next_batch_id: BatchId = 0;
-            let mut encode_fn = mock_fn;
+            let mut batch_running = false;
             let mut cancel_token = cancel_token;
-            while let Ok(cmd) = cmd_rx.recv() {
+            let (done_tx, done_rx) = bounded::<BatchDone>(1);
+
+            loop {
+                let cmd = select! {
+                    recv(cmd_rx) -> cmd => cmd,
+                    recv(done_rx) -> done => {
+                        if done.is_ok() {
+                            batch_running = false;
+                        }
+                        continue;
+                    }
+                };
+                let Ok(cmd) = cmd else {
+                    break;
+                };
+                // Same busy gate as the production actor: one batch in
+                // flight at a time, checked for all three batch
+                // commands in one place.
+                if matches!(
+                    &cmd,
+                    Command::StartBatch { .. } | Command::DryRun { .. } | Command::Analyze { .. }
+                ) {
+                    if drain_batch_done(&done_rx) {
+                        batch_running = false;
+                    }
+                    if batch_running {
+                        send_evt_lossy(
+                            &evt_tx,
+                            Event::Error {
+                                category: ErrorCategory::ConfigError,
+                                message: "another batch is already running".into(),
+                            },
+                            &dropped_counter,
+                        );
+                        continue;
+                    }
+                }
                 match cmd {
                     Command::StartBatch { params: _, files } => {
-                        if busy.swap(true, AtomicOrdering::SeqCst) {
-                            send_evt_lossy(
-                                &evt_tx,
-                                Event::Error {
-                                    category: ErrorCategory::ConfigError,
-                                    message: "another batch is already running".into(),
-                                },
-                                &dropped_counter,
-                            );
-                            continue;
-                        }
                         let id = next_batch_id;
                         next_batch_id += 1;
                         cancel_token = CancelToken::new();
@@ -1601,19 +1756,22 @@ mod mock_tests {
                             crate::pipeline::batch::batch_target_path_for_files(&files);
 
                         let evt_tx_for_closure = evt_tx.clone();
-                        let dropped_for_closure = dropped_counter.clone();
+                        let dropped_for_closure = Arc::clone(&dropped_counter);
                         let cancel_for_closure = cancel_token.clone();
-                        let evt_tx_progress = evt_tx_for_closure.clone();
-                        let dropped_progress = dropped_for_closure.clone();
                         // Review #126: clone the cache cell for the
                         // mock processor. Mock tests pre-populate it
                         // synchronously, so .get() always succeeds.
                         let cache_cell_for_mock = Arc::clone(&cache_cell);
+                        let config_for_closure = Arc::clone(&config);
+                        let encode_fn_for_closure = Arc::clone(&encode_fn);
+                        // The params are cloned per batch: the processor
+                        // closure takes ownership of its captures.
+                        let params_for_batch = params.clone();
 
                         let processor =
-                            |task: &TranscodeTask,
-                             ctx: &crate::pipeline::task::TaskContext|
-                             -> Result<EncodingRecord, EncodeError> {
+                            move |task: &TranscodeTask,
+                                  ctx: &crate::pipeline::task::TaskContext|
+                                  -> Result<EncodingRecord, EncodeError> {
                                 let idx = ctx.index - 1;
                                 send_evt_lossy(
                                     &evt_tx_for_closure,
@@ -1627,7 +1785,9 @@ mod mock_tests {
                                 if cancel_for_closure.is_cancelled() {
                                     return Err(EncodeError::UserCancel);
                                 }
-                                let mut on_progress = |p: FfmpegProgress| {
+                                let evt_tx_progress = evt_tx_for_closure.clone();
+                                let dropped_progress = Arc::clone(&dropped_for_closure);
+                                let mut on_progress = move |p: FfmpegProgress| {
                                     send_evt_lossy(
                                         &evt_tx_progress,
                                         Event::Progress {
@@ -1649,14 +1809,17 @@ mod mock_tests {
                                 // match-and-fallback form.
                                 let cache =
                                     cache_cell_for_mock.get().expect("mock cache pre-populated");
-                                let res = encode_fn(
-                                    task,
-                                    &params,
-                                    cache,
-                                    &config,
-                                    &cancel_for_closure,
-                                    &mut on_progress,
-                                );
+                                let res = {
+                                    let mut encode = encode_fn_for_closure.lock();
+                                    encode(
+                                        task,
+                                        &params_for_batch,
+                                        cache,
+                                        &config_for_closure,
+                                        &cancel_for_closure,
+                                        &mut on_progress,
+                                    )
+                                };
                                 match res {
                                     Ok(record) => {
                                         send_evt_lossy(
@@ -1679,29 +1842,21 @@ mod mock_tests {
                                             &dropped_for_closure,
                                         );
                                         Ok(crate::pipeline::task::build_failed_record(
-                                            task, e, &params,
+                                            task, e, &params_for_batch,
                                         ))
                                     }
                                 }
                             };
-                        let run_result =
-                            TaskManager::new(None).run(&tasks, "encoding", &batch_path, processor);
-                        busy.store(false, AtomicOrdering::SeqCst);
-                        match run_result {
-                            Ok(records) => send_evt_lossy(
-                                &evt_tx,
-                                Event::BatchCompleted { records },
-                                &dropped_counter,
-                            ),
-                            Err((idx, _)) => send_evt_lossy(
-                                &evt_tx,
-                                Event::BatchCancelled {
-                                    completed: idx,
-                                    total: tasks.len(),
-                                },
-                                &dropped_counter,
-                            ),
-                        }
+                        batch_running = true;
+                        spawn_task_batch(
+                            tasks,
+                            "encoding",
+                            batch_path,
+                            processor,
+                            evt_tx.clone(),
+                            Arc::clone(&dropped_counter),
+                            done_tx.clone(),
+                        );
                     }
                     Command::Cancel => {
                         cancel_token.cancel();
@@ -1763,21 +1918,29 @@ mod mock_tests {
                             encoders_output: String::new(),
                             nvenc: Vec::new(),
                         };
-                        let records = crate::pipeline::batch::dry_run_batch(
-                            &params,
-                            &dummy_cache,
-                            &Config::default(),
-                            files.iter(),
-                        );
-                        send_evt_lossy(
-                            &evt_tx,
-                            Event::DryRunFinished { records },
-                            &dropped_counter,
+                        let evt_tx_for_worker = evt_tx.clone();
+                        let dropped_for_worker = Arc::clone(&dropped_counter);
+                        batch_running = true;
+                        spawn_batch_job(
+                            move || {
+                                let records = crate::pipeline::batch::dry_run_batch(
+                                    &params,
+                                    &dummy_cache,
+                                    &Config::default(),
+                                    files.iter(),
+                                );
+                                send_evt_lossy(
+                                    &evt_tx_for_worker,
+                                    Event::DryRunFinished { records },
+                                    &dropped_for_worker,
+                                );
+                            },
+                            done_tx.clone(),
                         );
                     }
                     // Analyze is exercised here with a lite version
                     // of the production arm (no busy-gate — that's
-                    // the same atomic-swap pattern tested in
+                    // the same gate pattern tested in
                     // start_batch_rejects_second_batch_with_error).
                     // Uses the real probe function so we get real
                     // Started + N×Progress + Finished sequences.
@@ -1788,31 +1951,40 @@ mod mock_tests {
                     Command::Analyze { files } => {
                         let total = files.len();
                         send_evt_lossy(&evt_tx, Event::AnalyzeStarted { total }, &dropped_counter);
-                        let progress = |p: AnalyzeProgress| {
-                            send_evt_lossy(
-                                &evt_tx,
-                                Event::AnalyzeProgress {
-                                    done: p.done,
-                                    total: p.total,
-                                    failed: p.failed,
-                                    last: p.last,
-                                },
-                                &dropped_counter,
-                            );
-                        };
-                        let records = analyze_records_with_probe_and_progress_parallel(
-                            &files,
-                            probe_video_metadata_auto,
-                            progress,
-                        );
-                        let failed_count = records.iter().filter(|r| r.fps.is_none()).count();
-                        send_evt_lossy(
-                            &evt_tx,
-                            Event::AnalyzeFinished {
-                                records,
-                                failed_count,
+                        let evt_tx_for_worker = evt_tx.clone();
+                        let dropped_for_worker = Arc::clone(&dropped_counter);
+                        batch_running = true;
+                        spawn_batch_job(
+                            move || {
+                                let progress = |p: AnalyzeProgress| {
+                                    send_evt_lossy(
+                                        &evt_tx_for_worker,
+                                        Event::AnalyzeProgress {
+                                            done: p.done,
+                                            total: p.total,
+                                            failed: p.failed,
+                                            last: p.last,
+                                        },
+                                        &dropped_for_worker,
+                                    );
+                                };
+                                let records = analyze_records_with_probe_and_progress_parallel(
+                                    &files,
+                                    probe_video_metadata_auto,
+                                    progress,
+                                );
+                                let failed_count =
+                                    records.iter().filter(|r| r.fps.is_none()).count();
+                                send_evt_lossy(
+                                    &evt_tx_for_worker,
+                                    Event::AnalyzeFinished {
+                                        records,
+                                        failed_count,
+                                    },
+                                    &dropped_for_worker,
+                                );
                             },
-                            &dropped_counter,
+                            done_tx.clone(),
                         );
                     }
                 }
@@ -2025,8 +2197,23 @@ mod mock_tests {
 
     #[test]
     fn start_batch_rejects_second_batch_with_error() {
-        let (mock_fn, call_count) = make_succeeding_mock();
-        let (cmd_tx, evt_rx) = run_actor_inline(mock_fn, None);
+        // The busy gate covers the worker's lifetime: the second
+        // StartBatch arrives while the first batch is still running,
+        // so it must be rejected instead of queued.
+        //
+        // The mock sleeps long enough that the first batch is
+        // definitely still running when the second command is
+        // processed.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let (cmd_tx, evt_rx) = run_actor_inline(
+            move |task, _, _, _, _, _| {
+                calls_clone.fetch_add(1, AtomicOrdering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                Ok(fake_record(&task.input))
+            },
+            None,
+        );
         let files: Vec<crate::types::InputPath> = vec![input("/a.mp4")];
         cmd_tx
             .send(Command::StartBatch {
@@ -2034,24 +2221,83 @@ mod mock_tests {
                 files: files.clone(),
             })
             .unwrap();
-        // Don't drop cmd_tx yet — second StartBatch should be rejected
-        // while first is in flight (succeeding_mock returns immediately
-        // but the busy flag is held until BatchCompleted emits).
-        // Actually, succeeding_mock returns instantly, so the first
-        // batch finishes before the second arrives. To verify
-        // rejection we need a slow mock. Use a closure that sleeps
-        // before returning — but that would slow all tests. Instead,
-        // verify the success path is intact and trust the atomic
-        // swap(true) → Event::Error sequence (covered by a slow
-        // test if we add one).
-        drop(cmd_tx);
+        cmd_tx
+            .send(Command::StartBatch {
+                params: EncodeParams::default(),
+                files,
+            })
+            .unwrap();
+
         let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
-        assert!(matches!(events[0], Event::BatchStarted { .. }));
-        assert!(matches!(
-            events.last().unwrap(),
-            Event::BatchCompleted { .. }
-        ));
-        assert_eq!(call_count.load(AtomicOrdering::SeqCst), 1);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                Event::Error { message, .. } if message.contains("another batch")
+            )),
+            "the second batch must be rejected, got: {events:?}"
+        );
+        // Only the first batch ran (one file).
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cancel_command_stops_a_running_batch() {
+        // Regression test for the actor/worker split (§3.10.1.1).
+        //
+        // Before the split the actor ran the batch inline, so
+        // `Command::Cancel` sat in the command queue until the batch
+        // was over — the UI's cancel button never aborted anything.
+        // Now the batch runs on a worker and the cancel reaches it.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let (cmd_tx, evt_rx) = run_actor_inline(
+            move |task, _, _, _, _, _| {
+                calls_clone.fetch_add(1, AtomicOrdering::SeqCst);
+                // Slow enough that the cancel lands while this file
+                // is still being encoded.
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                Ok(fake_record(&task.input))
+            },
+            None,
+        );
+        let files: Vec<crate::types::InputPath> =
+            (0..20).map(|i| input(&format!("/x/{i}.mp4"))).collect();
+        cmd_tx
+            .send(Command::StartBatch {
+                params: EncodeParams::default(),
+                files,
+            })
+            .unwrap();
+
+        // Wait until the worker really started the batch.
+        loop {
+            match evt_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                Ok(Event::FileStarted { .. }) => break,
+                Ok(_) => continue,
+                Err(e) => panic!("no FileStarted event: {e}"),
+            }
+        }
+
+        cmd_tx.send(Command::Cancel).unwrap();
+
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
+        let last = events.last().expect("expected a terminal event");
+        match last {
+            Event::BatchCancelled { completed, total } => {
+                assert_eq!(*total, 20);
+                assert!(
+                    *completed < 20,
+                    "the batch must stop early, completed={completed}"
+                );
+            }
+            _ => panic!("expected BatchCancelled, got {last:?}"),
+        }
+        // The encoder must not have run through the whole list.
+        let calls = calls.load(AtomicOrdering::SeqCst);
+        assert!(
+            calls < 20,
+            "cancel must stop the batch, but {calls} files were encoded"
+        );
     }
 
     #[test]
