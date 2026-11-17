@@ -169,8 +169,24 @@ pub struct Resolution {
 /// `path` is the record's location; `None` disables the store entirely
 /// (every call probes).
 pub fn resolve(path: Option<&Path>, force: bool) -> Result<Resolution, EncodeError> {
-    let encoders_output = run_ffmpeg(&["-encoders"])?;
-    let ffmpeg_version = ffmpeg_version()?;
+    resolve_with(path, force, run_ffmpeg)
+}
+
+/// Resolve with an injectable runner (test seam).
+///
+/// The runner answers every ffmpeg invocation: `["-encoders"]`,
+/// `["-version"]` and the 1-frame capability probes.
+pub fn resolve_with<F>(
+    path: Option<&Path>,
+    force: bool,
+    runner: F,
+) -> Result<Resolution, EncodeError>
+where
+    F: Fn(&[&str]) -> Result<String, EncodeError>,
+{
+    let encoders_output = runner(&["-encoders"])?;
+    let version = runner(&["-version"])?;
+    let ffmpeg_version = version.lines().next().unwrap_or("").trim().to_string();
     let fingerprint = fingerprint(&ffmpeg_version, &encoders_output);
 
     let stored = path.and_then(load);
@@ -192,7 +208,7 @@ pub fn resolve(path: Option<&Path>, force: bool) -> Result<Resolution, EncodeErr
     }
 
     // Probe now.
-    let support = probe(&encoders_output);
+    let support = probe_with(&encoders_output, &runner);
     let now = Utc::now();
     let record = CapabilityRecord {
         version: RECORD_VERSION,
@@ -337,12 +353,6 @@ where
     ])
     .map(|_| ())
     .map_err(|e| failure_reason(&e))
-}
-
-/// `ffmpeg -version`, first line only.
-fn ffmpeg_version() -> Result<String, EncodeError> {
-    let out = run_ffmpeg(&["-version"])?;
-    Ok(out.lines().next().unwrap_or("").trim().to_string())
 }
 
 /// Fingerprint of an ffmpeg build.
@@ -495,6 +505,7 @@ fn failure_reason(err: &EncodeError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     fn temp_path(label: &str) -> PathBuf {
         let dir =
@@ -676,6 +687,159 @@ mod tests {
         };
         let stored = record_to_store(&resolution).expect("a fresh probe must be stored");
         assert_eq!(stored.probed_at, record.probed_at);
+    }
+
+    // ---- resolve (with an injected runner) ----
+
+    /// Fake ffmpeg: answers `-encoders`, `-version`, and the capability
+    /// probes. Records every invocation so the tests can assert what
+    /// was (not) probed.
+    fn fake_ffmpeg(
+        encoders: &'static str,
+        version: &'static str,
+        probe_ok: bool,
+        calls: Arc<Mutex<Vec<String>>>,
+    ) -> impl Fn(&[&str]) -> Result<String, EncodeError> {
+        move |args: &[&str]| {
+            calls.lock().unwrap().push(args.join(" "));
+            if args == ["-encoders"] {
+                return Ok(encoders.to_string());
+            }
+            if args == ["-version"] {
+                return Ok(version.to_string());
+            }
+            // A capability probe.
+            if probe_ok {
+                Ok(String::new())
+            } else {
+                Err(EncodeError::Probe(
+                    "ffmpeg exited 1: No NVENC capable devices found".into(),
+                ))
+            }
+        }
+    }
+
+    const ENCODERS_WITH_NVENC: &str = "\
+Encoders:
+ V..... libsvtav1            libsvtav1 SVT-AV1
+ V..... av1_nvenc            NVIDIA NVENC AV1 encoder
+";
+
+    const FFMPEG_VERSION: &str = "ffmpeg version 9.0.1 Copyright (c) 2000-2026";
+
+    fn store_path(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rencoder_nvenc_resolve_{}_{}",
+            label,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(CAPABILITY_FILE_NAME)
+    }
+
+    #[test]
+    fn resolve_without_a_record_probes_and_builds_one() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let runner = fake_ffmpeg(ENCODERS_WITH_NVENC, FFMPEG_VERSION, true, calls.clone());
+        let path = store_path("no_record");
+
+        let resolution = resolve_with(Some(&path), false, runner).unwrap();
+        assert!(resolution.probed, "a missing record must be probed");
+        assert_eq!(resolution.support.len(), 1);
+        assert!(resolution.support[0].usable);
+        // The probe ran (one call per NVENC encoder in the build).
+        assert!(calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.contains("-c:v av1_nvenc")));
+    }
+
+    #[test]
+    fn resolve_reuses_a_fresh_record_without_probing() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let runner = fake_ffmpeg(ENCODERS_WITH_NVENC, FFMPEG_VERSION, true, calls.clone());
+        let path = store_path("fresh");
+
+        // Store a record that matches the fake build's fingerprint.
+        let mut record = sample_record();
+        record.ffmpeg_fingerprint = fingerprint(FFMPEG_VERSION, ENCODERS_WITH_NVENC);
+        save(&path, &record).unwrap();
+
+        let resolution = resolve_with(Some(&path), false, runner).unwrap();
+        assert!(!resolution.probed, "a fresh record must be reused");
+        assert!(!resolution.review_due);
+        // No probe ran.
+        assert!(
+            !calls.lock().unwrap().iter().any(|c| c.contains("-c:v")),
+            "a fresh record must not trigger a probe: {:?}",
+            calls.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_reprobes_when_the_record_belongs_to_another_build() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let runner = fake_ffmpeg(ENCODERS_WITH_NVENC, FFMPEG_VERSION, true, calls.clone());
+        let path = store_path("other_build");
+
+        // A record from a different ffmpeg build (different fingerprint).
+        let mut record = sample_record();
+        record.ffmpeg_fingerprint = "0000000000000000".to_string();
+        save(&path, &record).unwrap();
+
+        let resolution = resolve_with(Some(&path), false, runner).unwrap();
+        assert!(
+            resolution.probed,
+            "a record from another build must be re-probed"
+        );
+    }
+
+    #[test]
+    fn resolve_forces_a_probe_even_with_a_fresh_record() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let runner = fake_ffmpeg(ENCODERS_WITH_NVENC, FFMPEG_VERSION, true, calls.clone());
+        let path = store_path("forced");
+
+        let mut record = sample_record();
+        record.ffmpeg_fingerprint = fingerprint(FFMPEG_VERSION, ENCODERS_WITH_NVENC);
+        save(&path, &record).unwrap();
+
+        let resolution = resolve_with(Some(&path), true, runner).unwrap();
+        assert!(resolution.probed, "force must re-probe");
+    }
+
+    #[test]
+    fn resolve_reports_an_expired_record_as_due_for_review() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let runner = fake_ffmpeg(ENCODERS_WITH_NVENC, FFMPEG_VERSION, true, calls.clone());
+        let path = store_path("expired");
+
+        let mut record = sample_record();
+        record.ffmpeg_fingerprint = fingerprint(FFMPEG_VERSION, ENCODERS_WITH_NVENC);
+        record.next_review_at = Utc::now() - Duration::days(1);
+        save(&path, &record).unwrap();
+
+        let resolution = resolve_with(Some(&path), false, runner).unwrap();
+        assert!(!resolution.probed, "an expired record is still reused");
+        assert!(resolution.review_due, "an expired record must be flagged");
+    }
+
+    #[test]
+    fn resolve_marks_a_failed_probe_as_unusable() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let runner = fake_ffmpeg(ENCODERS_WITH_NVENC, FFMPEG_VERSION, false, calls.clone());
+        let path = store_path("probe_failed");
+
+        let resolution = resolve_with(Some(&path), false, runner).unwrap();
+        assert_eq!(resolution.support.len(), 1);
+        assert!(!resolution.support[0].usable);
+        assert!(resolution.support[0]
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("No NVENC capable devices found"));
     }
 
     #[test]
