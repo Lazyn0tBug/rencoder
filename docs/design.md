@@ -3594,8 +3594,8 @@ anyhow = "1"
 | busy 闸门（单批次） | actor | actor | **无锁**——actor 本地 `bool`（批次在 worker 上跑之后，闸门只有 actor 读写） |
 | 批次完成信号 | worker | actor | 通道 `bounded(1)`——回话走通道，不共享可变状态 |
 | 编码器缓存（**可替换**） | 初始化线程 / nv 变化时的刷新线程 | worker（等初始化落地后取一张快照） | `Arc<Mutex<Option<CacheSlot>>>` |
-| NVENC 能力判定（进程内） | 降级时写入 | `select_encoder` | `OnceLock<Mutex<HashMap<String, bool>>>`——**尚未收敛**，下一步折进 actor 状态（§3.10.1.1 的"下一步"） |
-| 丢弃事件计数 | 发送失败时（actor + 各 worker） | 日志 | `Arc<AtomicU64>`（多写者，一个计数器） |
+| NVENC 降级判定（本次运行内） | worker（发现降级时）/ actor（汇总） | `select_encoder`（选编码器时） | **无锁**——持有者独占：actor 持权威副本，每批给 worker 一份快照，降级经 done 通道回报 |
+| 丢弃事件计数 | 各发送方自己 | 只有它自己 | `Cell<u64>`（每个发送方一个），不需要共享 |
 | 日志文件写入 | tracing sink | 各线程的日志 | `Mutex<Inner>`（`std::sync`）——**序列化 IO 的例外**，见规则 2 |
 | UI 日志接收端 | `tracing_init::init` | UI 的 use_hook | `OnceLock<Receiver<String>>`（只写一次） |
 
@@ -3659,6 +3659,27 @@ UI 乐观地显示"已取消"，lib 却把整批继续编完，在飞的 ffmpeg 
 
 **下一步（尚未做）**：NVENC 能力判定表（`OnceLock<Mutex<HashMap>>`）折进 actor 独占的
 状态——降级写入发生在 worker 里，届时由 worker 通过通道回报 actor，actor 独占这份判定。
+
+**运行期的判定也要有持有者**：不只是"锁"，还有"这份状态归谁"。原来 NVENC 降级判定
+（"这个编码器在这次运行里坏过"）放在进程级全局表里——语义上它的生命周期确实是"进程"
+（CLI 一次命令 = 一个进程，GUI 一个会话 = 一个进程），但**归属是隐形的**：没人"拥有"
+它，于是它既逃出了测试的边界，也没法说清谁在读、谁在写。
+
+改成显式的持有者：
+
+- GUI：actor 持权威副本；每批开工时给 worker 一份**快照**（worker 拿到的是值，不是引用）。
+- CLI：一次命令持一个本地副本。
+- worker 在批里发现降级 → 写自己的快照（同一批的后续文件立刻看到）→ 同时把降级
+  **通过 done 通道回报** actor → actor 合并进权威副本 → 下一批的快照带上它。
+
+于是全局表消失，判定变成一份**值**，用参数一路传下去（`select_encoder` ← `encode_prepare`
+← `transcode_single*` ← `transcode_batch`）。写只发生在一处（NVENC 失败的当场），
+读只有一处（选编码器），所以不需要锁。
+
+**计数也要有归属**：丢弃事件的计数原来是一个所有发送方共享的 `Arc<AtomicU64>`——写的地方
+多、读的地方**一个都没有**（只加不读）。改成每个发送方自己数一份（`Cell<u64>`），
+第一次丢的时候打一条 warn（"UI 落后了"）：省掉一个共享原语，顺带让这个信息第一次
+真的被人看见。
 
 **已知限制**：UI 断开（`cmd_tx` 全部 drop）时 actor 直接退出，**不**取消在跑的批——
 worker 自己跑完，事件发给没人接收的通道。这与拆分前的行为一致（拆分前 actor 堵在批里，
@@ -3859,6 +3880,8 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 66 | 批在 worker 线程上跑，actor 不阻塞（§3.10.1.1 规则 5）：`Command::Cancel` 在批处理期间真正被处理 → kill 在飞的 ffmpeg + 删半成品 | ✅ |
 | 67 | 一批的事件由同一个发送者发（worker 发），通道 FIFO 保住 UI 看到的顺序；批结束由 `bounded(1)` done 通道回报，actor 收到才放开 busy 闸门 | ✅ |
 | 68 | busy 闸门从 `Arc<AtomicBool>` 降为 actor 本地 `bool`；跨线程可变状态只剩 cancel 的 1 bit + done 通道 | ✅ |
+| 69 | NVENC 降级判定从进程级全局表改为显式持有者（actor 持权威副本，worker 拿快照，降级经 done 通道回报；CLI 持本地副本）——全局可变状态消失 | ✅ |
+| 70 | 丢弃事件计数从共享 `Arc<AtomicU64>` 改为每个发送方自计（`Cell<u64>`）+ 首丢告警——原来只加不读 | ✅ |
 
 ---
 
