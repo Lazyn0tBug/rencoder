@@ -18,8 +18,14 @@
 # no `mkdir`, no surprise auto-create file on first invocation.
 #
 # Usage:
-#   ./scripts/dist.sh             # build for the host target only
-#   ./scripts/dist.sh --release   # pass-through to dist build
+#   ./scripts/dist.sh                    # build for the host target only
+#   ./scripts/dist.sh --target <triple>  # build for an explicit target
+#   ./scripts/dist.sh --release          # pass-through to dist build
+#
+# Every archive staged into ./dist/ is augmented with the U18 app-dir
+# layout (rencoder.toml + log/ + data/), and the checksums are
+# recomputed afterwards -- cargo-dist hashes the archive before the
+# augmentation, so its own checksum files describe the wrong bytes.
 #
 # Prereq: cargo-dist is installed (`cargo install cargo-dist`).
 
@@ -29,8 +35,14 @@ cd "$(dirname "$0")/.."
 
 # Detect the host target so the script does the right thing on each
 # machine (aarch64-apple-darwin on M1/M2, x86_64-unknown-linux-gnu on
-# Linux, etc.) without hardcoding.
+# Linux, etc.) without hardcoding. `--target <triple>` overrides the
+# detection -- the CI passes the matrix triple explicitly rather than
+# relying on the runner's host triple happening to match.
 TARGET=$(rustc -vV | sed -n 's|host: ||p')
+if [ "${1:-}" = "--target" ]; then
+    TARGET=${2:?missing target triple}
+    shift 2
+fi
 if [ -z "$TARGET" ]; then
     echo "error: could not detect host target via 'rustc -vV'" >&2
     exit 1
@@ -46,8 +58,14 @@ dist build --target "$TARGET" "$@"
 rm -rf dist
 mkdir -p dist
 for f in target/distrib/*.tar.xz target/distrib/*.tar.gz \
-         target/distrib/*.sha256 target/distrib/sha256.sum; do
+         target/distrib/*.zip target/distrib/*.sha256 \
+         target/distrib/sha256.sum; do
     [ -f "$f" ] || continue
+    # cargo-dist's source archive holds the repo source, not an app
+    # package -- there is nothing to install from it.
+    case "$(basename "$f")" in
+        source.tar.*) continue ;;
+    esac
     cp "$f" dist/
 done
 
@@ -56,22 +74,26 @@ done
 # runtime layout described in docs/smart_code.md §3.6, so the
 # extracted binary is ready to run with no further setup.
 #
-# We re-pack each tarball in place rather than re-deriving from
-# scratch, so cargo-dist's SHA256 (covering binary + LICENSE +
-# README) stays authoritative for the binary contents. The added
-# files (config + dirs) are deterministic and live outside the
-# binary's hash surface.
+# We re-pack each archive in place. cargo-dist's own checksums are
+# computed BEFORE the augmentation and therefore describe the
+# pre-augmentation archive -- they are recomputed further down.
 #
-# `rencoder_*-*.tar.xz` glob covers both rencoder_cli-* and
-# rencoder_ui-* tarballs. The matching inner dir (rencoder_cli-*
-# or rencoder_ui-*) is detected dynamically rather than per-binary
-# hardcoded.
+# `rencoder_*-*` glob covers both rencoder_cli-* and rencoder_ui-*
+# packages. The matching inner dir (rencoder_cli-* or rencoder_ui-*)
+# is detected dynamically rather than per-binary hardcoded. Both
+# archive formats are handled: cargo-dist's default is tar.gz on some
+# versions and tar.xz on others.
 augmented=0
-for tarball in dist/rencoder_*-*.tar.xz; do
+for tarball in dist/rencoder_*-*.tar.xz dist/rencoder_*-*.tar.gz; do
     [ -f "$tarball" ] || continue
 
+    case "$tarball" in
+        *.tar.xz) extract_flag="-xJf"; pack_flag="-cJf" ;;
+        *.tar.gz)  extract_flag="-xzf"; pack_flag="-czf" ;;
+    esac
+
     workdir=$(mktemp -d)
-    tar -xJf "$tarball" -C "$workdir"
+    tar "$extract_flag" "$tarball" -C "$workdir"
 
     # cargo-dist lays out: <workdir>/<pkg>-<triple>/<files>
     inner_top=$(find "$workdir" -mindepth 1 -maxdepth 1 -type d \
@@ -101,26 +123,74 @@ for tarball in dist/rencoder_*-*.tar.xz; do
     # write to dist/$tarball.new relative to the tempdir (which
     # doesn't exist there).
     inner_name=$(basename "$inner_top")
-    tar -C "$workdir" -cJf "$tarball.new" "$inner_name"
+    tar -C "$workdir" "$pack_flag" "$tarball.new" "$inner_name"
     mv "$tarball.new" "$tarball"
     rm -rf "$workdir"
     augmented=$((augmented + 1))
 done
 
-# Also extract the host tarball(s) so ./dist/rencoder_<bin>-<target>/
+# Augment zip packages (Windows) with the same U18 app-dir layout.
+# `zip` / `unzip` are not reliably available on the GitHub windows
+# runner, so the zip is rewritten with Python's `zipfile` (Python 3 is
+# preinstalled on every runner; `python3` may be missing on Windows,
+# hence the fallback to `python`).
+PYTHON=python3
+command -v python3 >/dev/null 2>&1 || PYTHON=python
+if ! command -v "$PYTHON" >/dev/null 2>&1; then
+    echo "error: neither python3 nor python found (needed for zip augmentation)" >&2
+    exit 1
+fi
+for zipfile in dist/*.zip; do
+    [ -f "$zipfile" ] || continue
+    "$PYTHON" scripts/augment_zip.py "$zipfile"
+    augmented=$((augmented + 1))
+done
+
+# Recompute the checksums AFTER augmentation. The archives changed
+# (rencoder.toml + log/ + data/ were added), so cargo-dist's checksums
+# -- taken before augmentation -- no longer describe them. The release
+# job verifies these files with `sha256sum -c` before publishing.
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    else
+        echo "error: neither sha256sum nor shasum found" >&2
+        exit 1
+    fi
+}
+rm -f dist/*.sha256 dist/sha256.sum
+: > dist/sha256.sum
+for archive in dist/*.tar.xz dist/*.tar.gz dist/*.zip; do
+    [ -f "$archive" ] || continue
+    archive_name=$(basename "$archive")
+    sum=$(sha256_of "$archive")
+    # Bare file name in the checksum file so `sha256sum -c` resolves it
+    # against the directory holding the archives.
+    printf '%s  %s\n' "$sum" "$archive_name" > "dist/$archive_name.sha256"
+    printf '%s  %s\n' "$sum" "$archive_name" >> dist/sha256.sum
+done
+
+# Also extract the host package(s) so ./dist/rencoder_<bin>-<target>/
 # is directly runnable without unpacking by hand. Iterates over
 # both rencoder_cli-$TARGET and rencoder_ui-$TARGET (whichever
 # exist).
 for bin in rencoder_cli rencoder_ui; do
-    host_tarball="dist/${bin}-$TARGET.tar.xz"
-    if [ -f "$host_tarball" ]; then
-        tar -xJf "$host_tarball" -C dist/
-        echo "Extracted ./dist/${bin}-$TARGET/ (with U18 app_dir layout)"
-    fi
+    for ext in tar.xz tar.gz; do
+        host_tarball="dist/${bin}-${TARGET}.${ext}"
+        [ -f "$host_tarball" ] || continue
+        case "$ext" in
+            tar.xz) tar -xJf "$host_tarball" -C dist/ ;;
+            tar.gz)  tar -xzf "$host_tarball" -C dist/ ;;
+        esac
+        echo "Extracted ./dist/${bin}-${TARGET}/ (with U18 app_dir layout)"
+    done
 done
 
 echo
-echo "Augmented $augmented tarball(s) with rencoder.toml + log/ + data/"
+echo "Augmented $augmented package(s) with rencoder.toml + log/ + data/"
+echo "Checksums recomputed after augmentation (dist/*.sha256, dist/sha256.sum)"
 echo
 echo "Artifacts in dist/:"
 ls -la dist/

@@ -1757,47 +1757,62 @@ AppConfig::load(path)
 
 ### 3.7 持续部署（GitHub Actions U18）
 
-release 流程由 `.github/workflows/release.yml` 编排，触发条件为 tag push
-匹配 `v[0-9]+.[0-9]+.[0-9]+*`（cargo SemVer style）。
+release 流程由 `.github/workflows/build.yml` 编排，触发条件为 tag push
+匹配 `v[0-9]*.[0-9]*.[0-9]*`（**GitHub glob 不是正则**：`+` 是字面字符，
+`v[0-9]+.[0-9]+.[0-9]+*` 匹配不到 `v1.2.3`），或 workflow_dispatch 手动
+指定一个**已存在**的 tag。
 
 ```
-tag push v0.x.y
+tag push v1.2.3
+  ↓
+verify: HEAD == refs/tags/<tag>（防止发布错代码）
   ↓
 build (matrix: 3 targets)
-  ├─ aarch64-apple-darwin   -> rencoder_cli-aarch64-apple-darwin.tar.xz (cargo-dist) + U18 augmentation
-  ├─ x86_64-unknown-linux-gnu -> rencoder_cli-x86_64-unknown-linux-gnu.tar.xz (cargo-dist) + U18 augmentation
-  └─ x86_64-pc-windows-msvc  -> rencoder_cli-x86_64-pc-windows-msvc.zip  (cargo-dist; portable)
+  ├─ aarch64-apple-darwin   -> rencoder_cli-*.tar.xz / rencoder_ui-*.tar.xz (cargo-dist) + U18 augmentation
+  ├─ x86_64-unknown-linux-gnu -> *.tar.xz (cargo-dist) + U18 augmentation
+  └─ x86_64-pc-windows-msvc  -> *.zip (cargo-dist) + U18 augmentation (Python helper)
   ↓
-macos-dmg (needs build; only on aarch64-apple-darwin success)
+macos-dmg (needs build)
   ├─ download aarch64-apple-darwin artifact
-  ├─ brew install create-dmg
   ├─ ad-hoc codesign -s -<binary> (mountable on Apple Silicon)
-  └─ create-dmg → rencoder_cli-aarch64-apple-darwin.dmg
+  └─ hdiutil → rencoder_cli-aarch64-apple-darwin.dmg (+ .sha256)
   ↓
 release (needs build + macos-dmg)
-  └─ softprops/action-gh-release --generate-notes
+  ├─ verify: sha256sum -c 每个 *.sha256
+  └─ softprops/action-gh-release --generate-notes --fail-on-unmatched-files
 ```
 
 **为什么不用 cargo-dist 生成 GitHub Actions workflow**：
 
 cargo-dist 0.32 的 `dist init --ci github` 会生成一个 600+ 行 Jinja2 模板的 release.yml，
 带 partials、prerelease logic、SBOM、attestations、cross-platform runner matrix 等大量
-默认 feature。本项目只产 3 targets + 1 个 DMG，**手写 224 行比承载 cargo-dist 的全部 feature set
+默认 feature。本项目只产 3 targets + 1 个 DMG，**手写两百多行比承载 cargo-dist 的全部 feature set
 更可维护**。如果未来需要 homebrew / npm 发布，再考虑 cargo-dist 的 partials 系统。
 
 **cargo-dist 0.32 限制 + 应对**：
 
 cargo-dist 0.32 不支持 `dmg` installer 类型（只支持 msi/shell/powershell/npm/homebrew）。
-应对：单独的 `macos-dmg` job 用 `create-dmg`（homebrew formula，macos-latest runner 自带）
-+ ad-hoc codesign（`--sign -`）让 DMG 在 Apple Silicon 上能挂载。
+应对：单独的 `macos-dmg` job 用 macOS 自带的 `hdiutil`（不依赖 homebrew，
+CI 上不安装 create-dmg）+ ad-hoc codesign（`--sign -`）让 DMG 在 Apple Silicon 上能挂载。
 正式签名 + notarization 需要 Developer ID + Apple ID secrets，那是独立的 story。
 
-**Windows 限制**：
+**Windows 布局**：三平台包现在都带 U18 的 app-dir 布局（`rencoder.toml` +
+空 `log/` + 空 `data/`）。zip 的 augmentation 由 `scripts/augment_zip.py`
+（Python `zipfile`）完成——GitHub 的 windows runner 上 `zip` / `unzip`
+不可靠，而 Python 3 是所有 runner 的预装组件；tarball 仍由 `tar -xJf`
+在 Unix 上就地重打包。空目录用 `.gitkeep` 占位，否则 zip / tar 都不保存空目录。
 
-`scripts/dist.sh` 里的 augmentation 用 Unix-only `tar -xJf` 语法，Windows runner
-跑同样脚本会失败。`build` job 用 `if [ "$target" != ...windows... ]` 跳过 Windows 的 augmentation，
-所以 Windows zip 不含 `rencoder.toml` / `log/` / `data/`。U18 在 Windows 上的最终 layout
-需要 U19 加 PowerShell augmentation step（或用 git-bash 的 tar）。
+**发布前的三道校验**：
+
+1. **tag ↔ HEAD**：dispatch 时指定的 tag 必须指向当前 HEAD，否则不发布。
+2. **校验和**：release job 在创建 release 前 `sha256sum -c` 每个 `*.sha256`；
+   DMG 也产出 `.sha256`。
+3. **文件匹配**：`fail_on_unmatched_files: true` + 上传侧
+   `if-no-files-found: error`——产物为空时直接失败，而不是发一个空 release。
+
+**权限与并发**：workflow 顶层 `contents: read`，只有 release job 拿
+`contents: write`（最小权限）；concurrency group 按 tag 分组且
+`cancel-in-progress: false`，避免两个 release 同时写同一个 tag。
 
 ---
 

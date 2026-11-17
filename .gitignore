@@ -12,3 +12,4 @@ rencoder_cli/data/
 
 .context/
 Cargo.lock
+__pycache__/
