@@ -18,6 +18,7 @@
 //! avoiding a per-file file read.
 
 use crate::config::Config;
+use crate::encoder::nvenc;
 use crate::error::EncodeError;
 use crate::types::{EncoderCache, VideoFormat};
 
@@ -29,28 +30,42 @@ pub fn select_encoder(
     config: &Config,
 ) -> Result<String, EncodeError> {
     // 1. Config override: the user's explicit choice. If this ffmpeg
-    //    build doesn't have it, fall back -- but say so.
+    //    build doesn't have it (or it failed at runtime earlier in this
+    //    process), fall back -- but say so.
     if let Some(override_enc) = config.encoders.for_format(format) {
-        if cache.has_encoder(override_enc) {
+        if nvenc::is_disabled(override_enc) {
+            tracing::warn!(
+                encoder = override_enc,
+                format = format_name(format),
+                "configured encoder failed earlier in this run; falling back"
+            );
+        } else if cache.has_encoder(override_enc) {
             return Ok(override_enc.to_string());
+        } else {
+            tracing::warn!(
+                encoder = override_enc,
+                format = format_name(format),
+                "configured encoder is not available in this ffmpeg build; falling back"
+            );
         }
-        tracing::warn!(
-            encoder = override_enc,
-            format = format_name(format),
-            "configured encoder is not available in this ffmpeg build; falling back"
-        );
     }
 
-    // 2. NVENC variant: only when the capability probe passed for it.
-    if let Some(nvenc) = nvenc_for(format) {
-        if cache.nvenc_usable(nvenc) {
-            return Ok(nvenc.to_string());
-        }
-        // Not usable: either the probe rejected it (we know why) or
-        // NVENC is disabled entirely (nothing to report).
-        if let Some(reason) = cache.nvenc_failure_reason(nvenc) {
+    // 2. NVENC variant: only when the capability probe passed for it
+    //    and it has not failed at runtime.
+    if let Some(nvenc_enc) = nvenc_for(format) {
+        if nvenc::is_disabled(nvenc_enc) {
             tracing::warn!(
-                encoder = nvenc,
+                encoder = nvenc_enc,
+                format = format_name(format),
+                "NVENC encoder failed earlier in this run; using software encoding"
+            );
+        } else if cache.nvenc_usable(nvenc_enc) {
+            return Ok(nvenc_enc.to_string());
+        } else if let Some(reason) = cache.nvenc_failure_reason(nvenc_enc) {
+            // Not usable: either the probe rejected it (we know why) or
+            // NVENC is disabled entirely (nothing to report).
+            tracing::warn!(
+                encoder = nvenc_enc,
                 reason = %reason,
                 format = format_name(format),
                 "NVENC encoder unavailable on this machine; falling back to software encoding"

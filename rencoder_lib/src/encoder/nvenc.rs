@@ -18,7 +18,9 @@
 //! user says otherwise. Nobody knows the state of a machine better than
 //! its owner.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -39,6 +41,33 @@ const RECORD_VERSION: u32 = 1;
 /// NVENC encoders that may exist in an ffmpeg build. Only the ones
 /// actually present in `ffmpeg -encoders` get probed.
 const NVENC_CANDIDATES: [&str; 3] = ["h264_nvenc", "hevc_nvenc", "av1_nvenc"];
+
+/// NVENC encoders that failed at runtime in this process.
+///
+/// The stored capability can be stale (driver update, ffmpeg swap, GPU
+/// disabled in the BIOS). When an NVENC encode fails anyway, the
+/// machine clearly cannot run that encoder -- so remember it for the
+/// rest of the process instead of failing every file the same way.
+static DISABLED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn disabled_set() -> &'static Mutex<HashSet<String>> {
+    DISABLED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Mark an NVENC encoder as unusable for the rest of this process.
+pub fn disable_for_process(encoder: &str) {
+    disabled_set().lock().unwrap().insert(encoder.to_string());
+}
+
+/// Was this encoder disabled after a runtime failure?
+pub fn is_disabled(encoder: &str) -> bool {
+    disabled_set().lock().unwrap().contains(encoder)
+}
+
+/// Is this an NVENC encoder? (`h264_nvenc`, `hevc_nvenc`, `av1_nvenc`)
+pub fn is_nvenc_encoder(encoder: &str) -> bool {
+    encoder.ends_with("_nvenc")
+}
 
 /// The stored result of the last capability probe.
 #[derive(Clone, Debug, Serialize, Deserialize)]

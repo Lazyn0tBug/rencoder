@@ -24,6 +24,7 @@ use crate::config::Config;
 use crate::data::extract::probe_video_metadata_auto;
 use crate::encoder::{
     command::{build_ffmpeg_command, should_skip_encoding},
+    nvenc,
     select::select_encoder,
 };
 use crate::error::EncodeError;
@@ -110,6 +111,8 @@ pub fn transcode_single(
             started_at_meta,
             started_at_instant,
             output,
+            cache,
+            config,
         ),
     }
 }
@@ -161,6 +164,8 @@ pub fn transcode_single_with_progress(
             started_at_instant,
             cancel,
             on_progress,
+            cache,
+            config,
         ),
     }
 }
@@ -340,7 +345,7 @@ fn encode_prepare(
 /// ffmpeg.run + on_progress streaming) lives in the `run_ffmpeg`
 /// closure. The shared record construction + skip policy live here.
 #[allow(clippy::too_many_arguments)]
-fn transcode_inner<F>(
+fn transcode_inner<F, R>(
     task: &TranscodeTask,
     params: &EncodeParams,
     metadata: &VideoMetadata,
@@ -348,10 +353,12 @@ fn transcode_inner<F>(
     output_path: &Path,
     started_at_meta: chrono::DateTime<chrono::Utc>,
     started_at_instant: Instant,
-    run_ffmpeg: F,
+    mut run_ffmpeg: F,
+    rebuild_argv: R,
 ) -> Result<EncodingRecord, EncodeError>
 where
-    F: FnOnce(Vec<String>) -> Result<(), (ErrorCategory, String, String)>,
+    F: FnMut(Vec<String>) -> Result<(), (ErrorCategory, String, String)>,
+    R: FnOnce() -> Option<Vec<String>>,
 {
     let codec = metadata.codec.as_deref().unwrap_or("");
     let need_reduce = matches!(
@@ -376,7 +383,42 @@ where
     // Clone argv for the closure — build_encode_record needs it too.
     // Per-batch this is one ~20-element Vec<String> clone; trivial.
     let argv_for_run = argv.clone();
-    let run_result = run_ffmpeg(argv_for_run);
+    let mut run_result = run_ffmpeg(argv_for_run);
+
+    // NVENC fallback: an NVENC encode that fails means this machine
+    // cannot run that encoder after all (the capability probe was
+    // stale). Fall back to software right here instead of failing the
+    // file — and remember the verdict for the rest of the process, so
+    // the next files do not fail the same way.
+    let mut argv = argv;
+    if run_result.is_err() {
+        if let Some(encoder) = extract_encoder_from_argv(&argv) {
+            if nvenc::is_nvenc_encoder(&encoder) {
+                let (_, message, stderr_tail) = run_result.clone().unwrap_err();
+                tracing::warn!(
+                    encoder = %encoder,
+                    error = %message,
+                    stderr = %stderr_tail,
+                    "NVENC encode failed; falling back to software encoding"
+                );
+                nvenc::disable_for_process(&encoder);
+                if let Some(fallback_argv) = rebuild_argv() {
+                    if !fallback_argv.is_empty() {
+                        argv = fallback_argv;
+                        run_result = run_ffmpeg(argv.clone());
+                        if let Err((_, message, _)) = &run_result {
+                            tracing::warn!(
+                                encoder = %encoder,
+                                error = %message,
+                                "software fallback also failed"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     build_encode_record(
         task,
         params,
@@ -406,6 +448,8 @@ fn transcode_with_argv(
     started_at_meta: chrono::DateTime<chrono::Utc>,
     started_at_instant: Instant,
     output: ProcessOutput,
+    cache: &EncoderCache,
+    config: &Config,
 ) -> Result<EncodingRecord, EncodeError> {
     let _ = output_path; // currently unused inside; reserved for symmetry with progress variant
     transcode_inner(
@@ -417,7 +461,25 @@ fn transcode_with_argv(
         started_at_meta,
         started_at_instant,
         |argv| run_ffmpeg_with_stderr(&argv, output),
+        || rebuild_argv_after_nvenc_failure(task, params, cache, config, metadata),
     )
+}
+
+/// Build a fresh argv after an NVENC failure: the encoder selection now
+/// skips the encoder that just failed, so this picks the software one.
+fn rebuild_argv_after_nvenc_failure(
+    task: &TranscodeTask,
+    params: &EncodeParams,
+    cache: &EncoderCache,
+    config: &Config,
+    metadata: &VideoMetadata,
+) -> Option<Vec<String>> {
+    let argv = build_argv(task, params, cache, config, metadata);
+    if argv.is_empty() {
+        None
+    } else {
+        Some(argv)
+    }
 }
 // ^ argv moves into the closure; build_encode_record uses a fresh
 // argv passed by the caller. The closure's FnOnce captures argv
@@ -445,6 +507,8 @@ fn transcode_with_progress(
     started_at_instant: Instant,
     cancel: &CancelToken,
     on_progress: &mut dyn FnMut(FfmpegProgress),
+    cache: &EncoderCache,
+    config: &Config,
 ) -> Result<EncodingRecord, EncodeError> {
     transcode_inner(
         task,
@@ -455,6 +519,7 @@ fn transcode_with_progress(
         started_at_meta,
         started_at_instant,
         |argv| run_ffmpeg_with_progress(&argv, cancel, metadata.duration_secs, on_progress),
+        || rebuild_argv_after_nvenc_failure(task, params, cache, config, metadata),
     )
 }
 
@@ -1672,6 +1737,86 @@ Encoders:
     }
 
     #[test]
+    fn nvenc_failure_falls_back_to_software_encoding() {
+        // The stored capability was stale: the NVENC encode fails. The
+        // file must be re-encoded with the software encoder instead of
+        // being reported as a failure.
+        let dir = std::env::temp_dir().join("rencoder_batch_nvenc_fallback");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("in.mp4");
+        let output = dir.join("out.mkv");
+        std::fs::write(&input, b"x").unwrap();
+
+        let task = TranscodeTask {
+            input: ip(&input),
+            output: Some(output.clone()),
+        };
+        let params = params_x264_crf();
+        // The cache has no usable NVENC encoder, so the rebuilt argv
+        // picks the software default (libx264 for the X264 params).
+        let cache = EncoderCache {
+            encoders_output: "\
+Encoders:
+ V..... libx264              libx264 H.264
+"
+            .to_string(),
+            nvenc: Vec::new(),
+        };
+        let config = Config::default();
+
+        // A fake NVENC encoder name: `is_nvenc_encoder` only looks at
+        // the suffix, and the process-wide "disabled" registry stays
+        // out of the real encoder names.
+        let nvenc_argv = vec![
+            "ffmpeg".to_string(),
+            "-c:v".to_string(),
+            "test_nvenc".to_string(),
+        ];
+
+        let mut calls: Vec<Vec<String>> = Vec::new();
+        let record = transcode_inner(
+            &task,
+            &params,
+            &VideoMetadata::default(),
+            nvenc_argv,
+            output.as_path(),
+            Utc::now(),
+            Instant::now(),
+            |argv| {
+                calls.push(argv);
+                Err((
+                    ErrorCategory::FfmpegNonzeroExit,
+                    "No NVENC capable devices found".to_string(),
+                    String::new(),
+                ))
+            },
+            || {
+                Some(
+                    rebuild_argv_after_nvenc_failure(
+                        &task,
+                        &params,
+                        &cache,
+                        &config,
+                        &VideoMetadata::default(),
+                    )
+                    .unwrap(),
+                )
+            },
+        )
+        .expect("transcode_inner should return Ok(EncodingRecord)");
+
+        // Two attempts: NVENC first, software second.
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].contains(&"test_nvenc".to_string()));
+        assert!(calls[1].contains(&"libx264".to_string()));
+        // The encoder that failed is remembered for this process.
+        assert!(nvenc::is_disabled("test_nvenc"));
+        // The record carries the argv that actually ran.
+        assert_eq!(record.ffmpeg_argv, calls[1]);
+    }
+
+    #[test]
     fn propagates_ffmpeg_failure_as_failed_record() {
         // Mock run_ffmpeg failure: ffmpeg spawn fails because the program
         // path is invalid. We use a fake argv with a non-existent program
@@ -1706,6 +1851,8 @@ Encoders:
             Utc::now(),
             Instant::now(),
             ProcessOutput::Null,
+            &_cache,
+            &_config,
         )
         .expect("transcode_with_argv should return Ok(EncodingRecord)");
 
