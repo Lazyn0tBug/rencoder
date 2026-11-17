@@ -2047,13 +2047,15 @@ ffmpeg 一升级（macOS 定期抬 dylib major，Linux 各发行版 major 不同
 #### 3.8.2 Actor 模型：UI 与 lib 是两个 actor
 
 ```
-UI actor (Dioxus)  ──Command──►  lib actor (BatchController bg thread)
-                 ◄───Event────
+UI actor (Dioxus)  ──Command──►  lib actor (BatchController bg thread)  ──起 worker──►  batch worker
+                 ◄───Event────                              ◄────done 信号────
 ```
 
 - 两个 actor 完全独立，**只**通过消息通信。无共享变量、无回调、无跨边界函数调用。
 - ffmpeg 子进程、`PartialOutputHandle`、`Child` handle、SIGINT 全部封装在 lib actor 内部。
 - 这把 lib 内部的复杂性收敛到一处，UI 端只看到消息流。
+- **lib actor 不跑批**（§3.10.1.1）：批在 worker 线程上跑，actor 全程可响应。这是 UI 的
+  Cancel 按钮能真正中止编码（kill 在飞的 ffmpeg + 删半成品）的前提。
 
 **Channel 上限（review #111）**:两个 actor 之间的 mpsc 是有界的。
 - `cmd_tx` (UI → lib):容量 16,`try_send` 语义。人类节奏下足够,
@@ -2236,6 +2238,9 @@ UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `int
 - `evt_rx`：由 UI 顶层**专用 OS 线程**独占消费;不广播、不多订阅者——保证单消费者的因果序。`crossbeam_channel::Receiver` 是 single-consumer,无法 clone——这正是我们想要的(避免事件分发歧义)。具体 UI 端如何消费(为何不用 `use_coroutine` + async 块)见 §3.9。
 - Channel 策略:`crossbeam unbounded`(`std::sync::mpsc` 无 unbounded 变体)。单 batch 下每秒最多 ~50 个事件,UI 永远消费得过来;如未来有背压风险再换 `bounded + DropOldest`。
 - Actor 线程命名:`rencoder-controller`,便于 thread 列表里识别。
+- **批次 worker 线程命名:`rencoder-batch`**。actor 收到 `StartBatch` / `DryRun` /
+  `Analyze` 后起一个 worker 跑这一批,批结束 worker 退出(§3.10.1.1)。actor 本身不跑批,
+  因此它在批处理期间照样能处理 `Command::Cancel`。
 
 **Lib 内部细节**:actor 线程启动时一次性加载 `AppConfig`(经 `resolve_config` + `AppConfig::load` + `Config::from_encode_config`)+ 初始化 `EncoderCache`(从 `encode.nv`)。失败 → emit `Event::Error(ConfigError)` + 线程退出(UI 看到错误 + 之后无事件,知道 actor 死了)。
 
@@ -3335,15 +3340,20 @@ state,才能在 footer / `[LOG]` 页显示。custom `MakeWriter` 把
 | 步骤 | 位置 | 耗时 |
 |---|---|---|
 | 用户 click → `Msg::UserClickedCancel` → `phase = Cancelled` (乐观) + `try_send(Command::Cancel)` | `msg.rs:602` reducer | <1ms |
-| cmd_tx channel → actor cmd_rx | `job.rs:815` | <1ms |
-| `cancel_token.cancel()` 写入 `Arc<AtomicBool>` | `job.rs:1099` | <1ms |
-| 等下一行 ffmpeg progress 输出(cancel poll 在 stdout 循环里,每 ~0.5s/line) | `batch.rs:1180-1198` | 0–500ms |
-| `child.kill()` + `child.wait()`(SIGTERM 等 ffmpeg 退出) | `batch.rs:1182-1183` | 200ms–1s |
-| Processor closure 返回 `Err(UserCancel)`(cancel poll between files in `job.rs:900-902`) | `job.rs:900` | <1ms |
-| `TaskManager::run` 返回 `Err((idx, _))` → actor 发 `Event::BatchCancelled` | `job.rs:1017-1033` | <1ms |
-| UI evt_rx → reducer 看到 `Event::BatchCancelled`(但 phase guard 丢弃,不处理) | `msg.rs:808` | <1ms |
+| cmd_tx channel → actor cmd_rx | `job.rs` actor 循环 | <1ms |
+| `cancel_token.cancel()` 写入 `Arc<AtomicBool>` | actor（`Command::Cancel` 分支） | <1ms |
+| 等下一行 ffmpeg progress 输出(cancel poll 在 stdout 循环里,每 ~0.5s/line) | `batch.rs` `run_ffmpeg_with_progress` | 0–500ms |
+| `child.kill()` + `child.wait()`(SIGTERM 等 ffmpeg 退出) | 同上 | 200ms–1s |
+| Processor closure 返回 `Err(UserCancel)`(cancel poll between files) | worker 的 processor | <1ms |
+| `TaskManager::run` 返回 `Err((idx, _))` → worker 发 `Event::BatchCancelled` | worker | <1ms |
+| UI evt_rx → reducer 看到 `Event::BatchCancelled`(但 phase guard 丢弃,不处理) | `msg.rs` | <1ms |
 
 **总延迟 ≈ 1–2s**。如果 UI 等 `Event::BatchCancelled` 才改 phase,这段时间里 badge = `ENCODING`,progress 行 = `cancelled`(因为 `t.cancelled = true`)→ 矛盾 flicker(用户反馈 issue #4)。
+
+**前提：第 2 步必须真的发生**——actor 在批处理期间要能取 `cmd_rx`。这一条曾经不成立：
+actor 同步跑整批(`TaskManager::run` 是个 for 循环),`Command::Cancel` 排在队列里直到整批
+跑完才被处理,于是"取消"实际上从未中止过任何编码。批改到 worker 线程上跑之后
+(§3.10.1.1),这一步才是 <1ms。
 
 **Optimistic cancel invariant**: reducer `Msg::UserClickedCancel` 在 Encoding phase 时立即设 `phase = Cancelled`,**不等 lib**。`apply_event` 入口加 phase guard:任何 batch-scoped `Event::*`(`BatchStarted` / `FileStarted` / `Progress` / `FileCompleted` / `BatchCompleted` / `BatchCancelled` / `LogLine` for batch indices / `Error`)在 `state.tasks.active.phase == Cancelled` 时直接 return。Non-batch events(`HistoryLoaded` / `ConfigSaved` / `AnalyzeStarted` etc.) 不受 guard 影响。
 
@@ -3549,7 +3559,7 @@ anyhow = "1"
 | 锁要持有多久？期间会做 IO 吗？ | 会做 IO（spawn 进程、跑 ffmpeg、读写文件）→ 锁内只取 `Arc`，锁外用 |
 | 状态会被替换吗，还是只写一次？ | 只写一次 → `OnceLock`；会被替换 → 可替换的 `Arc` 句柄 |
 
-**本项目的四条规则**：
+**本项目的五条规则**：
 
 1. **单一写者**：每个共享状态只有一个写者 → 用 `Mutex`，不用 `RwLock`。
 2. **锁内不做长 IO**：持锁期间不得 spawn 进程、不得跑 ffmpeg、不得等另一个锁。需要长时间
@@ -3560,20 +3570,26 @@ anyhow = "1"
    已知的一处代价：CLI 的日志 sink 用 `Mutex<Inner>` 串行化写入，所以 **signal handler
    的日志会等在途的那一次写**（单次本地写，有界）。清理半成品的动作在日志之后，延迟也
    在这个量级。
+   这条例外**不能推广到"日志走通道 + 写者线程"**：signal handler 打日志之后立刻
+   `process::exit(1)`，走通道的话这行 interrupt 日志可能还排在队列里没落盘。CLI 的
+   日志 sink 必须同步写。
 3. **可替换的共享状态用 Arc 句柄**：`Arc<Mutex<Option<Arc<T>>>>` —— 替换整个句柄，读路径
    是指针克隆。
 4. **跨线程只走通道**：命令 / 事件走 channel，不共享可变状态；只写一次的状态用 `OnceLock`。
+5. **中枢不阻塞**：actor 只做"收命令 → 判闸门 → 起 worker → 回话"。跑一批的活一律放
+   worker 线程（见 §3.10.1.1）。actor 阻塞 = 中枢失效。
 
 **共享状态清单**（谁写、谁读、怎么保护）：
 
 | 状态 | 写者 | 读者 | 保护 |
 |---|---|---|---|
-| `PartialOutputHandle`（当前输出路径） | 每轮转码登记 / 清除 | signal handler | `Arc<Mutex<Option<TaskContext>>>`（parking_lot） |
-| `CancelToken` | actor / UI 的 Cancel | 每轮转码之间轮询 | `Arc<AtomicBool>` |
-| `busy`（单批次闸门） | actor | actor | `Arc<AtomicBool>` + swap |
-| 编码器缓存（**可替换**） | 初始化线程 / nv 变化时的刷新线程 | actor（每文件读一次） | `Arc<Mutex<Option<Arc<Result<EncoderCache, EncodeError>>>>>` |
-| NVENC 能力判定（进程内） | 降级时写入 | `select_encoder` | `OnceLock<Mutex<HashMap<String, bool>>>` |
-| 丢弃事件计数 | 发送失败时 | 日志 | `Arc<AtomicU64>` |
+| `PartialOutputHandle`（当前输出路径） | CLI 每轮转码登记 / 清除 | CLI signal handler | `Arc<Mutex<Option<TaskContext>>>`（parking_lot）——**只有 CLI 路径用**；actor 路径的 cancel 分支自己删半成品，不需要它 |
+| `CancelToken` | actor（`Command::Cancel`） | worker（在飞行的 ffmpeg 上轮询） | `Arc<AtomicBool>`——**唯一正当的跨线程 bit**（§3.10.1.1） |
+| busy 闸门（单批次） | actor | actor | **无锁**——actor 本地 `bool`（批次在 worker 上跑之后，闸门只有 actor 读写） |
+| 批次完成信号 | worker | actor | 通道 `bounded(1)`——回话走通道，不共享可变状态 |
+| 编码器缓存（**可替换**） | 初始化线程 / nv 变化时的刷新线程 | actor（收命令时取快照交给 worker） | `Arc<Mutex<Option<Arc<Result<EncoderCache, EncodeError>>>>>` |
+| NVENC 能力判定（进程内） | 降级时写入 | `select_encoder` | `OnceLock<Mutex<HashMap<String, bool>>>`——**尚未收敛**，下一步折进 actor 状态（§3.10.1.1 的"下一步"） |
+| 丢弃事件计数 | 发送失败时（actor + 各 worker） | 日志 | `Arc<AtomicU64>`（多写者，一个计数器） |
 | 日志文件写入 | tracing sink | 各线程的日志 | `Mutex<Inner>`（`std::sync`）——**序列化 IO 的例外**，见规则 2 |
 | UI 日志接收端 | `tracing_init::init` | UI 的 use_hook | `OnceLock<Receiver<String>>`（只写一次） |
 
@@ -3582,7 +3598,8 @@ anyhow = "1"
 
 | 线程 | 起于 | 职责 | 生命周期 |
 |---|---|---|---|
-| actor | `start_controller` | 处理 Command、发 Event | 进程 |
+| actor | `start_controller` | 处理 Command、发 Event、起 worker | 进程 |
+| 批次 worker | actor（`StartBatch` / `DryRun` / `Analyze`） | 跑一批文件（`TaskManager::run` 的同步循环） | 一批，结束即退 |
 | 缓存初始化 | `start_controller` | `ffmpeg -encoders` + NVENC 能力解析 | 一次，结束即退 |
 | NVENC 探测 | `Command::Detect` / nv 变化 | 能力实测 + 写记录 | 一次，结束即退 |
 | stderr 读取 | 每次 ffmpeg | 收集 stderr 尾部（有上限） | 随 ffmpeg 子进程 |
@@ -3593,8 +3610,45 @@ anyhow = "1"
 **"锁内不做长 IO"** 在 stderr 读取线程上尤其要紧：它跟 ffmpeg 子进程同时活着，此时持有任何
 共享锁都会把编码拖慢。
 
-**共享状态清单是约束，不是快照**：它列的是"加了共享状态就得按这四条规则来"的那几处。
+**共享状态清单是约束，不是快照**：它列的是"加了共享状态就得按这五条规则来"的那几处。
 测试专用的锁（env 变量串行化、聚合表的收集）不列——它们不参与生产路径的并发结构。
+
+#### 3.10.1.1 中枢：actor 不阻塞，批在 worker 上跑
+
+**为什么要有这一节**：actor 是中枢——所有跨线程的请求都从它过。但如果 actor 自己跑批
+（`TaskManager::run` 是一个同步 for 循环），它就在整批期间卡住：`cmd_rx` 全程只有
+actor 一个读者，`Command::Cancel` 排在队列里没人取。UI 的 Cancel 按钮按下后，
+UI 乐观地显示"已取消"，lib 却把整批继续编完，在飞的 ffmpeg 也不会被 kill，半成品留在
+磁盘上。**这不是"取消慢"，是"取消没发生"**。
+
+**要求**：
+
+1. **actor 不跑批**。`StartBatch` / `DryRun` / `Analyze` 的实际工作放到 worker 线程上；
+   actor 只做：收命令 → 判闸门 → 起 worker → 回话。
+2. **一批一个 worker**（不是线程池）。一批 = 一次 `TaskManager::run` 的串行循环；
+   worker 起于该批、止于该批。
+3. **一批的事件由同一个发送者发**。`FileStarted` / `Progress` / `FileCompleted` /
+   `BatchCompleted` / `BatchCancelled` 都由 worker 发——单发送者 ⇒ 通道 FIFO ⇒ UI
+   看到的顺序不会错位。
+4. **批结束由 worker 回报**：一条 `bounded(1)` 的 done 通道。worker 发完最后一个事件后
+   发一个"这批完了"，actor 收到才放开 busy 闸门。闸门放开前 actor 先把 done 通道排空，
+   免得"刚跑完的那批"被误判成"还在跑"。
+
+**中枢化之后，跨线程共享可变状态只剩两样**：
+
+| 东西 | 方向 | 为什么正当 |
+|---|---|---|
+| `CancelToken`（1 bit） | actor 写 / worker 轮询 | 轮询型取消：worker 每 ~0.5s 查一次 flag。走通道往返太贵，一个 bit 不值得一个锁 |
+| done 信号 | worker 写 / actor 读 | 通道——天然同步，不需要锁 |
+
+其余的（busy 闸门、批 id、编码器缓存的取用）都是 actor 独占的普通变量；worker 只拿到
+**不可变快照**（`Arc<EncoderCache>` 之类）。
+
+**读法**：看到一个新的 `Mutex` / `Atomic` 时先问一句——这份状态有第二个拥有者吗？
+没有的话，多出来的原语就是负担。
+
+**下一步（尚未做）**：NVENC 能力判定表（`OnceLock<Mutex<HashMap>>`）折进 actor 独占的
+状态——降级写入发生在 worker 里，届时由 worker 通过通道回报 actor，actor 独占这份判定。
 
 #### 3.10.2 参数流：一个字段只有一个转换入口
 
@@ -3786,7 +3840,10 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 62 | 选同步原语前先写清"几个读者 / 几个写者 / 锁持有多久"：单一写者用 `Mutex`，锁内不做 IO，可替换状态用 `Arc` 句柄（§3.10.1） | ✅ |
 | 63 | 一个配置字段只有一个转换入口：`EncodeParams::from_app_config`；运行时 `Config` 不再重复 `max_fps` / `max_fps_eps`（§3.10.2） | ✅ |
 | 64 | 同一份事实的措辞 / 映射 / 判定放 lib，交互方式各前端自己实现（§3.10.3） | ✅ |
-| 57 | 同路径保护三层:`output_path_for` 命名避让 → `utils::fs::is_same_file`（父目录规范化 + 文件名大小写不敏感）→ 转码前拦截记 `Failed` 不调 ffmpeg | ✅ |
+| 65 | 同路径保护三层:`output_path_for` 命名避让 → `utils::fs::is_same_file`（父目录规范化 + 文件名大小写不敏感）→ 转码前拦截记 `Failed` 不调 ffmpeg | ✅ |
+| 66 | 批在 worker 线程上跑，actor 不阻塞（§3.10.1.1 规则 5）：`Command::Cancel` 在批处理期间真正被处理 → kill 在飞的 ffmpeg + 删半成品 | ✅ |
+| 67 | 一批的事件由同一个发送者发（worker 发），通道 FIFO 保住 UI 看到的顺序；批结束由 `bounded(1)` done 通道回报，actor 收到才放开 busy 闸门 | ✅ |
+| 68 | busy 闸门从 `Arc<AtomicBool>` 降为 actor 本地 `bool`；跨线程可变状态只剩 cancel 的 1 bit + done 通道 | ✅ |
 
 ---
 
