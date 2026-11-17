@@ -481,14 +481,23 @@ fn write_atomic(path: &Path, content: &[u8]) -> Result<(), ConfigError> {
     result
 }
 
-/// Tmp path: `<target>.tmp` in the same directory. Falls back to a
-/// stable sibling if `path` has no usable file_name (shouldn't happen
+/// Tmp path: `<target>.<pid>.tmp` in the same directory. Falls back to
+/// a stable sibling if `path` has no usable file_name (shouldn't happen
 /// for normal config paths, but defensive).
+///
+/// The pid is part of the name on purpose: the config auto-create can
+/// run in several processes at once (the CLI integration tests spawn
+/// the binary in parallel; the GUI and the CLI can share an app dir).
+/// With a fixed `<target>.tmp` name, one process renames the file away
+/// while another's rename is still pending, and the loser fails with
+/// ENOENT -- "failed to load config from ...". Distinct names per
+/// process make the race harmless: both write the same content, the
+/// last rename wins.
 fn tmp_path_for(path: &Path) -> PathBuf {
     let mut tmp = path.to_path_buf();
     let name = match path.file_name() {
-        Some(n) => format!("{}.tmp", n.to_string_lossy()),
-        None => "rencoder.tmp".to_string(),
+        Some(n) => format!("{}.{}.tmp", n.to_string_lossy(), std::process::id()),
+        None => format!("rencoder.{}.tmp", std::process::id()),
     };
     tmp.set_file_name(name);
     tmp
