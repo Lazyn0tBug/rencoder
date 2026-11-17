@@ -904,15 +904,19 @@ where
 
 /// Run one batch of tasks on a worker thread and report the outcome.
 ///
-/// `processor` is called once per task by [`TaskManager`], which also
-/// owns the batch/task scaffold logs. The terminal event
-/// (`BatchCompleted` / `BatchCancelled`) is sent by the worker, so the
-/// whole batch reads as one ordered stream.
-fn spawn_task_batch<P>(
+/// `make_processor` is called *in the worker* — that is where the
+/// encoder cache is resolved (the one-time init may still be running,
+/// and waiting for it must not block the actor). The processor it
+/// returns is called once per task by [`TaskManager`], which also owns
+/// the batch/task scaffold logs.
+///
+/// The terminal event (`BatchCompleted` / `BatchCancelled`) is sent by
+/// the worker, so the whole batch reads as one ordered stream.
+fn spawn_task_batch<P, F>(
     tasks: Vec<TranscodeTask>,
     label: &'static str,
     batch_path: PathBuf,
-    mut processor: P,
+    make_processor: F,
     evt_tx: Sender<Event>,
     dropped_counter: Arc<std::sync::atomic::AtomicU64>,
     done_tx: Sender<BatchDone>,
@@ -923,9 +927,23 @@ fn spawn_task_batch<P>(
         ) -> Result<EncodingRecord, EncodeError>
         + Send
         + 'static,
+    F: FnOnce() -> Result<P, (ErrorCategory, String)> + Send + 'static,
 {
     spawn_batch_job(
         move || {
+            let mut processor = match make_processor() {
+                Ok(processor) => processor,
+                Err((category, message)) => {
+                    // The batch could not start (no encoder cache).
+                    // The error event is terminal for the UI.
+                    send_evt_lossy(
+                        &evt_tx,
+                        Event::Error { category, message },
+                        &dropped_counter,
+                    );
+                    return;
+                }
+            };
             let total = tasks.len();
             // `TaskManager::new(None)`: the actor path has no signal
             // handler — the cancel branch of `run_ffmpeg_with_progress`
@@ -1022,6 +1040,14 @@ fn make_encode_processor(
 
         match res {
             Ok(record) => {
+                // A cancelled encode (the ffmpeg child was killed and
+                // its partial output removed) ends the batch: the user
+                // asked to stop, so the batch reports "cancelled"
+                // instead of "completed with one failed file".
+                let cancelled = record
+                    .error
+                    .as_ref()
+                    .is_some_and(|e| e.category == ErrorCategory::Cancelled);
                 send_evt_lossy(
                     &evt_tx,
                     Event::FileCompleted {
@@ -1030,6 +1056,9 @@ fn make_encode_processor(
                     },
                     &dropped_counter,
                 );
+                if cancelled {
+                    return Err(EncodeError::UserCancel);
+                }
                 Ok(record)
             }
             Err(e) => {
@@ -1050,23 +1079,45 @@ fn make_encode_processor(
     }
 }
 
-/// Take a snapshot of the encoder cache for a batch.
+/// How long a batch waits for the encoder cache to land.
 ///
-/// The lock is held only for the pointer clone — no IO inside
-/// (§3.10.1 rule 2). The snapshot is immutable, so the batch worker
-/// never needs the cell again.
+/// The init spawns ffmpeg (`ffmpeg -encoders`), so it takes a moment.
+/// A batch that starts in that window waits for it instead of failing
+/// with "encoder cache init in progress" — that failure was a real
+/// bug: the first batch after startup could not start at all.
+const CACHE_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Take the encoder cache, waiting for the one-time init to land.
+///
+/// The wait happens in the batch worker, so the actor stays responsive
+/// while it waits. The cell is polled rather than waited on with a
+/// condition variable: the wait is short, happens once per process,
+/// and a poll keeps the shared-state inventory free of another
+/// primitive (§3.10.1).
 ///
 /// A batch uses ONE snapshot: a batch is a unit, the encoder must not
 /// change under it.
-fn cache_snapshot(cell: &CacheCell) -> Result<Arc<EncoderCache>, (ErrorCategory, String)> {
-    let snapshot = { cell.lock().clone() };
-    match snapshot {
-        Some(Ok(cache)) => Ok(cache),
-        Some(Err(e)) => Err((e.category(), format!("encoder cache init failed: {e}"))),
-        None => Err((
-            ErrorCategory::ConfigError,
-            "encoder cache init in progress".into(),
-        )),
+fn take_cache(cell: &CacheCell, timeout: std::time::Duration) -> Option<CacheSlot> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        // The lock is held only for the pointer clone — no IO inside
+        // (§3.10.1 rule 2).
+        if let Some(slot) = { cell.lock().clone() } {
+            return Some(slot);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Turn a cache slot into the cache a batch needs, or into the error
+/// to report.
+fn cache_from_slot(slot: CacheSlot) -> Result<Arc<EncoderCache>, (ErrorCategory, String)> {
+    match slot {
+        Ok(cache) => Ok(cache),
+        Err(e) => Err((e.category(), format!("encoder cache init failed: {e}"))),
     }
 }
 
@@ -1244,21 +1295,11 @@ fn run_actor(
                 );
 
                 // One cache snapshot per batch (a batch is a unit —
-                // the encoder must not change under it). The actor
-                // takes it here, so the worker never touches the
-                // cache cell.
-                let cache = match cache_snapshot(&cache_cell) {
-                    Ok(cache) => cache,
-                    Err((category, message)) => {
-                        send_evt_lossy(
-                            &evt_tx,
-                            Event::Error { category, message },
-                            &dropped_counter,
-                        );
-                        continue;
-                    }
-                };
-
+                // the encoder must not change under it). The cache is
+                // resolved *in the worker*: the one-time init may
+                // still be running, and waiting for it must not block
+                // the actor.
+                //
                 // Review #122: extension still hoisted (unused now — kept for
                 // the hoist comment / future use).
                 let _ext = params.format.default_extension();
@@ -1280,14 +1321,27 @@ fn run_actor(
 
                 let batch_path = crate::pipeline::batch::batch_target_path_for_files(&files);
 
-                let processor = make_encode_processor(
-                    params.clone(),
-                    Arc::clone(&config),
-                    cache,
-                    cancel_token.clone(),
-                    evt_tx.clone(),
-                    Arc::clone(&dropped_counter),
-                );
+                let cache_cell_for_worker = Arc::clone(&cache_cell);
+                let params_for_worker = params.clone();
+                let config_for_worker = Arc::clone(&config);
+                let cancel_for_worker = cancel_token.clone();
+                let evt_tx_for_worker = evt_tx.clone();
+                let dropped_for_worker = Arc::clone(&dropped_counter);
+                let make_processor = move || {
+                    let slot = take_cache(&cache_cell_for_worker, CACHE_WAIT_TIMEOUT).ok_or((
+                        ErrorCategory::ConfigError,
+                        "encoder cache init timed out".into(),
+                    ))?;
+                    let cache = cache_from_slot(slot)?;
+                    Ok(make_encode_processor(
+                        params_for_worker,
+                        config_for_worker,
+                        cache,
+                        cancel_for_worker,
+                        evt_tx_for_worker,
+                        dropped_for_worker,
+                    ))
+                };
 
                 // The batch runs on its own thread: the actor stays
                 // responsive, so `Command::Cancel` reaches the
@@ -1297,7 +1351,7 @@ fn run_actor(
                     tasks,
                     "encoding",
                     batch_path,
-                    processor,
+                    make_processor,
                     evt_tx.clone(),
                     Arc::clone(&dropped_counter),
                     done_tx.clone(),
@@ -1309,28 +1363,41 @@ fn run_actor(
                 // StartBatch, but no ffmpeg invocation. The busy gate
                 // (checked above) applies so a real batch can't sneak
                 // in during dry-run.
-                //
-                // Same Result shape as StartBatch: a failed cache init
-                // surfaces the error; an unset cell means the init
-                // thread hasn't finished yet.
-                let cache = match cache_snapshot(&cache_cell) {
-                    Ok(cache) => cache,
-                    Err((category, message)) => {
-                        send_evt_lossy(
-                            &evt_tx,
-                            Event::Error { category, message },
-                            &dropped_counter,
-                        );
-                        continue;
-                    }
-                };
-
+                let cache_cell_for_worker = Arc::clone(&cache_cell);
                 let evt_tx_for_worker = evt_tx.clone();
                 let dropped_for_worker = Arc::clone(&dropped_counter);
                 let config_for_worker = Arc::clone(&config);
                 batch_running = true;
                 spawn_batch_job(
                     move || {
+                        // The cache is resolved here, in the worker: the
+                        // one-time init may still be running, and
+                        // waiting for it must not block the actor.
+                        let slot = take_cache(&cache_cell_for_worker, CACHE_WAIT_TIMEOUT);
+                        let cache = match slot {
+                            Some(slot) => match cache_from_slot(slot) {
+                                Ok(cache) => cache,
+                                Err((category, message)) => {
+                                    send_evt_lossy(
+                                        &evt_tx_for_worker,
+                                        Event::Error { category, message },
+                                        &dropped_for_worker,
+                                    );
+                                    return;
+                                }
+                            },
+                            None => {
+                                send_evt_lossy(
+                                    &evt_tx_for_worker,
+                                    Event::Error {
+                                        category: ErrorCategory::ConfigError,
+                                        message: "encoder cache init timed out".into(),
+                                    },
+                                    &dropped_for_worker,
+                                );
+                                return;
+                            }
+                        };
                         let records = crate::pipeline::batch::dry_run_batch(
                             &params,
                             &cache,
@@ -1768,8 +1835,8 @@ mod mock_tests {
                         // closure takes ownership of its captures.
                         let params_for_batch = params.clone();
 
-                        let processor =
-                            move |task: &TranscodeTask,
+                        let processor_factory = move || {
+                            Ok(move |task: &TranscodeTask,
                                   ctx: &crate::pipeline::task::TaskContext|
                                   -> Result<EncodingRecord, EncodeError> {
                                 let idx = ctx.index - 1;
@@ -1846,13 +1913,14 @@ mod mock_tests {
                                         ))
                                     }
                                 }
-                            };
+                            })
+                        };
                         batch_running = true;
                         spawn_task_batch(
                             tasks,
                             "encoding",
                             batch_path,
-                            processor,
+                            processor_factory,
                             evt_tx.clone(),
                             Arc::clone(&dropped_counter),
                             done_tx.clone(),

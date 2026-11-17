@@ -245,6 +245,117 @@ fn transcode_batch_skips_when_output_exists() {
     ));
 }
 
+// ---- actor: Command::Cancel aborts a running batch (end-to-end) ----
+
+/// Build a fixture whose codec differs from the target codec.
+///
+/// The default fixture is h264; encoding it to h264 would hit the
+/// same-codec skip rule and no ffmpeg would ever run.
+fn make_video_with_codec(dir: &Path, name: &str, codec: &str, duration: u32) -> PathBuf {
+    let path = dir.join(name);
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=640x480:r=30",
+            "-c:v",
+            codec,
+            "-t",
+            &duration.to_string(),
+        ])
+        .arg(&path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("ffmpeg spawn failed");
+    assert!(status.success(), "ffmpeg failed for {name}");
+    path
+}
+
+#[test]
+fn actor_cancel_aborts_the_batch_and_removes_the_partial_output() {
+    // End-to-end proof of the actor/worker split (§3.10.1.1): the
+    // batch runs on a worker thread, so `Command::Cancel` is actually
+    // processed while ffmpeg is running. Before the split the command
+    // sat in the queue until the batch was over and nothing was
+    // aborted.
+    if skip_if_no_ffmpeg() {
+        return;
+    }
+    let dir = fixture_dir("actor_cancel");
+    // Long enough that the encode is still running when the cancel
+    // lands (the cancel is sent after the first progress event).
+    let input = make_video_with_codec(&dir, "in.mp4", "mpeg4", 120);
+
+    let (cmd_tx, evt_rx) = rencoder_lib::job::start_controller().into_split();
+
+    let params = EncodeParams {
+        format: VideoFormat::X264,
+        is_crf: true,
+        bitrate_or_crf: 28,
+        target: Target::Dir(dir.clone()),
+        extensions: vec![],
+        extra_args: vec![],
+        max_fps: rencoder_lib::types::MaxFpsConfig::default(),
+    };
+    cmd_tx
+        .send(rencoder_lib::job::Command::StartBatch {
+            params,
+            files: vec![rencoder_lib::types::InputPath::new(&input).unwrap()],
+        })
+        .unwrap();
+
+    // Wait for the encode to actually start.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .expect("timed out waiting for the encode to start");
+        match evt_rx.recv_timeout(remaining) {
+            Ok(rencoder_lib::job::Event::Progress { .. }) => break,
+            Ok(rencoder_lib::job::Event::Error { message, .. }) => {
+                panic!("encode failed before it started: {message}")
+            }
+            Ok(_) => continue,
+            Err(e) => panic!("no progress event: {e}"),
+        }
+    }
+
+    cmd_tx.send(rencoder_lib::job::Command::Cancel).unwrap();
+
+    // The batch must end as cancelled -- not as "completed with one
+    // failed file".
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut outcome = None;
+    while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
+        match evt_rx.recv_timeout(remaining) {
+            Ok(rencoder_lib::job::Event::BatchCancelled { completed, total }) => {
+                outcome = Some((completed, total));
+                break;
+            }
+            Ok(rencoder_lib::job::Event::BatchCompleted { .. }) => {
+                panic!("the batch ran to completion — cancel did not abort it")
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    let (completed, total) = outcome.expect("expected a BatchCancelled event");
+    assert_eq!(total, 1);
+    assert_eq!(completed, 0, "no file should have finished");
+
+    // The half-written output must be gone: the cancel branch removes
+    // it so the next run doesn't mistake it for a finished encode.
+    let output = dir.join("in.mkv");
+    assert!(
+        !output.exists(),
+        "the partial output must be removed on cancel: {}",
+        output.display()
+    );
+}
+
 // ---- init_encoder_cache ----
 
 #[test]

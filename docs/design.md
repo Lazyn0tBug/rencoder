@@ -3361,6 +3361,12 @@ actor 同步跑整批(`TaskManager::run` 是个 for 循环),`Command::Cancel` �
 
 `run_ffmpeg_with_progress` 在 cancel branch(`batch.rs:1180-1198`)kill child 后,提取 argv 最后一项作为 output path,调 `std::fs::remove_file`。CLI 路径已经走 `PartialOutputHandle` Guard(actor 路径之前没接,这次补齐)。这保证 partial `.mkv` 不留在磁盘上——下一次跑同样文件时,`encode_prepare` 的 partial-output detector 也不会再误判。
 
+**被取消的文件 = 整批取消**:ffmpeg 被 kill 后,那个文件的 record 是 `Failed` 且
+`error.category = Cancelled`。actor 的 processor 看到这一条就**中止整批**(`Err`),
+于是 worker 发的是 `Event::BatchCancelled`,而不是"跑完了,其中一个文件失败"。
+用户按了取消,回给他的就该是"取消",不是"完成但有一个失败"。
+
+
 ```rust
 // batch.rs run_ffmpeg_with_progress cancel branch (v1.2 follow-up #2)
 if cancel.is_cancelled() {
@@ -3587,7 +3593,7 @@ anyhow = "1"
 | `CancelToken` | actor（`Command::Cancel`） | worker（在飞行的 ffmpeg 上轮询） | `Arc<AtomicBool>`——**唯一正当的跨线程 bit**（§3.10.1.1） |
 | busy 闸门（单批次） | actor | actor | **无锁**——actor 本地 `bool`（批次在 worker 上跑之后，闸门只有 actor 读写） |
 | 批次完成信号 | worker | actor | 通道 `bounded(1)`——回话走通道，不共享可变状态 |
-| 编码器缓存（**可替换**） | 初始化线程 / nv 变化时的刷新线程 | actor（收命令时取快照交给 worker） | `Arc<Mutex<Option<Arc<Result<EncoderCache, EncodeError>>>>>` |
+| 编码器缓存（**可替换**） | 初始化线程 / nv 变化时的刷新线程 | worker（等初始化落地后取一张快照） | `Arc<Mutex<Option<CacheSlot>>>` |
 | NVENC 能力判定（进程内） | 降级时写入 | `select_encoder` | `OnceLock<Mutex<HashMap<String, bool>>>`——**尚未收敛**，下一步折进 actor 状态（§3.10.1.1 的"下一步"） |
 | 丢弃事件计数 | 发送失败时（actor + 各 worker） | 日志 | `Arc<AtomicU64>`（多写者，一个计数器） |
 | 日志文件写入 | tracing sink | 各线程的日志 | `Mutex<Inner>`（`std::sync`）——**序列化 IO 的例外**，见规则 2 |
@@ -3633,6 +3639,10 @@ UI 乐观地显示"已取消"，lib 却把整批继续编完，在飞的 ffmpeg 
 4. **批结束由 worker 回报**：一条 `bounded(1)` 的 done 通道。worker 发完最后一个事件后
    发一个"这批完了"，actor 收到才放开 busy 闸门。闸门放开前 actor 先把 done 通道排空，
    免得"刚跑完的那批"被误判成"还在跑"。
+5. **准备工作也在 worker 上做**：编码器缓存的一次性初始化要 spawn ffmpeg，可能比一批
+   的启动更早发生。worker 拿缓存时**等初始化落地**（有上限），而不是报"初始化进行中"
+   让这批失败——后者是真实 bug：启动后第一批根本起不来。等发生在 worker 上，actor 不受
+   影响。
 
 **中枢化之后，跨线程共享可变状态只剩两样**：
 
