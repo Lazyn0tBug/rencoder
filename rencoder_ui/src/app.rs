@@ -549,6 +549,110 @@ fn SetupPage(
                     }
                 }
 
+                // ---- NVENC (hardware acceleration) ----
+                div { class: "form-row",
+                    label { class: "form-label", "nvenc" }
+                    div { class: "form-radios",
+                        for (value, label) in [(true, "on"), (false, "off")] {
+                            {
+                                let checked = draft.nv.unwrap_or(false) == value;
+                                let kind = ConfigFieldKind::Nv;
+                                let mut state_c = state;
+                                let config_c = config;
+                                let tx_c = tx_opt.clone();
+                                rsx! {
+                                    label { class: "radio",
+                                        input {
+                                            r#type: "radio",
+                                            name: "nvenc",
+                                            value: "{label}",
+                                            checked: "{checked}",
+                                            onchange: move |_| {
+                                                let cfg = config_c.read().clone();
+                                                if let Some(tx) = tx_c.clone() {
+                                                    state_c.with_mut(|s| {
+                                                        reduce(
+                                                            s,
+                                                            Msg::UserEditedConfigField {
+                                                                kind,
+                                                                value: ConfigFieldValue::Nv(value),
+                                                            },
+                                                            &tx,
+                                                            &cfg,
+                                                        )
+                                                    });
+                                                }
+                                            },
+                                        }
+                                        " {label}"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ---- NVENC capability (what this machine can run) ----
+                {
+                    let capability = state.read().nvenc_capability.clone();
+                    // Rendered as plain lines: rsx! has no `match` arm
+                    // with a block in child position.
+                    let lines: Vec<String> = match &capability {
+                        None => vec!["not detected yet".to_string()],
+                        Some(cap) if cap.support.is_empty() => {
+                            vec!["this ffmpeg build has no NVENC encoder".to_string()]
+                        }
+                        Some(cap) => cap
+                            .support
+                            .iter()
+                            .map(|entry| match (&entry.usable, &entry.reason) {
+                                (true, _) => format!("{}  usable", entry.encoder),
+                                (false, Some(reason)) => {
+                                    format!("{}  unusable — {reason}", entry.encoder)
+                                }
+                                (false, None) => format!("{}  unusable", entry.encoder),
+                            })
+                            .collect(),
+                    };
+                    let review_due = capability.map(|c| c.review_due).unwrap_or(false);
+                    let mut state_c = state;
+                    let config_c = config;
+                    let tx_c = tx_opt.clone();
+                    rsx! {
+                        div { class: "form-row",
+                            label { class: "form-label", "capability" }
+                            div {
+                                for line in lines.iter() {
+                                    div { class: "plan-row",
+                                        span { class: "code", "{line}" }
+                                    }
+                                }
+                                {
+                                    if review_due {
+                                        rsx! {
+                                            span { class: "muted", "detected over 30 days ago — recommend re-detecting" }
+                                        }
+                                    } else {
+                                        rsx! {}
+                                    }
+                                }
+                                button {
+                                    class: "secondary-btn",
+                                    onclick: move |_| {
+                                        let cfg = config_c.read().clone();
+                                        if let Some(tx) = tx_c.clone() {
+                                            state_c.with_mut(|s| {
+                                                reduce(s, Msg::UserClickedDetectNv, &tx, &cfg)
+                                            });
+                                        }
+                                    },
+                                    "re-detect"
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // ---- EXTENSIONS (csv text input) ----
                 div { class: "form-row",
                     label { class: "form-label", "extensions" }

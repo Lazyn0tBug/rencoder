@@ -51,21 +51,8 @@ fn main() -> Result<()> {
 fn detect_cmd() -> Result<()> {
     let cache_path = rencoder_lib::config::path::resolve_nvenc_cache();
     let resolution =
-        nvenc::resolve(cache_path.as_deref(), true).context("NVENC detection failed")?;
-    let record = resolution
-        .to_save
-        .ok_or_else(|| anyhow::anyhow!("detection produced no record"))?;
-
-    if let Some(path) = &cache_path {
-        if let Err(e) = nvenc::save(path, &record) {
-            warn!(
-                error = %e,
-                path = %path.display(),
-                "could not store the NVENC capability record"
-            );
-        }
-    }
-    print!("{}", nvenc::report(&record));
+        nvenc::resolve_and_store(cache_path.as_deref(), true).context("NVENC detection failed")?;
+    print!("{}", nvenc::report(&resolution.record));
     Ok(())
 }
 
@@ -212,13 +199,13 @@ fn encode_cmd(args: args::EncodeArgs, force_detect: bool) -> Result<()> {
     // user asked about it.
     let cache = if enable_nv {
         let cache_path = rencoder_lib::config::path::resolve_nvenc_cache();
-        let mut resolution = nvenc::resolve(cache_path.as_deref(), force_detect)
+        let mut resolution = nvenc::resolve_and_store(cache_path.as_deref(), force_detect)
             .context("NVENC detection failed")?;
 
         if resolution.review_due && !force_detect {
             match advise_refresh()? {
                 Refresh::Yes => {
-                    resolution = nvenc::resolve(cache_path.as_deref(), true)
+                    resolution = nvenc::resolve_and_store(cache_path.as_deref(), true)
                         .context("NVENC detection failed")?;
                 }
                 Refresh::No => {
@@ -240,15 +227,7 @@ fn encode_cmd(args: args::EncodeArgs, force_detect: bool) -> Result<()> {
             }
         }
 
-        if let (Some(path), Some(record)) = (&cache_path, resolution.to_save.as_ref()) {
-            if let Err(e) = nvenc::save(path, record) {
-                warn!(
-                    error = %e,
-                    path = %path.display(),
-                    "could not store the NVENC capability record"
-                );
-            }
-        }
+        // `resolve_and_store` already persisted a freshly probed record.
         cache_from_resolution(&resolution)
     } else {
         init_encoder_cache(false).with_context(|| "failed to initialize encoder cache")?

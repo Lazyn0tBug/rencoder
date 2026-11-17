@@ -61,6 +61,46 @@ pub fn cache_from_resolution(resolution: &nvenc::Resolution) -> EncoderCache {
     }
 }
 
+/// Build the encoder cache for a session, resolving the NVENC
+/// capability through the on-disk record.
+///
+/// The record (`<app_dir>/nvenc-capability.json`) is shared with the
+/// CLI: a fresh record is reused as-is (no probe), a missing or
+/// mismatching one is probed and stored. `capability` carries the
+/// summary for the UI.
+pub fn init_encoder_cache_with_capability(
+    enable_nv: bool,
+) -> (
+    Result<EncoderCache, EncodeError>,
+    Option<crate::types::NvencCapability>,
+) {
+    if !enable_nv {
+        return (init_encoder_cache(false), None);
+    }
+    let path = crate::config::path::resolve_nvenc_cache();
+    match crate::encoder::nvenc::resolve_and_store(path.as_deref(), false) {
+        Ok(resolution) => {
+            let capability = crate::types::NvencCapability {
+                support: resolution.support.clone(),
+                probed_at: Some(resolution.record.probed_at),
+                review_due: resolution.review_due,
+            };
+            (Ok(cache_from_resolution(&resolution)), Some(capability))
+        }
+        Err(e) => (Err(e), None),
+    }
+}
+
+/// What the background cache init produces: the cache (or the error
+/// that prevented building it) plus the NVENC capability summary the
+/// UI shows next to the NVENC switch.
+#[derive(Debug)]
+pub struct CacheInit {
+    pub cache: Result<EncoderCache, EncodeError>,
+    /// `None` when NVENC is disabled or the resolve failed.
+    pub capability: Option<crate::types::NvencCapability>,
+}
+
 /// Build an `EncoderCache` on a background thread; return a receiver
 /// the caller can poll/await (review #126).
 ///
@@ -73,14 +113,15 @@ pub fn cache_from_resolution(resolution: &nvenc::Resolution) -> EncoderCache {
 /// The receiver delivers the final `Result<EncoderCache, EncodeError>`
 /// exactly once. A failed init returns `Err(EncodeError::Probe(...))`;
 /// consumers should map that to `Event::Error` like the sync variant.
-pub fn init_encoder_cache_async(
+pub fn init_encoder_cache_async_with_capability(
     enable_nv: bool,
-) -> std::sync::mpsc::Receiver<Result<EncoderCache, EncodeError>> {
+) -> std::sync::mpsc::Receiver<CacheInit> {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("rencoder-cache-init".into())
         .spawn(move || {
-            let result = init_encoder_cache(enable_nv);
+            let (cache, capability) = init_encoder_cache_with_capability(enable_nv);
+            let result = CacheInit { cache, capability };
             // Block on the send until the consumer picks up. With
             // sync_channel(1), the first send succeeds (buffer slot
             // empty); subsequent sends would fail because the
@@ -149,9 +190,16 @@ Encoders:
                 usable: true,
                 reason: None,
             }],
-            to_save: None,
+            record: nvenc::CapabilityRecord {
+                version: 1,
+                ffmpeg_version: "ffmpeg version 9.0.1".to_string(),
+                ffmpeg_fingerprint: "abc".to_string(),
+                probed_at: chrono::Utc::now(),
+                next_review_at: chrono::Utc::now(),
+                encoders: Vec::new(),
+            },
+            probed: false,
             review_due: false,
-            rebuilt: false,
         };
         let cache = cache_from_resolution(&resolution);
         assert!(cache.nvenc_usable("av1_nvenc"));
@@ -169,7 +217,7 @@ Encoders:
         // Use a custom runner via init_encoder_cache_impl would
         // require re-plumbing; instead we exercise the real path
         // but tolerate the ffmpeg binary missing on the test host.
-        let rx = init_encoder_cache_async(false);
+        let rx = init_encoder_cache_async_with_capability(false);
         let result = rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("init_encoder_cache_async channel closed without result");

@@ -105,6 +105,15 @@ pub enum Command {
     /// in-memory config it has. Emits `Event::ConfigSaved` on
     /// success / `Event::Error` on failure.
     SaveConfig,
+    /// Detect this machine's NVENC capability and report it back.
+    ///
+    /// Same logic as the CLI's `rencoder detect`: the result is stored
+    /// in `<app_dir>/nvenc-capability.json`, and the stored record is
+    /// reused when it matches the current ffmpeg build.
+    ///
+    /// * `force = true` -- always probe (the "重新检测" button).
+    /// * `force = false` -- reuse the stored record when it is fresh.
+    Detect { force: bool },
     /// Start a parallel analyze batch (U22 / Tier 3 #9).
     ///
     /// The lib actor probes each file (c-probe if enabled, ffprobe
@@ -210,6 +219,11 @@ pub enum Event {
     /// to disk. The path is included so the UI can show feedback
     /// like "saved to /path/to/rencoder.toml".
     ConfigSaved { path: PathBuf },
+
+    /// The NVENC capability of this machine (after a `Command::Detect`
+    /// or the startup resolve). The UI shows it next to the NVENC
+    /// switch: which hardware encoders run here, and why not.
+    NvencCapability(crate::types::NvencCapability),
 
     // ---- Analyze topic (U22 / Tier 3 #9) ----
     // See docs/design.md §3.4 "分析进度上报" for the full protocol
@@ -687,7 +701,11 @@ pub fn start_controller() -> ControllerHandle {
         .as_ref()
         .and_then(|e| e.nv)
         .unwrap_or(false);
-    let cache_rx = crate::pipeline::cache::init_encoder_cache_async(enable_nv);
+    // The NVENC capability is resolved through the on-disk record
+    // (shared with the CLI): a fresh record is reused as-is, a missing
+    // one is probed and stored. The summary rides along so the UI can
+    // show it without a second round-trip.
+    let cache_rx = crate::pipeline::cache::init_encoder_cache_async_with_capability(enable_nv);
 
     std::thread::Builder::new()
         .name("renencoder-controller".into())
@@ -738,6 +756,17 @@ fn load_and_share_config(evt_tx: &Sender<Event>) -> Option<(Arc<Config>, Arc<App
     Some((Arc::new(config), Arc::new(app_config), config_path))
 }
 
+/// Summarize a capability resolution for the UI.
+fn nvenc_capability_of(
+    resolution: &crate::encoder::nvenc::Resolution,
+) -> crate::types::NvencCapability {
+    crate::types::NvencCapability {
+        support: resolution.support.clone(),
+        probed_at: Some(resolution.record.probed_at),
+        review_due: resolution.review_due,
+    }
+}
+
 fn run_actor(
     cmd_rx: Receiver<Command>,
     evt_tx: Sender<Event>,
@@ -754,7 +783,7 @@ fn run_actor(
     // process other commands (Cancel / LoadHistory / SaveConfig)
     // while init runs. StartBatch handlers block on this when a
     // batch actually starts.
-    cache_rx: std::sync::mpsc::Receiver<Result<EncoderCache, crate::error::EncodeError>>,
+    cache_rx: std::sync::mpsc::Receiver<crate::pipeline::cache::CacheInit>,
 ) {
     // Review #126: cache init is now async — see
     // `init_encoder_cache_async`. The cmd_rx loop below runs
@@ -780,21 +809,30 @@ fn run_actor(
         // The receiver delivers exactly one `Result`. Use
         // `unwrap_or_else` to surface a channel-disconnect as
         // a sentinel error so the OnceLock always gets set.
-        let result = cache_rx.recv().unwrap_or_else(|_| {
-            Err(EncodeError::Probe(
-                "encoder cache init channel closed".into(),
-            ))
-        });
-        // EncoderCache + EncodeError both impl Clone (small values),
-        // so we clone before moving into OnceLock::set and the
-        // error log path.
+        let init = cache_rx
+            .recv()
+            .unwrap_or_else(|_| crate::pipeline::cache::CacheInit {
+                cache: Err(EncodeError::Probe(
+                    "encoder cache init channel closed".into(),
+                )),
+                capability: None,
+            });
         // Peek at the result so we can emit an error event with the
         // correct category before moving into the OnceLock.
-        let err_event = match &result {
+        let err_event = match &init.cache {
             Err(e) => Some((e.category(), format!("encoder cache init failed: {e}"))),
             Ok(_) => None,
         };
-        let _ = cache_cell_for_thread.set(result);
+        // The NVENC capability as resolved at startup -- the UI shows
+        // it without the user having to ask for it.
+        if let Some(capability) = init.capability {
+            send_evt_lossy(
+                &evt_tx_for_init,
+                Event::NvencCapability(capability),
+                &dropped_for_init,
+            );
+        }
+        let _ = cache_cell_for_thread.set(init.cache);
         if let Some((category, message)) = err_event {
             send_evt_lossy(
                 &evt_tx_for_init,
@@ -1126,6 +1164,32 @@ fn run_actor(
                     );
                 }
             },
+
+            Command::Detect { force } => {
+                // Same path as the CLI's `rencoder detect`: resolve
+                // through the on-disk record, store a fresh probe, and
+                // report what this machine can actually run.
+                let cache_path = crate::config::path::resolve_nvenc_cache();
+                match crate::encoder::nvenc::resolve_and_store(cache_path.as_deref(), force) {
+                    Ok(resolution) => {
+                        send_evt_lossy(
+                            &evt_tx,
+                            Event::NvencCapability(nvenc_capability_of(&resolution)),
+                            &dropped_counter,
+                        );
+                    }
+                    Err(e) => {
+                        send_evt_lossy(
+                            &evt_tx,
+                            Event::Error {
+                                category: ErrorCategory::ProbeFailed,
+                                message: format!("NVENC detection failed: {e}"),
+                            },
+                            &dropped_counter,
+                        );
+                    }
+                }
+            }
 
             Command::Analyze { files } => {
                 // U22 / Tier 3 #9: parallel analyze with per-file
@@ -1525,6 +1589,19 @@ mod mock_tests {
                     // talks to the production actor). The mock actor
                     // has no app_config to save — no-op here.
                     Command::SaveConfig => {}
+                    // The mock actor does not probe; report an empty
+                    // capability so the UI arm stays exercised.
+                    Command::Detect { force: _ } => {
+                        send_evt_lossy(
+                            &evt_tx,
+                            Event::NvencCapability(crate::types::NvencCapability {
+                                support: Vec::new(),
+                                probed_at: None,
+                                review_due: false,
+                            }),
+                            &dropped_counter,
+                        );
+                    }
                     Command::DryRun { params, files } => {
                         // Mock actor: dry-run is purely prepare-step;
                         // the mock encode_fn must NOT be invoked
@@ -1937,6 +2014,23 @@ mod mock_tests {
     }
 
     #[cfg(feature = "parallel-analyze")]
+    #[test]
+    fn detect_command_emits_a_capability_event() {
+        // The actor's Command::Detect arm: the capability comes back
+        // as an event so the UI can render it.
+        let (cmd_tx, evt_rx) = run_actor_inline(make_succeeding_mock().0, None);
+        cmd_tx.send(Command::Detect { force: true }).unwrap();
+        drop(cmd_tx);
+
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::NvencCapability(_))),
+            "expected a NvencCapability event, got {events:?}"
+        );
+    }
+
     #[test]
     fn analyze_emits_started_progress_finished_sequence() {
         // U22 / Tier 3 #9: send Command::Analyze with 3 temp files

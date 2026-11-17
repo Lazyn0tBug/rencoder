@@ -283,6 +283,11 @@ rencoder detect              # 独立使用：探测 + 写入 + 打印报告
 rencoder --detect encode ... # 作为命令行选项：本次强制探测（并更新缓存）
 ```
 
+GUI 走同一条路：`Command::Detect { force }` → lib 用同一个记录文件解析 → 发
+`Event::NvencCapability` 回报。UI 的 Setup 页在 NVENC 开关旁显示能力清单
+（每个编码器能不能用、不能用是什么原因），并提供"重新检测"按钮；启动时 lib
+也会解析一次并回报，所以用户不点按钮也知道这台机器支持什么。
+
 `--detect` 是全局选项，出现在子命令前后都认。`detect` 的报告本身就是这项设计的
 主要价值——把"这台机器能用哪些硬件编码器"变成用户能主动查的事实：
 
@@ -2075,6 +2080,11 @@ pub enum Command {
     /// 走这条；lib 内部 `AppConfig::save(&config_path)`，发 `Event::ConfigSaved`
     /// 或 `Event::Error`。
     SaveConfig,
+    /// 探测这台机器的 NVENC 能力并回报。逻辑与 CLI 的 `rencoder detect` 相同：
+    /// 结果存进 `<app_dir>/nvenc-capability.json`，与 CLI 共用同一份记录。
+    /// - `force = true`：总是重新探测（UI 的"重新检测"按钮）
+    /// - `force = false`：记录新鲜时直接复用（启动时解析）
+    Detect { force: bool },
 }
 ```
 
@@ -2111,6 +2121,9 @@ pub enum Event {
     /// path 是 lib 实际写到的文件（`ControllerHandle::config_path`）。
     /// 失败走 `Event::Error` 而不是这个 variant。
     ConfigSaved { path: PathBuf },
+    /// 这台机器的 NVENC 能力（启动解析或 `Command::Detect` 之后）。
+    /// UI 把它显示在 NVENC 开关旁边：哪些硬件编码器真能跑、哪些不行及原因。
+    NvencCapability(NvencCapability),
 
     // Analyze topic (U22 / Tier 3 #9) —— 见 §3.4 "分析进度上报"
     /// `Command::Analyze` 接收后、第一个文件 probe 之前发。`total` =

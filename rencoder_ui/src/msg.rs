@@ -115,6 +115,8 @@ pub enum ConfigFieldKind {
     Crf,
     MaxFps,
     Extensions,
+    /// NVENC hardware acceleration on / off.
+    Nv,
 }
 
 /// Generic value type for `UserEditedConfigField` (review #133).
@@ -127,6 +129,8 @@ pub enum ConfigFieldValue {
     MaxFps(Option<u32>),
     /// Comma-separated. Empty string clears the filter (= "all").
     Extensions(String),
+    /// NVENC hardware acceleration on / off.
+    Nv(bool),
 }
 
 /// UI-side task id — timestamp-based `yyyymmddhhmmss` (per spec).
@@ -203,6 +207,11 @@ pub struct AppState {
     /// component use the id as the Dioxus key (stable across
     /// re-renders while the toast is on screen).
     next_toast_id: u64,
+    /// NVENC capability of this machine, as reported by the lib
+    /// (`Event::NvencCapability`). `None` until the first report
+    /// arrives — the lib resolves it at startup and on every
+    /// `Command::Detect`.
+    pub nvenc_capability: Option<rencoder_lib::types::NvencCapability>,
 }
 
 /// Cap on the toasts queue. Older toasts are popped when the
@@ -464,6 +473,10 @@ pub enum Msg {
     /// start deferred.
     #[allow(dead_code)]
     UserClickedLoadHistory,
+    /// User clicked "重新检测" next to the NVENC switch: force a
+    /// fresh capability probe. The lib stores the result and
+    /// reports it back via `Event::NvencCapability`.
+    UserClickedDetectNv,
     /// User clicked a top-bar tab. Reducer writes
     /// `state.active_page`. No lib command.
     UserClickedTab(Page),
@@ -523,6 +536,12 @@ pub fn reduce(
             apply_config_field_edit(state, kind, value);
             state.config_save_status = "Saving…".into();
             let _ = cmd_tx.try_send(Command::SaveConfig);
+        }
+        Msg::UserClickedDetectNv => {
+            // Force a fresh probe. The lib stores the result in
+            // `<app_dir>/nvenc-capability.json` and reports it back
+            // via `Event::NvencCapability`.
+            let _ = cmd_tx.try_send(Command::Detect { force: true });
         }
         Msg::UserClickedStart => {
             let phase = state.tasks.active.as_ref().map(|t| t.phase);
@@ -872,6 +891,12 @@ fn apply_event(state: &mut AppState, evt: Event) {
         | Event::AnalyzeFinished { .. } => {
             // U22 standalone Analyze no longer used by the UI
             // (Start auto-DryRun subsumes it). Silently drop.
+        }
+        Event::NvencCapability(capability) => {
+            // The lib resolved this machine's NVENC capability (at
+            // startup or after a `Command::Detect`). The Setup page
+            // renders it next to the NVENC switch.
+            state.nvenc_capability = Some(capability);
         }
         Event::ConfigSaved { .. } => {
             // review-delta F1 (was empty): wire the lib's save
@@ -1233,6 +1258,9 @@ fn apply_config_field_edit(state: &mut AppState, kind: ConfigFieldKind, value: C
         (ConfigFieldKind::MaxFps, ConfigFieldValue::MaxFps(v)) => {
             enc.max_fps = v;
         }
+        (ConfigFieldKind::Nv, ConfigFieldValue::Nv(v)) => {
+            enc.nv = Some(v);
+        }
         (ConfigFieldKind::Extensions, ConfigFieldValue::Extensions(s)) => {
             // Parse "mp4, mkv, mov " -> ["mp4", "mkv", "mov"].
             // Empty string clears the filter (= "all").
@@ -1244,7 +1272,7 @@ fn apply_config_field_edit(state: &mut AppState, kind: ConfigFieldKind, value: C
                 .collect();
             enc.extensions = if parts.is_empty() { None } else { Some(parts) };
         }
-        // Exhaustiveness: 4 ConfigFieldKind variants; the matching
+        // Exhaustiveness: 5 ConfigFieldKind variants; the matching
         // ConfigFieldValue arm exists for each. Any mismatch is a
         // compile error.
         (k, v) => unreachable!(
@@ -1308,6 +1336,71 @@ mod tests {
             tasks: TaskQueue::new(1),
             ..Default::default()
         }
+    }
+
+    // ---- NVENC detect ----
+
+    #[test]
+    fn detect_nv_dispatches_a_forced_detect_command() {
+        use crossbeam_channel::unbounded;
+        let (tx, rx) = unbounded::<Command>();
+        let mut state = fresh_state();
+        reduce(&mut state, Msg::UserClickedDetectNv, &tx, &default_config());
+        match rx
+            .try_recv()
+            .expect("a command should have been dispatched")
+        {
+            Command::Detect { force } => assert!(force, "the button must force a probe"),
+            _ => panic!("expected Command::Detect"),
+        }
+    }
+
+    #[test]
+    fn nvenc_capability_event_updates_the_state() {
+        use crossbeam_channel::unbounded;
+        let (tx, _rx) = unbounded::<Command>();
+        let mut state = fresh_state();
+        assert!(state.nvenc_capability.is_none());
+        let capability = rencoder_lib::types::NvencCapability {
+            support: vec![rencoder_lib::types::NvencSupport {
+                encoder: "av1_nvenc".into(),
+                usable: false,
+                reason: Some("No NVENC capable devices found".into()),
+            }],
+            probed_at: Some(DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap()),
+            review_due: true,
+        };
+        reduce(
+            &mut state,
+            Msg::Lib(Event::NvencCapability(capability.clone())),
+            &tx,
+            &default_config(),
+        );
+        let stored = state.nvenc_capability.expect("capability should be stored");
+        assert_eq!(stored.support.len(), 1);
+        assert!(stored.review_due);
+        assert_eq!(stored.support[0].encoder, "av1_nvenc");
+    }
+
+    #[test]
+    fn editing_the_nv_field_updates_the_config_draft() {
+        use crossbeam_channel::unbounded;
+        let (tx, _rx) = unbounded::<Command>();
+        let mut state = fresh_state();
+        reduce(
+            &mut state,
+            Msg::UserEditedConfigField {
+                kind: ConfigFieldKind::Nv,
+                value: ConfigFieldValue::Nv(true),
+            },
+            &tx,
+            &default_config(),
+        );
+        assert_eq!(
+            state.config_draft.encode.as_ref().and_then(|e| e.nv),
+            Some(true),
+            "the draft should carry the nv switch"
+        );
     }
 
     #[test]

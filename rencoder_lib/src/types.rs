@@ -94,6 +94,22 @@ impl VideoMetadata {
     }
 }
 
+/// NVENC capability of this machine, as reported by the lib.
+///
+/// The UI shows this next to the NVENC switch: which hardware
+/// encoders actually run here, and (when one does not) why.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NvencCapability {
+    /// Per-encoder verdicts. Only encoders this ffmpeg build has are
+    /// listed -- an ffmpeg without NVENC support yields an empty list.
+    pub support: Vec<NvencSupport>,
+    /// When the probe ran. `None` when unknown (unreadable record).
+    pub probed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The stored result is past its review date (30 days): the UI
+    /// shows the advisory instead of silently using a stale result.
+    pub review_due: bool,
+}
+
 // ===== Max-FPS configuration =====
 //
 // Predicate lives here; parameter mapping (`-r <fps>` / `-fps_mode`)
@@ -208,7 +224,7 @@ pub enum ProcessOutput {
 /// capability >= 8.0, and a mismatched driver or an exhausted NVENC
 /// session quota fails the same way. The probe is the only answer that
 /// covers the whole stack.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct NvencSupport {
     /// Encoder name, e.g. `"av1_nvenc"`.
     pub encoder: String,

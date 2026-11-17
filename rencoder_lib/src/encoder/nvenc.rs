@@ -146,15 +146,13 @@ pub struct Resolution {
     pub encoders_output: String,
     /// The probe results to use for this run.
     pub support: Vec<NvencSupport>,
-    /// The record to persist, when the result is new (probed now) or
-    /// when the review date was pushed back. `None` when the stored
-    /// record is used unchanged.
-    pub to_save: Option<CapabilityRecord>,
+    /// The record describing this result -- freshly built when we probed,
+    /// or the stored one we reused.
+    pub record: CapabilityRecord,
+    /// Was the record freshly built? Then it is worth storing.
+    pub probed: bool,
     /// The stored record is past its review date: advise the user.
     pub review_due: bool,
-    /// The stored record did not match the current ffmpeg build (or was
-    /// missing / unreadable), so a fresh probe ran.
-    pub rebuilt: bool,
 }
 
 /// Resolve the NVENC capability for this run.
@@ -186,9 +184,9 @@ pub fn resolve(path: Option<&Path>, force: bool) -> Result<Resolution, EncodeErr
             return Ok(Resolution {
                 encoders_output,
                 support: record.support().to_vec(),
-                to_save: None,
+                record: record.clone(),
+                probed: false,
                 review_due,
-                rebuilt: false,
             });
         }
     }
@@ -207,10 +205,30 @@ pub fn resolve(path: Option<&Path>, force: bool) -> Result<Resolution, EncodeErr
     Ok(Resolution {
         encoders_output,
         support,
-        to_save: Some(record),
+        record,
+        probed: true,
         review_due: false,
-        rebuilt: true,
     })
+}
+
+/// Resolve the capability and store the result when it is new.
+///
+/// A store failure is not fatal: the capability is still usable for
+/// this run, it just will not be reused next time.
+pub fn resolve_and_store(path: Option<&Path>, force: bool) -> Result<Resolution, EncodeError> {
+    let resolution = resolve(path, force)?;
+    if resolution.probed {
+        if let Some(path) = path {
+            if let Err(e) = save(path, &resolution.record) {
+                tracing::warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "could not store the NVENC capability record"
+                );
+            }
+        }
+    }
+    Ok(resolution)
 }
 
 /// Probe every NVENC encoder this ffmpeg build has.
