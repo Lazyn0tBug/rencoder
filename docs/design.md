@@ -272,8 +272,13 @@ Null）上都能给出确定答案的办法。
   av1_nvenc"。用户换了 ffmpeg（brew 升级、另一个环境的二进制）答案就变了。指纹 =
   `ffmpeg -version` 版本串 + 编码器列表的哈希；加载时对不上就当没有缓存。
 - **过期只是建议**：30 天后（`next_review_at`）提示用户"检测结果可能过期，是否重新
-  检测？"，**用户选 yes 才重测**——没有人比用户更清楚这台机器的状态。选 no 就把
-  `next_review_at` 往后推 30 天，不再打扰。非交互环境（stdin 不是 TTY）只提示不追问。
+  检测？"，**用户选 yes 才重测**——没有人比用户更清楚这台机器的状态。
+  - **CLI**：在终端里问 y/N；选 no 就把 `next_review_at` 往后推 30 天，不再打扰。
+    非交互环境（stdin 不是 TTY）只提示不追问。
+  - **GUI**：没有 stdin，问不了——所以**由 lib 在启动解析时把日期推后 30 天**
+    （advisory 每 30 天只出现一次），UI 把它显示成一行提示 + 一个"重新检测"
+    按钮。用户点按钮就刷新，不点就一直用旧记录。两条路最后是同一个状态机：
+    提示一次 → 30 天内不再提示。
 - **懒首次**：没有可用缓存时，普通运行顺带探测一次并写入，用户不需要先跑 `detect`。
 
 **detect 命令**：
@@ -3638,7 +3643,7 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 56 | 帧率容差 `eps = 0.01`,判定式 `src > cap + eps`（严格大于,eps 在上限右侧）—— 对齐 encode.zsh `MAX_FPS_EPS` | ✅ |
 | 57 | NVENC 选择：CLI `--nv`/`--no-nv` > 配置 `[encode].nv`；启用时做能力实测（1 帧试编码）并进程内缓存；不可用则 fallback + warn（带 stderr 原文） | ✅ |
 | 58 | NVENC 码控走 `-cq N -b:v 0`（恒定质量），其余编码器仍是 `-crf N` —— 对齐 encode.zsh `ENC_SPEC` | ✅ |
-| 59 | NVENC 检测结果跨进程保存到 `<app_dir>/nvenc-capability.json`；指纹绑定 ffmpeg 构建；30 天过期只是建议，用户选 yes 才重测，拒绝则再等 30 天 | ✅ |
+| 59 | NVENC 检测结果跨进程保存到 `<app_dir>/nvenc-capability.json`；指纹绑定 ffmpeg 构建；30 天过期只是建议，CLI 问 y/N、GUI 由 lib 推后日期，提示一次后 30 天内不再提示 | ✅ |
 | 60 | `rencoder detect` 独立子命令 + 全局 `--detect` 选项（子命令前后都认） | ✅ |
 | 61 | NVENC 编码失败即当场 fallback（软件编码器重跑该文件），不重新探测；降级对本进程后续文件生效 | ✅ |
 | 57 | 同路径保护三层:`output_path_for` 命名避让 → `utils::fs::is_same_file`（父目录规范化 + 文件名大小写不敏感）→ 转码前拦截记 `Failed` 不调 ffmpeg | ✅ |

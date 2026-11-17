@@ -213,13 +213,25 @@ pub fn resolve(path: Option<&Path>, force: bool) -> Result<Resolution, EncodeErr
 
 /// Resolve the capability and store the result when it is new.
 ///
+/// Two write cases:
+///
+/// * a fresh probe -> store the new record;
+/// * the stored record was past its review date -> push the review
+///   date 30 days out, so the advisory ("this result may be stale")
+///   is shown **once per 30 days** rather than on every start. This
+///   is the GUI's equivalent of the CLI's "declined the refresh"
+///   answer: the CLI asks, the GUI cannot ask (no stdin), so both
+///   end up with "advise once, then leave it alone until the user
+///   asks for a refresh".
+///
 /// A store failure is not fatal: the capability is still usable for
 /// this run, it just will not be reused next time.
 pub fn resolve_and_store(path: Option<&Path>, force: bool) -> Result<Resolution, EncodeError> {
-    let resolution = resolve(path, force)?;
-    if resolution.probed {
+    let mut resolution = resolve(path, force)?;
+    if let Some(record) = record_to_store(&resolution) {
+        resolution.record = record.clone();
         if let Some(path) = path {
-            if let Err(e) = save(path, &resolution.record) {
+            if let Err(e) = save(path, &record) {
                 tracing::warn!(
                     error = %e,
                     path = %path.display(),
@@ -229,6 +241,24 @@ pub fn resolve_and_store(path: Option<&Path>, force: bool) -> Result<Resolution,
         }
     }
     Ok(resolution)
+}
+
+/// What a resolution wants stored, if anything.
+///
+/// * a fresh probe -> the new record;
+/// * an expired record -> the same record with its review date pushed
+///   30 days out (the advisory has been shown; do not repeat it);
+/// * a fresh stored record -> nothing to write.
+fn record_to_store(resolution: &Resolution) -> Option<CapabilityRecord> {
+    if resolution.probed {
+        return Some(resolution.record.clone());
+    }
+    if resolution.review_due {
+        let mut record = resolution.record.clone();
+        record.defer_review(Utc::now());
+        return Some(record);
+    }
+    None
 }
 
 /// Probe every NVENC encoder this ffmpeg build has.
@@ -595,6 +625,57 @@ mod tests {
         assert!(is_nvenc_encoder("av1_nvenc"));
         assert!(!is_nvenc_encoder("libx264"));
         assert!(!is_nvenc_encoder("libsvtav1"));
+    }
+
+    #[test]
+    fn expired_record_pushes_the_review_date_when_stored() {
+        // The advisory is shown once per 30 days: reporting it pushes
+        // the date, so the next start stays quiet.
+        let mut record = sample_record();
+        record.next_review_at = Utc::now() - Duration::days(1);
+        let resolution = Resolution {
+            encoders_output: String::new(),
+            support: record.support().to_vec(),
+            record: record.clone(),
+            probed: false,
+            review_due: true,
+        };
+        let stored = record_to_store(&resolution).expect("an expired record must be re-stored");
+        assert!(
+            stored.next_review_at > Utc::now() + Duration::days(29),
+            "the review date must be pushed ~30 days out: {:?}",
+            stored.next_review_at
+        );
+    }
+
+    #[test]
+    fn fresh_record_is_not_rewritten() {
+        let record = sample_record();
+        let resolution = Resolution {
+            encoders_output: String::new(),
+            support: record.support().to_vec(),
+            record: record.clone(),
+            probed: false,
+            review_due: false,
+        };
+        assert!(
+            record_to_store(&resolution).is_none(),
+            "a fresh record needs no write"
+        );
+    }
+
+    #[test]
+    fn probed_record_is_stored_as_is() {
+        let record = sample_record();
+        let resolution = Resolution {
+            encoders_output: String::new(),
+            support: record.support().to_vec(),
+            record: record.clone(),
+            probed: true,
+            review_due: false,
+        };
+        let stored = record_to_store(&resolution).expect("a fresh probe must be stored");
+        assert_eq!(stored.probed_at, record.probed_at);
     }
 
     #[test]

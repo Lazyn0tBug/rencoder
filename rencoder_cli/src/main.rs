@@ -209,19 +209,9 @@ fn encode_cmd(args: args::EncodeArgs, force_detect: bool) -> Result<()> {
                         .context("NVENC detection failed")?;
                 }
                 Refresh::No => {
-                    // Push the next advice 30 days out -- we must not
-                    // nag on every run.
-                    if let Some(path) = &cache_path {
-                        if let Some(mut record) = nvenc::load(path) {
-                            record.defer_review(chrono::Utc::now());
-                            if let Err(e) = nvenc::save(path, &record) {
-                                warn!(
-                                    error = %e,
-                                    "could not update the NVENC capability record"
-                                );
-                            }
-                        }
-                    }
+                    // Nothing to do: `resolve_and_store` already pushed
+                    // the review date 30 days out when it reported the
+                    // expired record, so the next run stays quiet.
                 }
                 Refresh::Skip => {}
             }
