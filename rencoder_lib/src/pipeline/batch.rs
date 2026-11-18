@@ -21,19 +21,16 @@ use std::time::Instant;
 use chrono::Utc;
 
 use crate::data::extract::probe_video_metadata_auto;
-use crate::encoder::{
-    command::{build_ffmpeg_command, should_skip_encoding},
-    nvenc,
-    select::select_encoder,
-};
+use crate::data::record::encoder_settings_from_params;
+use crate::encoder::{command::build_ffmpeg_command, nvenc, select::select_encoder};
 use crate::error::EncodeError;
 use crate::pipeline::cancel::CancelToken;
 use crate::pipeline::context::{BatchContext, FilePlan};
 use crate::pipeline::partial_output::PartialOutputHandle;
 use crate::pipeline::task::TaskManager;
 use crate::types::{
-    EncodeParams, EncoderSettings, EncodingOutcome, EncodingRecord, ErrorCategory, ErrorContext,
-    FpsDecision, ProcessOutput, SkippedReason, TranscodeTask, VideoMetadata,
+    EncodeParams, EncodingOutcome, EncodingRecord, ErrorCategory, ErrorContext, FpsDecision,
+    ProcessOutput, TranscodeTask, VideoMetadata,
 };
 
 /// Maximum bytes the stderr reader thread will keep in memory for the
@@ -88,7 +85,7 @@ pub fn transcode_single(
     // CLI path. Shared prepare logic + sync ffmpeg execution.
     let prepare = encode_prepare(task, ctx, started_at_meta, started_at_instant);
     match prepare {
-        EncodePrepareResult::Skipped(r) | EncodePrepareResult::FailedProbe(r) => Ok(r),
+        EncodePrepareResult::Failed(r) => Ok(*r),
         EncodePrepareResult::Ready(plan) => transcode_with_argv(task, plan, ctx, output),
     }
 }
@@ -156,22 +153,27 @@ pub fn transcode_single_with_progress(
 
     let prepare = encode_prepare(task, ctx, started_at_meta, started_at_instant);
     match prepare {
-        EncodePrepareResult::Skipped(r) | EncodePrepareResult::FailedProbe(r) => Ok(r),
+        EncodePrepareResult::Failed(r) => Ok(*r),
         EncodePrepareResult::Ready(plan) => {
             transcode_with_progress(task, plan, ctx, cancel, on_progress)
         }
     }
 }
 
-/// Outcome of the common prepare step (probe + partial detection +
-/// skip decision + argv build). Either ready to invoke ffmpeg, or a
-/// terminal record (skipped / failed-probe) the caller returns as-is.
+/// Outcome of the common prepare step (probe + argv build). Either
+/// ready to invoke ffmpeg, or a terminal record the caller returns
+/// as-is.
+///
+/// There is no "skipped" outcome: an existing output is overwritten,
+/// not treated as done (design doc §3.3.4 -- re-encoding is the rule).
 enum EncodePrepareResult {
     /// Ready to encode: the plan carries the probe result, the argv,
     /// the output path and the start times.
     Ready(FilePlan),
-    Skipped(EncodingRecord),
-    FailedProbe(EncodingRecord),
+    /// The file cannot be encoded (probe failed, no usable encoder).
+    /// Boxed: a record is much bigger than a plan, and this arm is
+    /// the rare one.
+    Failed(Box<EncodingRecord>),
 }
 
 /// Shared by [`transcode_single`] (CLI) and [`transcode_single_with_progress`]
@@ -179,9 +181,9 @@ enum EncodePrepareResult {
 /// argv-build steps so both paths agree on what work to do; only the
 /// actual ffmpeg invocation differs.
 ///
-/// Returns `EncodePrepareResult::{Ready, Skipped, FailedProbe}` so
-/// the caller can build either a final `EncodingRecord` (skipped /
-/// failed-probe) or proceed to invoke ffmpeg.
+/// Returns `EncodePrepareResult::{Ready, Failed}` so the caller can
+/// build either a final `EncodingRecord` (failed) or proceed to invoke
+/// ffmpeg.
 fn encode_prepare(
     task: &TranscodeTask,
     ctx: &BatchContext,
@@ -213,104 +215,53 @@ fn encode_prepare(
             output = %output_path.display(),
             "input and output paths must differ; skipping file"
         );
-        return EncodePrepareResult::FailedProbe(make_failed_record(
+        return EncodePrepareResult::Failed(Box::new(make_failed_record(
             task,
             params,
             started_at_meta,
             None,
             &EncodeError::InvalidParam("input and output paths must differ".into()),
             ErrorCategory::ConfigError,
-        ));
+        )));
     }
 
-    // Probe input FIRST so we have ground truth (source duration) for
-    // partial-output detection (§3.3.6 + §8 item 40). SIGTERM/SIGHUP
-    // can no longer clean up partial files (see §3.4.5 "注意"), so
-    // re-runs must detect + auto-remove + reencode them.
+    // Probe the source. A probe failure means the file cannot be
+    // encoded (corrupt / unreadable) — a per-file failure, not a
+    // reason to abort the batch.
     let metadata = match probe_video_metadata_auto(task.input.as_path()) {
         Ok(m) => m,
         Err(e) => {
-            return EncodePrepareResult::FailedProbe(make_failed_record(
+            return EncodePrepareResult::Failed(Box::new(make_failed_record(
                 task,
                 params,
                 started_at_meta,
                 None,
                 &e,
                 ErrorCategory::ProbeFailed,
-            ));
+            )));
         }
     };
 
-    if output_path.exists() {
-        let output_meta = probe_video_metadata_auto(&output_path).ok();
-        let is_partial = match (
-            metadata.duration_secs,
-            output_meta.as_ref().and_then(|m| m.duration_secs),
-        ) {
-            (Some(src), Some(out)) => out + 1.0 < src,
-            (Some(_), None) => true,
-            // Review fix #3 (refined): only re-encode when we can
-            // actually detect partiality. If both source and output
-            // durations are unknown (the test `skips_when_output_exists`
-            // case with a 0-byte output file and no source metadata),
-            // we have no way to tell partial from complete — keep
-            // the original skip-with-OutputExists behavior. This is
-            // safer than auto-re-encoding a known-good file.
-            (None, None) => false,
-            (None, Some(_)) => true,
-        };
-
-        if is_partial {
-            match std::fs::remove_file(&output_path) {
-                Ok(()) => {
-                    // v1.2 follow-up #4 commit 2: structured fields.
-                    // `output_path` is borrowed twice below — bind to
-                    // a local first so the closure in `tracing` doesn't
-                    // outlive it.
-                    let out_dur = output_meta
-                        .as_ref()
-                        .and_then(|m| m.duration_secs)
-                        .unwrap_or(0.0);
-                    let src_dur = metadata.duration_secs.unwrap_or(0.0);
-                    tracing::warn!(
-                        output = %output_path.display(),
-                        output_duration_secs = out_dur,
-                        source_duration_secs = src_dur,
-                        "partial output detected; removed, re-encoding"
-                    );
-                    // Fall through.
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        output = %output_path.display(),
-                        error = %e,
-                        "partial output detected but removal failed; skipping"
-                    );
-                    return EncodePrepareResult::Skipped(make_skipped_record(
-                        task,
-                        params,
-                        started_at_meta,
-                        None,
-                        SkippedReason::PartialOutput,
-                    ));
-                }
-            }
-        } else {
-            tracing::info!(
-                output = %output_path.display(),
-                "task skipped: output already exists"
-            );
-            return EncodePrepareResult::Skipped(make_skipped_record(
+    // The output may already exist -- we overwrite it. Re-encoding is
+    // the rule (design doc §3.3.4): the config is read once per
+    // process, so a previous run's output may have been produced with
+    // different settings, and the only safe answer is to redo it.
+    let argv = match build_argv(task, ctx, &metadata) {
+        Ok(argv) => argv,
+        Err(e) => {
+            // No usable encoder for this format. That is a per-file
+            // failure, not a reason to abort the batch (design doc
+            // §3.11.4 E1).
+            return EncodePrepareResult::Failed(Box::new(make_failed_record(
                 task,
                 params,
                 started_at_meta,
                 None,
-                SkippedReason::OutputExists,
-            ));
+                &e,
+                ErrorCategory::EncoderSelectionFailed,
+            )));
         }
-    }
-
-    let argv = build_argv(task, ctx, &metadata);
+    };
     EncodePrepareResult::Ready(FilePlan::new(
         metadata,
         argv,
@@ -328,7 +279,7 @@ fn encode_prepare(
 /// shape:
 ///
 /// 1. Compute the frame-rate action from `metadata.cap_fps()`.
-/// 2. If `should_skip_encoding`, return a `Skipped(SameCodec)` record.
+/// 2. Run ffmpeg (the output is overwritten if it exists).
 /// 3. Call the caller-provided `run_ffmpeg` (sync vs cancellable
 ///    variant) to get a `Result<(), (ErrorCategory, String, String)>`.
 /// 4. Delegate to [`build_encode_record`] for the final record.
@@ -350,28 +301,6 @@ where
     // `&mut` this function already owns).
     R: FnOnce(&BatchContext) -> Option<Vec<String>>,
 {
-    let params = ctx.params();
-    let metadata = plan.metadata();
-    let codec = metadata.codec.as_deref().unwrap_or("");
-    let need_reduce = matches!(
-        params.max_fps.decide(metadata.cap_fps()),
-        FpsDecision::Reduce { .. }
-    );
-
-    if should_skip_encoding(codec, params.format, need_reduce) {
-        tracing::info!(
-            source_codec = codec,
-            "task skipped: source codec matches target"
-        );
-        return Ok(make_skipped_record(
-            task,
-            params,
-            plan.started_at_meta(),
-            Some(plan.started_at_instant().elapsed().as_secs_f64()),
-            SkippedReason::SameCodec,
-        ));
-    }
-
     // Clone argv for the closure — build_encode_record needs it too.
     // Per-batch this is one ~20-element Vec<String> clone; trivial.
     let argv_for_run = plan.argv().to_vec();
@@ -483,11 +412,11 @@ fn rebuild_argv_after_nvenc_failure(
     ctx: &BatchContext,
     metadata: &VideoMetadata,
 ) -> Option<Vec<String>> {
-    let argv = build_argv(task, ctx, metadata);
-    if argv.is_empty() {
-        None
-    } else {
-        Some(argv)
+    // A failed rebuild is not fatal here: the caller keeps the argv it
+    // already has (and reports the original failure).
+    match build_argv(task, ctx, metadata) {
+        Ok(argv) if !argv.is_empty() => Some(argv),
+        _ => None,
     }
 }
 // ^ argv moves into the closure; build_encode_record uses a fresh
@@ -616,10 +545,10 @@ fn build_encode_record(
                     (EncodingOutcome::Failed, None)
                 }
                 None => {
-                    // Source duration unknown: can't tell partial
-                    // from complete, trust the file as-is. This
-                    // matches the original behavior — the test
-                    // `skips_when_output_exists` exercises this case.
+                    // Source duration unknown: the file is taken
+                    // as-is. (Design doc §3.3.4: a file in the batch
+                    // is transcribed, full stop -- there is no
+                    // partial/complete judgement to make.)
                     (
                         if need_reduce {
                             EncodingOutcome::ReducedFps
@@ -811,7 +740,7 @@ pub fn transcode_batch(
 /// Each record's outcome reflects what `transcode_batch` *would* do
 /// at the prepare step:
 /// - `Ready` → `outcome = Succeeded` (encode would run)
-/// - `Skipped(SameCodec | OutputExists | PartialOutput)` → record
+/// - the file could not be prepared (probe failed) → record
 ///   as-is
 /// - `FailedProbe` → record as-is
 ///
@@ -835,25 +764,27 @@ where
         };
         let prepare = encode_prepare(&task, ctx, Utc::now(), Instant::now());
         match prepare {
-            EncodePrepareResult::Ready { .. } => {
-                // Plan: encode would actually run. Build a fresh
-                // record with Succeeded outcome (don't go through
-                // make_skipped_record — that uses Skipped(SameCodec)
-                // or OutputExists internally and we'd be overriding
-                // the outcome).
-                records.push(make_planned_ready_record(&task, params, Utc::now()));
+            EncodePrepareResult::Ready(plan) => {
+                // The plan already carries the probe result — the
+                // dry run must not probe the same file twice.
+                records.push(make_planned_ready_record(
+                    &task,
+                    params,
+                    plan.metadata(),
+                    plan.started_at_meta(),
+                ));
             }
-            EncodePrepareResult::Skipped(r) | EncodePrepareResult::FailedProbe(r) => {
-                records.push(r);
+            EncodePrepareResult::Failed(r) => {
+                records.push(*r);
             }
         }
     }
     records
 }
 
-/// Build a "dry-run planned success" record: same metadata fields as
-/// `make_skipped_record` (probe + source info populated) but outcome
-/// is `Succeeded` and `ended_at` is `None` (no actual run yet).
+/// Build a "dry-run planned success" record: the source fields are
+/// populated (from the probe the prepare step already did) but the
+/// outcome is `Succeeded` and `ended_at` is `None` (no actual run yet).
 ///
 /// Review #124: source fields via `EncodingRecord::from_metadata`;
 /// override only the bits this helper cares about (encoder_settings
@@ -861,14 +792,13 @@ where
 fn make_planned_ready_record(
     task: &TranscodeTask,
     params: &EncodeParams,
+    metadata: &VideoMetadata,
     started_at: chrono::DateTime<chrono::Utc>,
 ) -> EncodingRecord {
     let source_size_bytes = std::fs::metadata(task.input.as_path())
         .map(|m| m.len())
         .unwrap_or(0);
-    let source_meta = probe_video_metadata_quick(task);
-    let mut record =
-        EncodingRecord::from_metadata(&task.input, source_size_bytes, source_meta.as_ref());
+    let mut record = EncodingRecord::from_metadata(&task.input, source_size_bytes, Some(metadata));
     record.started_at = started_at;
     record.encoder_settings = encoder_settings_from_params(params);
     record.output_path = task
@@ -905,66 +835,18 @@ pub fn batch_target_path_for_files(files: &[crate::types::InputPath]) -> std::pa
 /// Build the ffmpeg argv (used by `transcode_single`). Probes the source
 /// and decides whether to skip; the actual execution is handled by
 /// `transcode_with_argv` (which `transcode_single` calls).
-fn build_argv(task: &TranscodeTask, ctx: &BatchContext, metadata: &VideoMetadata) -> Vec<String> {
+fn build_argv(
+    task: &TranscodeTask,
+    ctx: &BatchContext,
+    metadata: &VideoMetadata,
+) -> Result<Vec<String>, EncodeError> {
     let params = ctx.params();
     let src_fps = metadata.cap_fps();
-    let codec = metadata.codec.as_deref().unwrap_or("");
-    let need_reduce = matches!(params.max_fps.decide(src_fps), FpsDecision::Reduce { .. });
-    if should_skip_encoding(codec, params.format, need_reduce) {
-        // Return empty to signal skip; `transcode_single` doesn't actually
-        // take this path because the early `OutputExists` check runs first
-        // and the post-probe skip path is handled in `transcode_with_argv`.
-        return Vec::new();
-    }
     // The context is unpacked here: the leaf selector keeps flat
     // parameters (design doc §3.10.4) so `encoder` does not depend on
     // `pipeline`.
-    let encoder = select_encoder(params.format, ctx.cache(), ctx.config(), ctx.verdicts())
-        .expect("select_encoder in build_argv should have been filtered");
-    build_ffmpeg_command(task, params, &encoder, src_fps, &ctx.config().ffmpeg_args)
-}
-
-/// Build the skipped-record skeleton (used for OutputExists and
-/// SameCodec paths).
-fn make_skipped_record(
-    task: &TranscodeTask,
-    params: &EncodeParams,
-    started_at: chrono::DateTime<chrono::Utc>,
-    encoding_duration_secs: Option<f64>,
-    reason: SkippedReason,
-) -> EncodingRecord {
-    let source_size_bytes = std::fs::metadata(task.input.as_path())
-        .map(|m| m.len())
-        .unwrap_or(0);
-    let source_meta = probe_video_metadata_quick(task);
-    EncodingRecord {
-        source_path: task.input.to_string(),
-        source_size_bytes,
-        source_codec: source_meta.as_ref().and_then(|m| m.codec.clone()),
-        source_container: source_meta.as_ref().and_then(|m| m.container.clone()),
-        source_width: source_meta.as_ref().and_then(|m| m.width),
-        source_height: source_meta.as_ref().and_then(|m| m.height),
-        source_fps: source_meta.as_ref().and_then(|m| m.best_fps()),
-        source_duration_secs: source_meta.as_ref().and_then(|m| m.duration_secs),
-        source_bit_rate_bps: source_meta.as_ref().and_then(|m| m.bit_rate),
-
-        started_at,
-        ended_at: None,
-        encoding_duration_secs,
-        encoder_selected: None,
-        encoder_settings: encoder_settings_from_params(params),
-        ffmpeg_argv: Vec::new(),
-        ffmpeg_stderr_tail: String::new(),
-
-        output_path: None,
-        output_size_bytes: None,
-        output_duration_secs: None,
-        output_codec: None,
-        compression_ratio: None,
-
-        outcome: EncodingOutcome::Skipped(reason),
-        error: None,
-    }
+    let encoder = select_encoder(params.format, ctx.cache(), params, ctx.verdicts())?;
+    Ok(build_ffmpeg_command(task, params, &encoder, src_fps))
 }
 
 /// Build a failed-probe record (used when probe_video_metadata_auto
@@ -1458,27 +1340,6 @@ fn extract_encoder_from_argv(argv: &[String]) -> Option<String> {
     None
 }
 
-/// Pull the encoder settings from EncodeParams into the typed struct.
-fn encoder_settings_from_params(params: &EncodeParams) -> EncoderSettings {
-    EncoderSettings {
-        is_crf: params.is_crf,
-        crf_or_bitrate: params.bitrate_or_crf,
-        preset: None,
-        max_fps_target: if params.max_fps.enabled() {
-            Some(params.max_fps.max_fps as f32)
-        } else {
-            None
-        },
-    }
-}
-
-/// Quick probe used by skipped-record construction -- avoids threading
-/// the full VideoMetadata through the transcode_single early-return for
-/// skipped paths. Tolerates failure (returns None).
-fn probe_video_metadata_quick(task: &TranscodeTask) -> Option<VideoMetadata> {
-    probe_video_metadata_auto(task.input.as_path()).ok()
-}
-
 /// Probe helper exposed for the batch caller (U7). Kept here so it lives
 /// near the orchestration that uses it; the real probe lives in
 /// `ffmpeg::probe`.
@@ -1490,7 +1351,6 @@ pub fn probe_input(path: &Path) -> Result<crate::types::VideoMetadata, EncodeErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
     use crate::encoder::nvenc::CapabilityVerdicts;
     use crate::types::EncoderCache;
     use crate::types::VideoFormat;
@@ -1621,7 +1481,6 @@ Encoders:
         };
         let params = params_x264_crf();
         let _cache = cache_with_libx264_and_svtav1();
-        let _config = Config::default();
 
         // We can't actually run ffmpeg on a fake webm file -- so use
         // TaskManager directly with a canned success closure that
@@ -1696,39 +1555,43 @@ Encoders:
     }
 
     #[test]
-    fn skips_when_output_exists() {
+    fn re_encodes_when_output_exists() {
+        // A file in the batch is transcribed, full stop (design doc
+        // §3.3.4): the config is read once per process, so a previous
+        // run's output may have been produced with different settings.
+        // An existing output is overwritten, never treated as "already
+        // done".
         if !ffmpeg_available() {
             eprintln!("skipping: ffmpeg not available");
             return;
         }
-        let dir = std::env::temp_dir().join("rencoder_skip_exists");
+        let dir = std::env::temp_dir().join("rencoder_reexists");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // Both sides must be probe-able real videos: the source so the
-        // probe succeeds, the output so the partial-output detector sees
-        // a complete file (an empty / unreadable output would be treated
-        // as partial and re-encoded instead of skipped).
         let input = make_video(&dir, "input.mp4");
         let output = make_video(&dir, "out.mkv");
+        let before = std::fs::metadata(&output).unwrap().len();
 
         let task = TranscodeTask {
             input: ip(&input),
-            output: Some(output),
+            output: Some(output.clone()),
         };
         let params = params_x264_crf();
         let cache = cache_with_libx264_and_svtav1();
-        let config = Config::default();
 
         let verdicts = CapabilityVerdicts::default();
-        let mut ctx = BatchContext::new(params, Arc::new(cache), Arc::new(config), verdicts);
+        let mut ctx = BatchContext::new(params, Arc::new(cache), verdicts);
         let record = transcode_single(&task, &mut ctx, ProcessOutput::Null)
             .expect("transcode_single should succeed");
-        assert_eq!(
-            record.outcome,
-            EncodingOutcome::Skipped(SkippedReason::OutputExists)
+        assert_eq!(record.outcome, EncodingOutcome::Succeeded);
+        assert!(record.output_path.is_some(), "the record names the output");
+        // The output was really (re)written, not left alone.
+        let after = std::fs::metadata(&output).unwrap().len();
+        assert!(after > 0);
+        assert_ne!(
+            before, 0,
+            "the fixture output must have existed before the re-encode"
         );
-        assert!(record.output_path.is_none());
-        // Skipped records don't perform work; no encoding_duration.
     }
 
     #[test]
@@ -1746,10 +1609,9 @@ Encoders:
         };
         let params = params_x264_crf();
         let cache = cache_with_libx264_and_svtav1();
-        let config = Config::default();
 
         let verdicts = CapabilityVerdicts::default();
-        let mut ctx = BatchContext::new(params, Arc::new(cache), Arc::new(config), verdicts);
+        let mut ctx = BatchContext::new(params, Arc::new(cache), verdicts);
         let record = transcode_single(&task, &mut ctx, ProcessOutput::Null)
             .expect("transcode_single should succeed");
         assert_eq!(record.outcome, EncodingOutcome::Failed);
@@ -1791,7 +1653,6 @@ Encoders:
             .to_string(),
             nvenc: Vec::new(),
         };
-        let config = Config::default();
 
         // A fake NVENC encoder name: `is_nvenc_encoder` only looks at
         // the suffix, and the run's verdict table stays out of the
@@ -1807,7 +1668,7 @@ Encoders:
             "test_nvenc".to_string(),
         ];
 
-        let mut ctx = BatchContext::new(params, Arc::new(cache), Arc::new(config), verdicts);
+        let mut ctx = BatchContext::new(params, Arc::new(cache), verdicts);
         let plan = FilePlan::new(
             VideoMetadata::default(),
             nvenc_argv,
@@ -1885,9 +1746,8 @@ Encoders:
             .to_string(),
             nvenc: Vec::new(),
         };
-        let config = Config::default();
 
-        let mut ctx = BatchContext::new(params, Arc::new(cache), Arc::new(config), verdicts);
+        let mut ctx = BatchContext::new(params, Arc::new(cache), verdicts);
         let plan = FilePlan::new(
             VideoMetadata::default(),
             vec![
@@ -1956,9 +1816,8 @@ Encoders:
             .to_string(),
             nvenc: Vec::new(),
         };
-        let config = Config::default();
 
-        let mut ctx = BatchContext::new(params, Arc::new(cache), Arc::new(config), verdicts);
+        let mut ctx = BatchContext::new(params, Arc::new(cache), verdicts);
         let plan = FilePlan::new(
             VideoMetadata::default(),
             vec![
@@ -2022,7 +1881,6 @@ Encoders:
         };
         let params = params_x264_crf();
         let _cache = cache_with_libx264_and_svtav1();
-        let _config = Config::default();
 
         // Run with a stub ffmpeg-like program that doesn't exist.
         let argv = vec![
@@ -2030,12 +1888,7 @@ Encoders:
             "-i".into(),
             "x".into(),
         ];
-        let mut ctx = BatchContext::new(
-            params,
-            Arc::new(_cache),
-            Arc::new(_config),
-            CapabilityVerdicts::default(),
-        );
+        let mut ctx = BatchContext::new(params, Arc::new(_cache), CapabilityVerdicts::default());
         let plan = FilePlan::new(
             VideoMetadata::default(),
             argv,

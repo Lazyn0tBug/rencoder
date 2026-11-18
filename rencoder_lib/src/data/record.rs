@@ -1,71 +1,18 @@
-//! Record construction: build an `EncodingRecord` from one of three
-//! paths (success / skipped / failed).
+//! Record construction: helpers that fill an `EncodingRecord` from the
+//! inputs a file's run produced.
 //!
-//! These helpers are factored out of `pipeline::batch` so the record
-//! assembly logic lives next to the type definition. They each take
-//! the partial inputs (file path, params, etc.) and produce a fully-
-//! populated EncodingRecord with timestamps, settings, and outcome.
+//! The record assembly lives next to the type definition so the two
+//! cannot drift apart.
+//!
+//! There is no "skipped" path any more: a file in the batch is
+//! transcribed, full stop (design doc §3.3.4). The `Skipped` outcome
+//! still exists in the record schema, but only so old Parquet files
+//! can be read back -- nothing produces it.
 
-use chrono::Utc;
-
-use crate::data::extract::probe_video_metadata_auto;
-use crate::types::{
-    EncoderSettings, EncodingOutcome, EncodingRecord, ErrorContext, SkippedReason, TranscodeTask,
-};
-
-/// Build a record for the skip path: no work was performed.
-/// Review #124: source fields via `EncodingRecord::from_metadata`.
-pub fn make_skipped_record(
-    task: &TranscodeTask,
-    params: &crate::types::EncodeParams,
-    started_at: chrono::DateTime<Utc>,
-    encoding_duration_secs: Option<f64>,
-    reason: SkippedReason,
-) -> EncodingRecord {
-    let source_size_bytes = std::fs::metadata(task.input.as_path())
-        .map(|m| m.len())
-        .unwrap_or(0);
-    let source_meta = probe_video_metadata_auto(task.input.as_path()).ok();
-    let mut record =
-        EncodingRecord::from_metadata(&task.input, source_size_bytes, source_meta.as_ref());
-    record.started_at = started_at;
-    record.encoding_duration_secs = encoding_duration_secs;
-    record.encoder_settings = encoder_settings_from_params(params);
-    record.outcome = EncodingOutcome::Skipped(reason);
-    record
-}
-
-/// Build a record for the probe-failure path: probe_video_metadata_auto
-/// returned Err before any encoding work happened.
-/// Review #124: source fields via `EncodingRecord::from_metadata`
-/// (with `None` — no metadata available on probe failure).
-pub fn make_failed_probe_record(
-    task: &TranscodeTask,
-    params: &crate::types::EncodeParams,
-    started_at: chrono::DateTime<Utc>,
-    encoding_duration_secs: Option<f64>,
-    err: &crate::error::EncodeError,
-) -> EncodingRecord {
-    let source_size_bytes = std::fs::metadata(task.input.as_path())
-        .map(|m| m.len())
-        .unwrap_or(0);
-    let mut record = EncodingRecord::from_metadata(&task.input, source_size_bytes, None);
-    record.started_at = started_at;
-    record.ended_at = Some(Utc::now());
-    record.encoding_duration_secs = encoding_duration_secs;
-    record.encoder_settings = encoder_settings_from_params(params);
-    record.outcome = EncodingOutcome::Failed;
-    record.error = Some(ErrorContext {
-        category: err.category(),
-        message: err.to_string(),
-        ffmpeg_stderr_tail: String::new(),
-    });
-    record
-}
+use crate::types::EncoderSettings;
 
 /// Pull the encoder settings out of EncodeParams into the typed struct
-/// stored on EncodingRecord. Used by every record-construction helper
-/// (success / skipped / failed).
+/// stored on EncodingRecord. Used by every record-construction helper.
 pub fn encoder_settings_from_params(params: &crate::types::EncodeParams) -> EncoderSettings {
     EncoderSettings {
         is_crf: params.is_crf,

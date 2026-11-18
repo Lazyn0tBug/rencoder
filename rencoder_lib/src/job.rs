@@ -31,7 +31,7 @@ use chrono::{DateTime, Utc};
 
 use crate::analyzer::records::{analyze_records_with_probe_and_progress_parallel, AnalyzeProgress};
 use crate::config::app::AppConfig;
-use crate::config::{path::resolve_config, Config};
+use crate::config::path::resolve_config;
 use crate::data::extract::probe_video_metadata_auto;
 use crate::encoder::nvenc::CapabilityVerdicts;
 use crate::error::EncodeError;
@@ -69,13 +69,12 @@ pub enum Command {
         files: Vec<crate::types::InputPath>,
     },
     /// Dry-run: simulate a batch without invoking ffmpeg. Runs the
-    /// same `encode_prepare` (probe + partial-output detection +
-    /// skip detection + argv build) for each file, then emits
-    /// `Event::DryRunFinished` with the planned records (Succeeded
-    /// outcomes — actually `SkippedSameCodec` / `SkippedOutputExists` /
-    /// `FailedProbe` / `Skipped(SameCodec)` etc., but NO ffmpeg
-    /// ran). Lets the UI show the user what WOULD happen before
-    /// commit (Tier 2, §3.8.7 v1 limitations item 1).
+    /// same `encode_prepare` (probe + argv build) for each file, then
+    /// emits `Event::DryRunFinished` with the planned records
+    /// (Succeeded for the files that would be encoded, Failed for the
+    /// ones the prepare step could not handle — NO ffmpeg ran). Lets
+    /// the UI show the user what WOULD happen before commit
+    /// (Tier 2, §3.8.7 v1 limitations item 1).
     DryRun {
         params: EncodeParams,
         files: Vec<crate::types::InputPath>,
@@ -187,9 +186,10 @@ pub enum Event {
     /// what `transcode_batch` would have written to Parquet.
     BatchCompleted { records: Vec<EncodingRecord> },
     /// Dry-run finished — `records` contains the planned outcomes
-    /// (SameCodec skipped / OutputExists skipped / FailedProbe /
-    /// Succeeded / ReducedFps) WITHOUT invoking ffmpeg. UI uses
-    /// this to show the user what WOULD happen before commit.
+    /// (Succeeded for the files that would be encoded, Failed for the
+    /// ones the prepare step could not handle) WITHOUT invoking
+    /// ffmpeg. UI uses this to show the user what WOULD happen before
+    /// commit.
     DryRunFinished { records: Vec<EncodingRecord> },
     /// The batch was cancelled (by `Command::Cancel` or SIGINT).
     /// `completed` is how many files finished before the cancel
@@ -680,9 +680,9 @@ pub type DetectRunner = Arc<dyn Fn(&[&str]) -> Result<String, EncodeError> + Sen
 /// The production env is built by [`start_controller`]; a test env by
 /// [`start_controller_with`] -- same actor, different dependencies.
 pub struct ActorEnv {
-    /// The runtime config (derived from the app config).
-    pub config: Arc<Config>,
-    /// The app config (the source of the runtime config).
+    /// The app config -- the config-file layer. The run configuration
+    /// is derived from it (plus the command line, which the GUI does
+    /// not have) when a batch starts.
     pub app_config: Arc<AppConfig>,
     /// Where `Command::SaveConfig` writes.
     pub config_path: PathBuf,
@@ -697,13 +697,8 @@ pub struct ActorEnv {
 }
 
 /// The production environment: real ffmpeg, the app's own paths.
-fn production_env(
-    config: Arc<Config>,
-    app_config: Arc<AppConfig>,
-    config_path: PathBuf,
-) -> ActorEnv {
+fn production_env(app_config: Arc<AppConfig>, config_path: PathBuf) -> ActorEnv {
     ActorEnv {
-        config,
         app_config,
         config_path,
         data_dir: crate::config::path::resolve_data_dir(),
@@ -761,32 +756,30 @@ pub fn start_controller() -> ControllerHandle {
     // On load failure, emit Event::Error so the UI sees the reason;
     // fall back to defaults so the controller can still spawn (UI sees
     // the error then no more events).
-    let (config, app_config, config_path) = match load_and_share_config(&evt_tx) {
-        Some((c, a, p)) => (c, a, p),
+    let (app_config, config_path) = match load_and_share_config(&evt_tx) {
+        Some((a, p)) => (a, p),
         None => (
-            Arc::new(Config::default()),
             Arc::new(AppConfig::default()),
             PathBuf::from("(unavailable)"),
         ),
     };
 
-    let env = production_env(config, app_config.clone(), config_path.clone());
+    let env = production_env(app_config.clone(), config_path.clone());
 
     // Review #126: async cache init. The cache init spawns its own
     // thread and returns a one-shot receiver; the actor can drain
     // cmd_rx while init runs in the background. StartBatch
     // handlers block on the receiver only when a batch actually
     // starts.
-    let enable_nv = app_config
-        .encode
-        .as_ref()
-        .and_then(|e| e.nv)
-        .unwrap_or(false);
     // The NVENC capability is resolved through the on-disk record
     // (shared with the CLI): a fresh record is reused as-is, a missing
     // one is probed and stored. The summary rides along so the UI can
     // show it without a second round-trip.
-    let cache_rx = crate::pipeline::cache::init_encoder_cache_async_with_capability(enable_nv);
+    //
+    // The capability does NOT depend on the `nv` switch: it is a fact
+    // about the machine, and `nv` is this run's choice (design doc
+    // §3.10.5). So the resolution happens either way.
+    let cache_rx = crate::pipeline::cache::init_encoder_cache_async_with_capability();
 
     std::thread::Builder::new()
         .name("renencoder-controller".into())
@@ -813,13 +806,13 @@ pub fn start_controller_with(env: ActorEnv) -> ControllerHandle {
     let (cmd_tx, cmd_rx) = bounded::<Command>(CMD_TX_CAPACITY);
     let (evt_tx, evt_rx) = bounded::<Event>(EVT_TX_CAPACITY);
 
-    let enable_nv = env
-        .app_config
-        .encode
-        .as_ref()
-        .and_then(|e| e.nv)
-        .unwrap_or(false);
-    let cache_rx = crate::pipeline::cache::init_encoder_cache_async_with_capability(enable_nv);
+    // The cache init goes through the injected runner, so a test never
+    // spawns ffmpeg (the fake runner answers every invocation).
+    let detect_runner_for_cache = Arc::clone(&env.detect_runner);
+    let cache_rx =
+        crate::pipeline::cache::init_encoder_cache_async_with_capability_runner(move |args| {
+            detect_runner_for_cache(args)
+        });
 
     let app_config = Arc::clone(&env.app_config);
     let config_path = env.config_path.clone();
@@ -838,12 +831,12 @@ pub fn start_controller_with(env: ActorEnv) -> ControllerHandle {
     }
 }
 
-/// Load AppConfig + derive runtime Config. Returns the loaded
+/// Load the AppConfig (the config-file layer). Returns the loaded
 /// path too so the controller can hand it back via
 /// `ControllerHandle::config_path` (UI Save needs the original
-/// location). Emit `Event::Error` on either failure and return None
-/// so the caller falls back to defaults.
-fn load_and_share_config(evt_tx: &Sender<Event>) -> Option<(Arc<Config>, Arc<AppConfig>, PathBuf)> {
+/// location). Emit `Event::Error` on failure and return None so the
+/// caller falls back to defaults.
+fn load_and_share_config(evt_tx: &Sender<Event>) -> Option<(Arc<AppConfig>, PathBuf)> {
     let config_path = resolve_config()?;
     let app_config = match AppConfig::load(&config_path) {
         Ok(c) => c,
@@ -860,8 +853,7 @@ fn load_and_share_config(evt_tx: &Sender<Event>) -> Option<(Arc<Config>, Arc<App
             return None;
         }
     };
-    let config = Config::from_encode_config(app_config.encode.as_ref());
-    Some((Arc::new(config), Arc::new(app_config), config_path))
+    Some((Arc::new(app_config), config_path))
 }
 
 /// The encoder cache cell: a replaceable handle.
@@ -881,51 +873,20 @@ type CacheSlot = Result<Arc<EncoderCache>, Arc<EncodeError>>;
 /// batch must see that error.
 type CacheCell = Arc<Mutex<Option<CacheSlot>>>;
 
-/// Re-resolve the encoder cache after the NVENC switch changed.
+/// Replace the encoder cache with a freshly resolved capability.
 ///
-/// The resolution spawns ffmpeg subprocesses, so it runs on its own
-/// thread -- the actor must stay responsive (a `Command::Cancel` may
-/// be waiting behind it).
+/// Only the `detect` path calls this: the capability is a fact about
+/// the machine, so it changes only when the machine (or the ffmpeg
+/// build) changes -- not when the user flips the `nv` switch. That
+/// switch is a run choice and travels in the run's parameters, so
+/// flipping it never touches the cache.
 ///
-/// A failed resolution leaves the previous cache in place: the old one
-/// still works (it just may not match the new setting), while an
-/// error cache would fail every batch.
-fn refresh_encoder_cache(
-    cache_cell: CacheCell,
-    enable_nv: bool,
-    evt_tx: Sender<Event>,
-    dropped_counter: DropCounter,
-) {
-    std::thread::Builder::new()
-        .name("rencoder-cache-refresh".into())
-        .spawn(move || {
-            let (cache, capability) =
-                crate::pipeline::cache::init_encoder_cache_with_capability(enable_nv);
-            match cache {
-                Ok(cache) => {
-                    let mut guard = cache_cell.lock();
-                    *guard = Some(Ok(Arc::new(cache)));
-                    if let Some(capability) = capability {
-                        send_evt_lossy(
-                            &evt_tx,
-                            Event::NvencCapability(capability),
-                            &dropped_counter,
-                        );
-                    }
-                }
-                Err(e) => {
-                    send_evt_lossy(
-                        &evt_tx,
-                        Event::Error {
-                            category: e.category(),
-                            message: format!("encoder cache refresh failed: {e}"),
-                        },
-                        &dropped_counter,
-                    );
-                }
-            }
-        })
-        .expect("spawn cache-refresh thread");
+/// The lock is held only for the pointer swap -- no IO inside
+/// (§3.10.1 rule 2).
+fn replace_encoder_cache(cache_cell: &CacheCell, resolution: &crate::encoder::nvenc::Resolution) {
+    let cache = crate::pipeline::cache::cache_from_resolution(resolution);
+    let mut guard = cache_cell.lock();
+    *guard = Some(Ok(Arc::new(cache)));
 }
 
 /// Summarize a capability resolution for the UI.
@@ -1303,8 +1264,6 @@ fn run_actor(
     cache_rx: std::sync::mpsc::Receiver<crate::pipeline::cache::CacheInit>,
 ) {
     // The injected dependencies, unpacked for the arms below.
-    let config = Arc::clone(&env.config);
-    let app_config = Arc::clone(&env.app_config);
     let config_path = env.config_path.clone();
     let data_dir = env.data_dir.clone();
     let nvenc_cache_path = env.nvenc_cache_path.clone();
@@ -1502,7 +1461,6 @@ fn run_actor(
 
                 let cache_cell_for_worker = Arc::clone(&cache_cell);
                 let params_for_worker = params.clone();
-                let config_for_worker = Arc::clone(&config);
                 let cancel_for_worker = cancel_token.clone();
                 let evt_tx_for_worker = evt_tx.clone();
                 let dropped_for_worker = DropCounter::default();
@@ -1520,12 +1478,8 @@ fn run_actor(
                         "encoder cache init timed out".into(),
                     ))?;
                     let cache = cache_from_slot(slot)?;
-                    let batch_ctx = BatchContext::new(
-                        params_for_worker,
-                        cache,
-                        config_for_worker,
-                        verdicts_for_worker,
-                    );
+                    let batch_ctx =
+                        BatchContext::new(params_for_worker, cache, verdicts_for_worker);
                     Ok(make_encode_processor(
                         batch_ctx,
                         cancel_for_worker,
@@ -1560,7 +1514,6 @@ fn run_actor(
                 let cache_cell_for_worker = Arc::clone(&cache_cell);
                 let evt_tx_for_worker = evt_tx.clone();
                 let dropped_for_worker = DropCounter::default();
-                let config_for_worker = Arc::clone(&config);
                 // A dry run never encodes, so it cannot change a
                 // verdict -- it only reads them.
                 let verdicts_for_worker = verdicts.clone();
@@ -1595,12 +1548,7 @@ fn run_actor(
                                 return;
                             }
                         };
-                        let batch_ctx = BatchContext::new(
-                            params,
-                            cache,
-                            config_for_worker,
-                            verdicts_for_worker,
-                        );
+                        let batch_ctx = BatchContext::new(params, cache, verdicts_for_worker);
                         let records =
                             crate::pipeline::batch::dry_run_batch(&batch_ctx, files.iter());
                         send_evt_lossy(
@@ -1632,12 +1580,6 @@ fn run_actor(
                 // own copy would silently drop the edit: the file
                 // would be rewritten with the original values while
                 // the UI showed "Saved".
-                let new_nv = config.encode.as_ref().and_then(|e| e.nv).unwrap_or(false);
-                let old_nv = app_config
-                    .encode
-                    .as_ref()
-                    .and_then(|e| e.nv)
-                    .unwrap_or(false);
                 match config.save(&config_path) {
                     Ok(()) => {
                         send_evt_lossy(
@@ -1659,17 +1601,11 @@ fn run_actor(
                         );
                     }
                 }
-                if new_nv != old_nv {
-                    // The NVENC switch changed: re-resolve the
-                    // capability so the NEXT BATCH honours it -- the
-                    // cache is otherwise fixed for the whole session.
-                    refresh_encoder_cache(
-                        Arc::clone(&cache_cell),
-                        new_nv,
-                        evt_tx.clone(),
-                        DropCounter::default(),
-                    );
-                }
+                // The `nv` switch may have changed -- and that is all
+                // that changes: the capability is a fact about the
+                // machine, so the cache stays as it is. The next batch
+                // picks the new `nv` up from the run parameters (design
+                // doc §3.10.5).
             }
 
             Command::Detect { force } => {
@@ -1685,6 +1621,10 @@ fn run_actor(
                 let dropped_detect = DropCounter::default();
                 let cache_path = nvenc_cache_path.clone();
                 let detect_runner = Arc::clone(&detect_runner);
+                // A fresh probe may find different encoders usable than
+                // the cache knows about -- so the cache follows the
+                // capability (not the other way round).
+                let cache_cell_for_detect = Arc::clone(&cache_cell);
                 std::thread::Builder::new()
                     .name("renencoder-detect".into())
                     .spawn(move || {
@@ -1694,6 +1634,7 @@ fn run_actor(
                             move |args| detect_runner(args),
                         ) {
                             Ok(resolution) => {
+                                replace_encoder_cache(&cache_cell_for_detect, &resolution);
                                 send_evt_lossy(
                                     &evt_tx_detect,
                                     Event::NvencCapability(nvenc_capability_of(&resolution)),
@@ -1955,7 +1896,6 @@ mod mock_tests {
         let nvenc_cache_path = data_dir.clone().map(|d| d.join("nvenc-capability.json"));
 
         let env = ActorEnv {
-            config: Arc::new(Config::default()),
             app_config: Arc::new(AppConfig::default()),
             config_path,
             data_dir,

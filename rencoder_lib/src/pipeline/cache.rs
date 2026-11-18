@@ -21,28 +21,23 @@ use crate::encoder::nvenc;
 use crate::error::EncodeError;
 use crate::types::EncoderCache;
 
-/// Build an `EncoderCache` for the current run, probing NVENC if asked.
+/// Build an `EncoderCache` for the current run, probing NVENC.
 ///
-/// `enable_nv = false` skips the probe entirely (zero extra cost).
-/// `true` probes the NVENC encoders this ffmpeg build has; encoders
-/// that fail the probe are simply not usable, and `select_encoder`
-/// falls back to software encoding with a warning.
+/// The probe is **not** conditional on the `nv` switch: the capability
+/// is a fact about the machine, and `nv` is this run's choice (design
+/// doc §3.10.5). Encoders that fail the probe are simply not usable,
+/// and `select_encoder` falls back to software encoding with a
+/// warning.
 ///
-/// This is the "no store" path (the GUI, and any caller that has not
-/// resolved the capability yet). Callers that keep the capability on
-/// disk resolve it with [`crate::encoder::nvenc::resolve`] and build
-/// the cache with [`cache_from_resolution`].
-pub fn init_encoder_cache(enable_nv: bool) -> Result<EncoderCache, EncodeError> {
+/// This is the "no store" path (any caller that has not resolved the
+/// capability yet). Callers that keep the capability on disk resolve it
+/// with [`crate::encoder::nvenc::resolve`] and build the cache with
+/// [`cache_from_resolution`].
+pub fn init_encoder_cache() -> Result<EncoderCache, EncodeError> {
     let encoders_output = nvenc::run_ffmpeg(&["-encoders"])?;
-    let support = if enable_nv {
-        nvenc::probe(&encoders_output)
-    } else {
-        Vec::new()
-    };
-    if enable_nv && !support.iter().any(|s| s.usable) {
-        tracing::warn!(
-            "NVENC is enabled but no encoder passed the capability probe; using software encoding"
-        );
+    let support = nvenc::probe(&encoders_output);
+    if !support.iter().any(|s| s.usable) {
+        tracing::info!("no NVENC encoder passed the capability probe; software encoding only");
     }
     Ok(EncoderCache {
         encoders_output,
@@ -68,17 +63,30 @@ pub fn cache_from_resolution(resolution: &nvenc::Resolution) -> EncoderCache {
 /// CLI: a fresh record is reused as-is (no probe), a missing or
 /// mismatching one is probed and stored. `capability` carries the
 /// summary for the UI.
-pub fn init_encoder_cache_with_capability(
-    enable_nv: bool,
-) -> (
+pub fn init_encoder_cache_with_capability() -> (
     Result<EncoderCache, EncodeError>,
     Option<crate::types::NvencCapability>,
 ) {
-    if !enable_nv {
-        return (init_encoder_cache(false), None);
-    }
+    init_encoder_cache_with_capability_runner(crate::encoder::nvenc::run_ffmpeg)
+}
+
+/// Same, with an injectable ffmpeg runner (the test seam).
+///
+/// The runner answers every ffmpeg invocation the resolution makes
+/// (`-encoders`, `-version`, the 1-frame capability probes) -- the
+/// same seam [`crate::encoder::nvenc::resolve_with`] takes. The GUI
+/// actor injects its runner so its tests never spawn ffmpeg.
+pub fn init_encoder_cache_with_capability_runner<F>(
+    runner: F,
+) -> (
+    Result<EncoderCache, EncodeError>,
+    Option<crate::types::NvencCapability>,
+)
+where
+    F: Fn(&[&str]) -> Result<String, EncodeError> + Send + Sync + 'static,
+{
     let path = crate::config::path::resolve_nvenc_cache();
-    match crate::encoder::nvenc::resolve_and_store(path.as_deref(), false) {
+    match crate::encoder::nvenc::resolve_and_store_with(path.as_deref(), false, runner) {
         Ok(resolution) => {
             let capability = crate::types::NvencCapability {
                 support: resolution.support.clone(),
@@ -113,14 +121,22 @@ pub struct CacheInit {
 /// The receiver delivers the final `Result<EncoderCache, EncodeError>`
 /// exactly once. A failed init returns `Err(EncodeError::Probe(...))`;
 /// consumers should map that to `Event::Error` like the sync variant.
-pub fn init_encoder_cache_async_with_capability(
-    enable_nv: bool,
-) -> std::sync::mpsc::Receiver<CacheInit> {
+pub fn init_encoder_cache_async_with_capability() -> std::sync::mpsc::Receiver<CacheInit> {
+    init_encoder_cache_async_with_capability_runner(crate::encoder::nvenc::run_ffmpeg)
+}
+
+/// Same, with an injectable ffmpeg runner (the test seam).
+pub fn init_encoder_cache_async_with_capability_runner<F>(
+    runner: F,
+) -> std::sync::mpsc::Receiver<CacheInit>
+where
+    F: Fn(&[&str]) -> Result<String, EncodeError> + Send + Sync + 'static,
+{
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("rencoder-cache-init".into())
         .spawn(move || {
-            let (cache, capability) = init_encoder_cache_with_capability(enable_nv);
+            let (cache, capability) = init_encoder_cache_with_capability_runner(runner);
             let result = CacheInit { cache, capability };
             // Block on the send until the consumer picks up. With
             // sync_channel(1), the first send succeeds (buffer slot
@@ -217,7 +233,7 @@ Encoders:
         // Use a custom runner via init_encoder_cache_impl would
         // require re-plumbing; instead we exercise the real path
         // but tolerate the ffmpeg binary missing on the test host.
-        let rx = init_encoder_cache_async_with_capability(false);
+        let rx = init_encoder_cache_async_with_capability();
         let result = rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("init_encoder_cache_async channel closed without result");

@@ -137,7 +137,7 @@ fs_perms::set_config_file_mode(&tmp)?;
 | 日志（文件 sink） | `<app_dir>/log/rencoder.YYYY-MM-DD.NN.log`（U18） | 日滚 + 10MB 大小滚（NN 自增），7 天保留（`max_age_days=0` 不限）；自定义 `MakeWriter` 实现；`RENENCODER_LOG_DIR` 覆盖 |
 | 日志（span） | `#[instrument]` + `FmtSpan::CLOSE` | 关键函数（`encode_cmd` / `analyze_cmd`）记录 span 上下文，便于排障 |
 | 配置（用户面） | TOML via `AppConfig`（U18） | 替代 jq + 自写 JSON schema；unknown keys 立即报错（`#[serde(deny_unknown_fields)]`） |
-| 配置（有效配置） | `EffectiveConfig` = 默认 ← 文件 ← 命令行 三层合并（§3.10.5） | 合并只在一处；运行时 `Config` 退役（item 85） |
+| 配置（有效配置） | `EncodeParams` = 合并后的运行配置（§3.10.5） | 运行时 `Config` 退役（item 85）；"默认←文件←命令行"的合并收在一处仍是 future |
 | 分析聚合 | `polars`（DataFrame `group_by` + `agg`） | 复用 Polars 生态；不再手写 BTreeMap 遍历 |
 | 分析输出（默认） | per-file CSV 到 stdout + 一行 summary 到 stderr | 原始数据可管道到 DuckDB/Polars 二次分析；摘要与数据流分离 |
 | 转码工作记录 | `EncodingRecord`（4 维度：source / process / result / status） | 工作分析（吞吐、压缩率、失败率），不是视频分析 |
@@ -434,7 +434,7 @@ ffprobe 一次探测给出两个帧率：`avg_frame_rate`（平均速率）与 `
 
 **判定与参数映射必须同源**：
 
-同一个"是否降帧"的判断散落在三处（跳过判定、argv 参数映射、结果记录）。脚本在这上面栽过两次：v10.2.0 之前用"`MAX_FPS_ARGS` 数组是否为空"当判据，而加入 `-fps_mode passthrough` 后该数组恒非空，判据失效。
+同一个"是否降帧"的判断散落在三处（帧率动作判定、argv 参数映射、结果记录）。脚本在这上面栽过两次：v10.2.0 之前用"`MAX_FPS_ARGS` 数组是否为空"当判据，而加入 `-fps_mode passthrough` 后该数组恒非空，判据失效。
 
 因此引入 `FpsDecision` 枚举：判定一次得到动作（`Disabled` / `Unknown` / `Passthrough` / `Reduce`），动作直接决定注入的参数与结果记录里的 `ReducedFps` 标记。三处读同一个动作，不可能自相矛盾。
 
@@ -467,14 +467,12 @@ ffmpeg 不带 `-r` 时并不等于"不干预帧率"——默认 vsync 行为会�
 
 - `data/extract.rs` 拥有 probe 实现 + fps 解析（`probe_video_metadata*`、`parse_fps_value`）
 - `data/store.rs` 拥有 Polars DataFrame writers（`records_to_dataframe`、`records_to_csv/jsonl/parquet`、`dataframe_to_*`）
-- `data/record.rs` 拥有 `EncodingRecord` 组装 helpers（`make_skipped_record`、`make_failed_record`、`encoder_settings_from_params`）
+- `data/record.rs` 拥有 `EncodingRecord` 组装 helpers（`encoder_settings_from_params`）
 - `encoder/{command,select}.rs` 拥有 `build_ffmpeg_command` + `select_encoder`
 - `pipeline/{batch,cancel,cache}.rs` 拥有 `transcode_batch` + `CancelToken` + `init_encoder_cache`
 - `utils/{fs,time}.rs` 拥有 `output_path_for` + `is_same_file` + `utc_timestamp_filename`
-- `config/mod.rs` 拥有配置的重导出 + **三层合并**（默认 ← 文件 ← 命令行，§3.10.5）
+- `config/mod.rs` 拥有配置的重导出（运行时 `Config` 已退役 —— §8 item 83）
 - `config/app.rs` 拥有 user-facing `AppConfig`（U18 重命名自 `project.rs`；TOML 加载在 U17 新增）
-- `config/effective.rs` 拥有 `EffectiveConfig`（合并后的唯一形态）+ `fingerprint()`（§3.10.5）
-- `config/capability.rs` 拥有 `CapabilityConfig`（**能力判定**的进程级快照，与 `nv` 解耦）
 
 ```
 rencoder_lib/
@@ -483,14 +481,12 @@ rencoder_lib/
 │   └── records.rs              # probe → AnalysisRecord + aggregate → VideoStats
 ├── collect.rs                   # 文件收集（按目录 / 单文件 / 扩展名过滤）
 ├── config/
-│   ├── mod.rs                   # 重导出 + 三层合并（默认 ← 文件 ← 命令行）
-│   ├── app.rs              # AppConfig + Encode/Analyze/Encoders/FormatArg/AnalyzeFormatArg
-│   ├── effective.rs        # EffectiveConfig + fingerprint()（合并后的唯一形态）
-│   └── capability.rs        # CapabilityConfig（能力判定快照；与 nv 解耦）
+│   ├── mod.rs                   # 重导出
+│   └── app.rs              # AppConfig + Encode/Analyze/Encoders/FormatArg/AnalyzeFormatArg
 ├── data/
 │   ├── mod.rs
 │   ├── extract.rs               # probe_video_metadata*, parse_fps_value, stderr_tail, output_size, output_duration
-│   ├── record.rs                # make_skipped_record, make_failed_probe_record, encoder_settings_from_params
+│   ├── record.rs                # encoder_settings_from_params
 │   └── store.rs                 # records_to_dataframe, records_to_csv/jsonl/parquet, dataframe_to_*
 ├── encoder/
 │   ├── mod.rs
@@ -527,9 +523,10 @@ rencoder_lib/
   收集 capture 写入 record、调 log。`batch.rs` 是这一层的主要实现，`cache.rs` 是辅助。
 - **utils/** 是跨模块共享的最小工具集。`fs` 路径规范化，`time` UTC 时间戳。
   日志（CLI 端 `tracing_init`）**不**在这一层 —— 日志是跨切的关注点。
-- **config/** 分三层：`app.rs`（user-facing TOML schema）+ `effective.rs`（三层合并后的
-  `EffectiveConfig`，**唯一**进入编码链的配置形态）+ `capability.rs`（能力测试配置的进程级
-  快照）。`mod.rs` 负责重导出与合并入口。CLI 与 GUI 加载 TOML 后走**同一条**合并路径。
+- **config/** 只有一层：`app.rs`（user-facing TOML schema）。运行时 `Config` 已退役 ✓
+  ——`encoders` 与 `ffmpeg_args` 进了 `EncodeParams` ✓，所以"这次运行用了什么配置"
+  只有**一个**答案 ✓（`EncodeParams` ✓）。CLI 与 GUI 都走 `from_app_config` ✓；
+  "默认 ← 文件 ← 命令行"的合并收在一处是 §3.10.5 的 **future** ✓。
 
 **为什么 `analyzer/` 还在，`fps/` 已删除**：
 
@@ -768,6 +765,9 @@ pub enum TranscodeResult {
 /// Canonical name for `TranscodeResult`（U18 重命名以表达"outcome 包含跳过"）。
 /// 在 §3.8 / 新代码中优先使用 `EncodingOutcome`；`TranscodeResult` 保留作
 /// backwards-compat alias。
+///
+/// `Skipped` 是**只读历史**：现在没有"跳过"这个概念（§3.3.4），
+/// 它只为读旧 Parquet 保留，没有产生者。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncodingOutcome {
     Succeeded,
@@ -932,12 +932,12 @@ pub fn collect_files(
 
 ```rust
 /// 初始化编码器缓存（一次，每进程）
-/// 能力实测**不受 `nv` 开关影响**（§3.10.5）：能力配置总是形成——它是机器事实。
+/// 能力实测**不受 `nv` 开关影响**（§3.10.5）：能力是机器事实，总是形成。
 /// 对 ffmpeg -encoders 里出现的每个 NVENC 编码器跑一次 1 帧试编码，成功即"这台机器能用"。
 /// 结果进程内缓存，同进程内多次批次复用；`nv` 只在**选参数**时与能力结果合并判断。
 /// 探测失败 / 不可用一律降级到软件编码（warn，不作为 EncodeError 传播）。
 /// 对齐 encode.zsh 的 init_encoder_cache()
-pub fn init_encoder_cache(capability: &CapabilityConfig) -> Result<EncoderCache, EncodeError>;
+pub fn init_encoder_cache() -> Result<EncoderCache, EncodeError>;
 
 /// 选择编码器
 /// 优先级：配置覆盖 > 可用的 NVENC 变体 > 软件默认。
@@ -1145,33 +1145,27 @@ impl InputPath {
 第 3 层是兜底:即使将来新增了一条生成输出路径的路径(用户指定输出名、
 新的容器映射),也不会绕过前两层。
 
-#### 转码跳过判断：指纹相同才跳过
+#### 转码：批里的每个文件都会被转码
 
-**规则**：一个文件被跳过 ⟺ **输出已存在** 且 **输出是完整的** 且 **它带的有效配置指纹
-== 本次的有效配置指纹**。
+**行为**：每次运行，批里的**每个文件都会被转码**。输出文件已存在 → 直接覆盖写
+（ffmpeg 的 `-y`）。
 
-- **指纹** = **决定产物字节的那部分有效配置**（命令行 > 配置文件 > 默认配置，三层合并后的
-  结果）的哈希 ✓（§3.10.5 ✓）。含默认值 ✓——默认值也影响产物 ✓；不含
-  `extensions` / `max_batch_size` / `output_dir` / `[analyze].*` ✓——它们不影响字节 ✓，
-  变了不该重编 ✓。
-- 指纹写在**输出文件自己的元数据**里 ✓ → 判断时 probe 输出一次 ✓（同时拿到时长 ✓
-  和 tags ✓）。
-- 指纹不同 → 上次是另一份配置编的 → **重编** ✓（哪怕源编码已经匹配目标格式 ✓——
-  格式对上了不代表参数对上了 ✓）。
-- 输出没有指纹（不是本工具产的 ✓，或旧版本编的 ✓）→ **重编** ✓（保守 ✓）。
-- 输出不完整（时长明显短于源 ✓）→ 删掉重编 ✓（partial 清理 ✓）。
-- 唯一的硬错误仍是**输入与输出同路径** → 记 `Failed` ✓（防呆 ✓，不是跳过策略 ✓）。
+这里**没有"跳过 / 重编"这套判断**：不比较源编码、不比较配置、不给产物写指纹。
+少一个概念就少一处能自相矛盾的地方——多一套判断，就多一个"这套判断自己跟自己
+打架"的机会。
 
-**为什么不是"源编码已匹配就跳过"**：那只说明**格式**对上了 ✓，不说明**参数**对上了
-（码率 ✓、帧率上限 ✓、编码器覆盖 ✓、ffmpeg 参数 ✓ 都可能变了 ✓）。
-**为什么不是"一律重编"**：那会让"改了个无关配置"也触发全量重编 ✓——指纹就是为了
-区分这两种情况 ✓。
+| 情况 | 结果 |
+|---|---|
+| 输出已存在 | 照常转码（覆盖） |
+| 源编码已匹配目标格式 | 照常转码（覆盖） |
+| 源编码匹配 **且**需要降帧 | 转码，输出标记 `ReducedFps` |
+| 输入与输出是同一个文件 | 该文件记 `Failed`（硬错误，不转码） |
 
-**代价（认下）**：代码升级改了默认值 ✓ → 指纹变了 ✓ → 全部重编 ✓。这是"指纹 =
-有效配置"的诚实代价 ✓（产物可复现 ✓）。
+最后一条是**防呆**，不是另一套判断：输入和输出指向同一个文件时 ffmpeg 会把源文件
+截断，所以这一条必须挡住。
 
-**配置读几次**：**每进程一次** ✓。整个批次共用这一份快照（`BatchContext` ✓），
-**不按文件重读** ✓——按文件重读既慢 ✓ 又会让同一批里的文件用不同配置 ✓。
+**配置读几次**：**每进程一次**。整个批次共用这一份快照（`BatchContext`），
+**不按文件重读**——按文件重读既慢又会让同一批里的文件用不同配置。
 
 #### 单文件转码
 
@@ -1191,13 +1185,10 @@ pub fn transcode_single(
 ) -> Result<TranscodeResult, EncodeError>;
 ```
 
-**Partial output 检测**：**保留**（但职责变了）。
+**Partial output 检测**：**已不需要**。
 
-跳过规则是"存在 ✓ + 完整 ✓ + 指纹相同"（§3.3.4 ✓），其中"完整"这一条就是 partial
-检测 ✓：probe 输出 ✓，时长明显短于源 ✓ → 删掉重编 ✓。
-
-它现在**只服务跳过判定** ✓，不再自己决定"删了还是跳过" ✓——决定权在指纹那一条 ✓。
-probe 输出这一次 ✓ 同时拿到时长 ✓ 和指纹 tag ✓（一次 ffprobe 两件事 ✓）。
+输出已存在就照常转码（覆盖）——半成品会被直接覆盖，检测没有意义，所以检测本身
+已移除（§3.3.4 ✓）。
 
 **事后清理**不变：ffmpeg exit 0 但 output 缺失 / 0 字节 ✓，且 source 有 known
 duration ✓ → 立即 `remove_file` 并记录 `Failed` ✓（review #114 ✓）。不留 0 字节
@@ -1208,9 +1199,6 @@ ghost 等下一轮兜底 ✓。
   `[stderr truncated; N bytes dropped]` 注解。reader 持续 drain
   pipe 到 EOF,因此 `stderr_thread.join()` 不会卡住（review
   #112 + #116）。
-- **代价**:每个 skipped file 多一次 ffprobe 调用（~10ms）。
-  1000-file 二次跑额外 ~10s,可接受。
-
 #### 批量转码
 
 ```rust
@@ -1393,10 +1381,9 @@ rencoder encode [选项] [--] [额外FFmpeg参数]
 （命令行 > 配置项）——它是最"机器相关"的旋钮。详见 §3.4.5 App-level config +
 single-directory app。
 
-**命令行覆盖怎么合并**（§3.10.5）：CLI 把命令行上的选择组装成一层**覆盖**
-（`AppConfig` 形态 ✓），然后走**同一个**合并函数 ✓（默认 ← 文件 ← 覆盖）✓——
-不是"文件读完之后在 CLI 里逐字段 mutate" ✓（那样优先级就成了巧合 ✓）。
-GUI 不传命令行覆盖 ✓，走同一条合并路径 ✓（只少了最上面那一层 ✓）。
+**命令行覆盖怎么合并**：**当前是逐字段 mutate** ✓——CLI 读完 config 后直接改
+`params.nv` ✓ / `target` ✓ / `extra_args` ✓。"默认 ← 文件 ← 命令行"的合并收在一处
+是 §3.10.5 的 **future** 设计 ✓（现在优先级是巧合而不是规则 ✓）。
 ```
 
 #### 全局选项与 detect 子命令
@@ -1464,12 +1451,12 @@ Summary:
   Failed:     F
 ```
 
-（2026-11-15 起不再有 `Skipped` / `PartialSkip` 两类：一律重编，§3.3.4。
+（2026-11-15 起不再有 `Skipped` / `PartialSkip` 两类：批里的每个文件都转码，§3.3.4。
 `SkippedReason` 的枚举值仍在记录 schema 里，但不再产生。）
 
 **（历史）为什么 PartialSkip 曾是独立分类**：partial 输出留在磁盘上、partial 检测
 又删不掉时（权限拒绝 / 文件被占用），需要一个独立分类让用户在 summary 里看到它。
-partial 检测本身已随「一律重编」移除（§3.3.4），这个分类也不再产生；`SkippedReason`
+partial 检测本身已移除（§3.3.4），这个分类也不再产生；`SkippedReason`
 的枚举值保留在记录 schema 里（历史数据可能带它），但新记录不会有。
 
 #### 信号处理（U18 + U18.1）
@@ -1661,7 +1648,8 @@ log "task N/M (source) interrupted" 而不是光秃秃的 path。同步把 `epri
 
 **schema**：见 `rencoder_lib::config::app::AppConfig` 和 `examples/rencoder.toml.example`
 （dev-only 参考，dist 用户无需手动拷贝）。schema 校验在 `AppConfig::load`；文件读出来的
-`AppConfig` 与默认配置、命令行覆盖**合并成一处**的 `EffectiveConfig`（§3.10.5）。
+`AppConfig` 进 `EncodeParams::from_app_config` ✓。"默认 ← 文件 ← 命令行"的合并收在
+一处是 §3.10.5 的 **future** ✓。
 
 **CRF 字段**（U18）：`crf: u32`，默认 `45`（libsvtav1 中等质量），`0` = 退回
 bitrate 模式（用 `bitrate` 字段的 Kbps 值）。范围 `0..=63`（libsvtav1 max=63，
@@ -1683,7 +1671,7 @@ signal handler"。
 | 关注点 | U18.1 散落位置 | U19 归属 |
 |---|---|---|
 | 任务编号、lifecycle log、Guard 注册、结果聚合 | `transcode_batch_with_processor` 内联 | `pipeline::task::TaskManager::run` |
-| 探测、跳过判断、argv 构造、ffmpeg 执行 | `transcode_single` | `transcode_single`（不变） |
+| 探测、argv 构造、ffmpeg 执行 | `transcode_single` | `transcode_single`（不变） |
 | signal 处理（listener thread + cleanup） | `cli::signal::install_handler` | 不变 |
 | analyze 的 probe | `analyze_records_with_probe` | 不变（drop log helpers） |
 
@@ -2257,7 +2245,7 @@ UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `int
   `Analyze` 后起一个 worker 跑这一批,批结束 worker 退出(§3.10.1.1)。actor 本身不跑批,
   因此它在批处理期间照样能处理 `Command::Cancel`。
 
-**Lib 内部细节**:actor 线程启动时**一次性**加载配置(经 `resolve_config` + `AppConfig::load` → 与默认配置、命令行覆盖合并成 `EffectiveConfig`)+ **一次性**探测能力配置(`detect` 优先，命中缓存文件就不重探)→ 初始化 `EncoderCache`(用**能力配置**，不用 `encode.nv`)。失败 → emit `Event::Error(ConfigError)` + 线程退出(UI 看到错误 + 之后无事件,知道 actor 死了)。
+**Lib 内部细节**:actor 线程启动时**一次性**加载配置(经 `resolve_config` + `AppConfig::load`)+ **一次性**解析能力(`detect` 优先，命中 `<app_dir>/nvenc-capability.json` 就不重探)→ 初始化 `EncoderCache`。能力解析**与 `encode.nv` 无关**（§3.10.5）——`nv` 是本次运行的选择，在 `EncodeParams` 里。失败 → emit `Event::Error(ConfigError)` + 线程退出(UI 看到错误 + 之后无事件,知道 actor 死了)。
 
 #### 3.8.5 状态与持久化的双轨
 
@@ -2313,9 +2301,8 @@ UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `int
 | `job.rs` | `Event::CommandRejected { reason }` | 命令被拒（闸门拒绝等）——良性，**不是** fatal：UI 弹一条 toast 即可，正在跑的那批不受影响（§3.8.7.6）|
 | `data/store.rs` | `read_records(path)` | 单 Parquet 文件回读(v1 不使用,v1.1 启用) |
 | `encoder/ffmpeg_arg.rs` | `ExtraArg` enum + `ExtraArg::parse` factory + char-class 模块 | 类型级 ffmpeg argv 安全边界(§3.3.7)——非法 argv 在 parse 阶段被拒,运行时无法塞 unsafe 值。替换 v1 的 runtime `validate_extra_args` |
-| `config/effective.rs` | `EffectiveConfig` | 三层合并后的**有效配置**（默认 ← 文件 ← 命令行），一个字段一个归属类别（§3.10.5）；带 `fingerprint()` → 有效配置指纹 |
-| `config/capability.rs` | `CapabilityConfig` | **能力判定**的进程级快照（探测结果 + 探测元信息：何时探的 / 哪个 ffmpeg 构建 / 是否被 `--detect` 强制重探）。**不含 `nv`**——`nv` 是本次运行的选择，属于运行配置 |
-| `encoder/nvenc.rs` | `CapabilityVerdicts` | 探测**结果**本身（哪个编码器能用 / 不能用 + 原因）——与 `nv` 无关：机器事实 |
+| `config/app.rs` | `EncodersConfig::for_format` | 按格式取编码器覆盖；空字符串视为未设（否则 `has_encoder("")` 恒真） |
+| `pipeline/cache.rs` | `init_encoder_cache_with_capability_runner` / `init_encoder_cache_async_with_capability_runner` | 能力解析的 runner 缝——测试不必真跑探测 |
 | `types.rs` | `InputPath` newtype + `InputPath::new(&Path)` factory + `InputPathError` | 输入路径类型级安全边界(§3.3.8)——dash 前缀文件名在构造时就被拒,`build_ffmpeg_command` 不可能拿到 `-vf_negate.mp4`。替换 `collect_dir` 里的运行时 dash-prefix 检查(review #109 收尾) |
 
 **per-file 的可测试性**(§8 item 43 的意图)——当年抽 `process_one_file` 是为了给测试一个
@@ -2340,12 +2327,13 @@ UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `int
 
 | `job.rs` | `start_controller() -> ControllerHandle` | 编排：后台线程 + mpsc + `run_ffmpeg_with_progress`；与 CLI 路径**共享** `encode_prepare` / `build_encode_record`（不 fork），但**不**走 `transcode_batch`（那是 CLI 专用的批入口）；job.rs 是 thin glue，把现有 pieces 装成 actor |
 
-**Controller 启动时加载配置**（U21 增量，§3.10.5 的模型）：
+**Controller 启动时加载配置**（U21 增量，§3.10.5）：
 - `config::path::resolve_config()` 拿路径（`$RENENCODER_CONFIG` > `<app_dir>/rencoder.toml`）
 - `AppConfig::load(&path)` 读 TOML（缺失时自动创建默认文件，与 CLI 一致）→ **每进程一次** ✓
-- 合并三层（默认 ← 文件 ← 命令行）→ `EffectiveConfig` ✓（合并只在这一处 ✓）
-- 能力配置探测一次（`detect` 优先：复用 `<app_dir>/nvenc-capability.json`，没有就探测并落盘）→ `CapabilityConfig` ✓（**不绑 `nv`** ✓）
-- `init_encoder_cache(...)` 用**能力配置**（不是 `nv`）初始化 ✓——`nv` 是运行参数，不进缓存 ✓
+- 能力解析一次（`detect` 优先：复用 `<app_dir>/nvenc-capability.json`，没有就探测并落盘）✓
+  → `EncoderCache` ✓（**不绑 `nv`** ✓）
+- `nv` 是**本次运行的选择** ✓：Setup 页的开关写进 config draft ✓，下一批从 draft
+  组装参数时带上 ✓——切 `nv` **不重探能力、不换缓存** ✓
 - 失败 → `Event::Error(ConfigError)` 后线程退出
 - 这把 controller 与 CLI 拉到同一配置源——GUI 不再绕开 `rencoder.toml` ✓ |
 | `job.rs` | `pub enum Command` / `pub enum Event` | 消息协议（见 §3.8.3） |
@@ -3314,8 +3302,8 @@ fn push_toast(state: &mut AppState, msg: impl Into<String>, kind: ToastKind) {
 - `Event::LogLine { file_index, line }` = ffmpeg stderr per file
   (per-batch context, 1 line per stderr chunk)
 - tracing events from lib = lib internal logging
-  ("task skipped: source codec matches target",
-  "nvidia-smi unavailable", "processing task N/M" etc.)
+  ("no NVENC encoder passed the capability probe",
+  "processing task N/M" etc.)
   - 这些**没有 file context** —— `LogLine.file_index` 用 `usize::MAX` sentinel
   - 渲染时显示 `(global)` 而不是 `[N]`
 
@@ -3413,7 +3401,7 @@ v1.2 follow-up #2: `Analyzing` / `AwaitingConfirm` 阶段不渲染 file list。`
 
 ```rust
 Event::DryRunFinished { records } => {
-    // 2026-11-15 起一律重编：不跳过的文件只剩"prepare 阶段就失败"的那些（§3.3.4）。
+    // 批里的每个文件都会转码：没转成的只剩"prepare 阶段就失败"的那些（§3.3.4）。
     let to_encode = records.iter().filter(|r| matches!(r.outcome, EncodingOutcome::Succeeded)).count();
     let to_failed = total_files.saturating_sub(to_encode);
 
@@ -3721,25 +3709,32 @@ AppConfig ─┬─ CLI 手写映射 ──────────────�
 第三条里的 `max_fps_eps` 是硬编码的 `0.05`，第二条用的是 `MaxFpsConfig::default().eps`
 （`0.01`）——**同一个帧率容差在 CLI 和 UI 上不一样**，而且没人发现。
 
-**现在的规则**（§3.10.5 补齐了"合并"这一步）：
+**现在的规则**：
 
-- **合并**（默认 ← 文件 ← 命令行）只在**一处**做 ✓ → 产出 `EffectiveConfig` ✓。
-- `EncodeParams::from_app_config()` 是**唯一**的"有效配置 → 每轮参数"映射入口。CLI 和 UI
+- `EncodeParams::from_app_config()` 是**唯一**的"配置 → 每轮参数"映射入口。CLI 和 UI
   都用它 ✓，各自只补自己特有的部分（CLI 补 target 与 extra_args ✓）。
-- lib 的运行时 `Config` **退役** ✓（§3.10.5）：`encoders` 归运行配置 ✓、`ffmpeg_args` 归
-  应用外运行配置 ✓ → grab-bag 类型整体消失 ✓。
+- lib 的运行时 `Config` **退役** ✓：`encoders` 与 `ffmpeg_args` 进了 `EncodeParams` ✓
+  → grab-bag 类型整体消失 ✓，"这次运行用了什么配置"只有一个答案 ✓。
 - 常量（容差带、默认 crf、默认码率）只有一处定义，别处引用。
+
+**还差的**（§3.10.5 的 future 设计）："默认 ← 文件 ← 命令行"的**合并**还没收在一处 ✓
+——CLI 读完 config 后逐字段 mutate `params.nv` / `target` / `extra_args` ✓，
+优先级是巧合而不是规则 ✓。
 
 ```text
 现在：
 
+AppConfig ──EncodeConfig──→ EncodeParams::from_app_config ──→ EncodeParams
+                                   （CLI 与 UI 共用这一条）
+                                   CLI 随后再 mutate 三个字段
+
+目标（future）：
+
 默认 ← 配置文件 ← 命令行
-        └─ 合并（唯一一处）──→ EffectiveConfig
-                                   ├─ EncodeParams::from_app_config ──→ EncodeParams
-                                   │      （CLI 与 UI 共用这一条）
-                                   └─ 能力配置（detect 优先）──→ CapabilityConfig
-                                          （与 nv 解耦）
+        └─ 合并（唯一一处）──→ 有效配置
 ```
+
+
 
 #### 3.10.3 公共功能归属：两个前端都要用的放 lib
 
@@ -3878,7 +3873,7 @@ B' 必须一次落地：缝先于第二个实现出现，就是"只有一个实�
 | 要求 | 现状 | 违反后果 |
 |---|---|---|
 | **判别式要么用类型，要么不用** | `TranscodeTask.output: Option<PathBuf>` 是一 bit 的判别式（None = analyze），但编码路径把它 `expect` 成必填 | 非法组合是**运行期 panic**，不是编译错误 |
-| **record 的组装只有一个归属** | `make_skipped_record` / `encoder_settings_from_params` 在 `data/record.rs` 与 `pipeline/batch.rs` 各有一份，**活着的那份不是 doc 指的那份** | 改 record 组装要猜改哪份；两份会漂移 |
+| **record 的组装只有一个归属** | ✅ 已修：`make_skipped_record` / `make_failed_probe_record`（没有调用者的死代码）与 `pipeline/batch.rs` 里的 `encoder_settings_from_params` 副本都删了，只剩 `data/record.rs` 一份 | 改 record 组装要猜改哪份；两份会漂移 |
 | **没有零使用者的钩子** | `ResultCallback` 类型、参数、调用点俱全，调用方永远传 `None`；`Event::LogLine` 有定义有消费无生产者 | 读签名的人要花时间推断"它本来干嘛的" |
 | **上下文只带真被读的字段** | `TaskContext.source` 只被 task.rs 自己的日志读（那里 `task.input` 就在手边） | 多余字段是"以后可能用"的坟场 |
 
@@ -3926,7 +3921,7 @@ B' 必须一次落地：缝先于第二个实现出现，就是"只有一个实�
 |---|---|---|
 | **E1** | **编码路径不 panic**。找不到可用编码器（ffmpeg 没编 libsvtav1 / 配置指向不存在的编码器）是**一个文件的失败**，不是崩溃 | `build_argv` 对 `select_encoder` 的结果 `.expect()` ✗ → GUI 的 worker 线程 unwind（闸门放开了，但不发任何事件 ✗）→ UI 永远停在 Analyzing ✗；CLI unwind 到 main → exit 101 → 这一轮记录全丢 ✗ |
 | **E2** | **partial-output 的登记窗口 = 真正要写输出的时候**。信号处理器只该删"这一轮正在写的半成品" | Guard 在**探针之前**就登记了输出路径 ✗ → 重跑一个已编码完的目录时，Ctrl-C 落在某个文件的 probe 窗口里 → **删掉上一轮的成品文件** ✗ |
-| **E3** | **失败的输出有确定的下场**。一次失败的编码不能把半成品留在盘上冒充成品 | ffmpeg 失败不删输出 ✗；下一轮的"partial 检测"判据是时长差 1 秒 ✗ → **99% 失败的输出和完整的分不出来** → 截断文件被当 `Skipped(OutputExists)` 永久跳过 ✗ |
+| **E3** | **失败的输出有确定的下场**。一次失败的编码不能把半成品留在盘上冒充成品 | ffmpeg 失败不删输出 ✗ → 盘上留一个比源文件小得多的半成品 ✗；它和完整成品在盘上分不出来 ✗（partial 检测已随"跳过"概念一起移除，§3.3.4） |
 | **E4** | **中断要留下记录**。用户 Ctrl-C 之后，这一轮已经编好的文件必须进历史 | CLI 的 signal handler 直接 `process::exit(1)` ✗ → `write_records` 没跑 ✗ → parquet 没写（文件留在盘上，下一轮全变 `Skipped` ✗）；`process::exit` 也不杀子进程 ✗ → ffmpeg 继续往已 unlink 的 inode 里写 ✗ |
 
 #### 3.11.5 这一轮做什么、不做什么
@@ -3946,92 +3941,126 @@ B' 必须一次落地：缝先于第二个实现出现，就是"只有一个实�
 
 **验证**：每一条都补测试——E1 补"格式没有可用编码器 → 该文件 Failed，批继续"；E2 补"probe 期间收到信号不删已存在的输出"；交互第 1 条补 UI 侧"per-file 失败不 finalize 活动任务"。
 
-#### 3.10.5 配置的四个类别、三个来源、两个加载时机
+#### 3.10.5 配置的模型（**未来设计**，本轮不实现）
+
+> **状态**：本节记录**目标形态**，代码还没到。当前实现是
+> `EncodeParams::from_app_config`（唯一的「配置 → 参数」入口）+ 前端事后 mutate
+> （CLI 改 `params.nv` / `target` / `extra_args`）。两者之间的差距就是下面这些条目。
 
 **为什么要有这一节**：配置到参数的链路之前是散的——同一段 `[encode]` 里的字段落到了
 三个地方（`EncodeParams` ✓ / 启动时算一次的运行时 `Config` ✓ / 段外各自消费 ✓），
 "命令行优于配置文件"这条规则也散在两个前端 ✓。结果是：改一条规则要动很多地方 ✓，
-而"这次运行到底用了什么配置"没有单一答案 ✓——连"这个输出算不算已完成"都只能靠
-"干脆都不跳过"这种粗粒度规则兜 ✓。
+而"这次运行到底用了什么配置"没有单一答案 ✓。
 
-**四个类别**（一个字段属于哪一类，决定它怎么变成 ffmpeg 参数）：
+**已经落地的部分**（本轮）：
+
+- 运行时 `Config` **退役** ✓——`encoders` 与 `ffmpeg_args` 移进 `EncodeParams` ✓，
+  "这次运行用了什么配置"只有**一个**答案 ✓（`EncodeParams` ✓）。
+- 能力判定与 `nv` **解耦** ✓——能力是**机器事实** ✓（每进程形成一次 ✓），
+  `nv` 是**本次运行的选择** ✓（在 `EncodeParams` 里 ✓），两者在选编码器时合并判断 ✓。
+  副作用：切 `nv` 不再重探能力、不再换缓存 ✓（GUI 的「SaveConfig → 比新旧 → 刷缓存」
+  那条旁路消失 ✓）。
+
+**还没落地的部分**（下面这套模型）：
+
+##### 四类配置 = 四个注入结构
+
+一个字段属于哪一类，决定它怎么变成 ffmpeg 参数：
 
 | 类别 | 配置字段 | 怎么变成 ffmpeg 参数 | 例子 |
 |---|---|---|---|
-| **能力测试配置** | `encode.nv` ✓（+ 探测策略 ✓：`detect` 命令 / `--detect` 选项 ✓——**不是配置字段** ✓） | 不直接进参数 ✓；它**支撑**参数的选择 ✓ | 本次要不要用 GPU 编码器 ✓ |
+| **能力测试配置** | `encode.nv` ✓ | 不直接进参数 ✓；它**支撑**参数的选择 ✓ | 本次要不要用 GPU 编码器 ✓ |
 | **运行配置** | `encode.format` ✓ / `crf`\|`bitrate` ✓ / `max_fps` ✓ / `encoders` ✓ | **编成** ffmpeg 参数 ✓ | `-c:v libsvtav1 -crf 45` ✓ |
 | **应用外运行配置** | `encode.ffmpeg_args.*` ✓（pre_input ✓ / post_input ✓ / default_preset ✓ / default_audio_* ✓） | **直通** argv ✓，不参与"编成参数" ✓ | `-preset slow` ✓ |
 | **采集与落盘配置** | `encode.extensions` ✓ / `max_batch_size` ✓ / `output_dir` ✓ + `[analyze].*` ✓ | **不参与** ffmpeg 参数 ✓；决定"收哪些文件" ✓、"结果写去哪" ✓ | 收 `mp4` ✓、输出到 `encoded/` ✓ |
 
-`nv` 归第一类 ✓（它决定"用不用硬件编码器" ✓），但它**不是机器事实** ✓——
-机器事实是**探测结果** ✓（见下 ✓）。
+`detect` 不是配置字段 ✓——它是 CLI 选项 / 子命令 ✓（`--detect` 强制重探 ✓、
+`rencoder detect` 探测并打印报告 ✓）。
 
-**三个来源**（同一个字段，取优先级最高的那一层）：
+##### 贡献流：逐层注入，互不覆盖
 
 ```
-默认配置（代码里绑死，Default 实现）   ← 最低，保证总有一套配置可用
-   ↑ 被配置文件覆盖（<app_dir>/rencoder.toml）
-   ↑ 被命令行覆盖（--nv/--no-nv、-- 透传、-f/-d）
-= 有效配置（effective）                 ← 唯一进入编码链的东西
+默认配置（代码里绑死）      ← 最低，保证总有一套配置可用
+   ↑ 配置文件（<app_dir>/rencoder.toml）
+   ↑ 命令行（--nv/--no-nv、-- 透传、-f/-d）
 ```
 
-合并**只发生在一处** ✓。现在"默认+文件"在 `EncodeParams::from_app_config` ✓、
-"命令行"在 CLI 事后 mutate ✓ —— 两处拼起来的"优先级"是巧合而不是规则 ✓。
+每一份贡献只说"**我设了哪些字段**" ✓，**任何一份都不改写另一份** ✓——它们全部留在
+流里 ✓。需要取值时才**解析** ✓：
 
-**两个加载时机**（都是**每进程一次** ✓，不是每文件 ✓）：
+- **独占字段**（format ✓ / crf ✓ / max_fps ✓ / nv ✓ / encoders ✓）：取**优先级最高的
+  那个有值的贡献** ✓。措辞是"CLI 没说话，所以用文件的" ✓，不是"文件被 CLI 覆盖了" ✓。
+- **可组合字段**（`ffmpeg_args` 的各段 ✓ / `extra_args` ✓）：**按流序全部拼接** ✓，
+  一个都不丢 ✓。这就是"注入"和"覆盖"的区别 ✓。
 
-- **配置文件**：进程启动读一次 ✓
-- **能力配置**：进程启动探测一次 ✓（`detect` 优先 ✓：复用
-  `<app_dir>/nvenc-capability.json` ✓，没有就探测并落盘 ✓）
+##### 注入只有两种结果：加进去 / 加不进去
 
-**"能力测试配置" 与 "能力判定" 是两件事** ✓：
+「加不进去」落在**结构**上 ✓，不是落在字段上 ✓：
 
-- **能力测试配置**（旋钮 ✓）：`nv` ✓（本次要不要用 GPU ✓）+ 探测时机 ✓（走缓存 ✓ /
-  `--detect` 强制重探 ✓）——这些是**用户的选择** ✓，属于配置层 ✓。
-- **能力判定**（事实 ✓）：探测出来的"这台机器能跑 `av1_nvenc` 吗" ✓——这是**机器的事实** ✓，
-  与 `nv` **无关** ✓，每进程形成一次 ✓。
-
-所以：**能力判定总是形成** ✓（不受 `nv` 影响 ✓），`nv` 只在**编参数**时与能力判定**合并
-判断** ✓（要 GPU ✓ 且这台机器支持 ✓ → 用 NVENC ✓；否则软件编码 ✓）。切 `nv` 只需要
-重新组装参数 ✓，**不需要重建缓存** ✓（"SaveConfig → 比新旧 → 刷缓存"那条旁路因此消失 ✓）。
-
-**有效配置指纹** ✓：哈希"**决定产物字节**的那部分有效配置" ✓（§3.3.4 ✓），随产物一起
-保存 ✓，用于判断"这个输出是不是本次配置产的" ✓。
-
-- **进指纹的** ✓：运行配置 ✓（format ✓ / crf|bitrate ✓ / max_fps ✓ / encoders ✓）
-  + 应用外运行配置 ✓（ffmpeg_args ✓）+ `nv` ✓（它决定选哪个编码器 ✓ → 字节不同 ✓）。
-- **不进指纹的** ✓：`extensions` ✓ / `max_batch_size` ✓ / `output_dir` ✓ / `[analyze].*` ✓
-  ——它们**不影响产物字节** ✓，变了不该触发重编 ✓（进了就是无谓的全量重编 ✓）。
-- **含默认值** ✓：默认值也决定字节 ✓（默认 crf 从 45 改成 40 → 产物不同 ✓ → 指纹变 ✓）。
-
-- 指纹写在**输出文件自己的元数据**里 ✓（不是历史记录 ✓）：指纹跟着文件走 ✓，不依赖
-  历史还在不在 ✓；不是本工具产的输出没有指纹 ✓ → 保守重编 ✓（正确 ✓）。
-- 代价 1 ✓：代码升级改了默认值 ✓ → 指纹变了 ✓ → 全部重编 ✓。这是"指纹含默认值"的
-  诚实代价 ✓（产物可复现 ✓）。
-- 代价 2 ✓：**能力判定不进指纹** ✓（机器状态 ✓ 不是配置 ✓）——驱动升级让
-  `av1_nvenc` 变得不可用 ✓ → 已编好的输出**不会**因此重编 ✓。这是刻意的取舍 ✓：
-  能力变更是"这台机器变了" ✓，不是"这次配置变了" ✓；重编全库太贵 ✓。
-  后果是知道的 ✓：能力变化后老产物可能用的是老编码器 ✓（记录里查得到 ✓）。
-
-**指纹怎么落地** ✓：
-
-- **写**：编参数时加一条输出侧 metadata ✓（`-metadata rencoder_fingerprint=<hex>` ✓）——
-  ffmpeg 把它写进产物自己的容器元数据 ✓（随文件走 ✓）。
-- **读**：判断跳过时 probe 输出 ✓（一次 ffprobe 同时拿到时长 ✓ 和 tag ✓）。
-- **住哪** ✓：指纹是"本次运行的配置"的一个属性 ✓ → 跟 `EncodeParams` 一起走 ✓
-  （`BatchContext` ✓ 携带 ✓）——编的时候写进去 ✓、比的时候拿出来比 ✓，同一个值 ✓。
-
-**由此消失的东西** ✓：
-
-| 消失的 | 为什么 |
+| 注入 | 加不进去的条件 |
 |---|---|
-| 运行时 `Config`（启动时算一次的 grab-bag ✓） | `encoders` 归运行配置 ✓、`ffmpeg_args` 归"应用外运行配置" ✓ → 整个类型消失 ✓ |
-| 能力配置被 `nv` 绑住 ✓ | 能力配置总是形成 ✓；`nv` 进运行配置 ✓ |
-| 优先级散在两个前端 ✓ | 收成一处 merge ✓（CLI 调 ✓、GUI 不调 ✓） |
-| `EncodeParams.target` 在 GUI 里是死的 ✓ | GUI 设成它选的目录 ✓ → 批路径只有一个来源 ✓ |
-| `output_dir` 死字段 ✓ | 它是 target 的配置侧对应物 ✓ → 接上 ✓ |
+| codec | 这个格式没有可用编码器 ✓ → **整个文件失败** ✓（不调 ffmpeg ✓） |
+| codec_params | 码率模式构造不出来 ✓ → 整个文件失败 ✓ |
+| fps | 判不出来**不是**失败 ✓——"不注入"也是一种结果 ✓ |
+| extra | 参数在**解析时**就被 `ExtraArg` 拒了 ✓，到不了注入 ✓ |
 
----
+##### argv 是带槽位的模板
+
+`-i` 必须在 pre_input 之后、post_input 之前 ✓，输出路径必须最后 ✓。所以"拼接"只在
+**槽内**成立 ✓：
+
+```
+argv = [ pre_input 槽 ][ -i 输入 ][ post_input 槽 ][ codec 注入 ]
+     + [ codec_params 注入（一个结构） ][ fps 注入（可为空） ][ extra 注入 ][ 输出路径 ]
+```
+
+**codec params 是一个注入结构** ✓，不是"每个 codec param 各注入一次" ✓——
+构造不出来就是**一次** per-file 失败 ✓，不会出现"半块 argv" ✓。
+
+##### 语义单元：每组按自己的语义校验
+
+params 的结构按语义分组 ✓，每组在**自己的语义下**校验 ✓：
+
+| 单元 | 字段 | 校验语义 |
+|---|---|---|
+| codec | crf / bitrate / preset | 按**实际选中的编码器** ✓（x264 上限 51 ✓、libsvtav1 上限 63 ✓） |
+| 帧率 | max_fps | 规范值集合 ✓（0 / 24 / 25 / 30 / 60 ✓） |
+| 线程 | （范例 ✓，不实现 ✓） | 按 threads 语义 ✓ |
+| 应用外 | ffmpeg_args / extra_args | argv 安全边界 ✓ |
+
+**为什么要有单元**：现在是一个平铺的 `validate()` ✓，逐字段查 ✓——
+`if enc.crf > 63` ✓ 是 libsvtav1 的范围 ✓，对所有格式一刀切 ✓。于是
+**format = x264 + crf = 60** 能过配置校验 ✓（x264 上限是 51 ✓），一路跑到 ffmpeg
+才报错 ✓，而且是以 **per-file 失败**的形式报 ✓（用户看到的是"这个文件编不了" ✓，
+不是"你的配置错了" ✓）。
+
+##### 校验时机：两阶段
+
+| 阶段 | 查什么 | 为什么在这 |
+|---|---|---|
+| 文件加载时 ✓ | max_fps 是不是规范值 ✓ / bitrate>0 ✓ / max_batch_size>0 ✓ | 早失败 ✓——用户改完配置立刻看到 ✓ |
+| 解析后 + 选定编码器后 ✓ | crf 是否在**这个编码器**的范围内 ✓ | 需要知道最终格式和编码器才知道 ✓ |
+
+##### 这套模型带出来的待决项
+
+1. **`preset` 归 codec 单元** ✓：它跟着编码器走 ✓（只有 libsvtav1 有 `-preset` ✓，
+   nvenc 用 `-cq` ✓，libaom 用 `-cpu-used` ✓）。现在它住在 `ffmpeg_args.default_preset` ✓，
+   靠 `encoder.contains("svt")` 在 argv 里临时判断 ✓。
+2. **threads 只是范例** ✓，不实现 ✓。
+3. **两套默认值** ✓：代码里的默认值 ✓ vs 首次运行自动写出的 `rencoder.toml` 里的值 ✓
+   （后者把前者**冻住** ✓——以后代码改默认值对这个用户不生效 ✓）。→ 自动写出的文件
+   要不要**只写注释** ✓？
+4. **argv 安全边界不对称** ✓：CLI 的 `--` 透传走 `ExtraArg::parse` ✓（类型级校验 ✓），
+   文件里的 `ffmpeg_args` 是**裸 `Vec<String>`** ✓，什么都能塞 ✓。同一类里两个成员 ✓，
+   一个有边界一个没有 ✓。
+5. **透传能不能覆盖派生参数** ✓：extra 注入排在 codec_params 之后 ✓ → ffmpeg
+   **后者胜** ✓ → 用户能在 `--` 里写 `-crf 30` 盖掉配置算出的值 ✓。允许吗 ✓？
+   允许的话记录要报**实际**值 ✓（现在报的是配置的值 ✓）。
+6. **`EncodeConfig.crf` / `max_batch_size` 要 `Option` 化** ✓：现在这两个字段不是
+   `Option` ✓ → 文件层**永远声称自己设了它们** ✓ → "默认 < 文件 < 命令行"在这两个
+   字段上其实不是解析出来的 ✓，而是 serde 的默认值在替我们执行 ✓。
+7. **溯源** ✓（便宜版 ✓）：解析完把有效配置 debug 打一行 ✓；不做 per-field 的来源
+   标记 ✓（太重 ✓）。
 
 ---
 
@@ -4149,7 +4178,7 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 37 | `ErrorContext` 加 `#[non_exhaustive]`（U21，对齐 `ErrorCategory`）；外部 crate 不可构造,字段读取仍可 | ✅ |
 | 38 | §3.8.7 定义 `TaskInfo` / `TaskQueue` / `TaskId` / `ProgressInfo` / `LogLine` UI state struct,让 reducer 可独立 unit-test | ✅ |
 | 39 | `Command::LoadHistory` 不带 path 字段；controller 用 `config::path::resolve_data_dir()` 自解析（honors `$RENENCODER_DATA_DIR`,v1.1 启用） | ✅ |
-| 40 | Partial-output 检测(U21)：output duration < source - 1s → partial → 删 + 重转；probe 失败视作 partial；删除失败 → `Skipped(PartialOutput)`——**2026-11-15 起随「一律重编」移除**（半成品会被直接覆盖，检测失去意义，§3.3.4） | ⚠️ 已作废 |
+| 40 | Partial-output 检测(U21)：output duration < source - 1s → partial → 删 + 重转；probe 失败视作 partial；删除失败 → `Skipped(PartialOutput)`——**2026-11-15 起移除**（输出已存在就照常转码，半成品被直接覆盖，检测没有意义，§3.3.4） | ⚠️ 已作废 |
 | 41 | CLI encode summary 增加 `PartialSkip` 独立分类(`PartialOutput` 不计入 `Skipped` 也不计入 `Failed`)——**2026-11-15 起 summary 不再输出 `Skipped` / `PartialSkip` 两行**（§3.3.4、§3.4）；`SkippedReason` 的变体留在记录 schema 里（历史数据），但不再产生 | ⚠️ 已作废 |
 | 42 | Per-frame Progress 事件接线：`transcode_single_with_progress` + controller 把 `FfmpegProgress` 包成 `Event::Progress`；CancelToken 真正能 kill 当前 ffmpeg 子进程 | ✅ |
 | 43 | Mock 测试层：`process_one_file` + `run_actor` 抽出允许注入 encode 闭包，验证消息协议契约不需要 ffmpeg；覆盖 event sequence / busy rejection / cancel / LoadHistory 过滤（LoadHistory 测试 v1.1 触发）——**注入点已由 §3.10.4 的 `FileEncoder` 缝取代**（`process_one_file` 不再存在） | ✅ |
@@ -4190,11 +4219,11 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 78 | per-file 失败走 `EncodingRecord.error`，**不再**发 fatal-only 的 `Event::Error`（协议 §3.8.3 早就这么写，代码违反了两轮） | ✅ |
 | 79 | 编码器找不到 = 一个文件的失败（`Failed` record），不是 panic——GUI 不再卡死在 Analyzing，CLI 不再 exit 101 丢光记录 | ✅ |
 | 80 | partial-output 只在真的要写输出时登记——信号处理器不会删掉上一轮已完成的文件 | ✅ |
-| 81 | ~~**一律重编**~~（2026-11-15 的决定）→ **已被 item 82 取代**：指纹相同才跳过 | ⚠️ 已作废 |
-| 82 | **指纹相同才跳过**：跳过 ⟺ 输出存在 ∧ 输出完整 ∧ 输出的**有效配置指纹** == 本次指纹（§3.3.4 / §3.10.5）。指纹 = 三层合并后的有效配置的哈希（含默认值），写在**输出文件自己的元数据**里（不是历史记录）。指纹不同 / 无指纹 / 输出不完整 → 重编。配置**每进程读一次**，整批共用同一份快照，**不按文件重读** | ✅ |
-| 83 | **配置的四个类别 / 三个来源 / 两个加载时机**（§3.10.5）：能力测试配置（`nv`/`detect`，支撑参数选择）/ 运行配置（`[encode]`，编成 ffmpeg 参数）/ 应用外运行配置（`ffmpeg_args`，直通 argv）/ 采集配置（`[analysis]`，只读运行输出）；来源 默认 ← 文件 ← 命令行，**合并只在一处**；加载时机 = 配置文件与能力配置各**每进程一次** | ✅ |
-| 84 | **能力配置与 `nv` 解耦**：能力配置总是形成（机器事实），`nv` 是本次运行的选择，编参数时与能力配置合并判断 → 切 `nv` 只重组参数，不重建缓存（GUI 的"SaveConfig → 比新旧 → 刷缓存"旁路随之消失） | ✅ |
-| 85 | **运行时 `Config` 退役**：`encoders` 归运行配置、`ffmpeg_args` 归应用外运行配置 → 启动时算一次的 grab-bag 类型整体消失，配置只有一个"有效配置"形态 | ✅ |
+| 81 | 批里的每个文件都转码，输出已存在就覆盖写；**不引入"跳过 / 重编"这套判断**（不比较源编码、不比较配置、不给产物写指纹）——多一个概念就多一处能自相矛盾的地方。配置**每进程读一次**，整批共用同一份快照，**不按文件重读** | ✅ |
+| 82 | **能力判定每进程一次 + 与 `nv` 解耦**：能力是机器事实（总是形成，`detect` 优先复用 `<app_dir>/nvenc-capability.json`），`nv` 是本次运行的选择（在 `EncodeParams` 里），选编码器时合并判断 → 切 `nv` 只重组参数，不重探能力、不换缓存（GUI 的"SaveConfig → 比新旧 → 刷缓存"旁路随之消失） | ✅ |
+| 83 | **运行时 `Config` 退役**：`encoders` 与 `ffmpeg_args` 进了 `EncodeParams` → 启动时算一次的 grab-bag 类型整体消失，"这次运行用了什么配置"只有一个答案 | ✅ |
+| 84 | **配置的四个类别 / 贡献流 / 注入结构 / 语义单元**（§3.10.5）：四类配置 = 四个注入结构；默认 ← 文件 ← 命令行 逐层注入、互不覆盖，独占字段解析 / 可组合字段拼接；注入只有"加进去 / 加不进去"；每类按自己的语义校验 | ⏳ future |
+| 85 | **编码器找不到 = 一个文件的失败**，不是 panic（§3.11.4 E1）——`build_argv` 返回 `Result`，GUI 不再卡死在 Analyzing，CLI 不再 exit 101 丢光记录 | ✅ |
 
 ---
 

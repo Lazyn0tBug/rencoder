@@ -744,7 +744,7 @@ struct BatchSummary {
     phase: BatchPhase,
     total_files: usize,
     to_encode: usize,
-    to_skip: usize,
+    to_failed: usize,
     cancelled: bool,
 }
 
@@ -789,7 +789,7 @@ fn TaskPage(
                 phase: task.phase,
                 total_files: task.total_files,
                 to_encode: task.to_encode,
-                to_skip: task.to_skip,
+                to_failed: task.to_failed,
                 cancelled: task.cancelled,
             },
         )
@@ -801,7 +801,7 @@ fn TaskPage(
                 phase: latest.phase,
                 total_files: latest.total_files,
                 to_encode: latest.to_encode,
-                to_skip: latest.to_skip,
+                to_failed: latest.to_failed,
                 cancelled: latest.cancelled,
             },
         )
@@ -813,7 +813,7 @@ fn TaskPage(
                 phase: BatchPhase::Done,
                 total_files: 0,
                 to_encode: 0,
-                to_skip: 0,
+                to_failed: 0,
                 cancelled: false,
             },
         )
@@ -833,15 +833,17 @@ fn TaskPage(
             DirPicker { state: state, cmd_tx: cmd_tx }
 
             // Count summary — only when at least one phase has run
-            // a dry-run (to_encode/to_skip > 0 means the dry-run is
+            // a dry-run (to_encode/to_failed > 0 means the dry-run is
             // done). When no active task and no history, skip.
             if active.is_some()
-                && (summary.to_encode > 0 || summary.to_skip > 0 || summary.total_files > 0)
+                && (summary.to_encode > 0
+                    || summary.to_failed > 0
+                    || summary.total_files > 0)
             {
                 div { class: "count-summary",
                     span { class: "count-encode", "{summary.to_encode} to encode" }
                     span { class: "sep", " · " }
-                    span { class: "count-skip", "{summary.to_skip} to skip" }
+                    span { class: "count-skip", "{summary.to_failed} failed" }
                     span { class: "sep", " · " }
                     span { class: "count-total", "{summary.total_files} total" }
                 }
@@ -1036,7 +1038,7 @@ fn BatchStatus(summary: BatchSummary) -> Element {
         phase,
         total_files,
         to_encode,
-        to_skip,
+        to_failed,
         cancelled,
     } = summary;
     let badge = match phase {
@@ -1068,7 +1070,7 @@ fn BatchStatus(summary: BatchSummary) -> Element {
                 div { class: "batch-status-row",
                     span { class: "code", "{total_files} files" }
                     span { class: "code", "→ {to_encode} to encode" }
-                    span { class: "code", "→ {to_skip} skipped" }
+                    span { class: "code", "→ {to_failed} failed" }
                 }
             }
             if cancelled {

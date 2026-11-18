@@ -367,9 +367,10 @@ pub struct TaskInfo {
     /// Files that would actually be encoded (outcome =
     /// `Succeeded`). Set on `Event::DryRunFinished`.
     pub to_encode: usize,
-    /// Files that would NOT be encoded (outcome = `Skipped(...)`
-    /// or `Failed`). Set on `Event::DryRunFinished`.
-    pub to_skip: usize,
+    /// Files that would NOT be encoded. Since re-encoding is the rule
+    /// (design doc §3.3.4), these are the files the prepare step failed
+    /// on — nothing is skipped any more. Set on `Event::DryRunFinished`.
+    pub to_failed: usize,
     /// Files encoded so far during `Encoding`. Updated on each
     /// `Event::FileCompleted`.
     pub encoded: usize,
@@ -844,17 +845,22 @@ fn apply_event(state: &mut AppState, evt: Event) {
                 return;
             }
             let total_files = state.tasks.active.as_ref().unwrap().total_files;
-            // review-delta F5: clamp to_skip at 0. The normal
+            // The files this run will NOT encode. Since re-encoding
+            // is the rule (design doc §3.3.4), the only such files are
+            // the ones the prepare step failed on (probe failure) —
+            // nothing is skipped any more.
+            //
+            // review-delta F5: clamp at 0. The normal
             // path has records.len() == total_files (each file
             // produces one record); if a file vanished mid-dry-run
             // and records.len() < total_files, subtracting gives a
             // stale 'skip' count.
-            let to_skip = total_files.saturating_sub(to_encode);
+            let to_failed = total_files.saturating_sub(to_encode);
             {
                 let t = state.tasks.active.as_mut().unwrap();
                 t.dry_run_records = records;
                 t.to_encode = to_encode;
-                t.to_skip = to_skip;
+                t.to_failed = to_failed;
             }
             // v1.2 follow-up #2: dry-run summary toast. The
             // Analyze stats (`Found N to encode, M to skip` /
@@ -865,7 +871,7 @@ fn apply_event(state: &mut AppState, evt: Event) {
             if to_encode == 0 {
                 push_toast(
                     state,
-                    format!("0 encodable files ({to_skip} skipped); pick a different dir"),
+                    format!("0 encodable files ({to_failed} failed); pick a different dir"),
                     ToastKind::Warning,
                 );
                 finalize(state, |t| {
@@ -876,7 +882,7 @@ fn apply_event(state: &mut AppState, evt: Event) {
             }
             push_toast(
                 state,
-                format!("Found {to_encode} to encode ({to_skip} to skip)"),
+                format!("Found {to_encode} to encode ({to_failed} failed)"),
                 ToastKind::Info,
             );
             // AwaitingConfirm: user reviews the toast, then
@@ -1227,7 +1233,7 @@ fn dispatch_dry_run_for_new_task(
         dir,
         total_files,
         to_encode: 0,
-        to_skip: 0,
+        to_failed: 0,
         encoded: 0,
         cancelled: false,
         finished: false,
@@ -1319,9 +1325,13 @@ mod tests {
         }
     }
 
-    fn sample_skipped(path: &str) -> EncodingRecord {
-        use rencoder_lib::types::SkippedReason;
-        sample_record(path, EncodingOutcome::Skipped(SkippedReason::SameCodec))
+    /// A file the prepare step could not handle (probe failure).
+    ///
+    /// Re-encoding is the rule (design doc §3.3.4), so the dry run
+    /// never reports "skipped" — the files it will not encode are the
+    /// ones that failed.
+    fn sample_failed(path: &str) -> EncodingRecord {
+        sample_record(path, EncodingOutcome::Failed)
     }
 
     fn cmd_tx() -> Sender<Command> {
@@ -1422,7 +1432,7 @@ mod tests {
             dir: PathBuf::from("/x"),
             total_files: 0,
             to_encode: 0,
-            to_skip: 0,
+            to_failed: 0,
             encoded: 0,
             cancelled: false,
             finished: false,
@@ -1461,7 +1471,7 @@ mod tests {
             dir: PathBuf::from("/x"),
             total_files: 5,
             to_encode: 0,
-            to_skip: 0,
+            to_failed: 0,
             encoded: 0,
             cancelled: false,
             finished: false,
@@ -1496,7 +1506,7 @@ mod tests {
             dir: PathBuf::from("/x"),
             total_files: 5,
             to_encode: 5,
-            to_skip: 0,
+            to_failed: 0,
             encoded: 5,
             cancelled: false,
             finished: true,
@@ -1540,7 +1550,7 @@ mod tests {
             dir: PathBuf::from("/x"),
             total_files: 5,
             to_encode: 5,
-            to_skip: 0,
+            to_failed: 0,
             encoded: 0,
             cancelled: false,
             finished: false,
@@ -1569,7 +1579,7 @@ mod tests {
             dir: PathBuf::from("/x"),
             total_files: 2,
             to_encode: 2,
-            to_skip: 0,
+            to_failed: 0,
             encoded: 2,
             cancelled: false,
             finished: false,
@@ -1604,7 +1614,7 @@ mod tests {
             dir: PathBuf::from("/x"),
             total_files: 5,
             to_encode: 4,
-            to_skip: 1,
+            to_failed: 1,
             encoded: 0,
             cancelled: false,
             finished: false,
@@ -1636,7 +1646,7 @@ mod tests {
             dir: PathBuf::from("/x"),
             total_files: 2,
             to_encode: 2,
-            to_skip: 0,
+            to_failed: 0,
             encoded: 0,
             cancelled: false,
             finished: true, // simulate post-BatchCompleted but still in active
@@ -1709,7 +1719,7 @@ mod tests {
             dir: PathBuf::from("/x"),
             total_files: 5,
             to_encode: 5,
-            to_skip: 0,
+            to_failed: 0,
             encoded: 2,
             cancelled: false,
             finished: false,
@@ -1758,7 +1768,7 @@ mod tests {
             dir: PathBuf::from("/x"),
             total_files: 5,
             to_encode: 5,
-            to_skip: 0,
+            to_failed: 0,
             encoded: 2,
             cancelled: true,
             finished: false,
@@ -1825,7 +1835,7 @@ mod tests {
             dir: PathBuf::from("/x"),
             total_files: 2,
             to_encode: 2,
-            to_skip: 0,
+            to_failed: 0,
             encoded: 0,
             cancelled: false,
             finished: false,
@@ -1863,7 +1873,7 @@ mod tests {
             records: vec![],
             dry_run_records: vec![],
             to_encode: 10,
-            to_skip: 0,
+            to_failed: 0,
             finished: false,
             cancelled: false,
         });
@@ -1918,7 +1928,7 @@ mod tests {
             dir: PathBuf::from("/x"),
             total_files: 5,
             to_encode: 5,
-            to_skip: 0,
+            to_failed: 0,
             encoded: 1,
             cancelled: false,
             finished: false,
@@ -1953,7 +1963,7 @@ mod tests {
             dir: PathBuf::from("/x"),
             total_files: 5,
             to_encode: 0,
-            to_skip: 0,
+            to_failed: 0,
             encoded: 0,
             cancelled: false,
             finished: false,
@@ -1990,7 +2000,7 @@ mod tests {
             dir: PathBuf::from("/nonexistent-for-test"),
             total_files: 3,
             to_encode: 0,
-            to_skip: 0,
+            to_failed: 0,
             encoded: 0,
             cancelled: false,
             finished: false,
@@ -1999,7 +2009,7 @@ mod tests {
         });
         let records = vec![
             sample_record("/a.mp4", EncodingOutcome::Succeeded),
-            sample_skipped("/b.mp4"),
+            sample_failed("/b.mp4"),
             sample_record("/c.mp4", EncodingOutcome::Failed),
         ];
         reduce(&mut state, Msg::Lib(Event::DryRunFinished { records }), &tx);
@@ -2009,7 +2019,7 @@ mod tests {
         let t = state.tasks.active.as_ref().unwrap();
         assert_eq!(t.phase, BatchPhase::AwaitingConfirm);
         assert_eq!(t.to_encode, 1);
-        assert_eq!(t.to_skip, 2);
+        assert_eq!(t.to_failed, 2);
         assert_eq!(t.dry_run_records.len(), 3);
         assert!(t.records.is_empty());
     }
@@ -2046,7 +2056,7 @@ mod tests {
             dir: tmp.clone(),
             total_files: 1,
             to_encode: 0,
-            to_skip: 0,
+            to_failed: 0,
             encoded: 0,
             cancelled: false,
             finished: false,
@@ -2100,7 +2110,7 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_finished_to_skip_saturates_at_zero() {
+    fn dry_run_finished_to_failed_saturates_at_zero() {
         // review-delta F5: if total_files underflows the
         // subtraction `total_files - to_encode` (e.g., a stale
         // total_files carried over after files vanished mid-dry-run),
@@ -2117,12 +2127,12 @@ mod tests {
             dir: PathBuf::from("/nonexistent-for-test"),
             // Pathological: total_files < records.len(). Pretend the
             // task was set up with total_files=1 but the dry-run
-            // found 3 records (1 Succeeded). Old code: to_skip =
+            // found 3 records (1 Succeeded). Old code: to_failed =
             // 1 - 1 = 0 (fine). To force the underflow path, set
             // total_files=0.
             total_files: 0,
             to_encode: 0,
-            to_skip: 0,
+            to_failed: 0,
             encoded: 0,
             cancelled: false,
             finished: false,
@@ -2131,16 +2141,16 @@ mod tests {
         });
         let records = vec![
             sample_record("/a.mp4", EncodingOutcome::Succeeded),
-            sample_skipped("/b.mp4"),
-            sample_skipped("/c.mp4"),
+            sample_failed("/b.mp4"),
+            sample_failed("/c.mp4"),
         ];
         reduce(&mut state, Msg::Lib(Event::DryRunFinished { records }), &tx);
-        // to_encode = 1, to_skip = saturating_sub(0, 1) = 0.
+        // to_encode = 1, to_failed = saturating_sub(0, 1) = 0.
         // Phase: AwaitingConfirm (positive count).
         let t = state.tasks.active.as_ref().unwrap();
         assert_eq!(t.phase, BatchPhase::AwaitingConfirm);
         assert_eq!(t.to_encode, 1);
-        assert_eq!(t.to_skip, 0, "to_skip must saturate at 0");
+        assert_eq!(t.to_failed, 0, "to_failed must saturate at 0");
     }
 
     #[test]
@@ -2159,14 +2169,14 @@ mod tests {
             dir: PathBuf::from("/x"),
             total_files: 2,
             to_encode: 0,
-            to_skip: 0,
+            to_failed: 0,
             encoded: 0,
             cancelled: false,
             finished: false,
             records: vec![],
             dry_run_records: vec![],
         });
-        let records = vec![sample_skipped("/a.mp4"), sample_skipped("/b.mp4")];
+        let records = vec![sample_failed("/a.mp4"), sample_failed("/b.mp4")];
         reduce(&mut state, Msg::Lib(Event::DryRunFinished { records }), &tx);
         assert!(state.tasks.active.is_none());
         assert_eq!(state.task_history.len(), 1);
@@ -2182,7 +2192,7 @@ mod tests {
             "unexpected toast message: {}",
             toast.message
         );
-        assert!(toast.message.contains("2 skipped"));
+        assert!(toast.message.contains("2 failed"));
     }
 
     #[test]
@@ -2199,7 +2209,7 @@ mod tests {
             dir: PathBuf::from("/x"),
             total_files: 1,
             to_encode: 0,
-            to_skip: 0,
+            to_failed: 0,
             encoded: 0,
             cancelled: true, // Cancel during Analyzing
             finished: false,
@@ -2236,7 +2246,7 @@ mod tests {
             dir: PathBuf::from("/x"),
             total_files: 1,
             to_encode: 0,
-            to_skip: 0,
+            to_failed: 0,
             encoded: 0,
             cancelled: false,
             finished: false,
@@ -2459,7 +2469,7 @@ mod tests {
             dir: PathBuf::from("/x"),
             total_files: 0,
             to_encode: 0,
-            to_skip: 0,
+            to_failed: 0,
             encoded: 0,
             cancelled: false,
             finished: false,

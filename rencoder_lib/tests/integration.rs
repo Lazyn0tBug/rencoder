@@ -10,7 +10,6 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rencoder_lib::{
-    config::Config,
     data::extract::probe_video_metadata,
     pipeline::{
         batch::{transcode_batch, transcode_single},
@@ -155,7 +154,6 @@ fn transcode_batch_end_to_end_produces_output_files() {
         encoders_output: "V..... libsvtav1            libsvtav1 SVT-AV1\n".to_string(),
         nvenc: Vec::new(),
     };
-    let config = Config::default();
     let params = EncodeParams {
         format: VideoFormat::Av1,
         is_crf: true,
@@ -164,12 +162,12 @@ fn transcode_batch_end_to_end_produces_output_files() {
         extensions: vec!["mp4".into()],
         extra_args: vec![],
         max_fps: rencoder_lib::types::MaxFpsConfig::default(),
+        ..Default::default()
     };
 
     let mut ctx = rencoder_lib::pipeline::context::BatchContext::new(
         params,
         std::sync::Arc::new(cache),
-        std::sync::Arc::new(config),
         rencoder_lib::encoder::nvenc::CapabilityVerdicts::default(),
     );
     let results = transcode_batch(&files, &mut ctx, ProcessOutput::Null, None, None);
@@ -202,15 +200,18 @@ fn transcode_batch_end_to_end_produces_output_files() {
 }
 
 #[test]
-fn transcode_batch_skips_when_output_exists() {
+fn transcode_batch_reencodes_when_output_exists() {
     if skip_if_no_ffmpeg() {
         return;
     }
     let dir = fixture_dir("skip_exists");
     let input = make_video(&dir, "in.mp4", 30, 1);
     // The output is a DIFFERENT path that already holds a complete
-    // video: the transcode must skip it. (Input == output is a
-    // different case -- it is rejected outright, see the
+    // video. Re-encoding is the rule (design doc §3.3.4): the config
+    // is read once per process, so the previous run's output may have
+    // been produced with different settings -- it gets overwritten,
+    // never treated as "already done". (Input == output is a different
+    // case -- it is rejected outright, see the
     // `fails_when_input_and_output_are_the_same_file` unit test.)
     let output = make_video(&dir, "out.mkv", 30, 1);
 
@@ -218,11 +219,13 @@ fn transcode_batch_skips_when_output_exists() {
         input: rencoder_lib::types::InputPath::new(&input).unwrap(),
         output: Some(output.clone()),
     };
+    // The cache must offer the software default for the target
+    // format -- the file is re-encoded now, so an encoder has to be
+    // selectable.
     let cache = EncoderCache {
-        encoders_output: String::new(),
+        encoders_output: " V..... libx264              libx264 H.264\n".to_string(),
         nvenc: Vec::new(),
     };
-    let config = Config::default();
     let params = EncodeParams {
         format: VideoFormat::X264,
         is_crf: true,
@@ -231,22 +234,26 @@ fn transcode_batch_skips_when_output_exists() {
         extensions: vec![],
         extra_args: vec![],
         max_fps: rencoder_lib::types::MaxFpsConfig::default(),
+        ..Default::default()
     };
 
     let mut ctx = rencoder_lib::pipeline::context::BatchContext::new(
         params,
         std::sync::Arc::new(cache),
-        std::sync::Arc::new(config),
         rencoder_lib::encoder::nvenc::CapabilityVerdicts::default(),
     );
     let result = transcode_single(&task, &mut ctx, ProcessOutput::Null)
         .expect("transcode_single should succeed");
+    // The encode ran and overwrote the existing output.
     assert!(matches!(
         result.outcome,
-        rencoder_lib::types::EncodingOutcome::Skipped(
-            rencoder_lib::types::SkippedReason::OutputExists
-        )
+        rencoder_lib::types::EncodingOutcome::Succeeded
+            | rencoder_lib::types::EncodingOutcome::ReducedFps
     ));
+    assert!(
+        result.output_path.is_some(),
+        "the record must name the output that was written"
+    );
 }
 
 // ---- actor: Command::Cancel aborts a running batch (end-to-end) ----
@@ -303,6 +310,7 @@ fn actor_cancel_aborts_the_batch_and_removes_the_partial_output() {
         extensions: vec![],
         extra_args: vec![],
         max_fps: rencoder_lib::types::MaxFpsConfig::default(),
+        ..Default::default()
     };
     cmd_tx
         .send(rencoder_lib::job::Command::StartBatch {
@@ -366,7 +374,7 @@ fn actor_cancel_aborts_the_batch_and_removes_the_partial_output() {
 fn init_encoder_cache_works_without_nvidia_smi() {
     // On macOS or any system without nvidia-smi, this should still succeed
     // with has_nvidia=false (R20).
-    let cache = init_encoder_cache(true).expect("init should succeed");
+    let cache = init_encoder_cache().expect("init should succeed");
     // We can't assert has_nvidia directly (depends on env), but the call
     // must not have returned Err.
     assert!(

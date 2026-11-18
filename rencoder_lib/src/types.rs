@@ -166,8 +166,8 @@ impl Default for MaxFpsConfig {
 /// The frame-rate action decided for one source file.
 ///
 /// The decision and the argv mapping must come from the same place:
-/// `should_skip_encoding` (skip?), the ffmpeg argv (`-r` / `-fps_mode`?)
-/// and the result record (`ReducedFps`?) all read this value. Computing
+/// the ffmpeg argv (`-r` / `-fps_mode`?) and the result record
+/// (`ReducedFps`?) both read this value. Computing
 /// "is it reduced?" independently in three places is how the shell script
 /// ended up with a skip predicate that silently stopped working
 /// (`encode.zsh` v10.2.0: `MAX_FPS_ARGS` became non-empty as soon as
@@ -312,9 +312,18 @@ pub struct EncodeParams {
     /// any runtime check.
     pub extra_args: Vec<crate::encoder::ffmpeg_arg::ExtraArg>,
     pub max_fps: MaxFpsConfig,
-    // Note: NVIDIA enablement lives on `EncoderCache.nvenc` after
-    // `init_encoder_cache(enable_nv)` runs the capability probe. Keeping a
-    // separate `enable_nv` field here would be dead state.
+    /// Whether this run may use NVENC hardware encoders.
+    ///
+    /// This is a *run choice*, not a machine fact: the machine's
+    /// capability is probed once per process and lives in
+    /// [`crate::types::EncoderCache::nvenc`]. The two are combined when
+    /// the encoder is selected (design doc §3.10.5).
+    pub nv: bool,
+    /// Per-format encoder overrides (`[encode.encoders]`). `None` means
+    /// "use the built-in default".
+    pub encoders: crate::config::app::EncodersConfig,
+    /// ffmpeg argv construction knobs (`[encode.ffmpeg_args]`).
+    pub ffmpeg_args: crate::config::app::FfmpegArgsConfig,
 }
 
 impl EncodeParams {
@@ -324,26 +333,18 @@ impl EncodeParams {
     // parsing must call `ExtraArg::parse` per element; failing entries
     // surface as `ExtraArgParseError` and never reach this struct.
 
-    /// Build a full `EncodeParams` from the loaded `AppConfig`'s
+    /// Build the run configuration from the loaded `AppConfig`'s
     /// `encode` section. Missing fields fall back to defaults.
-    ///
-    /// Review #123: renamed from `from_encode_config` to
-    /// `from_app_config` to disambiguate from
-    /// [`crate::config::Config::from_encode_config`], which has the
-    /// same name but a different job (sub-config extraction).
-    /// Both existed side by side; the disambiguation makes it
-    /// clear at the call site which layer is being constructed.
     ///
     /// This is the single source of truth for "how a TOML `[encode]`
     /// block becomes an `EncodeParams`". Both the CLI and the GUI
     /// (`rencoder_ui::msg::build_encode_params_from_config`) call this
-    /// — the GUI helper existed first and was duplicated, this commit
+    /// -- the GUI helper existed first and was duplicated, this commit
     /// consolidates.
     ///
-    /// Note: `target` is always `Target::default()` — currently
-    /// `[encode] target` is parsed but not consumed by
-    /// `transcode_single`. If/when target becomes per-batch
-    /// controllable, this function picks it up automatically.
+    /// Note: `target` is always `Target::default()` -- the batch
+    /// target is a per-run thing (CLI `-f` / `-d`, GUI picker), not a
+    /// config field.
     pub fn from_app_config(encode: Option<&crate::config::app::EncodeConfig>) -> Self {
         use crate::config::app::EncodeConfig;
         let default_enc = EncodeConfig::default();
@@ -370,6 +371,9 @@ impl EncodeParams {
                 // constant here (the config path is the production one).
                 eps: MaxFpsConfig::default().eps,
             },
+            nv: enc.nv.unwrap_or(false),
+            encoders: enc.encoders.clone().unwrap_or_default(),
+            ffmpeg_args: enc.ffmpeg_args.clone(),
         }
     }
 }
@@ -484,26 +488,25 @@ pub struct EncoderSettings {
     pub max_fps_target: Option<f32>,
 }
 
-/// Reason a file was skipped (no work performed).
+/// Why an old record says a file was skipped.
 ///
-/// `#[non_exhaustive]` (added U21): future variants don't break exhaustive
-/// match. `PartialOutput` is reserved for the case where partial-output
-/// detection succeeds but removal fails (rare); the happy path is
-/// "detect → remove → reencode" which produces a real encode record,
-/// not a Skipped one.
+/// **Read-only legacy**: nothing produces a `Skipped` outcome any more
+/// (a file in the batch is transcribed, full stop -- design doc
+/// §3.3.4). The variants survive so old Parquet files can still be read
+/// back into the same shape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SkippedReason {
     SameCodec,
     OutputExists,
     /// Output exists and is detected as partial (truncated/corrupt),
-    /// but removal failed (e.g. permission denied). Encode cannot
-    /// proceed because the output is in the way.
+    /// but removal failed (e.g. permission denied).
     PartialOutput,
 }
 
 /// Outcome of a single encode. `Succeeded` and `ReducedFps` produced
-/// output; `Skipped` did not; `Failed` did not and has an error context.
+/// output; `Failed` did not and has an error context. `Skipped` is
+/// legacy-read-only (see [`SkippedReason`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EncodingOutcome {
     Succeeded,
@@ -595,9 +598,8 @@ impl EncodingRecord {
     /// caller fills in per outcome (process / result / status).
     ///
     /// Review #124: this deduplicates the source-field assignment
-    /// that was repeated in `make_planned_ready_record`,
-    /// `make_skipped_record`, `make_failed_probe_record`, and
-    /// `build_encode_record`'s success arm — four sites building
+    /// that was repeated in `make_planned_ready_record` and
+    /// `build_encode_record`'s success arm — two sites building
     /// the same 7-field block from the same `&VideoMetadata`.
     pub fn from_metadata(
         input_path: &crate::types::InputPath,
@@ -784,6 +786,47 @@ mod tests {
         assert!(params.is_crf);
         assert_eq!(params.bitrate_or_crf, 28);
         assert_eq!(params.extensions, vec!["mov"]);
+    }
+
+    /// The three fields that used to live in the retired runtime
+    /// `Config` (`encoders`, `ffmpeg_args`) plus the run's `nv`
+    /// choice now travel with the parameters -- so "what is this run
+    /// configured with" has exactly one answer (design doc §3.10.5).
+    #[test]
+    fn from_app_config_carries_nv_encoders_and_ffmpeg_args() {
+        use crate::config::app::{EncodeConfig, EncodersConfig, FfmpegArgsConfig};
+
+        let ffmpeg_args = FfmpegArgsConfig {
+            default_audio_codec: Some("aac".into()),
+            ..FfmpegArgsConfig::default()
+        };
+
+        let enc = crate::config::app::EncodeConfig {
+            nv: Some(true),
+            encoders: Some(EncodersConfig {
+                av1: Some("libaom-av1".into()),
+                ..Default::default()
+            }),
+            ffmpeg_args,
+            ..EncodeConfig::default()
+        };
+
+        let params = EncodeParams::from_app_config(Some(&enc));
+        assert!(params.nv, "the nv choice must reach the run parameters");
+        assert_eq!(
+            params.encoders.for_format(VideoFormat::Av1),
+            Some("libaom-av1")
+        );
+        assert_eq!(
+            params.ffmpeg_args.default_audio_codec.as_deref(),
+            Some("aac")
+        );
+
+        // No config file at all: hardware encoding is off, and the
+        // encoder overrides / argv knobs are the built-in defaults.
+        let params = EncodeParams::from_app_config(None);
+        assert!(!params.nv);
+        assert!(params.encoders.for_format(VideoFormat::Av1).is_none());
     }
 
     #[test]

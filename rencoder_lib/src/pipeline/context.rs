@@ -29,12 +29,14 @@ use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 
-use crate::config::Config;
 use crate::encoder::nvenc::CapabilityVerdicts;
 use crate::types::{EncodeParams, EncoderCache, VideoMetadata};
 
 /// Everything one batch carries: its parameters, the resolved encoder
-/// cache, the runtime config and this run's NVENC verdicts.
+/// cache and this run's NVENC verdicts.
+///
+/// The effective configuration lives in `params` -- there is no second
+/// config object to keep in sync (design doc §3.10.5).
 ///
 /// The verdicts are the only mutable part: the NVENC fallback writes
 /// them when an encoder turns out to be unusable (design doc §3.10.1.1
@@ -43,7 +45,6 @@ use crate::types::{EncodeParams, EncoderCache, VideoMetadata};
 pub struct BatchContext {
     params: EncodeParams,
     cache: Arc<EncoderCache>,
-    config: Arc<Config>,
     verdicts: CapabilityVerdicts,
 }
 
@@ -52,13 +53,11 @@ impl BatchContext {
     pub fn new(
         params: EncodeParams,
         cache: Arc<EncoderCache>,
-        config: Arc<Config>,
         verdicts: CapabilityVerdicts,
     ) -> Self {
         Self {
             params,
             cache,
-            config,
             verdicts,
         }
     }
@@ -71,11 +70,6 @@ impl BatchContext {
     /// The resolved encoder cache (immutable snapshot).
     pub fn cache(&self) -> &EncoderCache {
         &self.cache
-    }
-
-    /// The runtime config.
-    pub fn config(&self) -> &Config {
-        &self.config
     }
 
     /// The run's NVENC verdicts.
@@ -176,7 +170,6 @@ mod tests {
                 encoders_output: String::new(),
                 nvenc: Vec::new(),
             }),
-            Arc::new(Config::default()),
             CapabilityVerdicts::default(),
         )
     }
@@ -186,7 +179,11 @@ mod tests {
         let mut ctx = ctx();
         assert!(!ctx.params().format.default_extension().is_empty());
         assert!(ctx.cache().encoders_output.is_empty());
-        assert!(ctx.config().encoders.av1.is_none());
+        assert!(ctx
+            .params()
+            .encoders
+            .for_format(ctx.params().format)
+            .is_none());
         assert!(!ctx.verdicts().is_disabled("h264_nvenc"));
         // The verdicts are the mutable part.
         ctx.verdicts_mut().set("h264_nvenc", false);

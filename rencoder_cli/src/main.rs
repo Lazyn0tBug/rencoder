@@ -19,15 +19,12 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use rencoder_lib::{
     collect::collect_files,
-    config::{AnalyzeFormatArg, AppConfig, Config},
+    config::{AnalyzeFormatArg, AppConfig},
     data::extract::probe_video_metadata,
     encoder::nvenc::{self, CapabilityVerdicts},
     pipeline::context::BatchContext,
-    pipeline::{
-        batch::transcode_batch,
-        cache::{cache_from_resolution, init_encoder_cache},
-    },
-    types::{EncodeParams, EncodingOutcome, ProcessOutput, SkippedReason, Target},
+    pipeline::{batch::transcode_batch, cache::cache_from_resolution},
+    types::{EncodeParams, EncodingOutcome, ProcessOutput, Target},
 };
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -152,8 +149,10 @@ fn encode_cmd(args: args::EncodeArgs, force_detect: bool) -> Result<()> {
     } else {
         config_nv
     };
-
-    let config = Config::from_encode_config(app_config.encode.as_ref());
+    // `nv` is a run choice, not a machine fact: it travels with the
+    // run's parameters and is combined with the capability when the
+    // encoder is selected (design doc §3.10.5).
+    params.nv = enable_nv;
 
     // Parse each `--` passthrough entry through the type-level safety
     // boundary. A bad entry fails fast here with a precise error
@@ -180,31 +179,35 @@ fn encode_cmd(args: args::EncodeArgs, force_detect: bool) -> Result<()> {
     // ~200-500ms per encoder, and the answer barely changes). `--detect`
     // forces a fresh probe; a record past its review date only gets the
     // user asked about it.
-    let cache = if enable_nv {
-        let cache_path = rencoder_lib::config::path::resolve_nvenc_cache();
-        let mut resolution = nvenc::resolve_and_store(cache_path.as_deref(), force_detect)
-            .context("NVENC detection failed")?;
+    //
+    // The capability is resolved whether or not this run uses NVENC:
+    // it is a fact about the machine, and `nv` is this run's choice
+    // (design doc §3.10.5). Resolving it costs a file read when the
+    // stored record is fresh.
+    let cache_path = rencoder_lib::config::path::resolve_nvenc_cache();
+    let mut resolution = nvenc::resolve_and_store(cache_path.as_deref(), force_detect)
+        .context("NVENC detection failed")?;
 
-        if resolution.review_due && !force_detect {
-            match advise_refresh()? {
-                Refresh::Yes => {
-                    resolution = nvenc::resolve_and_store(cache_path.as_deref(), true)
-                        .context("NVENC detection failed")?;
-                }
-                Refresh::No => {
-                    // Nothing to do: `resolve_and_store` already pushed
-                    // the review date 30 days out when it reported the
-                    // expired record, so the next run stays quiet.
-                }
-                Refresh::Skip => {}
+    // The staleness advisory only matters when this run actually uses
+    // NVENC -- otherwise the user is asked about a knob they don't
+    // touch.
+    if resolution.review_due && !force_detect && enable_nv {
+        match advise_refresh()? {
+            Refresh::Yes => {
+                resolution = nvenc::resolve_and_store(cache_path.as_deref(), true)
+                    .context("NVENC detection failed")?;
             }
+            Refresh::No => {
+                // Nothing to do: `resolve_and_store` already pushed
+                // the review date 30 days out when it reported the
+                // expired record, so the next run stays quiet.
+            }
+            Refresh::Skip => {}
         }
+    }
 
-        // `resolve_and_store` already persisted a freshly probed record.
-        cache_from_resolution(&resolution)
-    } else {
-        init_encoder_cache(false).with_context(|| "failed to initialize encoder cache")?
-    };
+    // `resolve_and_store` already persisted a freshly probed record.
+    let cache = cache_from_resolution(&resolution);
 
     // Install signal handler; the per-batch loop registers/unregisters
     // the current output path so a SIGINT cleans up the partial file.
@@ -217,7 +220,6 @@ fn encode_cmd(args: args::EncodeArgs, force_detect: bool) -> Result<()> {
     let mut ctx = BatchContext::new(
         params,
         std::sync::Arc::new(cache),
-        std::sync::Arc::new(config),
         CapabilityVerdicts::default(),
     );
 
@@ -464,29 +466,10 @@ fn print_encode_summary(results: &[rencoder_lib::types::EncodingRecord]) {
         .iter()
         .filter(|r| matches!(r.outcome, EncodingOutcome::ReducedFps))
         .count();
-    let skipped = results
-        .iter()
-        .filter(|r| {
-            matches!(
-                r.outcome,
-                EncodingOutcome::Skipped(SkippedReason::OutputExists | SkippedReason::SameCodec)
-            )
-        })
-        .count();
-    // PartialOutput skips are NOT counted as `Skipped` (they leave a
-    // partial file behind, not a clean skip) and NOT counted as
-    // `Failed` (ffmpeg was never invoked). Surfaced separately so the
-    // user notices this rare actionable state (typically permission
-    // denied or file in use). See design.md §3.4 + §8 item 41.
-    let partial_skip = results
-        .iter()
-        .filter(|r| {
-            matches!(
-                r.outcome,
-                EncodingOutcome::Skipped(SkippedReason::PartialOutput)
-            )
-        })
-        .count();
+    // No `Skipped` / `PartialSkip` counters: re-encoding is the rule
+    // (design doc §3.3.4), so nothing is skipped any more. The
+    // `SkippedReason` variants stay in the record schema for history
+    // written by older versions.
     let failed = results
         .iter()
         .filter(|r| matches!(r.outcome, EncodingOutcome::Failed))
@@ -497,9 +480,7 @@ fn print_encode_summary(results: &[rencoder_lib::types::EncodingRecord]) {
     println!("  Total:       {total}");
     println!("  Success:     {success}");
     println!("  Reduced:     {reduced}");
-    println!("  Skipped:     {skipped}");
-    println!("  PartialSkip: {partial_skip}");
-    println!("  Failed:  {failed}");
+    println!("  Failed:      {failed}");
 }
 
 /// Resolve the CLI args to a `Target`. `--file` wins over `--dir`; with
@@ -559,13 +540,13 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn config_from_encode_config_uses_defaults_when_no_encode_section() {
-        let cfg = Config::from_encode_config(None);
-        assert!(cfg.encoders.av1.is_none());
+    fn params_have_no_encoder_override_without_an_encode_section() {
+        let params = EncodeParams::from_app_config(None);
+        assert!(params.encoders.av1.is_none());
     }
 
     #[test]
-    fn config_from_encode_config_picks_up_encoders() {
+    fn params_pick_up_the_encoder_overrides() {
         let enc = EncodeConfig {
             encoders: Some(EncodersConfig {
                 av1: Some("libaom-av1".into()),
@@ -574,10 +555,10 @@ mod tests {
             }),
             ..Default::default()
         };
-        let cfg = Config::from_encode_config(Some(&enc));
-        assert_eq!(cfg.encoders.av1.as_deref(), Some("libaom-av1"));
-        assert_eq!(cfg.encoders.vp9.as_deref(), Some("libvpx-vp9"));
-        assert!(cfg.encoders.x264.is_none());
+        let params = EncodeParams::from_app_config(Some(&enc));
+        assert_eq!(params.encoders.av1.as_deref(), Some("libaom-av1"));
+        assert_eq!(params.encoders.vp9.as_deref(), Some("libvpx-vp9"));
+        assert!(params.encoders.x264.is_none());
     }
 
     /// The CLI and the UI must agree on the run parameters for the same

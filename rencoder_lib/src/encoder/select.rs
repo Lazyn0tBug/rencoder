@@ -2,9 +2,10 @@
 //! encoder name, with config overrides and NVENC fallback.
 //!
 //! Selection priority (highest first):
-//! 1. Config override (from the supplied `Config`)
-//! 2. NVENC variant -- only when the capability probe said this machine
-//!    can actually run it
+//! 1. Config override (`[encode.encoders]`)
+//! 2. NVENC variant -- only when this run asked for hardware encoding
+//!    (`params.nv`) *and* the capability probe said this machine can
+//!    actually run it
 //! 3. Software default
 //!
 //! Each candidate is verified against `cache.encoders_output`. If a
@@ -14,13 +15,12 @@
 //! got software) is the worst outcome here. Errors only when no
 //! candidate is reachable.
 //!
-//! The caller loads `Config` once per batch and passes `&Config` here,
-//! avoiding a per-file file read.
+//! The caller merges the configuration once per batch and passes
+//! `&EncodeParams` here, avoiding a per-file file read.
 
-use crate::config::Config;
 use crate::encoder::nvenc::CapabilityVerdicts;
 use crate::error::EncodeError;
-use crate::types::{EncoderCache, VideoFormat};
+use crate::types::{EncodeParams, EncoderCache, VideoFormat};
 
 /// Choose an encoder for `format`. Never spawns subprocesses -- consults
 /// the pre-built cache, the supplied config and the run's capability
@@ -31,13 +31,13 @@ use crate::types::{EncoderCache, VideoFormat};
 pub fn select_encoder(
     format: VideoFormat,
     cache: &EncoderCache,
-    config: &Config,
+    params: &EncodeParams,
     verdicts: &CapabilityVerdicts,
 ) -> Result<String, EncodeError> {
     // 1. Config override: the user's explicit choice. If this ffmpeg
     //    build doesn't have it (or it failed at runtime earlier in this
     //    process), fall back -- but say so.
-    if let Some(override_enc) = config.encoders.for_format(format) {
+    if let Some(override_enc) = params.encoders.for_format(format) {
         if verdicts.is_disabled(override_enc) {
             tracing::warn!(
                 encoder = override_enc,
@@ -55,9 +55,12 @@ pub fn select_encoder(
         }
     }
 
-    // 2. NVENC variant: only when the capability probe passed for it
-    //    and it has not failed at runtime.
-    if let Some(nvenc_enc) = nvenc_for(format) {
+    // 2. NVENC variant: only when this run asked for hardware encoding
+    //    and the capability probe passed for it (and it has not failed
+    //    at runtime). The two conditions are independent: `nv` is the
+    //    run's choice, the probe is the machine's fact (design doc
+    //    §3.10.5).
+    if let Some(nvenc_enc) = nvenc_for(format).filter(|_| params.nv) {
         if verdicts.is_disabled(nvenc_enc) {
             tracing::warn!(
                 encoder = nvenc_enc,
@@ -120,7 +123,7 @@ fn format_name(format: VideoFormat) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::EncoderConfig;
+    use crate::config::app::EncodersConfig;
     use crate::types::NvencSupport;
 
     const ENCODERS_WITH_NVENC: &str = "\
@@ -164,8 +167,28 @@ Encoders:
         }
     }
 
-    fn defaults() -> Config {
-        Config::default()
+    /// Params with hardware encoding off (the default).
+    fn params() -> EncodeParams {
+        EncodeParams::default()
+    }
+
+    /// Params that ask for hardware encoding.
+    fn params_nv() -> EncodeParams {
+        EncodeParams {
+            nv: true,
+            ..EncodeParams::default()
+        }
+    }
+
+    /// Params with a per-format encoder override.
+    fn params_with_override(encoder: &str) -> EncodeParams {
+        EncodeParams {
+            encoders: EncodersConfig {
+                av1: Some(encoder.to_string()),
+                ..Default::default()
+            },
+            ..EncodeParams::default()
+        }
     }
 
     /// Empty verdicts: nothing is known to be unusable yet.
@@ -176,7 +199,7 @@ Encoders:
     #[test]
     fn select_software_defaults_without_nvidia() {
         let cache = cache_with_usable_nvenc(&[]);
-        let cfg = defaults();
+        let cfg = params();
         assert_eq!(
             select_encoder(VideoFormat::Av1, &cache, &cfg, &verdicts()).unwrap(),
             "libsvtav1"
@@ -198,7 +221,7 @@ Encoders:
     #[test]
     fn select_nvenc_when_available() {
         let cache = cache_with_usable_nvenc(&["h264_nvenc", "hevc_nvenc", "av1_nvenc"]);
-        let cfg = defaults();
+        let cfg = params_nv();
         assert_eq!(
             select_encoder(VideoFormat::Av1, &cache, &cfg, &verdicts()).unwrap(),
             "av1_nvenc"
@@ -229,7 +252,7 @@ Encoders:
             encoders_output: stripped,
             nvenc: Vec::new(),
         };
-        let cfg = defaults();
+        let cfg = params_nv();
         assert_eq!(
             select_encoder(VideoFormat::Av1, &cache, &cfg, &verdicts()).unwrap(),
             "libsvtav1"
@@ -241,7 +264,7 @@ Encoders:
         // The encoder IS compiled in, but the capability probe rejected
         // it (e.g. a GPU below the required compute capability).
         let cache = cache_with_failed_nvenc(&["av1_nvenc"]);
-        let cfg = defaults();
+        let cfg = params_nv();
         assert_eq!(
             select_encoder(VideoFormat::Av1, &cache, &cfg, &verdicts()).unwrap(),
             "libsvtav1"
@@ -265,7 +288,7 @@ Encoders:
             encoders_output: String::new(),
             nvenc: Vec::new(),
         };
-        let cfg = defaults();
+        let cfg = params();
         let result = select_encoder(VideoFormat::Av1, &cache, &cfg, &verdicts());
         assert!(matches!(result, Err(EncodeError::EncoderNotFound(_))));
     }
@@ -281,13 +304,7 @@ Encoders:
             .to_string(),
             nvenc: Vec::new(),
         };
-        let cfg = Config {
-            encoders: EncoderConfig {
-                av1: Some("libaom-av1".to_string()),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+        let cfg = params_with_override("libaom-av1");
         assert_eq!(
             select_encoder(VideoFormat::Av1, &cache, &cfg, &verdicts()).unwrap(),
             "libaom-av1"
@@ -298,13 +315,7 @@ Encoders:
     fn config_override_falls_back_when_not_in_cache() {
         // Override specifies an encoder the build doesn't have.
         let cache = cache_with_usable_nvenc(&[]);
-        let cfg = Config {
-            encoders: EncoderConfig {
-                av1: Some("libdav1d".to_string()),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+        let cfg = params_with_override("libdav1d");
         // libdav1d not in cache, so the chain falls through to default.
         assert_eq!(
             select_encoder(VideoFormat::Av1, &cache, &cfg, &verdicts()).unwrap(),
@@ -328,16 +339,22 @@ Encoders:
                 reason: None,
             }],
         };
-        let cfg = Config {
-            encoders: EncoderConfig {
-                av1: Some("libaom-av1".to_string()),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+        let cfg = params_with_override("libaom-av1");
         assert_eq!(
             select_encoder(VideoFormat::Av1, &cache, &cfg, &verdicts()).unwrap(),
             "libaom-av1"
+        );
+    }
+
+    #[test]
+    fn nvenc_is_not_chosen_when_the_run_did_not_ask_for_it() {
+        // The machine can do it, but this run did not ask for hardware
+        // encoding: the run's choice wins over the machine's ability
+        // (design doc §3.10.5).
+        let cache = cache_with_usable_nvenc(&["av1_nvenc"]);
+        assert_eq!(
+            select_encoder(VideoFormat::Av1, &cache, &params(), &verdicts()).unwrap(),
+            "libsvtav1"
         );
     }
 }

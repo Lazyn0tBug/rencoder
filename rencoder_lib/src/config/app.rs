@@ -316,6 +316,23 @@ pub struct EncodersConfig {
     pub vp9: Option<String>,
 }
 
+impl EncodersConfig {
+    /// The encoder override for `format`, if the user set one.
+    ///
+    /// Empty strings are rejected here (not just at parse time): the
+    /// encoder lookup is a substring match against
+    /// `ffmpeg -encoders`, and `""` would match everything.
+    pub fn for_format(&self, format: VideoFormat) -> Option<&str> {
+        let raw = match format {
+            VideoFormat::Av1 => self.av1.as_deref(),
+            VideoFormat::X264 => self.x264.as_deref(),
+            VideoFormat::Hevc => self.hevc.as_deref(),
+            VideoFormat::Vp9 => self.vp9.as_deref(),
+        };
+        raw.filter(|s| !s.is_empty())
+    }
+}
+
 impl AppConfig {
     /// Load a project config from a TOML file.
     ///
