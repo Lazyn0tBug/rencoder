@@ -2286,6 +2286,10 @@ UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `int
 | `job.rs` | `process_one_file` | controller StartBatch 循环里的 per-file 逻辑;接受泛型 `encode_fn` 闭包,让测试注入 mock encoder |
 | `job.rs` | `encode_error_category(&EncodeError) -> ErrorCategory` | 编码错误 → UI 展示分类的映射 |
 | `job.rs` | `Command::DryRun { params, files }` | Dry-run 入口(V1.1):跟 StartBatch 同样的 busy-gate,但 emit `Event::DryRunFinished` 而不是 `BatchCompleted` |
+| `pipeline/context.rs` | `BatchContext` | 一批要带的东西(参数/编码器缓存/运行时配置/NVENC 判定)——编码链往下传的是它,不是它的零件(§3.10.4) |
+| `pipeline/context.rs` | `FilePlan` | 一个文件的现场(探测结果/argv/输出路径/两个时间基准)——取代 `EncodePrepareResult::Ready` |
+| `pipeline/batch.rs` | `FileEncoder` | "编一个文件"这一步的单方法 trait(测试缝)——生产走真 ffmpeg,测试替身只替换这一步,事件由共享代码发 |
+| `job.rs` | `ActorEnv` | actor 的注入依赖(配置/路径/编码器/探测 runner)——`start_controller_with` 让测试驱动同一个 actor |
 | `job.rs` | `Event::DryRunFinished { records }` | Dry-run 结果:planned outcomes,**没有**实际 ffmpeg 输出 |
 | `analyzer/records.rs` | `analyze_records_with_probe_and_progress_parallel<F, P>` | U22 / Tier 3 #9：并行 + 进度 closure-injection。`F` 是 probe 闭包（同 `analyze_records_with_probe_parallel`），`P: Fn(AnalyzeProgress) + Send + Sync` 在每个 worker 完成时调一次。`AnalyzeProgress { done, total, failed, last }` 4 字段 |
 | `analyzer/records.rs` | `AnalyzeProgress` struct + `AnalyzedFile { path, outcome: FileOutcome }` + `FileOutcome { Ok, ProbeFailed(EncodeError) }` | U22：进度回调 payload。`AnalyzedFile` 是新 type（不复用 `AnalysisRecord`——后者没有 `ProbeFailed` outcome 字段，复用得加 `error: Option<_>` 污染 success path）|
