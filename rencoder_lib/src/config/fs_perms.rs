@@ -48,7 +48,7 @@ fn apply_mode<P: AsRef<Path>>(path: P, mode_bits: u32) -> io::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
+        let _ = (path, mode_bits);
     }
     Ok(())
 }

@@ -19,7 +19,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-log = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 anyhow = "1"
-signal-hook = "0.3"
 
 [dev-dependencies]
 pretty_assertions = "1"
+
+[target.'cfg(unix)'.dependencies]
+# Includes macOS and Linux.
+signal-hook = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Console"] }

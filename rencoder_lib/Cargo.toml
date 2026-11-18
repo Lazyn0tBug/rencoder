@@ -25,7 +25,9 @@ rayon = { version = "1", optional = true }
 polars = { version = "0.53", default-features = false, features = ["csv", "lazy", "fmt", "parquet", "json", "dtype-datetime", "temporal"] }
 
 [features]
-default = ["c-probe", "parallel-analyze"]
+# Native FFmpeg probing requires pkg-config and FFmpeg development libraries.
+# Keep it opt-in so portable/default builds use the ffprobe subprocess.
+default = ["parallel-analyze"]
 parallel-analyze = ["dep:rayon"]
 c-probe = ["dep:cc", "dep:pkg-config"]
 
