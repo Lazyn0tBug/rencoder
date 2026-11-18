@@ -731,6 +731,23 @@ fn DirPicker(
     }
 }
 
+/// The badge + counts the task page shows.
+///
+/// The page pulls these out of the active task (or the latest history
+/// entry). This used to be a seven-element positional tuple that every
+/// use site had to destructure by hand -- adding one number meant
+/// editing the tuple *and* the destructure, and a reader had to count
+/// positions to know which field was which.
+#[derive(Clone, PartialEq)]
+struct BatchSummary {
+    task_id: String,
+    phase: BatchPhase,
+    total_files: usize,
+    to_encode: usize,
+    to_skip: usize,
+    cancelled: bool,
+}
+
 #[component]
 fn TaskPage(
     state: Signal<AppState, SyncStorage>,
@@ -744,52 +761,63 @@ fn TaskPage(
     // wins (its dry-run records during Analyzing, its records during
     // Encoding / Done). If no active task, fall back to the most
     // recent history entry.
-    let (records_for_list, to_encode, to_skip, total_files, phase, task_id, cancelled) =
-        if let Some(task) = active.as_ref() {
-            // Pick the file list source by phase (v1.2 review
-            // #133 follow-up):
-            //   Analyzing / AwaitingConfirm: dry-run records
-            //     (the user reviews what will be encoded)
-            //   Encoding / Done: per-file encode records
-            //     (the user watches progress; the file shows
-            //      'Succeeded' only after ffmpeg completes it).
-            // v1.2 follow-up #2: phase-aware file list source.
-            // - Analyzing / AwaitingConfirm: file list area renders
-            //   EMPTY — dry-run results surface only via toast
-            //   (§3.8.7.6). Rendering dry_run_records here would
-            //   re-introduce the "show Succeeded during AwaitingConfirm"
-            //   bug (#1 in the user feedback).
-            // - Encoding: render records (per-file FileCompleted
-            //   events fill this in real time).
-            // - Done / Cancelled: render records (final outcomes).
-            let list = match task.phase {
-                BatchPhase::Analyzing | BatchPhase::AwaitingConfirm => Vec::new(),
-                BatchPhase::Encoding | BatchPhase::Done | BatchPhase::Cancelled => {
-                    task.records.clone()
-                }
-            };
-            (
-                list,
-                task.to_encode,
-                task.to_skip,
-                task.total_files,
-                task.phase,
-                task.task_id.as_str().to_string(),
-                task.cancelled,
-            )
-        } else if let Some(latest) = history.first() {
-            (
-                latest.records.clone(),
-                latest.to_encode,
-                latest.to_skip,
-                latest.total_files,
-                latest.phase,
-                latest.task_id.as_str().to_string(),
-                latest.cancelled,
-            )
-        } else {
-            (Vec::new(), 0, 0, 0, BatchPhase::Done, String::new(), false)
+    let (records_for_list, summary) = if let Some(task) = active.as_ref() {
+        // Pick the file list source by phase (v1.2 review
+        // #133 follow-up):
+        //   Analyzing / AwaitingConfirm: dry-run records
+        //     (the user reviews what will be encoded)
+        //   Encoding / Done: per-file encode records
+        //     (the user watches progress; the file shows
+        //      'Succeeded' only after ffmpeg completes it).
+        // v1.2 follow-up #2: phase-aware file list source.
+        // - Analyzing / AwaitingConfirm: file list area renders
+        //   EMPTY — dry-run results surface only via toast
+        //   (§3.8.7.6). Rendering dry_run_records here would
+        //   re-introduce the "show Succeeded during AwaitingConfirm"
+        //   bug (#1 in the user feedback).
+        // - Encoding: render records (per-file FileCompleted
+        //   events fill this in real time).
+        // - Done / Cancelled: render records (final outcomes).
+        let list = match task.phase {
+            BatchPhase::Analyzing | BatchPhase::AwaitingConfirm => Vec::new(),
+            BatchPhase::Encoding | BatchPhase::Done | BatchPhase::Cancelled => task.records.clone(),
         };
+        (
+            list,
+            BatchSummary {
+                task_id: task.task_id.as_str().to_string(),
+                phase: task.phase,
+                total_files: task.total_files,
+                to_encode: task.to_encode,
+                to_skip: task.to_skip,
+                cancelled: task.cancelled,
+            },
+        )
+    } else if let Some(latest) = history.first() {
+        (
+            latest.records.clone(),
+            BatchSummary {
+                task_id: latest.task_id.as_str().to_string(),
+                phase: latest.phase,
+                total_files: latest.total_files,
+                to_encode: latest.to_encode,
+                to_skip: latest.to_skip,
+                cancelled: latest.cancelled,
+            },
+        )
+    } else {
+        (
+            Vec::new(),
+            BatchSummary {
+                task_id: String::new(),
+                phase: BatchPhase::Done,
+                total_files: 0,
+                to_encode: 0,
+                to_skip: 0,
+                cancelled: false,
+            },
+        )
+    };
 
     rsx! {
         section { class: "task-page",
@@ -807,25 +835,20 @@ fn TaskPage(
             // Count summary — only when at least one phase has run
             // a dry-run (to_encode/to_skip > 0 means the dry-run is
             // done). When no active task and no history, skip.
-            if active.is_some() && (to_encode > 0 || to_skip > 0 || total_files > 0) {
+            if active.is_some()
+                && (summary.to_encode > 0 || summary.to_skip > 0 || summary.total_files > 0)
+            {
                 div { class: "count-summary",
-                    span { class: "count-encode", "{to_encode} to encode" }
+                    span { class: "count-encode", "{summary.to_encode} to encode" }
                     span { class: "sep", " · " }
-                    span { class: "count-skip", "{to_skip} to skip" }
+                    span { class: "count-skip", "{summary.to_skip} to skip" }
                     span { class: "sep", " · " }
-                    span { class: "count-total", "{total_files} total" }
+                    span { class: "count-total", "{summary.total_files} total" }
                 }
             }
 
             if active.is_some() || !history.is_empty() {
-                BatchStatus {
-                    task_id: task_id.clone(),
-                    phase,
-                    total_files,
-                    to_encode,
-                    to_skip,
-                    cancelled,
-                }
+                BatchStatus { summary: summary.clone() }
             }
 
             // File list — dry-run records (with `?` for unknown
@@ -1007,14 +1030,15 @@ fn task_button_decision(
 }
 
 #[component]
-fn BatchStatus(
-    task_id: String,
-    phase: BatchPhase,
-    total_files: usize,
-    to_encode: usize,
-    to_skip: usize,
-    cancelled: bool,
-) -> Element {
+fn BatchStatus(summary: BatchSummary) -> Element {
+    let BatchSummary {
+        task_id,
+        phase,
+        total_files,
+        to_encode,
+        to_skip,
+        cancelled,
+    } = summary;
     let badge = match phase {
         BatchPhase::Analyzing => "[● ANALYZING]",
         BatchPhase::AwaitingConfirm => "[● READY]",

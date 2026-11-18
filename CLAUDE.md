@@ -109,6 +109,36 @@ cargo fmt --check
 - `-r <fps>` is an FFmpeg output option: `build_ffmpeg_command` must place it after `-i`, before the output path.
 - Phase 2 (this commit) covers workspace + base data structures. Subsequent phases per `docs/design.md` §7.
 
+## Review checklist
+
+The rules live in `docs/design.md` §3.10; these are the checks to run *before*
+saying a change is done.
+
+- [ ] **Requirement first.** A new requirement, a new shared state, or a change
+      to the concurrency structure gets written into `docs/design.md` **before**
+      the code (the RwLock episode: nobody could tell whether it was right
+      because the requirement was never written down).
+- [ ] **Shared state answered.** For every new shared state: how many readers,
+      how many writers, how long is the lock held. If the answer is "one owner",
+      it is a plain variable, not a lock (design doc §3.10.1).
+- [ ] **Concurrency structure updated.** Changing the actor/worker structure
+      means updating §3.10.1's shared-state inventory and thread list in the
+      same commit.
+- [ ] **Parameter bags.** A function with more than ~5 parameters is asked
+      "is this a context object?" (design doc §3.10.4). The test: a group
+      becomes an object only if it appears in >= 3 signatures, has exactly one
+      owner, and is not mutated in more than one place.
+- [ ] **No shadow implementations.** A test double must not re-implement the
+      thing it tests -- it replaces one step and drives the same code
+      (design doc §3.10.4 rule 2). A duplicated actor let a real bug
+      ("cancel never reached the encoder") pass with green tests.
+- [ ] **Every `✅` in the doc points at code.** A design-doc row marked done
+      must name something that exists. `Event::ActorExited` was specced, marked
+      done, and never implemented.
+- [ ] **Benign outcomes do not travel on fatal channels.** A rejected command
+      is not an error: `Event::Error` is fatal-only and the UI finalizes the
+      running batch when it sees one.
+
 ## TODO
 
 - (none open)
