@@ -873,3 +873,56 @@ lib). Keep the lib type; rename for accuracy.
 - CLI `format = "text"` still renders the aggregated Polars table
   (`fps`, `codec`, `files`, `duration_secs`, `bytes` columns)
 - No `FpsStats` references remain in code (only in historical docs)
+
+---
+
+## §3.10 并发中枢 + 上下文对象（v1.3）— DONE
+
+本轮把 actor 从"同步跑批"改成"派发 worker"，并把编码链的参数包收成上下文对象。
+设计见 `docs/design.md` §3.10 / §3.10.1.1 / §3.10.4。
+
+### 已完成
+
+- [x] **doc first**：§3.10（并发模型 / 参数流 / 公共功能归属）→ §3.10.1.1（中枢：
+      actor 不阻塞，批在 worker 上跑）→ §3.10.4（上下文对象）
+- [x] **四视角审查**（feasibility / design-lens / scope-guardian / coherence），
+      按审查结论改写 doc 再落代码：否掉 `ActorState` / `FileClock`，缝改成单方法
+      trait 且坐在 prepare 之上，B' 与 C 合并成一段
+- [x] 批改到 worker 线程；`Command::Cancel` 在批处理期间真正被处理（修掉"取消从未
+      发生"的 bug）；busy 闸门从 `Arc<AtomicBool>` 降为 actor 本地 `bool`
+- [x] 跨线程共享可变状态只剩两样：cancel 的 1 bit + done 通道
+- [x] NVENC 降级判定从进程级全局表改为显式持有者（`CapabilityVerdicts`），
+      CLI 持本地副本，GUI 的 actor 持权威副本、worker 拿快照并经 done 通道回报
+- [x] 丢弃事件计数从跨 5 个发送方共享的 `Arc<AtomicU64>` 改为每发送方一份
+      `DropCounter` + 首丢告警
+- [x] 编码链引入 `BatchContext` / `FilePlan`；`select_encoder` 保持平铺参数
+      （上下文在 `build_argv` 边界解包一次）
+- [x] actor 依赖可注入（`ActorEnv` + `FileEncoder` 缝 + `resolve_and_store_with`）；
+      **mock actor 删除**，测试改跑生产 actor —— 协议只剩一份实现
+- [x] 闸门拒绝走 `Event::CommandRejected`（良性），不再复用 fatal-only 的
+      `Event::Error`（否则 UI 会把正在跑的那批 finalize 成 Done）
+- [x] CLAUDE.md 加「Review checklist」（七条，每条对应本轮踩过的坑）
+
+### 结果
+
+| 指标 | 之前 | 之后 |
+|---|---|---|
+| ≥6 参数的函数 | 13 | 2（都不该再抽） |
+| actor 的实现份数 | 2 | 1 |
+| 跨线程共享可变状态 | 4 处 | 2 处（cancel 的 1 bit + done 通道） |
+| 全局可变状态 | 2 处 | 0 |
+
+### Verify
+
+- `cargo test --workspace` 434 passed
+- `cargo clippy --workspace --all-targets -- -D warnings` clean
+- `cargo fmt --check` clean
+- 真 ffmpeg 端到端：`actor_cancel_aborts_the_batch_and_removes_the_partial_output`、
+  `transcode_batch_end_to_end_produces_output_files`
+
+### 待办（下一轮）
+
+- [ ] **任务模型审查**（本轮未覆盖）：任务原语 / 层级 / 交互 / 执行可靠性，
+      四个维度逐条过一遍 —— 见 `docs/design.md` §3.10 之外的独立审查
+- [ ] UI 的 `BatchStatus` / `TaskPage` 已用具名 `BatchSummary` 取代位置元组；
+      UI 组件的 props 本身按 §3.10.4 判据不抽对象（没出现在 3 个签名里）

@@ -2183,6 +2183,10 @@ pub enum Event {
     // Error topic（仅 fatal；per-file 失败走 EncodingRecord.error）
     /// 仅 fatal 错误；payload 故意精简为 `(category, message)`。
     ///
+    /// **作用域**：fatal 是"这一批 / 这个子系统出事了"，不是"有什么失败了"。
+    /// UI 收到它要能判断该不该动当前正在跑的那批——与批无关的 fatal
+    /// （例如配置保存失败）不能 finalize 活动任务（§3.11.3）。
+    ///
     /// **不**携带 `ErrorContext.ffmpeg_stderr_tail`——大多数 fatal 类别
     /// (`ProbeFailed` / `EncoderSelectionFailed` / `FfmpegSpawnFailed` /
     /// `ConfigError` / `IoError`) ffmpeg 根本没跑,stderr 为空;
@@ -3846,6 +3850,89 @@ B' 必须一次落地：缝先于第二个实现出现，就是"只有一个实�
 
 ---
 
+### 3.11 任务模型：四条要求
+
+> **TL;DR** — 任务模型有四条硬性要求：**(1) 原语简单——一个概念一个类型，没有靠 `Option` 表达的判别式，没有两份同名的 helper；(2) 层级简单——"一批文件"只有一套执行模型；(3) 交互简单——per-file 失败永远走 record，不走 fatal 通道，fatal 通道只归 fatal；(4) 执行可靠——编码路径不 panic，半成品有确定的下场。**
+
+**为什么现在才有这一节**：并发模型（§3.10）审过、改好了，但它底下的**任务模型从没审过**。审下来是硬的：1 个 BLOCKER + 5 个 MAJOR。根因和 §3.10.4 一模一样：**契约是隐式的**——没人写下"per-file 失败该走哪条通道""半成品该由谁删""编码器找不到该怎么办"，于是每处各自实现，各自出错。
+
+这一节把契约写下来；实现细节（签名、字段）在代码的 rustdoc 里。
+
+#### 3.11.1 原语：一个概念一个类型
+
+| 要求 | 现状 | 违反后果 |
+|---|---|---|
+| **判别式要么用类型，要么不用** | `TranscodeTask.output: Option<PathBuf>` 是一 bit 的判别式（None = analyze），但编码路径把它 `expect` 成必填 | 非法组合是**运行期 panic**，不是编译错误 |
+| **record 的组装只有一个归属** | `make_skipped_record` / `encoder_settings_from_params` 在 `data/record.rs` 与 `pipeline/batch.rs` 各有一份，**活着的那份不是 doc 指的那份** | 改 record 组装要猜改哪份；两份会漂移 |
+| **没有零使用者的钩子** | `ResultCallback` 类型、参数、调用点俱全，调用方永远传 `None`；`Event::LogLine` 有定义有消费无生产者 | 读签名的人要花时间推断"它本来干嘛的" |
+| **上下文只带真被读的字段** | `TaskContext.source` 只被 task.rs 自己的日志读（那里 `task.input` 就在手边） | 多余字段是"以后可能用"的坟场 |
+
+**判据**：一个概念只对应一个类型；同名的东西只能有一份活着的实现。
+
+#### 3.11.2 层级："一批文件"只有一套执行模型
+
+现状是三套：
+
+| 路径 | 执行模型 | 用途 |
+|---|---|---|
+| 编码（CLI + GUI） | `TaskManager::run`（同步 for 循环 + 每任务的 scaffold 日志 + partial-output Guard） | 真编码 |
+| 预演 | 手写的 `for` 循环 | 只 prepare，不编码 |
+| 分析 | rayon `par_iter` | 只 probe |
+
+三套模型各有理由（§3.4 已记录），**但"造任务"和"造记录"这两件事不该有三份**。现在 `TranscodeTask` 的构造（含"输出路径规则"这条正确性规则）复制在三处；"一个文件失败了"有三种编码方式（`EncodingOutcome::Failed` + `ErrorContext` / `Event::Error` / `fps = None`）。
+
+**要求**：
+
+- **任务构造只有一个入口**：输出路径规则（`_encoded` 避让、同路径保护）只写一次，三条路径共用。
+- **失败只有一种表达**：encode 路径的"这个文件失败了"= `EncodingRecord { outcome: Failed, error: Some(..) }`；analyze 路径的失败要么也带错误载荷，要么明确记为"probe 没结果"（而不是靠 `fps = None` 兼表两义）。
+- **预演复用编码的任务构造**，不重写一遍。
+
+#### 3.11.3 交互：失败的通道
+
+这是这一轮最贵的一条，因为**协议文档和代码已经在打架**：
+
+> §3.8.3：`Event::Error` 仅 fatal；per-file 失败走 `EncodingRecord.error` / `FileCompleted`。
+
+代码不是这样：
+
+- GUI 的 per-file 失败发 `Event::Error`（fatal-only ✗）**并且**继续编后面的文件 ✗ → UI 收到 fatal → finalize 整批 → lib 还在编 → 后续记录被丢弃 ✗
+- GUI 的闸门拒绝也发 `Event::Error` ✗（已修为 `Event::CommandRejected` ✓，见 §8 item 76）
+- GUI 的**配置保存失败**、**NVENC 重探测失败**、**缓存刷新失败**都发 `Event::Error` ✗ → reducer 不管是谁发的，一律套到"当前活动任务"上 ✗ → 编码进行中的一次配置保存失败，会把正在跑的批 finalize 掉 ✗
+
+**要求（三条）**：
+
+1. **per-file 失败走 record，不走 fatal 通道**。`Event::Error` 只用于"这批没法跑了"（配置读不出来、缓存没有、探测器崩了）。
+2. **fatal 通道必须带作用域**：fatal 是"这一批/这一个子系统出事了"，UI 收到它要能判断**该不该动当前正在跑的那批**。与批无关的 fatal（配置保存失败）不能碰活动任务。
+3. **拒绝、警告、失败是三件事**：拒绝（命令被丢掉，什么都没坏）· 警告（有点问题但能继续）· 失败（这批完了）。三者的 UI 后果不同：拒绝 → toast；失败 → finalize。
+
+#### 3.11.4 执行：四条可靠性契约
+
+| # | 契约 | 现状 |
+|---|---|---|
+| **E1** | **编码路径不 panic**。找不到可用编码器（ffmpeg 没编 libsvtav1 / 配置指向不存在的编码器）是**一个文件的失败**，不是崩溃 | `build_argv` 对 `select_encoder` 的结果 `.expect()` ✗ → GUI 的 worker 线程 unwind（闸门放开了，但不发任何事件 ✗）→ UI 永远停在 Analyzing ✗；CLI unwind 到 main → exit 101 → 这一轮记录全丢 ✗ |
+| **E2** | **partial-output 的登记窗口 = 真正要写输出的时候**。信号处理器只该删"这一轮正在写的半成品" | Guard 在**探针之前**就登记了输出路径 ✗ → 重跑一个已编码完的目录时，Ctrl-C 落在某个文件的 probe 窗口里 → **删掉上一轮的成品文件** ✗ |
+| **E3** | **失败的输出有确定的下场**。一次失败的编码不能把半成品留在盘上冒充成品 | ffmpeg 失败不删输出 ✗；下一轮的"partial 检测"判据是时长差 1 秒 ✗ → **99% 失败的输出和完整的分不出来** → 截断文件被当 `Skipped(OutputExists)` 永久跳过 ✗ |
+| **E4** | **中断要留下记录**。用户 Ctrl-C 之后，这一轮已经编好的文件必须进历史 | CLI 的 signal handler 直接 `process::exit(1)` ✗ → `write_records` 没跑 ✗ → parquet 没写（文件留在盘上，下一轮全变 `Skipped` ✗）；`process::exit` 也不杀子进程 ✗ → ffmpeg 继续往已 unlink 的 inode 里写 ✗ |
+
+#### 3.11.5 这一轮做什么、不做什么
+
+**做**（按依赖顺序，每步可单独提交）：
+
+1. **E1 + 交互第 1 条**：编码器找不到 → per-file 失败（`Failed` record + `error`），不再 panic；per-file 失败**不再发 `Event::Error`**（记录里已经带了）。
+2. **交互第 2 条**：fatal 通道按作用域分流——与当前批次无关的 fatal（配置保存失败等）不碰活动任务。
+3. **E2**：partial-output 只在真的要写的时候登记。
+4. **原语清理**：删死副本（record 组装两份留一份）、预演复用任务构造（顺带修掉预演**探两次**的问题）、删零使用者的 `ResultCallback`。
+
+**不做（本轮只记录，不改）**：
+
+- **E3（失败的输出删不删）**：这是**产品决策**，不是技术决策——"失败的编码保留下来让人手动看" vs "删掉重试"各有道理，且会改变用户磁盘上的东西。留待单独决定。
+- **E4（中断留记录）**：要改 CLI 的信号处理结构（handler 不再直接 exit，而是置标志让主循环收尾并写记录）+ 杀子进程。工程量比前面几条大一个量级，且会改变"Ctrl-C 立刻退出"的手感。单独一轮。
+- **层级收敛**（三套执行模型合一）：§3.11.2 的"任务构造只有一个入口"本轮做；"三套模型合一"不做——它们的并行语义确实不同（编码要顺序 + partial-output 守卫，预演不要守卫，分析要并行）。
+
+**验证**：每一条都补测试——E1 补"格式没有可用编码器 → 该文件 Failed，批继续"；E2 补"probe 期间收到信号不删已存在的输出"；交互第 1 条补 UI 侧"per-file 失败不 finalize 活动任务"。
+
+---
+
 ## 5. 错误处理策略
 
 ```rust
@@ -3997,6 +4084,10 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 74 | 缝 = 单方法 trait `FileEncoder`（`&self`，可跨批共享）+ 注入的 `ActorEnv`；测试替身驱动**同一个** actor，协议只有一份实现（mock actor 删除，-280 行） | ✅ |
 | 75 | `nvenc::resolve_and_store_with`：探测与落盘一起换掉 runner——否则测试会把 NVENC 记录写进开发者的真实 app 目录 | ✅ |
 | 76 | 闸门拒绝走 `Event::CommandRejected`（良性），不再复用 fatal-only 的 `Event::Error`——否则 UI 会把正在跑的那批 finalize 成 Done | ✅ |
+| 77 | 任务模型四条要求（§3.11）：原语简单 / 层级简单 / 交互简单 / 执行可靠 | ✅ |
+| 78 | per-file 失败走 `EncodingRecord.error`，**不再**发 fatal-only 的 `Event::Error`（协议 §3.8.3 早就这么写，代码违反了两轮） | ✅ |
+| 79 | 编码器找不到 = 一个文件的失败（`Failed` record），不是 panic——GUI 不再卡死在 Analyzing，CLI 不再 exit 101 丢光记录 | ✅ |
+| 80 | partial-output 只在真的要写输出时登记——信号处理器不会删掉上一轮已完成的文件 | ✅ |
 
 ---
 
