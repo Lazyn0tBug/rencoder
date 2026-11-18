@@ -268,7 +268,24 @@ where
 /// A store failure is not fatal: the capability is still usable for
 /// this run, it just will not be reused next time.
 pub fn resolve_and_store(path: Option<&Path>, force: bool) -> Result<Resolution, EncodeError> {
-    let mut resolution = resolve(path, force)?;
+    resolve_and_store_with(path, force, run_ffmpeg)
+}
+
+/// Resolve **and store** with an injectable runner (test seam).
+///
+/// Same as [`resolve_and_store`], but the ffmpeg invocations go through
+/// `runner` — the same seam [`resolve_with`] offers. The GUI actor
+/// injects it so its tests never spawn ffmpeg; the CLI keeps the real
+/// one.
+pub fn resolve_and_store_with<F>(
+    path: Option<&Path>,
+    force: bool,
+    runner: F,
+) -> Result<Resolution, EncodeError>
+where
+    F: Fn(&[&str]) -> Result<String, EncodeError>,
+{
+    let mut resolution = resolve_with(path, force, runner)?;
     if let Some(record) = record_to_store(&resolution) {
         resolution.record = record.clone();
         if let Some(path) = path {

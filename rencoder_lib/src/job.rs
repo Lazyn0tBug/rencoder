@@ -31,12 +31,11 @@ use chrono::{DateTime, Utc};
 
 use crate::analyzer::records::{analyze_records_with_probe_and_progress_parallel, AnalyzeProgress};
 use crate::config::app::AppConfig;
-use crate::config::path::resolve_data_dir;
 use crate::config::{path::resolve_config, Config};
 use crate::data::extract::probe_video_metadata_auto;
 use crate::encoder::nvenc::CapabilityVerdicts;
 use crate::error::EncodeError;
-use crate::pipeline::batch::{transcode_single_with_progress, FfmpegProgress};
+use crate::pipeline::batch::{FfmpegFileEncoder, FfmpegProgress, FileEncoder};
 use crate::pipeline::cancel::CancelToken;
 use crate::pipeline::context::BatchContext;
 use crate::pipeline::task::TaskManager;
@@ -653,17 +652,67 @@ impl ControllerHandle {
     }
 }
 
+/// The ffmpeg runner the NVENC probe uses.
+///
+/// It answers every ffmpeg invocation the probe makes (`-encoders`,
+/// `-version`, the 1-frame capability probes) — the same seam
+/// [`crate::encoder::nvenc::resolve_with`] takes.
+pub type DetectRunner = Arc<dyn Fn(&[&str]) -> Result<String, EncodeError> + Send + Sync>;
+
+/// The actor's injected dependencies: where everything comes from.
+///
+/// Everything the actor needs from the outside world lives here, so the
+/// actor body has no hidden reads (no env var lookups buried in it --
+/// those are what make tests unrunnable in parallel). The env is built
+/// once and never mutated; the actor's *runtime* state (busy gate,
+/// batch id, verdicts, cancel token) stays in the actor's locals.
+///
+/// The production env is built by [`start_controller`]; a test env by
+/// [`start_controller_with`] -- same actor, different dependencies.
+pub struct ActorEnv {
+    /// The runtime config (derived from the app config).
+    pub config: Arc<Config>,
+    /// The app config (the source of the runtime config).
+    pub app_config: Arc<AppConfig>,
+    /// Where `Command::SaveConfig` writes.
+    pub config_path: PathBuf,
+    /// Where `Command::LoadHistory` reads from.
+    pub data_dir: Option<PathBuf>,
+    /// Where the NVENC capability record lives.
+    pub nvenc_cache_path: Option<PathBuf>,
+    /// How to encode one file (the test seam -- design doc §3.10.4).
+    pub file_encoder: Arc<dyn FileEncoder>,
+    /// The ffmpeg runner the NVENC probe uses (the test seam).
+    pub detect_runner: DetectRunner,
+}
+
+/// The production environment: real ffmpeg, the app's own paths.
+fn production_env(
+    config: Arc<Config>,
+    app_config: Arc<AppConfig>,
+    config_path: PathBuf,
+) -> ActorEnv {
+    ActorEnv {
+        config,
+        app_config,
+        config_path,
+        data_dir: crate::config::path::resolve_data_dir(),
+        nvenc_cache_path: crate::config::path::resolve_nvenc_cache(),
+        file_encoder: Arc::new(FfmpegFileEncoder),
+        detect_runner: Arc::new(crate::encoder::nvenc::run_ffmpeg),
+    }
+}
+
 /// Spawn the lib actor and return the message-passing handle.
 ///
 /// # Lifecycle
 ///
 /// Caller (UI) gets `(cmd_tx, evt_rx)` to drive the actor. The actor
 /// thread lives until `cmd_tx` is dropped — at which point the
-/// thread's `recv()` returns `None` and the thread exits. As the
-/// LAST event before that, the actor emits
-/// `Event::ActorExited` with an `ExitReason`, so the UI knows
-/// WHY the controller stopped (clean shutdown, fatal error, or
-/// cancel) before the channel goes silent.
+/// thread's `recv()` returns `None` and the thread exits. The UI
+/// sees the channel go silent; there is no explicit "the actor
+/// exited" event (the `Event::ActorExited` variant was never
+/// implemented).
 ///
 /// # Single-batch constraint
 ///
@@ -711,12 +760,7 @@ pub fn start_controller() -> ControllerHandle {
         ),
     };
 
-    let config_for_thread = Arc::clone(&config);
-    let app_config_for_thread = Arc::clone(&app_config);
-    let config_path_for_thread = config_path.clone();
-    // Review #111: dropped-event counter. Each sender owns one, so
-    // the actor's counter is not the init thread's counter.
-    let dropped_for_actor = DropCounter::default();
+    let env = production_env(config, app_config.clone(), config_path.clone());
 
     // Review #126: async cache init. The cache init spawns its own
     // thread and returns a one-shot receiver; the actor can drain
@@ -737,15 +781,7 @@ pub fn start_controller() -> ControllerHandle {
     std::thread::Builder::new()
         .name("renencoder-controller".into())
         .spawn(move || {
-            run_actor(
-                cmd_rx,
-                evt_tx,
-                config_for_thread,
-                app_config_for_thread,
-                config_path_for_thread,
-                dropped_for_actor,
-                cache_rx,
-            )
+            run_actor(cmd_rx, evt_tx, env, cache_rx);
         })
         .expect("spawn controller thread");
 
@@ -753,6 +789,41 @@ pub fn start_controller() -> ControllerHandle {
         cmd_tx,
         evt_rx,
         config: app_config.clone(),
+        config_path,
+    }
+}
+
+/// Spawn the lib actor with an injected environment.
+///
+/// Same actor, different dependencies -- the seam the tests use: a
+/// mock [`FileEncoder`], a fake NVENC probe, test paths. The message
+/// protocol therefore has exactly one implementation (design doc
+/// §3.10.4).
+pub fn start_controller_with(env: ActorEnv) -> ControllerHandle {
+    let (cmd_tx, cmd_rx) = bounded::<Command>(CMD_TX_CAPACITY);
+    let (evt_tx, evt_rx) = bounded::<Event>(EVT_TX_CAPACITY);
+
+    let enable_nv = env
+        .app_config
+        .encode
+        .as_ref()
+        .and_then(|e| e.nv)
+        .unwrap_or(false);
+    let cache_rx = crate::pipeline::cache::init_encoder_cache_async_with_capability(enable_nv);
+
+    let app_config = Arc::clone(&env.app_config);
+    let config_path = env.config_path.clone();
+    std::thread::Builder::new()
+        .name("renencoder-controller".into())
+        .spawn(move || {
+            run_actor(cmd_rx, evt_tx, env, cache_rx);
+        })
+        .expect("spawn controller thread");
+
+    ControllerHandle {
+        cmd_tx,
+        evt_rx,
+        config: app_config,
         config_path,
     }
 }
@@ -1052,6 +1123,7 @@ fn make_encode_processor(
     evt_tx: Sender<Event>,
     dropped_counter: DropCounter,
     update_tx: Sender<(String, bool)>,
+    encoder: Arc<dyn FileEncoder>,
 ) -> impl FnMut(
     &TranscodeTask,
     &crate::pipeline::task::TaskContext,
@@ -1104,7 +1176,7 @@ fn make_encode_processor(
             );
         };
 
-        let res = transcode_single_with_progress(task, &mut batch_ctx, &cancel, &mut on_progress);
+        let res = encoder.encode(task, &mut batch_ctx, &cancel, &mut on_progress);
 
         // Report the verdicts this file changed (rare: only when an
         // NVENC encode failed and the encoder turned out to be
@@ -1212,14 +1284,7 @@ fn cache_from_slot(slot: CacheSlot) -> Result<Arc<EncoderCache>, (ErrorCategory,
 fn run_actor(
     cmd_rx: Receiver<Command>,
     evt_tx: Sender<Event>,
-    config: Arc<Config>,
-    app_config: Arc<AppConfig>,
-    config_path: PathBuf,
-    // Review #111: dropped-event counter for diagnostics. The actor
-    // thread owns it; v1 doesn't surface the count, but it's
-    // logged here on each drop so the warning includes a running
-    // total.
-    dropped_counter: DropCounter,
+    env: ActorEnv,
     // Review #126: cache init runs on a background thread; this
     // receiver yields the result when ready. The cmd_rx loop can
     // process other commands (Cancel / LoadHistory / SaveConfig)
@@ -1227,6 +1292,17 @@ fn run_actor(
     // batch actually starts.
     cache_rx: std::sync::mpsc::Receiver<crate::pipeline::cache::CacheInit>,
 ) {
+    // The injected dependencies, unpacked for the arms below.
+    let config = Arc::clone(&env.config);
+    let app_config = Arc::clone(&env.app_config);
+    let config_path = env.config_path.clone();
+    let data_dir = env.data_dir.clone();
+    let nvenc_cache_path = env.nvenc_cache_path.clone();
+    let file_encoder = Arc::clone(&env.file_encoder);
+    let detect_runner = Arc::clone(&env.detect_runner);
+    // Review #111: dropped-event counter for diagnostics. Each sender
+    // owns one (it is never read by anyone but its own thread).
+    let dropped_counter = DropCounter::default();
     // Review #126: cache init is now async — see
     // `init_encoder_cache_async`. The cmd_rx loop below runs
     // immediately; the cache receiver is consumed lazily by
@@ -1426,6 +1502,7 @@ fn run_actor(
                 // verdicts; whatever it changes is reported back
                 // through the update channel.
                 let verdicts_for_worker = verdicts.clone();
+                let file_encoder_for_worker = Arc::clone(&file_encoder);
                 let make_processor = move |update_tx: Sender<(String, bool)>| {
                     // The context is built here, in the worker: the
                     // cache may still be initializing, and waiting for
@@ -1447,6 +1524,7 @@ fn run_actor(
                         evt_tx_for_worker,
                         dropped_for_worker,
                         update_tx,
+                        file_encoder_for_worker,
                     ))
                 };
 
@@ -1537,7 +1615,7 @@ fn run_actor(
             }
 
             Command::LoadHistory { limit, after } => {
-                let records = load_history(resolve_data_dir(), limit, after);
+                let records = load_history(data_dir.clone(), limit, after);
                 send_evt_lossy(&evt_tx, Event::HistoryLoaded { records }, &dropped_counter);
             }
 
@@ -1597,12 +1675,16 @@ fn run_actor(
                 // included -- for the duration.
                 let evt_tx_detect = evt_tx.clone();
                 let dropped_detect = DropCounter::default();
+                let cache_path = nvenc_cache_path.clone();
+                let detect_runner = Arc::clone(&detect_runner);
                 std::thread::Builder::new()
-                    .name("rencoder-detect".into())
+                    .name("renencoder-detect".into())
                     .spawn(move || {
-                        let cache_path = crate::config::path::resolve_nvenc_cache();
-                        match crate::encoder::nvenc::resolve_and_store(cache_path.as_deref(), force)
-                        {
+                        match crate::encoder::nvenc::resolve_and_store_with(
+                            cache_path.as_deref(),
+                            force,
+                            move |args| detect_runner(args),
+                        ) {
                             Ok(resolution) => {
                                 send_evt_lossy(
                                     &evt_tx_detect,
@@ -1815,372 +1897,100 @@ mod mock_tests {
     /// on a worker thread and the command loop stays responsive. The
     /// tests therefore exercise the real mechanism (§3.10.1.1).
     #[allow(clippy::needless_pass_by_value)]
+    /// Test harness: the **production** actor with test dependencies.
+    ///
+    /// The mock replaces one step -- "encode one file" -- through the
+    /// [`FileEncoder`] seam. Everything else (the busy gate, the worker
+    /// spawn, the event sequences, the cancel wiring) is the
+    /// production code, so the message protocol has exactly one
+    /// implementation (design doc §3.10.4).
+    ///
+    /// `mock_fn` is called once per file and returns the record for
+    /// that file. `data_dir` is where `Command::SaveConfig` writes and
+    /// `Command::LoadHistory` reads (not via env var -- parallel-safe).
     fn run_actor_inline<F>(
         mock_fn: F,
         data_dir: Option<PathBuf>,
     ) -> (Sender<Command>, Receiver<Event>)
     where
-        F: FnMut(
+        F: Fn(
                 &TranscodeTask,
-                &EncodeParams,
-                &EncoderCache,
-                &Config,
+                &BatchContext,
                 &CancelToken,
                 &mut dyn FnMut(FfmpegProgress),
             ) -> Result<EncodingRecord, EncodeError>
             + Send
+            + Sync
             + 'static,
     {
         let (cmd_tx, cmd_rx) = unbounded::<Command>();
         let (evt_tx, evt_rx) = unbounded::<Event>();
 
-        let cancel_token = CancelToken::new();
-        // Review #111: tests keep unbounded channels (synchronous
-        // drain, the bound is irrelevant), but the event senders take
-        // a dropped-event counter. Use a local one.
-        let dropped_counter = DropCounter::default();
-        // Review #126: pre-populate the cache cell synchronously
-        // so the mock processor closure can read it without an
-        // init thread. Production wires this through the async
-        // init (see `init_encoder_cache_async`).
-        let cache_cell: Arc<std::sync::OnceLock<EncoderCache>> =
-            Arc::new(std::sync::OnceLock::new());
-        cache_cell
-            .set(EncoderCache {
-                encoders_output: String::new(),
-                nvenc: Vec::new(),
+        // The cache is fed through the same channel the production
+        // uses: `CacheInit`'s fields are public, so the test can
+        // pre-populate it without spawning ffmpeg.
+        let (cache_tx, cache_rx) = std::sync::mpsc::channel();
+        cache_tx
+            .send(crate::pipeline::cache::CacheInit {
+                cache: Ok(EncoderCache {
+                    encoders_output: String::new(),
+                    nvenc: Vec::new(),
+                }),
+                capability: None,
             })
-            .expect("fresh OnceLock");
-        let config = Arc::new(Config::default());
-        let params = EncodeParams::default();
-        // The mock encoder is called from the batch worker thread, so
-        // it lives behind a lock: one batch at a time, but the closure
-        // has to be movable into the worker.
-        let encode_fn = Arc::new(Mutex::new(mock_fn));
+            .expect("send the pre-populated cache");
+
+        let config_path = data_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("saved-config.toml");
+        let nvenc_cache_path = data_dir.clone().map(|d| d.join("nvenc-capability.json"));
+
+        let env = ActorEnv {
+            config: Arc::new(Config::default()),
+            app_config: Arc::new(AppConfig::default()),
+            config_path,
+            data_dir,
+            nvenc_cache_path,
+            file_encoder: Arc::new(MockFileEncoder { f: mock_fn }),
+            // The NVENC probe never runs in a test: the fake runner
+            // answers "no encoders", so nothing is probed.
+            detect_runner: Arc::new(|_args| Ok(String::new())),
+        };
 
         std::thread::spawn(move || {
-            let mut next_batch_id: BatchId = 0;
-            let mut batch_running = false;
-            let mut cancel_token = cancel_token;
-            let (done_tx, done_rx) = bounded::<BatchDone>(1);
-
-            loop {
-                let cmd = select! {
-                    recv(cmd_rx) -> cmd => cmd,
-                    recv(done_rx) -> done => {
-                        if done.is_ok() {
-                            batch_running = false;
-                        }
-                        continue;
-                    }
-                };
-                let Ok(cmd) = cmd else {
-                    break;
-                };
-                // Same busy gate as the production actor: one batch in
-                // flight at a time, checked for all three batch
-                // commands in one place.
-                if matches!(
-                    &cmd,
-                    Command::StartBatch { .. } | Command::DryRun { .. } | Command::Analyze { .. }
-                ) {
-                    let (finished, _updates) = drain_batch_done(&done_rx);
-                    if finished {
-                        batch_running = false;
-                    }
-                    if batch_running {
-                        send_evt_lossy(
-                            &evt_tx,
-                            Event::Error {
-                                category: ErrorCategory::ConfigError,
-                                message: "another batch is already running".into(),
-                            },
-                            &dropped_counter,
-                        );
-                        continue;
-                    }
-                }
-                match cmd {
-                    Command::StartBatch { params: _, files } => {
-                        let id = next_batch_id;
-                        next_batch_id += 1;
-                        cancel_token = CancelToken::new();
-
-                        send_evt_lossy(
-                            &evt_tx,
-                            Event::BatchStarted {
-                                id,
-                                total_files: files.len(),
-                            },
-                            &dropped_counter,
-                        );
-
-                        let _total = files.len();
-                        // Review #122: hoist extension out of the per-task loop.
-                        let _ext = params.format.default_extension();
-                        let tasks: Vec<TranscodeTask> = files
-                            .iter()
-                            .map(|file| {
-                                // v1.2 follow-up #3: route through output_path_for
-                                // for the `_encoded` collision
-                                // guard (consistent with the
-                                // production StartBatch arm
-                                // above).
-                                TranscodeTask {
-                                    input: file.clone(),
-                                    output: Some(crate::utils::fs::output_path_for(
-                                        file.as_path(),
-                                        params.format,
-                                    )),
-                                }
-                            })
-                            .collect();
-                        let batch_path =
-                            crate::pipeline::batch::batch_target_path_for_files(&files);
-
-                        let evt_tx_for_closure = evt_tx.clone();
-                        let dropped_for_closure = DropCounter::default();
-                        let cancel_for_closure = cancel_token.clone();
-                        // Review #126: clone the cache cell for the
-                        // mock processor. Mock tests pre-populate it
-                        // synchronously, so .get() always succeeds.
-                        let cache_cell_for_mock = Arc::clone(&cache_cell);
-                        let config_for_closure = Arc::clone(&config);
-                        let encode_fn_for_closure = Arc::clone(&encode_fn);
-                        // The params are cloned per batch: the processor
-                        // closure takes ownership of its captures.
-                        let params_for_batch = params.clone();
-
-                        let processor_factory = move |_update_tx: Sender<(String, bool)>| {
-                            Ok(move |task: &TranscodeTask,
-                                  ctx: &crate::pipeline::task::TaskContext|
-                                  -> Result<EncodingRecord, EncodeError> {
-                                let idx = ctx.index - 1;
-                                send_evt_lossy(
-                                    &evt_tx_for_closure,
-                                    Event::FileStarted {
-                                        index: idx,
-                                        total: ctx.total,
-                                        source: task.input.clone(),
-                                    },
-                                    &dropped_for_closure,
-                                );
-                                if cancel_for_closure.is_cancelled() {
-                                    return Err(EncodeError::UserCancel);
-                                }
-                                let evt_tx_progress = evt_tx_for_closure.clone();
-                                let dropped_progress = DropCounter::default();
-                                let mut on_progress = move |p: FfmpegProgress| {
-                                    send_evt_lossy(
-                                        &evt_tx_progress,
-                                        Event::Progress {
-                                            file_index: idx,
-                                            frame: p.frame,
-                                            fps: p.fps,
-                                            speed: p.speed,
-                                            time_secs: p.time_secs,
-                                            eta_secs: p.eta_secs,
-                                        },
-                                        &dropped_progress,
-                                    );
-                                };
-                                // Review #126: mock tests pre-populate the cache_cell, so
-                                // .get().unwrap() is the correct shape
-                                // here. In production this is the
-                                // .get().unwrap() pattern; the
-                                // production path uses the explicit
-                                // match-and-fallback form.
-                                let cache =
-                                    cache_cell_for_mock.get().expect("mock cache pre-populated");
-                                let res = {
-                                    let mut encode = encode_fn_for_closure.lock();
-                                    encode(
-                                        task,
-                                        &params_for_batch,
-                                        cache,
-                                        &config_for_closure,
-                                        &cancel_for_closure,
-                                        &mut on_progress,
-                                    )
-                                };
-                                match res {
-                                    Ok(record) => {
-                                        send_evt_lossy(
-                                            &evt_tx_for_closure,
-                                            Event::FileCompleted {
-                                                index: idx,
-                                                record: record.clone(),
-                                            },
-                                            &dropped_for_closure,
-                                        );
-                                        Ok(record)
-                                    }
-                                    Err(e) => {
-                                        send_evt_lossy(
-                                            &evt_tx_for_closure,
-                                            Event::Error {
-                                                category: e.category(),
-                                                message: format!("encode error: {e}"),
-                                            },
-                                            &dropped_for_closure,
-                                        );
-                                        Ok(crate::pipeline::task::build_failed_record(
-                                            task, e, &params_for_batch,
-                                        ))
-                                    }
-                                }
-                            })
-                        };
-                        batch_running = true;
-                        spawn_task_batch(
-                            tasks,
-                            "encoding",
-                            batch_path,
-                            processor_factory,
-                            BatchUpdates::new(),
-                            evt_tx.clone(),
-                            DropCounter::default(),
-                            done_tx.clone(),
-                        );
-                    }
-                    Command::Cancel => {
-                        cancel_token.cancel();
-                    }
-                    Command::LoadHistory { limit, after } => {
-                        // Mock actor: use the test-supplied data_dir
-                        // (parallel-safe — env vars would race).
-                        let records = load_history(data_dir.clone(), limit, after);
-                        send_evt_lossy(&evt_tx, Event::HistoryLoaded { records }, &dropped_counter);
-                    }
-                    // SaveConfig: the mock has no app_config of its
-                    // own -- the point of the payload is that the
-                    // *caller's* config gets persisted. Write it to
-                    // the test-supplied data_dir so the test can read
-                    // it back (parallel-safe: no env vars).
-                    Command::SaveConfig { config } => {
-                        let path = data_dir
-                            .clone()
-                            .unwrap_or_else(|| PathBuf::from("."))
-                            .join("saved-config.toml");
-                        match config.save(&path) {
-                            Ok(()) => send_evt_lossy(
-                                &evt_tx,
-                                Event::ConfigSaved { path },
-                                &dropped_counter,
-                            ),
-                            Err(e) => send_evt_lossy(
-                                &evt_tx,
-                                Event::Error {
-                                    category: ErrorCategory::ConfigError,
-                                    message: format!("save failed: {e}"),
-                                },
-                                &dropped_counter,
-                            ),
-                        }
-                    }
-                    // The mock actor does not probe; report an empty
-                    // capability so the UI arm stays exercised.
-                    Command::Detect { force: _ } => {
-                        send_evt_lossy(
-                            &evt_tx,
-                            Event::NvencCapability(crate::types::NvencCapability {
-                                support: Vec::new(),
-                                probed_at: None,
-                                review_due: false,
-                            }),
-                            &dropped_counter,
-                        );
-                    }
-                    Command::DryRun { params, files } => {
-                        // Mock actor: dry-run is purely prepare-step;
-                        // the mock encode_fn must NOT be invoked
-                        // (this is enforced by the test that uses a
-                        // panicking mock). Build records via lib's
-                        // dry_run_batch — dry_run_batch accepts a
-                        // cache but ignores it (encode_prepare doesn't
-                        // consult NV for dry-run), so we pass a dummy.
-                        let dummy_cache = EncoderCache {
-                            encoders_output: String::new(),
-                            nvenc: Vec::new(),
-                        };
-                        let evt_tx_for_worker = evt_tx.clone();
-                        let dropped_for_worker = DropCounter::default();
-                        batch_running = true;
-                        spawn_batch_job(
-                            move || {
-                                let batch_ctx = BatchContext::new(
-                                    params,
-                                    Arc::new(dummy_cache),
-                                    Arc::new(Config::default()),
-                                    CapabilityVerdicts::default(),
-                                );
-                                let records =
-                                    crate::pipeline::batch::dry_run_batch(&batch_ctx, files.iter());
-                                send_evt_lossy(
-                                    &evt_tx_for_worker,
-                                    Event::DryRunFinished { records },
-                                    &dropped_for_worker,
-                                );
-                            },
-                            done_tx.clone(),
-                            None,
-                        );
-                    }
-                    // Analyze is exercised here with a lite version
-                    // of the production arm (no busy-gate — that's
-                    // the same gate pattern tested in
-                    // start_batch_rejects_second_batch_with_error).
-                    // Uses the real probe function so we get real
-                    // Started + N×Progress + Finished sequences.
-                    // Tests create temp files (which fail to probe)
-                    // and verify the event shape; success/failure
-                    // semantics of the closure are tested separately
-                    // in analyzer::records::tests.
-                    Command::Analyze { files } => {
-                        let total = files.len();
-                        send_evt_lossy(&evt_tx, Event::AnalyzeStarted { total }, &dropped_counter);
-                        let evt_tx_for_worker = evt_tx.clone();
-                        let dropped_for_worker = DropCounter::default();
-                        batch_running = true;
-                        spawn_batch_job(
-                            move || {
-                                let progress = |p: AnalyzeProgress| {
-                                    send_evt_lossy(
-                                        &evt_tx_for_worker,
-                                        Event::AnalyzeProgress {
-                                            done: p.done,
-                                            total: p.total,
-                                            failed: p.failed,
-                                            last: p.last,
-                                        },
-                                        &dropped_for_worker,
-                                    );
-                                };
-                                let records = analyze_records_with_probe_and_progress_parallel(
-                                    &files,
-                                    probe_video_metadata_auto,
-                                    progress,
-                                );
-                                let failed_count =
-                                    records.iter().filter(|r| r.fps.is_none()).count();
-                                send_evt_lossy(
-                                    &evt_tx_for_worker,
-                                    Event::AnalyzeFinished {
-                                        records,
-                                        failed_count,
-                                    },
-                                    &dropped_for_worker,
-                                );
-                            },
-                            done_tx.clone(),
-                            None,
-                        );
-                    }
-                }
-            }
+            run_actor(cmd_rx, evt_tx, env, cache_rx);
         });
 
         (cmd_tx, evt_rx)
+    }
+
+    /// The test double for "encode one file".
+    struct MockFileEncoder<F> {
+        f: F,
+    }
+
+    impl<F> FileEncoder for MockFileEncoder<F>
+    where
+        F: Fn(
+                &TranscodeTask,
+                &BatchContext,
+                &CancelToken,
+                &mut dyn FnMut(FfmpegProgress),
+            ) -> Result<EncodingRecord, EncodeError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        fn encode(
+            &self,
+            task: &TranscodeTask,
+            ctx: &mut BatchContext,
+            cancel: &CancelToken,
+            on_progress: &mut dyn FnMut(FfmpegProgress),
+        ) -> Result<EncodingRecord, EncodeError> {
+            (self.f)(task, ctx, cancel, on_progress)
+        }
     }
 
     /// Build a minimal EncodingRecord marked Succeeded with a given
@@ -2217,24 +2027,21 @@ mod mock_tests {
     /// Mock encoder that returns a Succeeded record for each file
     /// and counts calls. No progress events emitted.
     fn make_succeeding_mock() -> (
-        impl FnMut(
+        impl Fn(
                 &TranscodeTask,
-                &EncodeParams,
-                &EncoderCache,
-                &Config,
+                &BatchContext,
                 &CancelToken,
                 &mut dyn FnMut(FfmpegProgress),
             ) -> Result<EncodingRecord, EncodeError>
             + Send
+            + Sync
             + 'static,
         Arc<AtomicUsize>,
     ) {
         let count = Arc::new(AtomicUsize::new(0));
         let count_clone = count.clone();
         let f = move |task: &TranscodeTask,
-                      _: &EncodeParams,
-                      _: &EncoderCache,
-                      _: &Config,
+                      _: &BatchContext,
                       _: &CancelToken,
                       _: &mut dyn FnMut(FfmpegProgress)|
               -> Result<EncodingRecord, EncodeError> {
@@ -2246,21 +2053,18 @@ mod mock_tests {
 
     /// Mock encoder that emits 2 progress blocks per file then
     /// returns Succeeded. Used to verify Event::Progress flow.
-    fn make_progress_mock() -> impl FnMut(
+    fn make_progress_mock() -> impl Fn(
         &TranscodeTask,
-        &EncodeParams,
-        &EncoderCache,
-        &Config,
+        &BatchContext,
         &CancelToken,
         &mut dyn FnMut(FfmpegProgress),
     ) -> Result<EncodingRecord, EncodeError>
            + Send
+           + Sync
            + 'static {
         fn f(
             task: &TranscodeTask,
-            _: &EncodeParams,
-            _: &EncoderCache,
-            _: &Config,
+            _: &BatchContext,
             _: &CancelToken,
             on_progress: &mut dyn FnMut(FfmpegProgress),
         ) -> Result<EncodingRecord, EncodeError> {
@@ -2396,7 +2200,7 @@ mod mock_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_clone = calls.clone();
         let (cmd_tx, evt_rx) = run_actor_inline(
-            move |task, _, _, _, _, _| {
+            move |task, _, _, _| {
                 calls_clone.fetch_add(1, AtomicOrdering::SeqCst);
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 Ok(fake_record(&task.input))
@@ -2440,7 +2244,7 @@ mod mock_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_clone = calls.clone();
         let (cmd_tx, evt_rx) = run_actor_inline(
-            move |task, _, _, _, _, _| {
+            move |task, _, _, _| {
                 calls_clone.fetch_add(1, AtomicOrdering::SeqCst);
                 // Slow enough that the cancel lands while this file
                 // is still being encoded.
@@ -2494,7 +2298,7 @@ mod mock_tests {
         // Mock encoder that cancels the token on the 3rd call (after
         // 2 records have been emitted).
         let (cmd_tx, evt_rx) = run_actor_inline(
-            |task, _, _, _, cancel, _| {
+            |task, _, cancel, _| {
                 cancel.cancel();
                 Ok(fake_record(&task.input))
             },
@@ -2530,8 +2334,7 @@ mod mock_tests {
         // No RENENCODER_DATA_DIR set + no resolvable app dir →
         // load_history returns Vec::new() and emits HistoryLoaded(empty).
         std::env::remove_var("RENENCODER_DATA_DIR");
-        let (cmd_tx, evt_rx) =
-            run_actor_inline(|task, _, _, _, _, _| Ok(fake_record(&task.input)), None);
+        let (cmd_tx, evt_rx) = run_actor_inline(|task, _, _, _| Ok(fake_record(&task.input)), None);
         cmd_tx
             .send(Command::LoadHistory {
                 limit: None,
@@ -2571,7 +2374,7 @@ mod mock_tests {
         std::fs::write(&path, bytes).expect("write parquet");
 
         let (cmd_tx, evt_rx) = run_actor_inline(
-            |task, _, _, _, _, _| Ok(fake_record(&task.input)),
+            |task, _, _, _| Ok(fake_record(&task.input)),
             Some(tmp.clone()),
         );
         cmd_tx
@@ -2723,20 +2526,17 @@ mod mock_tests {
 
     #[cfg(feature = "parallel-analyze")]
     #[test]
-    fn analyze_rejects_concurrent_batch_with_error() {
-        // U22 review-delta #1: pin the busy-gate contract for
-        // Command::Analyze. The mock actor's lite Analyze arm
-        // doesn't have busy-gate (see the arm's comment at the
-        // top of run_actor_inline), so we can't actually exercise
-        // the rejection path here — same test gap as
-        // start_batch_rejects_second_batch_with_error above. The
-        // production arm in `run_actor` uses the same
-        // `busy.swap(true, Ordering::SeqCst)` pattern; verified by
-        // code review, not by this test.
+    fn analyze_runs_to_completion() {
+        // The Analyze success path: a normal batch runs to completion
+        // (Started + Progress + Finished) with the mocked-out probe
+        // backend.
         //
-        // What we DO test: the success path. A normal Analyze
-        // batch runs to completion (Started + Progress + Finished)
-        // even with the mocked-out probe backend.
+        // (This test used to be named
+        // `analyze_rejects_concurrent_batch_with_error`, but it never
+        // tested the rejection: the mock's Analyze arm had no busy
+        // gate. The mock now drives the production actor, which does
+        // gate Analyze -- see `start_batch_rejects_second_batch_with_error`
+        // for the gate contract.)
         let (cmd_tx, evt_rx) = run_actor_inline(make_succeeding_mock().0, None);
         let tmp = unique_tmp("analyze-busy");
         std::fs::create_dir_all(&tmp).unwrap();
@@ -2817,7 +2617,7 @@ mod mock_tests {
         std::fs::write(&path, bytes).expect("write");
 
         let (cmd_tx, evt_rx) = run_actor_inline(
-            |task, _, _, _, _, _| Ok(fake_record(&task.input)),
+            |task, _, _, _| Ok(fake_record(&task.input)),
             Some(tmp.clone()),
         );
         cmd_tx
@@ -2860,7 +2660,7 @@ mod mock_tests {
         std::fs::write(&path, bytes).expect("write");
 
         let (cmd_tx, evt_rx) = run_actor_inline(
-            |task, _, _, _, _, _| Ok(fake_record(&task.input)),
+            |task, _, _, _| Ok(fake_record(&task.input)),
             Some(tmp.clone()),
         );
         let cutoff = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000 + 200, 0).unwrap();
@@ -2891,7 +2691,7 @@ mod mock_tests {
     #[test]
     fn encode_error_propagates_as_event_error() {
         let (cmd_tx, evt_rx) = run_actor_inline(
-            |_, _, _, _, _, _| {
+            |_, _, _, _| {
                 Err(crate::error::EncodeError::Ffmpeg(
                     "simulated failure".into(),
                 ))
@@ -2990,9 +2790,7 @@ mod mock_tests {
 
         let (cmd_tx, evt_rx) = run_actor_inline(
             move |task: &TranscodeTask,
-                  _params: &EncodeParams,
-                  _cache: &EncoderCache,
-                  _config: &Config,
+                  _ctx: &BatchContext,
                   cancel: &CancelToken,
                   on_progress: &mut dyn FnMut(FfmpegProgress)| {
                 let output = task

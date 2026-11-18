@@ -93,6 +93,46 @@ pub fn transcode_single(
     }
 }
 
+/// "Encode one file" -- the step the GUI actor's tests replace.
+///
+/// The seam sits **above** the prepare step (it replaces the whole
+/// per-file work), so a test double never has to provide a real media
+/// file: it never probes, never builds an argv, never spawns ffmpeg.
+/// The events around it (`FileStarted` / `Progress` / `FileCompleted`)
+/// are emitted by the shared code, so the message protocol has exactly
+/// one implementation (design doc §3.10.4).
+///
+/// `&self`, not `&mut self`: the actor shares one encoder across
+/// batches, so the seam has to be shareable. A test double keeps its
+/// state behind an `Arc<AtomicUsize>` or similar.
+pub trait FileEncoder: Send + Sync + 'static {
+    /// Encode one file, reporting progress through `on_progress`.
+    fn encode(
+        &self,
+        task: &TranscodeTask,
+        ctx: &mut BatchContext,
+        cancel: &CancelToken,
+        on_progress: &mut dyn FnMut(FfmpegProgress),
+    ) -> Result<EncodingRecord, EncodeError>;
+}
+
+/// The production [`FileEncoder`]: encode with ffmpeg, streaming
+/// progress and honouring the cancel token.
+#[derive(Debug, Default)]
+pub struct FfmpegFileEncoder;
+
+impl FileEncoder for FfmpegFileEncoder {
+    fn encode(
+        &self,
+        task: &TranscodeTask,
+        ctx: &mut BatchContext,
+        cancel: &CancelToken,
+        on_progress: &mut dyn FnMut(FfmpegProgress),
+    ) -> Result<EncodingRecord, EncodeError> {
+        transcode_single_with_progress(task, ctx, cancel, on_progress)
+    }
+}
+
 /// Sibling to [`transcode_single`] for the GUI / actor path (U21).
 ///
 /// # Shared vs divergent

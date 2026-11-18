@@ -3790,14 +3790,19 @@ NVENC 判定表），就要给八个函数各加一个参数。因为上下文�
 生产实现走真 ffmpeg，测试实现走 mock；**事件由共享代码发**，替身只提供这一步，
 于是**协议只有一份实现**。
 
-- 它是一个**单方法 trait**（`fn encode(&mut self, …)`），不是 `FnMut` 套在锁里：
+- 它是一个**单方法 trait**（`fn encode(&self, …)`），不是 `FnMut` 套在锁里：
   后者会把锁持到整个编码结束（几秒到几分钟），违反 §3.10.1 规则 2。
+  取 `&self` 而不是 `&mut self`：actor 一批一个 worker，但**一个 actor 会跑很多批**，
+  所以编码器必须能共享（`Arc<dyn FileEncoder>`）；测试替身把自己的状态放在
+  `Arc<AtomicUsize>` 之类里面即可。
 - 它坐在 **prepare 之上**（替身整个替换"编一个文件"这一步），否则 mock 会先
   去 probe 不存在的素材文件，永远走不到缝。
 - 缝只服务 GUI 路径；CLI 路径直接调 `transcode_single`（共享 `BatchContext`，
   不共享缝）——两条路径的 ffmpeg 调用方式本来就不同（同步 vs 可取消）。
 - NVENC 探测**不另开缝**：lib 已经有 `nvenc::resolve_with(path, force, runner)`
-  这个 runner 缝（§3.8.6 的"新增"表里已列），注入路径与 runner 就够。
+  这个 runner 缝（§3.8.6 的"新增"表里已列），注入路径与 runner 就够
+  （配套加了 `resolve_and_store_with`：探测 + 落盘要一起换掉，否则测试会把
+  记录写进开发者的真实 app 目录）。
 - 编码器缓存**不需要缝**：`run_actor` 本来就收一条 `cache_rx`，而 `CacheInit`
   的字段全是 `pub`——测试往通道里发一条预置的缓存即可。
 
@@ -3819,6 +3824,8 @@ NVENC 判定表），就要给八个函数各加一个参数。因为上下文�
    （`resolve_data_dir()` 这种 env 读取不该藏在 actor 里——它让测试没法并行）。
    `ActorEnv` 构造后不变；运行期会变的东西（闸门、批 id、判定、cancel token）
    留在 actor 的局部变量里。
+   生产环境由 `start_controller()` 造；测试环境由 `start_controller_with(env)` 造
+   ——**同一个 actor，不同依赖**。
 
 **本节取代 §3.8.6 "不修改" 清单中的两条**：`transcode_batch` 签名与
 `process_one_file` 签名（§3.8.6 那两行标注"见 §3.10.4，已作废"）。
@@ -3836,7 +3843,7 @@ NVENC 判定表），就要给八个函数各加一个参数。因为上下文�
 | 段 | 改什么 | 怎么验证 |
 |---|---|---|
 | A | 编码链引入 `BatchContext` 与 `FilePlan`（后者取代 `EncodePrepareResult::Ready`），参数包收成对象 | 全量测试 + 真 ffmpeg 集成测试（CLI 与 GUI 共用的热路径） |
-| B' | actor 的依赖可注入（`ActorEnv` + 编码器缝 + 探测 runner + 缓存走已有的 `cache_rx`）**并**删掉 mock actor，19 处调用改跑生产 actor | 原有协议测试保留并改跑在生产 actor 上；**四条断言含义会变**（mock 忽略命令里的 params、Analyze 的闸门、预演用默认配置、Detect 返回假能力） |
+| B' | actor 的依赖可注入（`ActorEnv` + 编码器缝 + 探测 runner + 缓存走已有的 `cache_rx`）**并**删掉 mock actor，全部调用改跑生产 actor | 原有协议测试保留并改跑在生产 actor 上；**四条断言含义变了**（mock 忽略命令里的 params、Analyze 的闸门、预演用默认配置、Detect 返回假能力）——前三条改对，最后一条由注入的假 runner 兜住 |
 
 B' 必须一次落地：缝先于第二个实现出现，就是"只有一个实现的接口"——
 本项目自己反对这种形状。
@@ -3991,6 +3998,8 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 71 | 编码链用上下文对象传参：`BatchContext`（批级）+ `FilePlan`（文件级，取代 `EncodePrepareResult::Ready`）；`select_encoder` 保持平铺参数（边界解包） | ✅ |
 | 72 | 测试替身走同一条路：mock 不复制 actor，改为注入 mock 编码器驱动**同一个** actor；缝是单方法 trait（不套锁），且只在"编一个文件"这一步（prepare 之上） | ✅ |
 | 73 | 抽对象的判据是"≥3 个签名 + 唯一拥有者 + 不在多处被改"，不是"参数超过 N 个"——后者会不停生类型（`ActorState` / `FileClock` 因此被否） | ✅ |
+| 74 | 缝 = 单方法 trait `FileEncoder`（`&self`，可跨批共享）+ 注入的 `ActorEnv`；测试替身驱动**同一个** actor，协议只有一份实现（mock actor 删除，-280 行） | ✅ |
+| 75 | `nvenc::resolve_and_store_with`：探测与落盘一起换掉 runner——否则测试会把 NVENC 记录写进开发者的真实 app 目录 | ✅ |
 
 ---
 
