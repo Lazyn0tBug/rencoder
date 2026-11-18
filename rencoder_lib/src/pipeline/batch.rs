@@ -525,7 +525,6 @@ fn transcode_with_progress(
 /// Build the final EncodingRecord from ffmpeg's exit result. Shared
 /// between CLI and GUI paths — both produce the same record shape;
 /// the difference is upstream (sync vs cancellable ffmpeg run).
-#[allow(clippy::too_many_arguments)]
 fn build_encode_record(
     task: &TranscodeTask,
     mut plan: FilePlan,
@@ -738,7 +737,6 @@ fn build_encode_record(
 /// listener spawned in `install_handler()`. Concurrent calls to
 /// `transcode_batch` from multiple threads would race on the same
 /// cell. One batch in flight at a time.
-#[allow(clippy::too_many_arguments)]
 pub fn transcode_batch(
     files: &[crate::types::InputPath],
     ctx: &mut BatchContext,

@@ -2167,17 +2167,11 @@ pub enum Event {
     // Lifecycle topic (actor shutdown)
     /// Actor thread is shutting down. **Last** event sent before the
     /// channel closes. `reason` distinguishes clean vs error vs cancelled
-    /// shutdown — lets the UI display "controller stopped: <reason>"
-    /// instead of going blank on channel close.
-    ///
-    /// Without this, UI only learns lib exited via `evt_rx.recv()`
-    /// returning `Err` (channel disconnected). That's an implicit
-    /// signal that carries no reason, no error category, no
-    /// recovery affordance.
-    ///
-    /// Lifecycle symmetry: `Start` is construction (no message),
-    /// `Exit` is one explicit message before disconnect.
-    ActorExited { reason: ExitReason },
+    // NOTE: an `ActorExited { reason }` variant was specced here but
+    // never implemented. The UI notices the actor's exit by the event
+    // channel closing (`evt_rx.recv()` returning `Err`) -- an implicit
+    // signal that carries no reason. Revisit if the UI ever needs to
+    // tell "the controller stopped" apart from "the UI closed".
 
     // Error topic（仅 fatal；per-file 失败走 EncodingRecord.error）
     /// 仅 fatal 错误；payload 故意精简为 `(category, message)`。
@@ -2230,6 +2224,9 @@ Topic 设计意图：dispatch 由 UI 端 reducer 用 `match` 完成，路由成�
 pub struct ControllerHandle { /* 见 rustdoc */ }
 
 pub fn start_controller() -> ControllerHandle;
+
+/// 用注入的环境起 actor(测试缝):同一个 actor,不同的依赖。
+pub fn start_controller_with(env: ActorEnv) -> ControllerHandle;
 ```
 
 UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `into_split()` 把两端分给不同持有者:cmd_tx 给多个 UI 组件(可克隆),evt_rx 给 UI 顶层的事件消费线程(独占消费,见 §3.9 "UI 运行时 / Dioxus 适配")。
@@ -2282,14 +2279,14 @@ UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `int
 | `pipeline/batch.rs` | `transcode_single_with_progress` | GUI 路径的 per-file 入口(共享 `encode_prepare`,ffmpeg 调用换成 spawn 路径) |
 | `pipeline/batch.rs` | `build_encode_record` | CLI / GUI 共享的 record 构造(成功 / 失败两种 outcome) |
 | `pipeline/batch.rs` | `FfmpegProgress` struct | `Event::Progress` 的源数据 |
-| `pipeline/batch.rs` | `dry_run_batch(params, cache, config, files)` | Dry-run 路径(V1.1):跑 `encode_prepare` per file 但**不调 ffmpeg**,返回 planned `EncodingRecord`(Ready → Succeeded,Skipped/FailedProbe → as-is)。`encode.nv` 故意忽略——dry-run 不知道也不关心 GPU 是否启用 |
-| `job.rs` | `process_one_file` | controller StartBatch 循环里的 per-file 逻辑;接受泛型 `encode_fn` 闭包,让测试注入 mock encoder |
-| `job.rs` | `encode_error_category(&EncodeError) -> ErrorCategory` | 编码错误 → UI 展示分类的映射 |
+| `pipeline/batch.rs` | `dry_run_batch(ctx, files)` | Dry-run 路径(V1.1):跑 `encode_prepare` per file 但**不调 ffmpeg**,返回 planned `EncodingRecord`(Ready → Succeeded,Skipped/FailedProbe → as-is)。`encode.nv` 故意忽略——dry-run 不知道也不关心 GPU 是否启用 |
+| `error.rs` | `EncodeError::category() -> ErrorCategory` | 编码错误 → UI 展示分类的映射（review #121 从 `job.rs` 迁来，`pipeline` 不再依赖 `job`） |
 | `job.rs` | `Command::DryRun { params, files }` | Dry-run 入口(V1.1):跟 StartBatch 同样的 busy-gate,但 emit `Event::DryRunFinished` 而不是 `BatchCompleted` |
 | `pipeline/context.rs` | `BatchContext` | 一批要带的东西(参数/编码器缓存/运行时配置/NVENC 判定)——编码链往下传的是它,不是它的零件(§3.10.4) |
 | `pipeline/context.rs` | `FilePlan` | 一个文件的现场(探测结果/argv/输出路径/两个时间基准)——取代 `EncodePrepareResult::Ready` |
 | `pipeline/batch.rs` | `FileEncoder` | "编一个文件"这一步的单方法 trait(测试缝)——生产走真 ffmpeg,测试替身只替换这一步,事件由共享代码发 |
 | `job.rs` | `ActorEnv` | actor 的注入依赖(配置/路径/编码器/探测 runner)——`start_controller_with` 让测试驱动同一个 actor |
+| `encoder/nvenc.rs` | `resolve_with` / `resolve_and_store_with` | NVENC 探测的 runner 缝——注入 ffmpeg 调用，测试不必真跑探测；后者把"探测 + 落盘"一起换掉 |
 | `job.rs` | `Event::DryRunFinished { records }` | Dry-run 结果:planned outcomes,**没有**实际 ffmpeg 输出 |
 | `analyzer/records.rs` | `analyze_records_with_probe_and_progress_parallel<F, P>` | U22 / Tier 3 #9：并行 + 进度 closure-injection。`F` 是 probe 闭包（同 `analyze_records_with_probe_parallel`），`P: Fn(AnalyzeProgress) + Send + Sync` 在每个 worker 完成时调一次。`AnalyzeProgress { done, total, failed, last }` 4 字段 |
 | `analyzer/records.rs` | `AnalyzeProgress` struct + `AnalyzedFile { path, outcome: FileOutcome }` + `FileOutcome { Ok, ProbeFailed(EncodeError) }` | U22：进度回调 payload。`AnalyzedFile` 是新 type（不复用 `AnalysisRecord`——后者没有 `ProbeFailed` outcome 字段，复用得加 `error: Option<_>` 污染 success path）|
@@ -2299,27 +2296,13 @@ UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `int
 | `encoder/ffmpeg_arg.rs` | `ExtraArg` enum + `ExtraArg::parse` factory + char-class 模块 | 类型级 ffmpeg argv 安全边界(§3.3.7)——非法 argv 在 parse 阶段被拒,运行时无法塞 unsafe 值。替换 v1 的 runtime `validate_extra_args` |
 | `types.rs` | `InputPath` newtype + `InputPath::new(&Path)` factory + `InputPathError` | 输入路径类型级安全边界(§3.3.8)——dash 前缀文件名在构造时就被拒,`build_ffmpeg_command` 不可能拿到 `-vf_negate.mp4`。替换 `collect_dir` 里的运行时 dash-prefix 检查(review #109 收尾) |
 
-**`process_one_file` testability surface**(§8 item 43)——这是 §3.8 唯一保留的函数签名,因为它**解释了为何要抽出这个 helper**(测试性):
-
-```rust
-fn process_one_file<F>(
-    task: &TranscodeTask,
-    params: &EncodeParams,
-    cache: &EncoderCache,
-    config: &Config,
-    cancel: &CancelToken,
-    index: usize, total: usize,
-    encode_fn: &mut F,
-    emit: &Sender<Event>,
-) -> Result<EncodingRecord, ProcessError>
-where
-    F: FnMut(&TranscodeTask, &EncodeParams, &EncoderCache, &Config, &CancelToken, &mut dyn FnMut(FfmpegProgress))
-        -> Result<EncodingRecord, EncodeError>;
-```
+**per-file 的可测试性**(§8 item 43 的意图)——当年抽 `process_one_file` 是为了给测试一个
+注入点；那个函数早已不存在，今天的注入点是 `FileEncoder` 缝（§3.10.4 规则 2）：测试替身
+只替换"编一个文件"这一步，事件由共享代码发。
 
 其他签名(`run_ffmpeg_with_progress`、`FfmpegProgress` 字段、`EncodeError→ErrorCategory` 映射表) 在代码注释里。**`FfmpegProgress` struct + `run_ffmpeg_with_progress` 工作流 + ETA 计算细节** 都在 `pipeline/batch.rs` 的 doc comment 里——读代码注释,不在这里重复。
 
-**`EncodeError → ErrorCategory` 映射**(process_one_file 错误路径使用):
+**`EncodeError → ErrorCategory` 映射**(per-file 错误路径使用):
 
 | `EncodeError` variant | `ErrorCategory` | 理由 |
 |---------------------|----------------|------|
@@ -2333,7 +2316,7 @@ where
 
 `Event::Error` 是 fatal-only,所以"per-file encode 失败"走 `EncodingRecord.error` 字段,这里只处理**真 fatal**(setup / 系统错误)。映射函数在 `job.rs` 里,作为 `pub(crate) fn encode_error_category(e: &EncodeError) -> ErrorCategory` 存在,便于测试。
 
-| `job.rs` | `start_controller() -> ControllerHandle` | 编排：后台线程 + mpsc + 现有 `transcode_batch`（**复用 CLI 路径的纯函数，不 fork**）+ 新 `run_ffmpeg_with_progress`；job.rs 是 thin glue，把现有 pieces 装成 actor |
+| `job.rs` | `start_controller() -> ControllerHandle` | 编排：后台线程 + mpsc + `run_ffmpeg_with_progress`；与 CLI 路径**共享** `encode_prepare` / `build_encode_record`（不 fork），但**不**走 `transcode_batch`（那是 CLI 专用的批入口）；job.rs 是 thin glue，把现有 pieces 装成 actor |
 
 **Controller 启动时加载 AppConfig**（U21 增量）：
 - `config::path::resolve_config()` 拿路径（`$RENENCODER_CONFIG` > `<app_dir>/rencoder.toml`）
@@ -3367,7 +3350,7 @@ actor 同步跑整批(`TaskManager::run` 是个 for 循环),`Command::Cancel` �
 
 **In-flight partial output cleanup** (lib 侧):
 
-`run_ffmpeg_with_progress` 在 cancel branch(`batch.rs:1180-1198`)kill child 后,提取 argv 最后一项作为 output path,调 `std::fs::remove_file`。CLI 路径已经走 `PartialOutputHandle` Guard(actor 路径之前没接,这次补齐)。这保证 partial `.mkv` 不留在磁盘上——下一次跑同样文件时,`encode_prepare` 的 partial-output detector 也不会再误判。
+`run_ffmpeg_with_progress` 在 cancel branch kill child 后,提取 argv 最后一项作为 output path,调 `std::fs::remove_file`。CLI 路径已经走 `PartialOutputHandle` Guard(actor 路径之前没接,这次补齐)。这保证 partial `.mkv` 不留在磁盘上——下一次跑同样文件时,`encode_prepare` 的 partial-output detector 也不会再误判。
 
 **被取消的文件 = 整批取消**:ffmpeg 被 kill 后,那个文件的 record 是 `Failed` 且
 `error.category = Cancelled`。actor 的 processor 看到这一条就**中止整批**(`Err`),
@@ -3376,7 +3359,7 @@ actor 同步跑整批(`TaskManager::run` 是个 for 循环),`Command::Cancel` �
 
 
 ```rust
-// batch.rs run_ffmpeg_with_progress cancel branch (v1.2 follow-up #2)
+// run_ffmpeg_with_progress cancel branch (v1.2 follow-up #2)
 if cancel.is_cancelled() {
     let _ = child.kill();
     let _ = child.wait();
@@ -3601,6 +3584,7 @@ anyhow = "1"
 | `CancelToken` | actor（`Command::Cancel`） | worker（在飞行的 ffmpeg 上轮询） | `Arc<AtomicBool>`——**唯一正当的跨线程 bit**（§3.10.1.1） |
 | busy 闸门（单批次） | actor | actor | **无锁**——actor 本地 `bool`（批次在 worker 上跑之后，闸门只有 actor 读写） |
 | 批次完成信号 | worker | actor | 通道 `bounded(1)`——回话走通道，不共享可变状态 |
+| 降级回报通道 | worker（发现降级时） | worker 自己收，批次结束时并进 done 信号 | 通道（无界） |
 | 编码器缓存（**可替换**） | 初始化线程 / nv 变化时的刷新线程 | worker（等初始化落地后取一张快照） | `Arc<Mutex<Option<CacheSlot>>>` |
 | NVENC 降级判定（本次运行内） | worker（发现降级时）/ actor（汇总） | `select_encoder`（选编码器时） | **无锁**——持有者独占：actor 持权威副本，每批给 worker 一份快照，降级经 done 通道回报 |
 | 丢弃事件计数 | 各发送方自己 | 只有它自己 | 每个发送方一个 `DropCounter`——不再跨发送方共享 |
@@ -3665,8 +3649,8 @@ UI 乐观地显示"已取消"，lib 却把整批继续编完，在飞的 ffmpeg 
 **读法**：看到一个新的 `Mutex` / `Atomic` 时先问一句——这份状态有第二个拥有者吗？
 没有的话，多出来的原语就是负担。
 
-**下一步（尚未做）**：NVENC 能力判定表（`OnceLock<Mutex<HashMap>>`）折进 actor 独占的
-状态——降级写入发生在 worker 里，届时由 worker 通过通道回报 actor，actor 独占这份判定。
+**（已落地）**：NVENC 能力判定表（`OnceLock<Mutex<HashMap>>`）已经折进 actor 独占的
+状态——降级写入发生在 worker 里，worker 通过通道回报 actor，actor 独占这份判定。
 
 **运行期的判定也要有持有者**：不只是"锁"，还有"这份状态归谁"。原来 NVENC 降级判定
 （"这个编码器在这次运行里坏过"）放在进程级全局表里——语义上它的生命周期确实是"进程"
@@ -3680,9 +3664,9 @@ UI 乐观地显示"已取消"，lib 却把整批继续编完，在飞的 ffmpeg 
 - worker 在批里发现降级 → 写自己的快照（同一批的后续文件立刻看到）→ 同时把降级
   **通过 done 通道回报** actor → actor 合并进权威副本 → 下一批的快照带上它。
 
-于是全局表消失，判定变成一份**值**，用参数一路传下去（`select_encoder` ← `encode_prepare`
-← `transcode_single*` ← `transcode_batch`）。写只发生在一处（NVENC 失败的当场），
-读只有一处（选编码器），所以不需要锁。
+于是全局表消失，判定变成一份**值**：它住在 `BatchContext` 里随上下文传下去，在
+`build_argv` 边界解包一次交给 `select_encoder`（叶子保持平铺参数——见 §3.10.4）。
+写只发生在一处（NVENC 失败的当场），读只有一处（选编码器），所以不需要锁。
 
 **计数也要有归属**：丢弃事件的计数原来是一个所有发送方共享的 `Arc<AtomicU64>`——写的地方
 多、读的地方**一个都没有**（只加不读）。改成每个发送方自己一份（`DropCounter`）：第一次丢的
@@ -3748,13 +3732,10 @@ AppConfig ──EncodeConfig──┬─ EncodeParams::from_app_config ──→
 
 #### 3.10.4 上下文用对象传：别让参数包长成影子实现
 
-**症状（数据）**：函数签名越来越长——`transcode_with_progress` 12 个参数、
-`transcode_with_argv` 11 个、`transcode_batch` / `make_encode_processor` 8 个、
-`transcode_inner` 10 个、`build_encode_record` 9 个、`run_actor` 7 个
-（`cargo clippy` 的 `too_many_arguments` 已经在其中五处被 `#[allow]` 压掉——
-那是信号，不是许可）。同时 `job.rs` 里**整个 actor 被实现了两遍**：生产版
-`run_actor` 和测试版 `run_actor_inline`（366 行），后者把闸门、worker 起停、
-事件序列、cancel 接线全部重写了一遍。
+**症状（改造前）**：函数签名越来越长——最深的一个 12 个参数，六个函数带
+`#[allow(clippy::too_many_arguments)]`（那是信号，不是许可）。同时 `job.rs` 里
+**整个 actor 被实现了两遍**：生产版和测试版各一份，后者把闸门、worker 起停、
+事件序列、cancel 接线全部重写了一遍。**参数包是重复实现的成因，不是它的症状。**
 
 **病根**：不是"参数多"，是**没有上下文对象**。同一批东西（params / cache /
 config / verdicts）被拆成散参数，在每一层重新组装一遍；每加一个需求（比如
@@ -3769,7 +3750,7 @@ NVENC 判定表），就要给八个函数各加一个参数。因为上下文�
 | 上下文 | 一批要带的东西 | 每个文件的现场 |
 | 协议 | —— | 每个作业发哪些事件 |
 
-**两个上下文对象**（第三个被否，见下）：
+**两个上下文对象**（另外两个被否，见下）：
 
 - **`BatchContext`（批级）**：这一批要带的东西——参数、解析好的编码器缓存、
   运行时配置、本次运行的 NVENC 判定。一批一份，**在 worker 里构造**
@@ -3786,11 +3767,15 @@ NVENC 判定表），就要给八个函数各加一个参数。因为上下文�
   字段就是它的前身），不是并存的新类型。计时是 prepare 的**输入**（调用方
   建的），prepare 把它带进 plan 里。
 
-**否掉的一个**：~~`ActorState`~~ —— 它不是任何函数的参数，**一个参数也省不掉**；
-而 busy 闸门在生产 actor 里本来就是集中的一处（§3.10.1.1 规则 5），再包一层
-只是把一个 `bool` 变成两个方法。actor 的运行期状态留在 actor 的局部变量里。
+**否掉的两个**：
 
-**缝只有一条**：`FileEncoder`——"编一个文件"这一步（**包含 prepare**）。
+- ~~`ActorState`~~ —— 它不是任何函数的参数，**一个参数也省不掉**；而 busy 闸门在
+  生产 actor 里本来就是集中的一处（§3.10.1.1 规则 4），再包一层只是把一个 `bool`
+  变成两个方法。actor 的运行期状态留在 actor 的局部变量里。
+- ~~`FileClock`~~ —— 两个时间基准从来不是被当作一个整体用的，抽成类型只是换了个
+  名字；它们直接放进 `FilePlan`。
+
+**只新开一条缝**：`FileEncoder`——"编一个文件"这一步（**包含 prepare**）。
 生产实现走真 ffmpeg，测试实现走 mock；**事件由共享代码发**，替身只提供这一步，
 于是**协议只有一份实现**。
 
@@ -3814,7 +3799,7 @@ NVENC 判定表），就要给八个函数各加一个参数。因为上下文�
 
 1. **上下文用对象传，不用参数包**：同一批东西在层与层之间传的是对象，不是零件。
    什么时候该抽成对象？三个条件都满足：(a) 同一组东西出现在 ≥3 个签名里；
-   (b) 它只有一个拥有者（一批 / 一个文件 / 一个 actor）；(c) 它不在多处被改。
+   (b) 它只有一个拥有者（一批 / 一个文件）；(c) 它不在多处被改。
    ——"参数超过 N 个就抽对象"是坏判据：它分不清"四个总是一起走的参数"和
    "四个恰好挨着的参数"，而且会不停地生类型。
 2. **测试替身走同一条路**：mock 不复制 actor——它造一个 mock 编码器，驱动
@@ -3844,10 +3829,10 @@ NVENC 判定表），就要给八个函数各加一个参数。因为上下文�
 
 **迁移顺序**：
 
-| 段 | 改什么 | 怎么验证 |
-|---|---|---|
-| A | 编码链引入 `BatchContext` 与 `FilePlan`（后者取代 `EncodePrepareResult::Ready`），参数包收成对象 | 全量测试 + 真 ffmpeg 集成测试（CLI 与 GUI 共用的热路径） |
-| B' | actor 的依赖可注入（`ActorEnv` + 编码器缝 + 探测 runner + 缓存走已有的 `cache_rx`）**并**删掉 mock actor，全部调用改跑生产 actor | 原有协议测试保留并改跑在生产 actor 上；**四条断言含义变了**（mock 忽略命令里的 params、Analyze 的闸门、预演用默认配置、Detect 返回假能力）——前三条改对，最后一条由注入的假 runner 兜住 |
+| 段 | 改什么 | 怎么验证 | 状态 |
+|---|---|---|---|
+| A | 编码链引入 `BatchContext` 与 `FilePlan`（后者取代 `EncodePrepareResult::Ready`），参数包收成对象 | 全量测试 + 真 ffmpeg 集成测试（CLI 与 GUI 共用的热路径） | ✅ 已落地 |
+| B' | actor 的依赖可注入（`ActorEnv` + 编码器缝 + 探测 runner + 缓存走已有的 `cache_rx`）**并**删掉 mock actor，全部调用改跑生产 actor | 原有协议测试保留并改跑在生产 actor 上；**四条断言含义变了**（mock 忽略命令里的 params、Analyze 的闸门、预演用默认配置、Detect 返回假能力）——前三条改对，最后一条由注入的假 runner 兜住 | ✅ 已落地 |
 
 B' 必须一次落地：缝先于第二个实现出现，就是"只有一个实现的接口"——
 本项目自己反对这种形状。
@@ -3971,13 +3956,13 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 40 | Partial-output 检测(U21)：output duration < source - 1s → partial → 删 + 重转；probe 失败视作 partial；删除失败 → `Skipped(PartialOutput)` | ✅ |
 | 41 | CLI encode summary 增加 `PartialSkip` 独立分类(`PartialOutput` 不计入 `Skipped` 也不计入 `Failed`) | ✅ |
 | 42 | Per-frame Progress 事件接线：`transcode_single_with_progress` + controller 把 `FfmpegProgress` 包成 `Event::Progress`；CancelToken 真正能 kill 当前 ffmpeg 子进程 | ✅ |
-| 43 | Mock 测试层：`process_one_file` + `run_actor` 抽出允许注入 encode 闭包，验证消息协议契约不需要 ffmpeg；覆盖 event sequence / busy rejection / cancel / LoadHistory 过滤（LoadHistory 测试 v1.1 触发） | ✅ |
+| 43 | Mock 测试层：`process_one_file` + `run_actor` 抽出允许注入 encode 闭包，验证消息协议契约不需要 ffmpeg；覆盖 event sequence / busy rejection / cancel / LoadHistory 过滤（LoadHistory 测试 v1.1 触发）——**注入点已由 §3.10.4 的 `FileEncoder` 缝取代**（`process_one_file` 不再存在） | ✅ |
 | 44 | `run_ffmpeg_with_progress` 签名带 `total_duration_secs: Option<f64>`(ETA 计算输入)；`FfmpegProgress` 5 字段 struct 定义;cancel 阈值 `speed >= 0.001` 才返回 Some(eta) | ✅ |
-| 45 | `process_one_file` 抽出 `encode_fn: &mut F` 闭包参数让 mock 测试注入；`ProcessError` enum 区分 Encode vs EventSend(后者表示 UI dropped receiver,batch 应 abort) | ✅ |
+| 45 | `process_one_file` 抽出 `encode_fn: &mut F` 闭包参数让 mock 测试注入；`ProcessError` enum 区分 Encode vs EventSend——**同 43，已被 `FileEncoder` 缝取代** | ✅ |
 | 46 | `load_history(data_dir, limit, after)` 显式接受 data_dir 参数(不读 env var)——让 mock 测试 parallel-safe,env vars 是 process-global 会 race（v1.1 启用） | ✅ |
 | 47 | `rencoder_lib::job::EncodingRecord` 重新导出——UI 需要命名 `Event::FileCompleted` / `BatchCompleted` 携带的 record 类型 | ✅ |
 | 48 | `rencoder_ui` crate bootstrap(Dioxus desktop 0.6)：reducer + 9 个 unit test;App 在 `use_hook` 里 `std::thread::spawn` 做阻塞 `crossbeam::recv()` 循环,通过 `use_signal_sync` 的 SyncSignal 直接改 Dioxus state(详见 §3.9,不用 `use_coroutine` 因阻塞 recv 会 block executor);v1 三按钮 (Start/Cancel)+ 极简状态显示;Load History 按钮存在但 v1 不显示历史(v1.1 启用 HistoryPanel) | ✅ |
-| 49 | Actor 退出显式信号:`Event::ActorExited { reason: ExitReason }` 作为最后一个 event 在 lib drop `evt_tx` 前发出;UI drain thread 收到后下一次 `rx.recv()` 自然返回 `Err` 退出(v1 不维护 `controller_alive`,这是 §3.9.4 v1 限制)。Lifecycle 对称:start = 构造,exit = 显式消息,中间交互 = Command/Event | ✅ |
+| 49 | Actor 退出显式信号:`Event::ActorExited { reason: ExitReason }`——**未实现**(这个 variant 从不存在);UI 靠 evt_rx 收到 `Err` 察觉通道关闭 | ❌ 未实现 |
 | 50 | Preview / Dry Run (Tier 2 #6):`Command::DryRun { params, files }` 跑 `encode_prepare` 但**不调 ffmpeg**,emit `Event::DryRunFinished { records }`;`dry_run_batch` lib helper 复用 probe + partial + skip 逻辑。UI `Preview` 按钮 → reducer arm → DryRunPanel 渲染 planned outcomes。`encode.nv` 故意忽略——dry-run 不知道也不关心 GPU 是否启用 | ✅ |
 | 51 | Parallel analyze progress (Tier 3 #9):`Command::Analyze { files }` 走 `analyze_records_with_probe_and_progress_parallel` 闭包注入层(不是 c-probe FFI 回调层),emit `Event::AnalyzeStarted { total }` + N × `Event::AnalyzeProgress { done, total, failed, last: Option<AnalyzedFile> }` + `Event::AnalyzeFinished { records, failed_count }`;复合 A+B 显示(进度计数 + per-file log)、failure-only log、AnalyzedFile 新 type(不复用 AnalysisRecord 避免污染 success path)、v1 不响应 `Command::Cancel` 和 SIGINT、v1 走 busy-gate 不与 encode 并发。why 详见 §3.4 "分析进度上报" | ✅ |
 | 52 | UI 事件泵架构:UI 在 `use_hook` 里 `std::thread::spawn` 一个专用 OS 线程做阻塞 `crossbeam::Receiver::recv()`,通过 `use_signal_sync` 暴露的 `SyncSignal` 直接 `state.with_mut()` 改 Dioxus state。不用 `use_coroutine`(阻塞 recv() 会 block Dioxus executor,首帧不渲染);不桥接 `futures::mpsc`(冗余);lib API(`start_controller` 返回 crossbeam ControllerHandle)不动。详见 §3.9;bisect 历史见 `docs/debug-journal/event-pump-blocking.md` | ✅ |

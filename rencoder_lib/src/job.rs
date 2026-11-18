@@ -1308,17 +1308,13 @@ fn run_actor(
     // immediately; the cache receiver is consumed lazily by
     // StartBatch handlers.
     //
-    // We store `Result<EncoderCache, EncodeError>` in the
-    // OnceLock so a FAILED init stays observable: subsequent
-    // StartBatch handlers see `Err(...)` and can surface a
-    // meaningful "encoder cache init failed" error rather than a
-    // generic "cache not available" fallback. (`OnceLock::get`
-    // returns None only if NO `set` has happened yet, not on
-    // Err — so storing `Result` directly is what makes the
-    // failure visible.)
+    // The slot holds `Result<EncoderCache, EncodeError>` so a FAILED
+    // init stays observable: subsequent batches see `Err(...)` and
+    // can surface a meaningful "encoder cache init failed" error
+    // rather than a generic "cache not available" fallback.
     // The cache is refreshable: the UI can flip `[encode].nv` at
     // runtime, and the NVENC capability has to be re-resolved for the
-    // next batch. A `OnceLock` could not be replaced.
+    // next batch — so the slot has to be replaceable, not write-once.
     //
     // The cell holds an `Arc` so the read path is a pointer clone:
     // the reader drops the lock immediately and then encodes without
@@ -1330,7 +1326,7 @@ fn run_actor(
     // two writers (the init thread and the refresh thread), so a
     // read/write split would buy nothing.
     let cache_cell: CacheCell = Arc::new(Mutex::new(None));
-    // Drive the OnceLock from the background init thread.
+    // The background init thread fills the slot.
     let cache_cell_for_thread = Arc::clone(&cache_cell);
     let evt_tx_for_init = evt_tx.clone();
     let dropped_for_init = DropCounter::default();
@@ -1908,7 +1904,7 @@ mod mock_tests {
     /// `mock_fn` is called once per file and returns the record for
     /// that file. `data_dir` is where `Command::SaveConfig` writes and
     /// `Command::LoadHistory` reads (not via env var -- parallel-safe).
-    fn run_actor_inline<F>(
+    fn run_test_controller<F>(
         mock_fn: F,
         data_dir: Option<PathBuf>,
     ) -> (Sender<Command>, Receiver<Event>)
@@ -2105,7 +2101,7 @@ mod mock_tests {
 
     #[test]
     fn start_batch_emits_expected_event_sequence() {
-        let (cmd_tx, evt_rx) = run_actor_inline(make_succeeding_mock().0, None);
+        let (cmd_tx, evt_rx) = run_test_controller(make_succeeding_mock().0, None);
         let files: Vec<crate::types::InputPath> =
             (0..3).map(|i| input(&format!("/in/{i}.mp4"))).collect();
         cmd_tx
@@ -2167,7 +2163,7 @@ mod mock_tests {
 
     #[test]
     fn start_batch_emits_progress_events_during_encode() {
-        let (cmd_tx, evt_rx) = run_actor_inline(make_progress_mock(), None);
+        let (cmd_tx, evt_rx) = run_test_controller(make_progress_mock(), None);
         let files: Vec<crate::types::InputPath> =
             (0..2).map(|i| input(&format!("/p/{i}.mp4"))).collect();
         cmd_tx
@@ -2199,7 +2195,7 @@ mod mock_tests {
         // processed.
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_clone = calls.clone();
-        let (cmd_tx, evt_rx) = run_actor_inline(
+        let (cmd_tx, evt_rx) = run_test_controller(
             move |task, _, _, _| {
                 calls_clone.fetch_add(1, AtomicOrdering::SeqCst);
                 std::thread::sleep(std::time::Duration::from_millis(200));
@@ -2243,7 +2239,7 @@ mod mock_tests {
         // Now the batch runs on a worker and the cancel reaches it.
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_clone = calls.clone();
-        let (cmd_tx, evt_rx) = run_actor_inline(
+        let (cmd_tx, evt_rx) = run_test_controller(
             move |task, _, _, _| {
                 calls_clone.fetch_add(1, AtomicOrdering::SeqCst);
                 // Slow enough that the cancel lands while this file
@@ -2297,7 +2293,7 @@ mod mock_tests {
     fn cancel_mid_batch_emits_batch_cancelled() {
         // Mock encoder that cancels the token on the 3rd call (after
         // 2 records have been emitted).
-        let (cmd_tx, evt_rx) = run_actor_inline(
+        let (cmd_tx, evt_rx) = run_test_controller(
             |task, _, cancel, _| {
                 cancel.cancel();
                 Ok(fake_record(&task.input))
@@ -2334,7 +2330,8 @@ mod mock_tests {
         // No RENENCODER_DATA_DIR set + no resolvable app dir →
         // load_history returns Vec::new() and emits HistoryLoaded(empty).
         std::env::remove_var("RENENCODER_DATA_DIR");
-        let (cmd_tx, evt_rx) = run_actor_inline(|task, _, _, _| Ok(fake_record(&task.input)), None);
+        let (cmd_tx, evt_rx) =
+            run_test_controller(|task, _, _, _| Ok(fake_record(&task.input)), None);
         cmd_tx
             .send(Command::LoadHistory {
                 limit: None,
@@ -2373,7 +2370,7 @@ mod mock_tests {
         let bytes = crate::data::store::records_to_parquet(&records).expect("parquet");
         std::fs::write(&path, bytes).expect("write parquet");
 
-        let (cmd_tx, evt_rx) = run_actor_inline(
+        let (cmd_tx, evt_rx) = run_test_controller(
             |task, _, _, _| Ok(fake_record(&task.input)),
             Some(tmp.clone()),
         );
@@ -2409,7 +2406,7 @@ mod mock_tests {
         let dir = unique_tmp("save_config");
         std::fs::create_dir_all(&dir).unwrap();
 
-        let (cmd_tx, evt_rx) = run_actor_inline(make_succeeding_mock().0, Some(dir.clone()));
+        let (cmd_tx, evt_rx) = run_test_controller(make_succeeding_mock().0, Some(dir.clone()));
         let edited = AppConfig {
             encode: Some(crate::config::app::EncodeConfig {
                 crf: 28,
@@ -2443,7 +2440,7 @@ mod mock_tests {
     fn detect_command_emits_a_capability_event() {
         // The actor's Command::Detect arm: the capability comes back
         // as an event so the UI can render it.
-        let (cmd_tx, evt_rx) = run_actor_inline(make_succeeding_mock().0, None);
+        let (cmd_tx, evt_rx) = run_test_controller(make_succeeding_mock().0, None);
         cmd_tx.send(Command::Detect { force: true }).unwrap();
         drop(cmd_tx);
 
@@ -2478,7 +2475,7 @@ mod mock_tests {
             })
             .collect();
 
-        let (cmd_tx, evt_rx) = run_actor_inline(make_succeeding_mock().0, None);
+        let (cmd_tx, evt_rx) = run_test_controller(make_succeeding_mock().0, None);
         cmd_tx
             .send(Command::Analyze {
                 files: files.clone(),
@@ -2537,7 +2534,7 @@ mod mock_tests {
         // gate. The mock now drives the production actor, which does
         // gate Analyze -- see `start_batch_rejects_second_batch_with_error`
         // for the gate contract.)
-        let (cmd_tx, evt_rx) = run_actor_inline(make_succeeding_mock().0, None);
+        let (cmd_tx, evt_rx) = run_test_controller(make_succeeding_mock().0, None);
         let tmp = unique_tmp("analyze-busy");
         std::fs::create_dir_all(&tmp).unwrap();
         let files: Vec<crate::types::InputPath> = (0..3)
@@ -2574,7 +2571,7 @@ mod mock_tests {
         // now matches the actual expectation; the previous
         // "emits_finished_only" was a lie since the body asserted
         // 2 events.
-        let (cmd_tx, evt_rx) = run_actor_inline(make_succeeding_mock().0, None);
+        let (cmd_tx, evt_rx) = run_test_controller(make_succeeding_mock().0, None);
         cmd_tx.send(Command::Analyze { files: Vec::new() }).unwrap();
         drop(cmd_tx);
 
@@ -2616,7 +2613,7 @@ mod mock_tests {
         let bytes = crate::data::store::records_to_parquet(&records).expect("parquet");
         std::fs::write(&path, bytes).expect("write");
 
-        let (cmd_tx, evt_rx) = run_actor_inline(
+        let (cmd_tx, evt_rx) = run_test_controller(
             |task, _, _, _| Ok(fake_record(&task.input)),
             Some(tmp.clone()),
         );
@@ -2659,7 +2656,7 @@ mod mock_tests {
         let bytes = crate::data::store::records_to_parquet(&records).expect("parquet");
         std::fs::write(&path, bytes).expect("write");
 
-        let (cmd_tx, evt_rx) = run_actor_inline(
+        let (cmd_tx, evt_rx) = run_test_controller(
             |task, _, _, _| Ok(fake_record(&task.input)),
             Some(tmp.clone()),
         );
@@ -2690,7 +2687,7 @@ mod mock_tests {
 
     #[test]
     fn encode_error_propagates_as_event_error() {
-        let (cmd_tx, evt_rx) = run_actor_inline(
+        let (cmd_tx, evt_rx) = run_test_controller(
             |_, _, _, _| {
                 Err(crate::error::EncodeError::Ffmpeg(
                     "simulated failure".into(),
@@ -2754,7 +2751,7 @@ mod mock_tests {
         // be GONE — proving the cleanup ran in the real flow,
         // not just my isolated unit test.
         //
-        // NOTE: `run_actor_inline` (job.rs:1355) ignores the
+        // NOTE: `run_test_controller` (job.rs:1355) ignores the
         // `params` from `Command::StartBatch` and uses its own
         // `EncodeParams::default()` (X264, default ext = "mkv"
         // after v1.2 follow-up #3). So `task.output = file1.mkv`
@@ -2788,7 +2785,7 @@ mod mock_tests {
             partial.display()
         );
 
-        let (cmd_tx, evt_rx) = run_actor_inline(
+        let (cmd_tx, evt_rx) = run_test_controller(
             move |task: &TranscodeTask,
                   _ctx: &BatchContext,
                   cancel: &CancelToken,
