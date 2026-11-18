@@ -1139,24 +1139,26 @@ impl InputPath {
 第 3 层是兜底:即使将来新增了一条生成输出路径的路径(用户指定输出名、
 新的容器映射),也不会绕过前两层。
 
-#### 转码跳过判断
+#### 转码跳过判断：**没有跳过**
 
-```rust
-/// 判断源编码是否匹配目标格式
-pub fn should_skip_encoding(codec: &str, format: VideoFormat) -> bool;
-```
+**决定（2026-11-15）**：每次运行都**按本次配置重新编码**，不因为"输出已存在"或
+"源编码已经匹配目标"就跳过。
 
-**决策表**：
+理由：配置是**每次进程读一次**（`--config` 指定的路径每次都重新读，§3.4
+"App-level config"）——上一轮用的可能是另一份配置、另一种格式、另一档码率。
+拿上一轮的输出当"已完成"，等于用旧配置的结果冒充新配置的结果。
 
-```
-┌──────────────────┬────────────────┬──────────────────────────────┐
-│ 源编码匹配目标？  │ 需要降帧？      │ 结果                         │
-├──────────────────┼────────────────┼──────────────────────────────┤
-│ 否               │ 不关心         │ 正常转码                     │
-│ 是               │ 否             │ SkippedSameCodec（跳过）     │
-│ 是               │ 是             │ ReducedFps（继续转码以降帧） │
-└──────────────────┴────────────────┴──────────────────────────────┘
-```
+**配置读几次**：**每进程一次**。整个批次共用这一份快照（`BatchContext`），
+**不按文件重读**——按文件重读既慢又会让同一批里的文件用不同配置。
+
+| 情况 | 结果 |
+|---|---|
+| 输出已存在 | **照常转码**（覆盖） |
+| 源编码已匹配目标格式 | **照常转码**（覆盖） |
+| 源编码匹配 **且**需要降帧 | 转码，输出标记 `ReducedFps` |
+| 输入与输出是同一个文件 | 该文件记 `Failed`（硬错误，不转码） |
+
+唯一仍然"不动输出"的情况是**输入与输出同路径**——那是防呆，不是跳过策略。
 
 #### 单文件转码
 
@@ -1164,16 +1166,10 @@ pub fn should_skip_encoding(codec: &str, format: VideoFormat) -> bool;
 /// 内部流程（对齐 encode.zsh 的 encode_single_file + partial output 重转）：
 ///   0. 同路径检查：输出与输入指向同一个文件?→ 该文件记 Failed（不调 ffmpeg）
 ///   1. probe_video_metadata（一次 ffprobe,源）→ 拿 duration
-///   2. 输出存在?→ probe output duration 比较:
-///       a. output + 1s < source → partial → remove + 继续到 7
-///       b. output probe 失败 / 无 duration → 视作 partial → remove + 继续
-///       c. 其他 → `Skipped(OutputExists)` 提前返回
-///       d. remove 失败 → `Skipped(PartialOutput)` 提前返回
-///   3. MaxFpsConfig::decide（帧率动作判定，源帧率取 cap_fps）
-///   4. should_skip_encoding（编码匹配 + 帧率判断）
-///   5. select_encoder（缓存）
-///   6. build_ffmpeg_command（帧率参数映射）
-///   7. 执行（ProcessOutput 控制输出）
+///   2. MaxFpsConfig::decide（帧率动作判定，源帧率取 cap_fps）
+///   3. select_encoder（缓存）
+///   4. build_ffmpeg_command（帧率参数映射）
+///   5. 执行（ProcessOutput 控制输出）——输出已存在也照常写（覆盖）
 pub fn transcode_single(
     task: &TranscodeTask,
     params: &EncodeParams,
@@ -1182,20 +1178,17 @@ pub fn transcode_single(
 ) -> Result<TranscodeResult, EncodeError>;
 ```
 
-**Partial output 检测**（U21 引入,§3.4.5 "注意"段的对应实现）：
+**Partial output 检测**：**已不需要**（2026-11-15 起）。
 
-- **目的**:SIGTERM/SIGHUP 现在不再清半成品（见 §3.4.5）。下次启动时如果
-  output 存在且是 partial,自动删 + 重转,不让用户踩坑（以为"已完成"实际是损坏）。
-- **检测方法**:`probe_video_metadata_auto` 跑 output,对比 source duration。
-- **阈值**:output duration < source duration - 1.0 秒 → partial。
-  1 秒容忍 codec delay + 容器 metadata 误差。
-- **保守 fallback**:output probe 失败 / 无 duration → 视作 partial。
-  这是合理的:video 输出一定有 duration;没有 = 文件损坏。
-- **删除失败 fallback**:`fs::remove_file` 失败（如权限拒绝）→
-  `Skipped(PartialOutput)`,encode 不继续（output 在那挡着）。
-- **Post-run 0 字节清理**:ffmpeg exit 0 但 output 缺失 / 0 字节,且
-  source 有 known duration → 立即 `remove_file` 并记录 `Failed`。
-  不留 0 字节 ghost 等下次 partial detector 兜底（review #114）。
+它原本解决的是"上一轮留了个半成品，这一轮看到 output 存在就跳过 → 用户以为
+编完了，其实文件是坏的"。现在既然**一律重编**，半成品会被直接覆盖，问题自动消失，
+检测本身（每个文件多一次 ffprobe）也就没有存在意义了。
+
+保留的是**事后清理**：ffmpeg exit 0 但 output 缺失 / 0 字节，且 source 有 known
+duration → 立即 `remove_file` 并记录 `Failed`（review #114）。不留 0 字节 ghost
+等下一轮兜底。
+
+**中断留下的半成品**同理：下一轮会直接覆盖它（§3.4.5 的"注意"段）。
 - **stderr 内存上限**:ffmpeg verbose 跑可能喷出数百 MiB
   stderr,`run_ffmpeg_with_progress` 的 reader 线程有 256 KiB
   上限（`STDERR_READER_MAX_BYTES`）,超出部分丢入
@@ -3401,6 +3394,7 @@ v1.2 follow-up #2: `Analyzing` / `AwaitingConfirm` 阶段不渲染 file list。`
 
 ```rust
 Event::DryRunFinished { records } => {
+    // 2026-11-15 起一律重编，所以 to_skip 恒为 0（§3.3.4）。
     let to_encode = records.iter().filter(|r| matches!(r.outcome, EncodingOutcome::Succeeded)).count();
     let to_skip = total_files.saturating_sub(to_encode);
 
@@ -4088,6 +4082,7 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 78 | per-file 失败走 `EncodingRecord.error`，**不再**发 fatal-only 的 `Event::Error`（协议 §3.8.3 早就这么写，代码违反了两轮） | ✅ |
 | 79 | 编码器找不到 = 一个文件的失败（`Failed` record），不是 panic——GUI 不再卡死在 Analyzing，CLI 不再 exit 101 丢光记录 | ✅ |
 | 80 | partial-output 只在真的要写输出时登记——信号处理器不会删掉上一轮已完成的文件 | ✅ |
+| 81 | **一律重编**：不再因"输出已存在"或"源编码已匹配目标"跳过，按本次配置重新编码（2026-11-15 的决定，main 侧先落地，GUI 分支随后并入）。配置**每进程读一次**，整批共用同一份快照，**不按文件重读** | ✅ |
 
 ---
 
