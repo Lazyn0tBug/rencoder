@@ -1443,20 +1443,16 @@ Summary:
   Total:      N
   Success:    X
   Reduced:    Y    (FPS-reduced)
-  Skipped:    Z    (SameCodec | OutputExists)
-  PartialSkip: P   (PartialOutput —— partial detected 但删除失败)
   Failed:     F
 ```
 
-**为什么 PartialSkip 是独立分类（不是 Skipped 也不是 Failed）**：
+（2026-11-15 起不再有 `Skipped` / `PartialSkip` 两类：一律重编，§3.3.4。
+`SkippedReason` 的枚举值仍在记录 schema 里，但不再产生。）
 
-- 不是正常 skip:用户没看到完整文件,partial 留在磁盘上挡着后续 encode
-- 不是 failed:ffmpeg 没启动,没有尝试 encode
-- 独立分类让用户在 summary 里看到这个异常状态;典型场景是权限拒绝或文件被占用
-- §8 item 40 锁定决策
-
-**实现位置**:`rencoder_cli/src/main.rs::print_encode_summary` 显式 match 每个
-`SkippedReason` 变体,新 variant 加进 `PartialSkip` 计数(不进 `Skipped` 桶)。
+**（历史）为什么 PartialSkip 曾是独立分类**：partial 输出留在磁盘上、partial 检测
+又删不掉时（权限拒绝 / 文件被占用），需要一个独立分类让用户在 summary 里看到它。
+partial 检测本身已随「一律重编」移除（§3.3.4），这个分类也不再产生；`SkippedReason`
+的枚举值保留在记录 schema 里（历史数据可能带它），但新记录不会有。
 
 #### 信号处理（U18 + U18.1）
 
