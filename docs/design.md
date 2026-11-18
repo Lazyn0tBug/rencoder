@@ -2173,6 +2173,13 @@ pub enum Event {
     // signal that carries no reason. Revisit if the UI ever needs to
     // tell "the controller stopped" apart from "the UI closed".
 
+    // Rejection topic（命令被拒，但什么都没坏）
+    /// 命令被拒：闸门拒绝（已经有批在跑）、参数不合法这类**良性**拒绝。
+    /// 与 `Event::Error` 分开是必须的——`Error` 是 fatal-only，UI 收到它
+    /// 会把正在跑的那批 finalize 成 Done。一次良性的"重复 StartBatch 被拒"
+    /// 不该被当成"这批失败了"。
+    CommandRejected { reason: String },
+
     // Error topic（仅 fatal；per-file 失败走 EncodingRecord.error）
     /// 仅 fatal 错误；payload 故意精简为 `(category, message)`。
     ///
@@ -2292,6 +2299,7 @@ UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `int
 | `analyzer/records.rs` | `AnalyzeProgress` struct + `AnalyzedFile { path, outcome: FileOutcome }` + `FileOutcome { Ok, ProbeFailed(EncodeError) }` | U22：进度回调 payload。`AnalyzedFile` 是新 type（不复用 `AnalysisRecord`——后者没有 `ProbeFailed` outcome 字段，复用得加 `error: Option<_>` 污染 success path）|
 | `job.rs` | `Command::Analyze { files }` arm | U22：调用 `analyze_records_with_probe_and_progress_parallel` with `probe = probe_video_metadata_auto`，`progress = |p| evt_tx.send(Event::AnalyzeProgress { ... })`。先发 `AnalyzeStarted { total }`，批结束发 `AnalyzeFinished`。**走** busy-gate（v1 限制——UI 不能同时跑 analyze + encode；analyze 是 read-only，理论上可与 encode 并存，但 v1 简化起见跟 DryRun 一致复用 busy-gate）|
 | `job.rs` | `Event::AnalyzeStarted` / `Event::AnalyzeProgress` / `Event::AnalyzeFinished` | U22：见 §3.8.3。`Event::AnalyzeProgress` 在 mock actor 里是 no-op（test seam，ref-count 即可）|
+| `job.rs` | `Event::CommandRejected { reason }` | 命令被拒（闸门拒绝等）——良性，**不是** fatal：UI 弹一条 toast 即可，正在跑的那批不受影响（§3.8.7.6）|
 | `data/store.rs` | `read_records(path)` | 单 Parquet 文件回读(v1 不使用,v1.1 启用) |
 | `encoder/ffmpeg_arg.rs` | `ExtraArg` enum + `ExtraArg::parse` factory + char-class 模块 | 类型级 ffmpeg argv 安全边界(§3.3.7)——非法 argv 在 parse 阶段被拒,运行时无法塞 unsafe 值。替换 v1 的 runtime `validate_extra_args` |
 | `types.rs` | `InputPath` newtype + `InputPath::new(&Path)` factory + `InputPathError` | 输入路径类型级安全边界(§3.3.8)——dash 前缀文件名在构造时就被拒,`build_ffmpeg_command` 不可能拿到 `-vf_negate.mp4`。替换 `collect_dir` 里的运行时 dash-prefix 检查(review #109 收尾) |
@@ -3821,11 +3829,10 @@ NVENC 判定表），就要给八个函数各加一个参数。因为上下文�
 其余"不修改"条目（`EncodingRecord` / `EncodeError` / `TaskManager` /
 `PartialOutputHandle` / AppConfig 加载 / CLI 的行为面）不受影响。
 
-**已知副作用（记录，不在本次解决）**：闸门拒绝复用 `Event::Error`，而 §3.8.3
-把 `Event::Error` 定义为 fatal-only——UI 在 Encoding 阶段收到它会把正在跑的
-那批 finalize 成 Done。一次良性的"重复 StartBatch 被拒"因此会被当成"这批失败
-了"。共享 actor 之后这条行为会被测试钉住，届时需要单独决定：给闸门拒绝一个
-独立的 event variant，还是在 reducer 里区分。
+**闸门拒绝走 `Event::CommandRejected`，不走 `Event::Error`**：`Event::Error` 是
+fatal-only（§3.8.3），UI 收到它会把正在跑的那批 finalize 成 Done——一次良性的
+"重复 StartBatch 被拒"因此会被当成"这批失败了"。拒绝是**良性**的：命令被丢掉，
+正在跑的那批照跑不误，UI 弹一条 toast 告诉用户"已经有任务在跑了"就够了。
 
 **迁移顺序**：
 
@@ -3989,6 +3996,7 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 73 | 抽对象的判据是"≥3 个签名 + 唯一拥有者 + 不在多处被改"，不是"参数超过 N 个"——后者会不停生类型（`ActorState` / `FileClock` 因此被否） | ✅ |
 | 74 | 缝 = 单方法 trait `FileEncoder`（`&self`，可跨批共享）+ 注入的 `ActorEnv`；测试替身驱动**同一个** actor，协议只有一份实现（mock actor 删除，-280 行） | ✅ |
 | 75 | `nvenc::resolve_and_store_with`：探测与落盘一起换掉 runner——否则测试会把 NVENC 记录写进开发者的真实 app 目录 | ✅ |
+| 76 | 闸门拒绝走 `Event::CommandRejected`（良性），不再复用 fatal-only 的 `Event::Error`——否则 UI 会把正在跑的那批 finalize 成 Done | ✅ |
 
 ---
 

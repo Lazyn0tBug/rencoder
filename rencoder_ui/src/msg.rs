@@ -975,6 +975,13 @@ fn apply_event(state: &mut AppState, evt: Event) {
         Event::HistoryLoaded { records } => {
             state.history = records;
         }
+        Event::CommandRejected { reason } => {
+            // Benign: the command was dropped (e.g. a batch is already
+            // running). The running batch is untouched -- this is NOT
+            // `Event::Error`, which is fatal-only and would finalize
+            // it. Just tell the user.
+            push_toast(state, reason.clone(), ToastKind::Warning);
+        }
         Event::Error { message, .. } => {
             // review-delta F1: if the lib's save failed (it
             // emits this with the prefix 'save failed:'),
@@ -1838,6 +1845,49 @@ mod tests {
         assert_eq!(t.records.len(), 1);
         assert_eq!(t.records[0].source_path, "/first.mp4");
         assert_eq!(t.encoded, 1);
+    }
+
+    #[test]
+    fn command_rejected_pushes_a_toast_and_keeps_the_running_batch() {
+        // A benign rejection must NOT finalize the running batch (that
+        // is what `Event::Error` would do -- it is fatal-only).
+        let mut state = fresh_state();
+        let tx = cmd_tx();
+        state.tasks.active = Some(TaskInfo {
+            task_id: TaskId("20260101000000".into()),
+            batch_id: Some(1),
+            phase: BatchPhase::Encoding,
+            dir: std::path::PathBuf::from("/tmp/whatever"),
+            total_files: 10,
+            encoded: 3,
+            records: vec![],
+            dry_run_records: vec![],
+            to_encode: 10,
+            to_skip: 0,
+            finished: false,
+            cancelled: false,
+        });
+        reduce(
+            &mut state,
+            Msg::Lib(Event::CommandRejected {
+                reason: "another batch is already running".into(),
+            }),
+            &tx,
+        );
+        // The toast tells the user ...
+        assert_eq!(state.toasts.len(), 1);
+        assert!(state.toasts[0].message.contains("another batch"));
+        // ... and the running batch is untouched.
+        let active = state
+            .tasks
+            .active
+            .as_ref()
+            .expect("the batch is still active");
+        assert_eq!(active.phase, BatchPhase::Encoding);
+        assert_eq!(active.encoded, 3);
+        assert!(!active.finished);
+        // A rejection is not an error.
+        assert!(state.last_error.is_none());
     }
 
     #[test]

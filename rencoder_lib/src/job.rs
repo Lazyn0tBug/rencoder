@@ -136,8 +136,9 @@ pub enum Command {
     ///
     /// **v1 limitations** (see docs/design.md §3.4 "分析进度上报"):
     /// - Busy-gate: cannot run alongside `StartBatch` / `DryRun` (same
-    ///   gate). The second concurrent batch gets `Event::Error`
-    ///   ("another batch is already running") instead.
+    ///   gate). The second concurrent batch gets
+    ///   `Event::CommandRejected` ("another batch is already running")
+    ///   instead.
     /// - No `Command::Cancel` support: analyze batches are read-only
     ///   and short-lived; cancellation requires per-worker
     ///   `AtomicBool` polling that doubles the test matrix.
@@ -277,6 +278,15 @@ pub enum Event {
         records: Vec<crate::analyzer::records::AnalysisRecord>,
         failed_count: usize,
     },
+
+    // ---- Rejection topic (benign) ----
+    /// A command was rejected; nothing fatal happened.
+    ///
+    /// The busy gate answers this way when a batch is already running:
+    /// the command is dropped and the running batch continues. It used
+    /// to answer with [`Event::Error`], which is fatal-only -- the UI
+    /// read that as "the batch failed" and finalized it.
+    CommandRejected { reason: String },
 
     // ---- Error topic (fatal only) ----
     /// Fatal-only error. Per §3.8.3 item 26 + §8 item 36:
@@ -1429,11 +1439,13 @@ fn run_actor(
                 batch_running = false;
             }
             if batch_running {
+                // Benign rejection: the command is dropped, the running
+                // batch continues. `Event::Error` would be fatal-only
+                // and the UI would finalize the running batch.
                 send_evt_lossy(
                     &evt_tx,
-                    Event::Error {
-                        category: ErrorCategory::ConfigError,
-                        message: "another batch is already running".into(),
+                    Event::CommandRejected {
+                        reason: "another batch is already running".into(),
                     },
                     &dropped_counter,
                 );
@@ -2221,7 +2233,7 @@ mod mock_tests {
         assert!(
             events.iter().any(|e| matches!(
                 e,
-                Event::Error { message, .. } if message.contains("another batch")
+                Event::CommandRejected { reason } if reason.contains("another batch")
             )),
             "the second batch must be rejected, got: {events:?}"
         );
