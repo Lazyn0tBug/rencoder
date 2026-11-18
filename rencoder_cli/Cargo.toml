@@ -16,16 +16,16 @@ dialoguer = "0.11"
 parking_lot = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-log = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 anyhow = "1"
 
-[dev-dependencies]
-pretty_assertions = "1"
-
 [target.'cfg(unix)'.dependencies]
-# Includes macOS and Linux.
+# SIGINT / SIGTERM / SIGHUP (encode.zsh's `trap _cleanup INT TERM HUP`).
 signal-hook = "0.3"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Console"] }
+# Console control events (CTRL_C / CTRL_BREAK / CTRL_CLOSE / ...).
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
+
+[dev-dependencies]
+pretty_assertions = "1"

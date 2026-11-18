@@ -1,25 +1,78 @@
+# GitHub Actions release workflow for Rencoder.
+#
+# Builds for three targets with cargo-dist:
+#   - aarch64-apple-darwin     -> .tar.xz / .tar.gz
+#   - x86_64-unknown-linux-gnu -> .tar.xz / .tar.gz
+#   - x86_64-pc-windows-msvc   -> .zip (portable)
+#
+# Each archive is augmented by scripts/dist.sh with the U18 single-dir
+# app layout (rencoder.toml + log/ + data/) and gets a checksum that is
+# recomputed after the augmentation (cargo-dist hashes the archive
+# before it is augmented, so its own checksums describe stale bytes).
+#
+# A separate `macos-dmg` job turns the aarch64 CLI package into a
+# .dmg with macOS' built-in `hdiutil` (cargo-dist 0.32 has no dmg
+# installer type).
+#
+# Triggers on tag push matching `v[0-9]*.[0-9]*.[0-9]*` -- note this is
+# a glob, not a regex: `+` is a literal character here, so the older
+# `v[0-9]+.[0-9]+.[0-9]+*` pattern never matched `v1.2.3`.
+
 name: Release
 
 on:
   push:
     tags:
-      - '**'
+      - 'v[0-9]*.[0-9]*.[0-9]*'
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing tag to release
+        description: Existing tag to release (must point at the current HEAD)
         required: true
         type: string
 
+# Least privilege: the workflow itself only reads the repo. Writing
+# releases is granted to the `release` job alone.
 permissions:
   contents: read
 
+# Two releases for the same tag must not run at the same time. We do
+# NOT cancel in progress: a half-finished release is worse than a
+# queued one.
 concurrency:
   group: release-${{ github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
+  # Gate everything on "the tag we are about to publish really points
+  # at this commit". A mistyped dispatch tag would otherwise publish
+  # the branch tip under someone else's tag name.
+  verify:
+    name: verify tag
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify the release tag points at HEAD
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          tagged=$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")
+          head=$(git rev-parse HEAD)
+          if [ "$tagged" != "$head" ]; then
+            echo "::error::tag $RELEASE_TAG points at $tagged, HEAD is $head"
+            exit 1
+          fi
+          echo "tag $RELEASE_TAG -> $head"
+
   build:
+    name: build (${{ matrix.target }})
+    needs: verify
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -37,47 +90,120 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
-          fetch-depth: 0
           persist-credentials: false
-      - name: Verify release tag
-        env:
-          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          submodules: recursive
+
+      - name: Install Rust toolchain
         run: |
-          test "$(git rev-parse HEAD)" = "$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")"
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+
+      # Python is needed for the zip augmentation (scripts/augment_zip.py);
+      # `zip` / `unzip` are not reliably available on the windows runner.
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - name: Build portable package
-        run: bash scripts/dist.sh --target '${{ matrix.target }}'
-      - uses: actions/upload-artifact@v4
+
+      - name: Cache cargo-dist
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/dist
+          key: cargo-dist-v0.32.0
+
+      - name: Install cargo-dist
+        run: |
+          if [ ! -f ~/.cargo/bin/dist ]; then
+            curl --proto '=https' --tlsv1.2 -sSf \
+              https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-v0.32.0-lets-do-this-mac-latest.tar.xz \
+              | tar -xJ -C /tmp
+            mv /tmp/cargo-dist-v0.32.0-lets-do-this/bin/cargo-dist ~/.cargo/bin/dist
+            chmod +x ~/.cargo/bin/dist
+          fi
+          dist --version
+
+      - name: Build and package (cargo-dist + scripts/dist.sh)
+        run: |
+          set -euo pipefail
+          # scripts/dist.sh runs `dist build`, stages the archives into
+          # dist/, augments each one with the U18 app-dir layout, and
+          # recomputes the checksums.
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            bash scripts/dist.sh --target ${{ matrix.target }} --tag=${{ github.event.inputs.tag }}
+          else
+            bash scripts/dist.sh --target ${{ matrix.target }}
+          fi
+          ls -la dist/
+
+      - name: Verify the binaries do not link libav*
+        shell: bash
+        run: |
+          set -euo pipefail
+          # c-probe is opt-in: the shipped binaries probe through the
+          # ffprobe subprocess, so they must NOT depend on a
+          # version-matched libavformat / libavcodec / libavutil.
+          # Linking them would make the packages break the moment the
+          # user's ffmpeg upgrades (macOS bumps the dylib major version
+          # regularly; the Linux majors differ per distro release).
+          failed=0
+          for bin in target/${{ matrix.target }}/release/rencoder*; do
+            [ -f "$bin" ] || continue
+            if grep -a -q -E "libav(format|codec|util)" "$bin"; then
+              echo "::error::$bin links libav* -- c-probe must stay off for release builds"
+              failed=1
+            fi
+          done
+          if [ "$failed" -ne 0 ]; then
+            exit 1
+          fi
+          echo "no libav* linkage in the release binaries"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
         with:
           name: artifacts-${{ matrix.target }}
           if-no-files-found: error
           path: |
-            dist/*.tar.xz
+            dist/*.tar.*
             dist/*.zip
             dist/*.sha256
+            dist/sha256.sum
 
+  # Build a macOS .dmg from the aarch64 CLI package. cargo-dist 0.32
+  # doesn't support dmg natively; `hdiutil` ships with macOS, so no
+  # homebrew install is needed.
   macos-dmg:
-    needs: build
+    name: macos dmg
+    needs: [verify, build]
     runs-on: macos-14
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
         with:
           name: artifacts-aarch64-apple-darwin
           path: dist-tmp
+
       - name: Build disk image
         shell: bash
         run: |
-          mkdir dmg-stage
-          tar -xJf dist-tmp/rencoder_cli-aarch64-apple-darwin.tar.xz -C dmg-stage
-          hdiutil create -volname Rencoder -srcfolder dmg-stage -ov -format UDZO rencoder-aarch64-apple-darwin.dmg
-          shasum -a 256 rencoder-aarch64-apple-darwin.dmg > rencoder-aarch64-apple-darwin.dmg.sha256
-      - uses: actions/upload-artifact@v4
+          set -euo pipefail
+          TARBALL=$(ls dist-tmp/rencoder_cli-aarch64-apple-darwin.tar.* | head -1)
+          rm -rf dmg-stage
+          mkdir -p dmg-stage
+          # `tar -xf` auto-detects xz / gzip compression.
+          tar -xf "$TARBALL" -C dmg-stage
+          APP_DIR=$(find dmg-stage -mindepth 1 -maxdepth 1 -type d | head -1)
+          # Ad-hoc signature so the dmg is mountable on Apple Silicon.
+          codesign --force --deep --sign - "$APP_DIR/rencoder" 2>&1 | tail -3 || true
+          hdiutil create -volname Rencoder -srcfolder dmg-stage -ov \
+            -format UDZO rencoder-aarch64-apple-darwin.dmg
+          shasum -a 256 rencoder-aarch64-apple-darwin.dmg \
+            > rencoder-aarch64-apple-darwin.dmg.sha256
+
+      - name: Upload dmg
+        uses: actions/upload-artifact@v4
         with:
           name: artifacts-macos-dmg
           if-no-files-found: error
@@ -85,30 +211,42 @@ jobs:
             *.dmg
             *.dmg.sha256
 
+  # Combine all artifacts into a GitHub Release.
   release:
-    needs: [build, macos-dmg]
+    name: github release
+    needs: [verify, build, macos-dmg]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
         with:
           pattern: artifacts-*
-          path: release
+          path: release/
           merge-multiple: true
+
+      - name: List artifacts
+        run: |
+          ls -la release/
+
       - name: Verify package checksums
         working-directory: release
         run: |
-          for checksum in *.sha256; do sha256sum -c "$checksum"; done
-      - uses: softprops/action-gh-release@v2
+          set -euo pipefail
+          for checksum in *.sha256; do
+            sha256sum -c "$checksum"
+          done
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          name: Rencoder ${{ github.event.inputs.tag || github.ref_name }}
-          draft: false
+          name: "Rencoder ${{ github.event.inputs.tag || github.ref_name }}"
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
-            release/*.tar.xz
+            release/*.tar.*
             release/*.zip
             release/*.dmg
             release/*.sha256

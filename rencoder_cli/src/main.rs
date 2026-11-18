@@ -21,9 +21,15 @@ use rencoder_lib::{
     collect::collect_files,
     config::{AnalyzeFormatArg, AppConfig, Config},
     data::extract::probe_video_metadata,
-    pipeline::{batch::transcode_batch, cache::init_encoder_cache},
-    types::{EncodeParams, EncodingOutcome, ProcessOutput, SkippedReason, Target, VideoFormat},
+    encoder::nvenc::{self, CapabilityVerdicts},
+    pipeline::context::BatchContext,
+    pipeline::{
+        batch::transcode_batch,
+        cache::{cache_from_resolution, init_encoder_cache},
+    },
+    types::{EncodeParams, EncodingOutcome, ProcessOutput, SkippedReason, Target},
 };
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use tracing::{info, instrument, warn};
 
@@ -31,9 +37,61 @@ fn main() -> Result<()> {
     tracing_init::init().context("initialize tracing")?;
     let cli = args::Cli::parse();
     match cli.command {
-        args::Command::Encode(encode_args) => encode_cmd(encode_args),
+        args::Command::Encode(encode_args) => encode_cmd(encode_args, cli.detect),
         args::Command::Analyze(analyze_args) => analyze_cmd(analyze_args),
+        args::Command::Detect(_) => detect_cmd(),
     }
+}
+
+/// `rencoder detect` -- probe this machine's NVENC capability, store the
+/// result next to the config, and print a report.
+///
+/// The report is the point: "which hardware encoders can this machine
+/// actually run" becomes something the user can ask, instead of
+/// something they only learn from a fallback warning.
+fn detect_cmd() -> Result<()> {
+    let cache_path = rencoder_lib::config::path::resolve_nvenc_cache();
+    let resolution =
+        nvenc::resolve_and_store(cache_path.as_deref(), true).context("NVENC detection failed")?;
+    print!("{}", nvenc::report(&resolution.record));
+    Ok(())
+}
+
+/// What the user answered when advised that the stored capability is
+/// past its review date.
+enum Refresh {
+    /// Re-probe now.
+    Yes,
+    /// Keep the stored result; do not ask again for 30 days.
+    No,
+    /// Not interactive -- keep the stored result, ask nothing.
+    Skip,
+}
+
+/// Advise the user that the stored NVENC capability may be stale.
+///
+/// The record stays valid until the user says otherwise -- nobody knows
+/// the state of a machine better than its owner. A decline pushes the
+/// next advice 30 days out so we never nag on every run.
+fn advise_refresh() -> Result<Refresh> {
+    if !std::io::stdin().is_terminal() {
+        println!(
+            "NVENC 检测结果已超过 {} 天，如需更新请运行 `rencoder detect`。",
+            nvenc::REVIEW_INTERVAL_DAYS
+        );
+        return Ok(Refresh::Skip);
+    }
+    print!(
+        "NVENC 检测结果已超过 {} 天，可能已过期。是否重新检测？[y/N] ",
+        nvenc::REVIEW_INTERVAL_DAYS
+    );
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer)?;
+    Ok(match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Refresh::Yes,
+        _ => Refresh::No,
+    })
 }
 
 /// `rencoder encode ...` -- full pipeline: load config, init encoder
@@ -41,7 +99,7 @@ fn main() -> Result<()> {
 /// write per-file records to `<app_dir>/data/encoding-*.parquet`
 /// (U18; honors `$RENENCODER_DATA_DIR`).
 #[instrument(skip_all, fields(files = tracing::field::Empty))]
-fn encode_cmd(args: args::EncodeArgs) -> Result<()> {
+fn encode_cmd(args: args::EncodeArgs, force_detect: bool) -> Result<()> {
     let app_config = load_app_config(args.config.as_deref())?;
 
     let enc = app_config.encode.as_ref();
@@ -54,9 +112,23 @@ fn encode_cmd(args: args::EncodeArgs) -> Result<()> {
         anyhow::bail!("either --file or --dir must be provided (or use --interactive)");
     };
 
-    let extensions = enc.and_then(|e| e.extensions.clone()).unwrap_or_default();
+    // One mapping from the config to the per-run params:
+    // `EncodeParams::from_app_config` is the single entry point (design
+    // doc §3.10.2) -- the UI uses the same one. Hand-rolling it here is
+    // how the two frontends drifted apart (the frame-rate tolerance
+    // ended up 0.05 in the CLI and 0.01 in the UI).
+    let mut params = EncodeParams::from_app_config(app_config.encode.as_ref());
+    params.target = target.clone();
+    let extensions = params.extensions.clone();
 
-    let files = collect_files(&target, &extensions).with_context(|| {
+    // v1.2 follow-up #5: batch cap. env > TOML > default.
+    // `resolve_max_batch_size` handles `RENENCODER_MAX_BATCH_SIZE=0`
+    // (warn + fallback) and parse errors (warn + fallback), so a
+    // misconfigured env var doesn't silently allow a 0-cap run that
+    // would trip on entry #1.
+    let max_batch_size = rencoder_lib::config::app::resolve_max_batch_size(enc);
+
+    let files = collect_files(&target, &extensions, max_batch_size).with_context(|| {
         format!(
             "failed to collect files from {}",
             target_path(&target).display()
@@ -68,55 +140,90 @@ fn encode_cmd(args: args::EncodeArgs) -> Result<()> {
         return Ok(());
     }
 
-    let format: VideoFormat = enc
-        .and_then(|e| e.format)
-        .map(Into::into)
-        .unwrap_or(VideoFormat::Av1);
-
-    // CRF field semantics (U18 step 6): `u32` aligned with ffmpeg's `-crf N`.
-    // Sentinel `0` switches to bitrate mode; any other value is the CRF
-    // quality. Default is 45 (libsvtav1 medium) when no [encode] section
-    // is present at all.
-    let crf_value = enc.map(|e| e.crf).unwrap_or(45);
-    let (is_crf, bitrate_or_crf) = if crf_value == 0 {
-        let bitrate = enc.and_then(|e| e.bitrate).unwrap_or(5000);
-        (false, bitrate)
+    // CLI > config: `--nv` / `--no-nv` override `[encode].nv`. NVENC is
+    // the most machine-dependent knob there is -- the same config file
+    // has to work on a workstation with an RTX and on a laptop without
+    // one, so the CLI has to be able to flip it per run.
+    let config_nv = enc.and_then(|e| e.nv).unwrap_or(false);
+    let enable_nv = if args.nv {
+        true
+    } else if args.no_nv {
+        false
     } else {
-        (true, crf_value)
+        config_nv
     };
-
-    let enable_nv = enc.and_then(|e| e.nv).unwrap_or(false);
 
     let config = Config::from_encode_config(app_config.encode.as_ref());
 
-    let params = EncodeParams {
-        format,
-        bitrate_or_crf,
-        is_crf,
-        target: target.clone(),
-        extensions: extensions.clone(),
-        extra_args: args.extra_args.clone(),
-        max_fps: config.max_fps_config(),
-    };
+    // Parse each `--` passthrough entry through the type-level safety
+    // boundary. A bad entry fails fast here with a precise error
+    // pointing at the offending argv token — `EncodeParams` itself
+    // can only be constructed with a validated `Vec<ExtraArg>`.
+    let extra_args: Vec<_> = args
+        .extra_args
+        .iter()
+        .map(|s| {
+            rencoder_lib::encoder::ffmpeg_arg::ExtraArg::parse(s)
+                .map_err(|e| anyhow::anyhow!("invalid ffmpeg passthrough argument {s:?}: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+
+    params.extra_args = extra_args;
 
     info!(
         "collected {} file(s), target format: {:?}",
         files.len(),
-        format
+        params.format
     );
 
-    let cache =
-        init_encoder_cache(enable_nv).with_context(|| "failed to initialize encoder cache")?;
+    // NVENC capability: prefer the stored record (probing costs
+    // ~200-500ms per encoder, and the answer barely changes). `--detect`
+    // forces a fresh probe; a record past its review date only gets the
+    // user asked about it.
+    let cache = if enable_nv {
+        let cache_path = rencoder_lib::config::path::resolve_nvenc_cache();
+        let mut resolution = nvenc::resolve_and_store(cache_path.as_deref(), force_detect)
+            .context("NVENC detection failed")?;
+
+        if resolution.review_due && !force_detect {
+            match advise_refresh()? {
+                Refresh::Yes => {
+                    resolution = nvenc::resolve_and_store(cache_path.as_deref(), true)
+                        .context("NVENC detection failed")?;
+                }
+                Refresh::No => {
+                    // Nothing to do: `resolve_and_store` already pushed
+                    // the review date 30 days out when it reported the
+                    // expired record, so the next run stays quiet.
+                }
+                Refresh::Skip => {}
+            }
+        }
+
+        // `resolve_and_store` already persisted a freshly probed record.
+        cache_from_resolution(&resolution)
+    } else {
+        init_encoder_cache(false).with_context(|| "failed to initialize encoder cache")?
+    };
 
     // Install signal handler; the per-batch loop registers/unregisters
     // the current output path so a SIGINT cleans up the partial file.
     let current_output = signal::install_handler();
 
+    // The batch context: this command's parameters, the encoder
+    // cache, the runtime config and the NVENC verdicts (an encoder
+    // that fails at runtime is not tried again for the rest of the
+    // command).
+    let mut ctx = BatchContext::new(
+        params,
+        std::sync::Arc::new(cache),
+        std::sync::Arc::new(config),
+        CapabilityVerdicts::default(),
+    );
+
     let records = transcode_batch(
-        &params,
         &files,
-        &cache,
-        &config,
+        &mut ctx,
         ProcessOutput::Inherit,
         Some(&current_output),
         None,
@@ -199,7 +306,17 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
 
     let extensions = an.and_then(|a| a.extensions.clone()).unwrap_or_default();
 
-    let files = collect_files(&target, &extensions).with_context(|| {
+    // v1.2 follow-up #5: `analyze` is read-only and per-file
+    // bounded by wall-clock (no ffmpeg). Same cap-resolution as
+    // encode: env > TOML > default. Note: `AnalyzeConfig` has no
+    // own `max_batch_size` field today — the encode config's
+    // cap is shared with analyze (treating cap as a global
+    // collector knob). If we ever want per-section caps, that's
+    // a follow-up.
+    let max_batch_size =
+        rencoder_lib::config::app::resolve_max_batch_size(app_config.encode.as_ref());
+
+    let files = collect_files(&target, &extensions, max_batch_size).with_context(|| {
         format!(
             "failed to collect files from {}",
             target_path(&target).display()
@@ -212,7 +329,13 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
     tracing::Span::current().record("parallel", parallel);
 
     let records = if parallel {
-        rencoder_lib::analyzer::records::analyze_records_parallel(&files)
+        // The parallel analyzer takes `&[PathBuf]` and bypasses the
+        // `InputPath` boundary (probe-only, no argv injection risk).
+        // Convert at the CLI boundary; the lib's signature stays
+        // untouched per the review #109 plan.
+        let paths: Vec<std::path::PathBuf> =
+            files.iter().map(|ip| ip.as_path().to_path_buf()).collect();
+        rencoder_lib::analyzer::records::analyze_records_parallel(&paths)
             .with_context(|| "fps analysis failed")?
     } else {
         // U19 step 5: serial analyze routes through TaskManager so the
@@ -230,25 +353,29 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
             })
             .collect();
         let manager = rencoder_lib::pipeline::task::TaskManager::new(None);
-        manager.run(&tasks, "analyze", target_path(&target), |task, _ctx| {
-            let file_bytes = std::fs::metadata(&task.input).map(|m| m.len()).unwrap_or(0);
-            match probe_video_metadata(&task.input) {
-                Ok(metadata) => Ok(rencoder_lib::analyzer::records::AnalysisRecord {
-                    path: task.input.clone(),
-                    fps: metadata.best_fps().map(|f| f.round() as u32),
-                    codec: metadata.codec,
-                    duration_secs: metadata.duration_secs,
-                    file_bytes,
-                }),
-                Err(_) => Ok(rencoder_lib::analyzer::records::AnalysisRecord {
-                    path: task.input.clone(),
-                    fps: None,
-                    codec: None,
-                    duration_secs: None,
-                    file_bytes,
-                }),
-            }
-        })
+        manager
+            .run(&tasks, "analyze", target_path(&target), |task, _ctx| {
+                let file_bytes = std::fs::metadata(task.input.as_path())
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                match probe_video_metadata(task.input.as_path()) {
+                    Ok(metadata) => Ok(rencoder_lib::analyzer::records::AnalysisRecord::new(
+                        task.input.as_path().to_path_buf(),
+                        metadata.best_fps().map(|f| f.round() as u32),
+                        metadata.codec,
+                        metadata.duration_secs,
+                        file_bytes,
+                    )),
+                    Err(_) => Ok(rencoder_lib::analyzer::records::AnalysisRecord::new(
+                        task.input.as_path().to_path_buf(),
+                        None,
+                        None,
+                        None,
+                        file_bytes,
+                    )),
+                }
+            })
+            .unwrap_or_default()
     };
     let stats = rencoder_lib::analyzer::records::aggregate_records(&records);
 
@@ -346,6 +473,20 @@ fn print_encode_summary(results: &[rencoder_lib::types::EncodingRecord]) {
             )
         })
         .count();
+    // PartialOutput skips are NOT counted as `Skipped` (they leave a
+    // partial file behind, not a clean skip) and NOT counted as
+    // `Failed` (ffmpeg was never invoked). Surfaced separately so the
+    // user notices this rare actionable state (typically permission
+    // denied or file in use). See design.md §3.4 + §8 item 41.
+    let partial_skip = results
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.outcome,
+                EncodingOutcome::Skipped(SkippedReason::PartialOutput)
+            )
+        })
+        .count();
     let failed = results
         .iter()
         .filter(|r| matches!(r.outcome, EncodingOutcome::Failed))
@@ -353,10 +494,11 @@ fn print_encode_summary(results: &[rencoder_lib::types::EncodingRecord]) {
 
     println!();
     println!("Summary:");
-    println!("  Total:   {total}");
-    println!("  Success: {success}");
-    println!("  Reduced: {reduced}");
-    println!("  Skipped: {skipped}");
+    println!("  Total:       {total}");
+    println!("  Success:     {success}");
+    println!("  Reduced:     {reduced}");
+    println!("  Skipped:     {skipped}");
+    println!("  PartialSkip: {partial_skip}");
     println!("  Failed:  {failed}");
 }
 
@@ -419,15 +561,12 @@ mod tests {
     #[test]
     fn config_from_encode_config_uses_defaults_when_no_encode_section() {
         let cfg = Config::from_encode_config(None);
-        assert_eq!(cfg.max_fps, 0.0);
-        assert_eq!(cfg.max_fps_eps, 0.05);
         assert!(cfg.encoders.av1.is_none());
     }
 
     #[test]
-    fn config_from_encode_config_picks_up_max_fps_and_encoders() {
+    fn config_from_encode_config_picks_up_encoders() {
         let enc = EncodeConfig {
-            max_fps: Some(30),
             encoders: Some(EncodersConfig {
                 av1: Some("libaom-av1".into()),
                 vp9: Some("libvpx-vp9".into()),
@@ -436,10 +575,36 @@ mod tests {
             ..Default::default()
         };
         let cfg = Config::from_encode_config(Some(&enc));
-        assert_eq!(cfg.max_fps, 30.0);
         assert_eq!(cfg.encoders.av1.as_deref(), Some("libaom-av1"));
         assert_eq!(cfg.encoders.vp9.as_deref(), Some("libvpx-vp9"));
         assert!(cfg.encoders.x264.is_none());
+    }
+
+    /// The CLI and the UI must agree on the run parameters for the same
+    /// config -- design doc §3.10.2 ("one field, one conversion entry
+    /// point"). The CLI builds its params through
+    /// `EncodeParams::from_app_config`; this pins that it keeps doing so
+    /// (the frame-rate tolerance used to differ: 0.05 here, 0.01 in the
+    /// UI).
+    #[test]
+    fn cli_params_match_the_shared_mapping() {
+        let enc = EncodeConfig {
+            format: Some(FormatArg::Hevc),
+            crf: 28,
+            max_fps: Some(30),
+            extensions: Some(vec!["mp4".into()]),
+            ..Default::default()
+        };
+        let params = EncodeParams::from_app_config(Some(&enc));
+        assert_eq!(params.format, rencoder_lib::types::VideoFormat::Hevc);
+        assert!(params.is_crf);
+        assert_eq!(params.bitrate_or_crf, 28);
+        assert_eq!(params.extensions, vec!["mp4".to_string()]);
+        assert_eq!(params.max_fps.max_fps, 30.0);
+        assert_eq!(
+            params.max_fps.eps,
+            rencoder_lib::types::MaxFpsConfig::default().eps
+        );
     }
 
     #[test]

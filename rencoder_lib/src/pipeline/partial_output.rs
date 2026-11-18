@@ -73,7 +73,7 @@ mod tests {
             total: 3,
             batch_label: "encoding".into(),
             batch_path: PathBuf::from("/in"),
-            source: PathBuf::from(name),
+            source: crate::types::InputPath::new(&PathBuf::from(name)).unwrap(),
             output: Some(PathBuf::from(output)),
         }
     }
@@ -97,11 +97,11 @@ mod tests {
         set(&h, ctx("/in/a.mp4", "/out/a.mkv"));
         assert_eq!(
             set(&h, ctx("/in/b.mp4", "/out/b.mkv")).map(|c| c.source),
-            Some(PathBuf::from("/in/a.mp4"))
+            Some(crate::types::InputPath::new(&PathBuf::from("/in/a.mp4")).unwrap())
         );
         assert_eq!(
             h.lock().as_ref().map(|c| c.source.clone()),
-            Some(PathBuf::from("/in/b.mp4"))
+            Some(crate::types::InputPath::new(&PathBuf::from("/in/b.mp4")).unwrap())
         );
     }
 

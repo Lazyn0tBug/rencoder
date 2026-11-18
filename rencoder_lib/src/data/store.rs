@@ -17,8 +17,10 @@
 
 use chrono::{DateTime, Utc};
 use polars::prelude::*;
+use std::path::Path;
 
-use crate::types::EncodingRecord;
+use crate::error::EncodeError;
+use crate::types::{EncodingOutcome, EncodingRecord, ErrorCategory, ErrorContext, SkippedReason};
 
 /// Build a `Series` of `DateTime<Utc>` values, casting the underlying
 /// `i64` (milliseconds since epoch) into Polars' `Datetime` type so
@@ -148,49 +150,294 @@ pub fn records_to_dataframe(records: &[EncodingRecord]) -> PolarsResult<DataFram
 
 /// Render the DataFrame as CSV (header + rows). Empty DataFrame → just
 /// the header.
-pub fn dataframe_to_csv(df: &DataFrame) -> String {
+///
+/// Review #125: takes `&mut DataFrame` so the underlying polars
+/// writer can move out columns in place — the previous `&DataFrame`
+/// signature forced a full `df.clone()` (memory cost scales with
+/// record count; for a large batch this was a significant peak).
+pub fn dataframe_to_csv(df: &mut DataFrame) -> String {
     let mut buf = Vec::new();
     polars::prelude::CsvWriter::new(&mut buf)
-        .finish(&mut df.clone())
+        .finish(df)
         .expect("CsvWriter::finish");
     String::from_utf8(buf).unwrap_or_default()
 }
 
 /// Render the DataFrame as JSON Lines (one object per line).
-pub fn dataframe_to_jsonl(df: &DataFrame) -> String {
+/// Review #125: see `dataframe_to_csv` for the `&mut` rationale.
+pub fn dataframe_to_jsonl(df: &mut DataFrame) -> String {
     let mut buf = Vec::new();
     let _ = polars::io::json::JsonWriter::new(&mut buf)
         .with_json_format(polars::io::json::JsonFormat::JsonLines)
-        .finish(&mut df.clone());
+        .finish(df);
     String::from_utf8(buf).unwrap_or_default()
 }
 
 /// Render the DataFrame as Parquet bytes (Snappy compression; schema
 /// embedded; columnar).
-pub fn dataframe_to_parquet(df: &DataFrame) -> PolarsResult<Vec<u8>> {
+/// Review #125: see `dataframe_to_csv` for the `&mut` rationale.
+pub fn dataframe_to_parquet(df: &mut DataFrame) -> PolarsResult<Vec<u8>> {
     let mut buf = Vec::new();
     polars::prelude::ParquetWriter::new(&mut buf)
         .with_compression(polars::prelude::ParquetCompression::Snappy)
-        .finish(&mut df.clone())?;
+        .finish(df)?;
     Ok(buf)
 }
 
 /// One-shot helper: records → CSV string.
+/// Review #125: passes `&mut` to avoid cloning the DataFrame.
 pub fn records_to_csv(records: &[EncodingRecord]) -> String {
-    let df = records_to_dataframe(records).expect("records_to_dataframe");
-    dataframe_to_csv(&df)
+    let mut df = records_to_dataframe(records).expect("records_to_dataframe");
+    dataframe_to_csv(&mut df)
 }
 
 /// One-shot helper: records → JSONL string.
+/// Review #125: see `records_to_csv`.
 pub fn records_to_jsonl(records: &[EncodingRecord]) -> String {
-    let df = records_to_dataframe(records).expect("records_to_dataframe");
-    dataframe_to_jsonl(&df)
+    let mut df = records_to_dataframe(records).expect("records_to_dataframe");
+    dataframe_to_jsonl(&mut df)
 }
 
 /// One-shot helper: records → Parquet bytes.
+/// Review #125: see `records_to_csv`.
 pub fn records_to_parquet(records: &[EncodingRecord]) -> PolarsResult<Vec<u8>> {
-    let df = records_to_dataframe(records)?;
-    dataframe_to_parquet(&df)
+    let mut df = records_to_dataframe(records)?;
+    dataframe_to_parquet(&mut df)
+}
+
+/// Read records back from a single Parquet file. Inverse of
+/// `records_to_parquet`; consumed by the GUI `Command::LoadHistory`
+/// path (U21 §3.8.4). Multi-file glob + limit/after filtering lives
+/// in the controller, not here.
+///
+/// Note: `ffmpeg_argv` roundtrip is lossy — stored as space-joined
+/// string, split on read. Args containing spaces in their values
+/// would survive incorrectly; current argv never does (paths with
+/// spaces are still single args via `Command::arg`), but this is a
+/// known limitation worth documenting.
+pub fn read_records(path: &Path) -> Result<Vec<EncodingRecord>, EncodeError> {
+    use polars::prelude::ParquetReader;
+    let file = std::fs::File::open(path)?; // io::Error → EncodeError::Io via #[from]
+    let df = ParquetReader::new(file)
+        .finish()
+        .map_err(|e| EncodeError::Probe(format!("parquet read {}: {e}", path.display())))?;
+    columns_to_records(&df).map_err(|e| EncodeError::Probe(format!("parquet decode: {e}")))
+}
+
+/// Inverse of [`record_to_columns`]. Same column ordering and types;
+/// see schema comments there.
+fn columns_to_records(df: &DataFrame) -> PolarsResult<Vec<EncodingRecord>> {
+    let h = df.height();
+    if h == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Per-column Vec<Option<T>>; index i → row i.
+    let str_col = |name: &str| -> PolarsResult<Vec<Option<String>>> {
+        let s = df.column(name)?.str()?;
+        Ok(s.into_iter().map(|o| o.map(str::to_string)).collect())
+    };
+    let u64_col = |name: &str| -> PolarsResult<Vec<Option<u64>>> {
+        let s = df.column(name)?.u64()?;
+        Ok(s.into_iter().collect())
+    };
+    let u32_col = |name: &str| -> PolarsResult<Vec<Option<u32>>> {
+        let s = df.column(name)?.u32()?;
+        Ok(s.into_iter().collect())
+    };
+    let f64_col = |name: &str| -> PolarsResult<Vec<Option<f64>>> {
+        let s = df.column(name)?.f64()?;
+        Ok(s.into_iter().collect())
+    };
+    let f32_col = |name: &str| -> PolarsResult<Vec<Option<f32>>> {
+        let casted = df.column(name)?.cast(&DataType::Float32)?;
+        let s = casted.f32()?;
+        Ok(s.into_iter().collect())
+    };
+    let bool_col = |name: &str| -> PolarsResult<Vec<Option<bool>>> {
+        let s = df.column(name)?.bool()?;
+        Ok(s.into_iter().collect())
+    };
+
+    let source_path = str_col("source_path")?;
+    let source_size_bytes = u64_col("source_size_bytes")?;
+    let source_codec = str_col("source_codec")?;
+    let source_container = str_col("source_container")?;
+    let source_width = u32_col("source_width")?;
+    let source_height = u32_col("source_height")?;
+    let source_fps = f64_col("source_fps")?;
+    let source_duration_secs = f64_col("source_duration_secs")?;
+    let source_bit_rate_bps = u64_col("source_bit_rate_bps")?;
+
+    // started_at is a Datetime column; we stored microseconds
+    // (timestamp_micros) so we read with from_timestamp_micros.
+    // Using from_timestamp_millis here would interpret the value as
+    // ms and produce years like ~55,840 (a 1000x mismatch — the
+    // original read_records_round_trip test didn't check started_at
+    // so this went undetected until the mock_load_history filter
+    // tests surfaced it).
+    //
+    // Review fix #7: validate the column dtype before casting.
+    // A newer Polars version may write the column as `Datetime(Ns)`
+    // or with a non-UTC timezone; the cast to Int64 would then
+    // either yield raw i64 nanoseconds (overflows i64 micros by
+    // 1000x, from_timestamp_micros returns None) or produce a
+    // timezone-shifted value. In both cases, the previous code
+    // silently substituted Utc::now() across all records, which
+    // broke the newest-first sort. Detect the mismatch and
+    // return an error instead of corrupting the data.
+    fn read_timestamp_column(
+        df: polars::prelude::DataFrame,
+        name: &str,
+    ) -> Result<Vec<Option<DateTime<Utc>>>, PolarsError> {
+        let col = df.column(name)?;
+        let dt = col.dtype();
+        // Acceptable: Datetime(Us, UTC) or Datetime(Ms, UTC) or
+        // anything where the cast to Int64 gives us microseconds.
+        // Unacceptable: timezones, nanoseconds, physical types.
+        if !matches!(
+            dt,
+            DataType::Datetime(polars::prelude::TimeUnit::Microseconds, _)
+                | DataType::Datetime(polars::prelude::TimeUnit::Milliseconds, _)
+        ) {
+            return Err(PolarsError::ComputeError(
+                format!(
+                    "Parquet column '{}' has dtype {:?}; expected Datetime(Us/Ms, _). \
+                     Refusing to silently corrupt timestamps.",
+                    name, dt
+                )
+                .into(),
+            ));
+        }
+        let casted = col.cast(&DataType::Int64)?;
+        let i64_col = casted.i64()?;
+        let is_micros = matches!(
+            dt,
+            DataType::Datetime(polars::prelude::TimeUnit::Microseconds, _)
+        );
+        Ok(i64_col
+            .into_iter()
+            .map(|o| {
+                o.and_then(|v| {
+                    if is_micros {
+                        DateTime::<Utc>::from_timestamp_micros(v)
+                    } else {
+                        DateTime::<Utc>::from_timestamp_millis(v)
+                    }
+                })
+            })
+            .collect())
+    }
+    let started_at = read_timestamp_column(df.clone(), "started_at")?;
+    // ended_at has the same schema.
+    let ended_at = read_timestamp_column(df.clone(), "ended_at")?;
+
+    let encoding_duration_secs = f64_col("encoding_duration_secs")?;
+    let encoder_selected = str_col("encoder_selected")?;
+    let encoder_is_crf = bool_col("encoder_is_crf")?;
+    let encoder_crf_or_bitrate = u32_col("encoder_crf_or_bitrate")?;
+    let encoder_preset = str_col("encoder_preset")?;
+    let encoder_max_fps_target = f32_col("encoder_max_fps_target")?;
+    let ffmpeg_argv_joined = str_col("ffmpeg_argv")?;
+    let ffmpeg_stderr_tail = str_col("ffmpeg_stderr_tail")?;
+
+    let output_path = str_col("output_path")?;
+    let output_size_bytes = u64_col("output_size_bytes")?;
+    let output_duration_secs = f64_col("output_duration_secs")?;
+    let output_codec = str_col("output_codec")?;
+    let compression_ratio = f64_col("compression_ratio")?;
+
+    let outcome_str = str_col("outcome")?;
+    let error_category_str = str_col("error_category")?;
+    let error_message = str_col("error_message")?;
+
+    let mut records = Vec::with_capacity(h);
+    for i in 0..h {
+        let outcome = parse_outcome(outcome_str[i].as_deref().unwrap_or(""));
+        let error = match (
+            error_category_str[i].as_deref(),
+            error_message[i].as_deref(),
+        ) {
+            (Some(cat), Some(msg)) => Some(ErrorContext {
+                category: parse_error_category(cat),
+                message: msg.to_string(),
+                ffmpeg_stderr_tail: ffmpeg_stderr_tail[i].clone().unwrap_or_default(),
+            }),
+            _ => None,
+        };
+
+        records.push(EncodingRecord {
+            source_path: source_path[i].clone().unwrap_or_default(),
+            source_size_bytes: source_size_bytes[i].unwrap_or(0),
+            source_codec: source_codec[i].clone(),
+            source_container: source_container[i].clone(),
+            source_width: source_width[i],
+            source_height: source_height[i],
+            source_fps: source_fps[i],
+            source_duration_secs: source_duration_secs[i],
+            source_bit_rate_bps: source_bit_rate_bps[i],
+
+            started_at: started_at[i].unwrap_or_else(Utc::now),
+            ended_at: ended_at[i],
+            encoding_duration_secs: encoding_duration_secs[i],
+            encoder_selected: encoder_selected[i].clone(),
+            encoder_settings: crate::types::EncoderSettings {
+                is_crf: encoder_is_crf[i].unwrap_or(true),
+                crf_or_bitrate: encoder_crf_or_bitrate[i].unwrap_or(0),
+                preset: encoder_preset[i].clone(),
+                max_fps_target: encoder_max_fps_target[i],
+            },
+            ffmpeg_argv: ffmpeg_argv_joined[i]
+                .as_deref()
+                .unwrap_or("")
+                .split_whitespace()
+                .map(str::to_string)
+                .collect(),
+            ffmpeg_stderr_tail: ffmpeg_stderr_tail[i].clone().unwrap_or_default(),
+
+            output_path: output_path[i].clone(),
+            output_size_bytes: output_size_bytes[i],
+            output_duration_secs: output_duration_secs[i],
+            output_codec: output_codec[i].clone(),
+            compression_ratio: compression_ratio[i],
+
+            outcome,
+            error,
+        });
+    }
+    Ok(records)
+}
+
+/// Parse the Debug-formatted outcome string back to `EncodingOutcome`.
+/// Format: `"Succeeded"`, `"ReducedFps"`, `"Failed"`, or
+/// `"Skipped(SameCodec)"` / `"Skipped(OutputExists)"` /
+/// `"Skipped(PartialOutput)"`.
+fn parse_outcome(s: &str) -> EncodingOutcome {
+    match s {
+        "Succeeded" => EncodingOutcome::Succeeded,
+        "ReducedFps" => EncodingOutcome::ReducedFps,
+        "Failed" => EncodingOutcome::Failed,
+        "Skipped(SameCodec)" => EncodingOutcome::Skipped(SkippedReason::SameCodec),
+        "Skipped(OutputExists)" => EncodingOutcome::Skipped(SkippedReason::OutputExists),
+        "Skipped(PartialOutput)" => EncodingOutcome::Skipped(SkippedReason::PartialOutput),
+        // Forward compat: future variants come back as Failed with
+        // an empty error context. Better than panicking on unknown.
+        _ => EncodingOutcome::Failed,
+    }
+}
+
+fn parse_error_category(s: &str) -> ErrorCategory {
+    match s {
+        "ProbeFailed" => ErrorCategory::ProbeFailed,
+        "EncoderSelectionFailed" => ErrorCategory::EncoderSelectionFailed,
+        "FfmpegSpawnFailed" => ErrorCategory::FfmpegSpawnFailed,
+        "FfmpegNonzeroExit" => ErrorCategory::FfmpegNonzeroExit,
+        "ConfigError" => ErrorCategory::ConfigError,
+        "Cancelled" => ErrorCategory::Cancelled,
+        "IoError" => ErrorCategory::IoError,
+        // Unknown category → IoError as a safe fallback.
+        _ => ErrorCategory::IoError,
+    }
 }
 
 #[cfg(test)]
@@ -293,5 +540,64 @@ mod tests {
         let first = cats.get(0).expect("first");
         let cat_str = first.to_string();
         assert!(cat_str.contains("FfmpegNonzeroExit"));
+    }
+
+    #[test]
+    fn read_records_round_trip() {
+        // U21 §3.8.6: write_records → read_records should preserve
+        // the original EncodingRecord (modulo ffmpeg_argv join/split).
+        let tmp = std::env::temp_dir().join(format!("rencoder_store_rt_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("test.parquet");
+
+        let original = vec![sample_record()];
+        let bytes = records_to_parquet(&original).expect("write");
+        std::fs::write(&path, bytes).expect("save to disk");
+
+        let read_back = read_records(&path).expect("read");
+        assert_eq!(read_back.len(), original.len());
+        let a = &read_back[0];
+        let b = &original[0];
+        assert_eq!(a.source_path, b.source_path);
+        assert_eq!(a.source_size_bytes, b.source_size_bytes);
+        assert_eq!(a.source_codec, b.source_codec);
+        assert_eq!(a.source_fps, b.source_fps);
+        assert_eq!(a.encoder_selected, b.encoder_selected);
+        assert_eq!(a.encoder_settings.is_crf, b.encoder_settings.is_crf);
+        assert_eq!(
+            a.encoder_settings.crf_or_bitrate,
+            b.encoder_settings.crf_or_bitrate
+        );
+        assert_eq!(a.output_path, b.output_path);
+        assert_eq!(a.output_size_bytes, b.output_size_bytes);
+        assert_eq!(a.outcome, b.outcome);
+        // ffmpeg_argv roundtrip is lossy via space-join, but for
+        // argv without internal spaces it's identity:
+        assert_eq!(a.ffmpeg_argv, b.ffmpeg_argv);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn read_records_skipped_outcome_round_trip() {
+        // U21 §3.8.6 + §3.2: SkippedReason::PartialOutput is a new
+        // variant that must survive Parquet round-trip.
+        let mut rec = sample_record();
+        rec.outcome = EncodingOutcome::Skipped(SkippedReason::PartialOutput);
+        let df = records_to_dataframe(&[rec]).expect("df");
+        let outcome_col = df
+            .column("outcome")
+            .expect("outcome col")
+            .str()
+            .expect("str");
+        let first = outcome_col.get(0).expect("first");
+        assert_eq!(first, "Skipped(PartialOutput)");
+    }
+
+    #[test]
+    fn read_records_missing_file_returns_io_error() {
+        let path = std::path::PathBuf::from("/nonexistent/rencoder_test.parquet");
+        let result = read_records(&path);
+        assert!(result.is_err());
     }
 }

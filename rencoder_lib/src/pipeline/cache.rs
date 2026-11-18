@@ -1,72 +1,142 @@
-//! One-shot `EncoderCache`: `ffmpeg -encoders` output plus optional
-//! `nvidia-smi -L` detection.
+//! One-shot `EncoderCache`: `ffmpeg -encoders` output plus the NVENC
+//! capability probe.
 //!
 //! Built once per batch via `init_encoder_cache`, then passed by `&` to
 //! every `select_encoder` call. The `ffmpeg -encoders` output never
 //! changes during a run, so cloning the (potentially multi-MB) string
 //! per file would be wasteful.
+//!
+//! NVENC detection is a **capability probe**, not an existence check:
+//! `ffmpeg -encoders` says the encoder was compiled in, `nvidia-smi -L`
+//! says a GPU exists -- neither says this machine can actually run
+//! `av1_nvenc` (compute capability >= 8.0, matching driver, free NVENC
+//! session). The probe answers that with a 1-frame test encode.
+//!
+//! The probe result is a property of the machine, not of a batch: it is
+//! kept on disk by [`crate::encoder::nvenc`] and reused across
+//! processes. This module owns the "build a cache from a resolved
+//! capability" part.
 
+use crate::encoder::nvenc;
 use crate::error::EncodeError;
 use crate::types::EncoderCache;
 
-/// Build an `EncoderCache` for the current run.
+/// Build an `EncoderCache` for the current run, probing NVENC if asked.
 ///
-/// `enable_nv = false` skips `nvidia-smi` entirely. `true` runs the probe;
-/// missing binary, spawn failure, or empty output all set `has_nvidia = false`
-/// with an `info!` log (R20) -- not an `EncodeError`.
+/// `enable_nv = false` skips the probe entirely (zero extra cost).
+/// `true` probes the NVENC encoders this ffmpeg build has; encoders
+/// that fail the probe are simply not usable, and `select_encoder`
+/// falls back to software encoding with a warning.
+///
+/// This is the "no store" path (the GUI, and any caller that has not
+/// resolved the capability yet). Callers that keep the capability on
+/// disk resolve it with [`crate::encoder::nvenc::resolve`] and build
+/// the cache with [`cache_from_resolution`].
 pub fn init_encoder_cache(enable_nv: bool) -> Result<EncoderCache, EncodeError> {
-    init_encoder_cache_impl(enable_nv, run_subprocess)
-}
-
-/// Test seam: same as `init_encoder_cache` but with an injectable runner.
-/// Production calls `init_encoder_cache` (which passes `run_subprocess`).
-fn init_encoder_cache_impl<F>(enable_nv: bool, runner: F) -> Result<EncoderCache, EncodeError>
-where
-    F: Fn(&str, &[&str]) -> Result<String, EncodeError>,
-{
-    let encoders_output = runner("ffmpeg", &["-encoders"])?;
-    let has_nvidia = enable_nv && detect_nvidia(&runner);
+    let encoders_output = nvenc::run_ffmpeg(&["-encoders"])?;
+    let support = if enable_nv {
+        nvenc::probe(&encoders_output)
+    } else {
+        Vec::new()
+    };
+    if enable_nv && !support.iter().any(|s| s.usable) {
+        tracing::warn!(
+            "NVENC is enabled but no encoder passed the capability probe; using software encoding"
+        );
+    }
     Ok(EncoderCache {
         encoders_output,
-        has_nvidia,
+        nvenc: support,
     })
 }
 
-fn detect_nvidia<F>(runner: &F) -> bool
-where
-    F: Fn(&str, &[&str]) -> Result<String, EncodeError>,
-{
-    match runner("nvidia-smi", &["-L"]) {
-        Ok(out) => !out.trim().is_empty(),
-        Err(e) => {
-            log::info!("nvidia-smi unavailable, falling back to software encoding: {e}");
-            false
-        }
+/// Build an `EncoderCache` from an already-resolved NVENC capability.
+///
+/// No subprocess, no probe: the caller already knows which encoders
+/// this machine can run.
+pub fn cache_from_resolution(resolution: &nvenc::Resolution) -> EncoderCache {
+    EncoderCache {
+        encoders_output: resolution.encoders_output.clone(),
+        nvenc: resolution.support.clone(),
     }
 }
 
-fn run_subprocess(program: &str, args: &[&str]) -> Result<String, EncodeError> {
-    let output = std::process::Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|e| EncodeError::Probe(format!("{program} spawn: {e}")))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(EncodeError::Probe(format!(
-            "{program} exited {}: {}",
-            output.status,
-            stderr.trim()
-        )));
+/// Build the encoder cache for a session, resolving the NVENC
+/// capability through the on-disk record.
+///
+/// The record (`<app_dir>/nvenc-capability.json`) is shared with the
+/// CLI: a fresh record is reused as-is (no probe), a missing or
+/// mismatching one is probed and stored. `capability` carries the
+/// summary for the UI.
+pub fn init_encoder_cache_with_capability(
+    enable_nv: bool,
+) -> (
+    Result<EncoderCache, EncodeError>,
+    Option<crate::types::NvencCapability>,
+) {
+    if !enable_nv {
+        return (init_encoder_cache(false), None);
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    let path = crate::config::path::resolve_nvenc_cache();
+    match crate::encoder::nvenc::resolve_and_store(path.as_deref(), false) {
+        Ok(resolution) => {
+            let capability = crate::types::NvencCapability {
+                support: resolution.support.clone(),
+                probed_at: Some(resolution.record.probed_at),
+                review_due: resolution.review_due,
+            };
+            (Ok(cache_from_resolution(&resolution)), Some(capability))
+        }
+        Err(e) => (Err(e), None),
+    }
+}
+
+/// What the background cache init produces: the cache (or the error
+/// that prevented building it) plus the NVENC capability summary the
+/// UI shows next to the NVENC switch.
+#[derive(Debug)]
+pub struct CacheInit {
+    pub cache: Result<EncoderCache, EncodeError>,
+    /// `None` when NVENC is disabled or the resolve failed.
+    pub capability: Option<crate::types::NvencCapability>,
+}
+
+/// Build an `EncoderCache` on a background thread; return a receiver
+/// the caller can poll/await (review #126).
+///
+/// `ffmpeg -encoders` takes ~50-200ms on a cold start; `nvidia-smi -L`
+/// adds another 50-100ms. Blocking the actor thread for this duration
+/// delays `Command::StartBatch` processing. By spawning the init on a
+/// background thread and returning a one-shot receiver, the actor can
+/// drain the `cmd_rx` loop while the cache is being built.
+///
+/// The receiver delivers the final `Result<EncoderCache, EncodeError>`
+/// exactly once. A failed init returns `Err(EncodeError::Probe(...))`;
+/// consumers should map that to `Event::Error` like the sync variant.
+pub fn init_encoder_cache_async_with_capability(
+    enable_nv: bool,
+) -> std::sync::mpsc::Receiver<CacheInit> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("rencoder-cache-init".into())
+        .spawn(move || {
+            let (cache, capability) = init_encoder_cache_with_capability(enable_nv);
+            let result = CacheInit { cache, capability };
+            // Block on the send until the consumer picks up. With
+            // sync_channel(1), the first send succeeds (buffer slot
+            // empty); subsequent sends would fail because the
+            // consumer has already received. We only call once so
+            // this is fine.
+            let _ = tx.send(result);
+        })
+        .expect("spawn cache-init thread");
+    rx
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::EncoderCache;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
 
     const ENCODERS_BASIC: &str = "\
 Encoders:
@@ -91,7 +161,7 @@ Encoders:
     fn has_encoder_substring_match() {
         let cache = EncoderCache {
             encoders_output: ENCODERS_BASIC.to_string(),
-            has_nvidia: false,
+            nvenc: Vec::new(),
         };
         assert!(cache.has_encoder("libsvtav1"));
         assert!(cache.has_encoder("libx264"));
@@ -103,7 +173,7 @@ Encoders:
     fn has_encoder_finds_nvenc_in_full_list() {
         let cache = EncoderCache {
             encoders_output: ENCODERS_WITH_NVENC.to_string(),
-            has_nvidia: true,
+            nvenc: Vec::new(),
         };
         assert!(cache.has_encoder("av1_nvenc"));
         assert!(cache.has_encoder("h264_nvenc"));
@@ -112,87 +182,49 @@ Encoders:
     }
 
     #[test]
-    fn enable_nv_false_skips_nvidia_check() {
-        let nvidia_calls = Arc::new(AtomicUsize::new(0));
-        let n = nvidia_calls.clone();
-        let runner = move |program: &str, _args: &[&str]| -> Result<String, EncodeError> {
-            match program {
-                "ffmpeg" => Ok(ENCODERS_BASIC.to_string()),
-                "nvidia-smi" => {
-                    n.fetch_add(1, Ordering::SeqCst);
-                    Ok("GPU 0: Test".to_string())
-                }
-                _ => Err(EncodeError::Probe(format!("unexpected {program}"))),
-            }
+    fn cache_from_resolution_carries_the_support_list() {
+        let resolution = nvenc::Resolution {
+            encoders_output: ENCODERS_WITH_NVENC.to_string(),
+            support: vec![crate::types::NvencSupport {
+                encoder: "av1_nvenc".to_string(),
+                usable: true,
+                reason: None,
+            }],
+            record: nvenc::CapabilityRecord {
+                version: 1,
+                ffmpeg_version: "ffmpeg version 9.0.1".to_string(),
+                ffmpeg_fingerprint: "abc".to_string(),
+                probed_at: chrono::Utc::now(),
+                next_review_at: chrono::Utc::now(),
+                encoders: Vec::new(),
+            },
+            probed: false,
+            review_due: false,
         };
-        let cache = init_encoder_cache_impl(false, runner).unwrap();
-        assert!(!cache.has_nvidia);
-        assert_eq!(nvidia_calls.load(Ordering::SeqCst), 0);
+        let cache = cache_from_resolution(&resolution);
+        assert!(cache.nvenc_usable("av1_nvenc"));
+        assert!(!cache.nvenc_usable("hevc_nvenc"));
+        assert!(cache.has_encoder("libsvtav1"));
     }
 
+    // Review delta #8 (delta-review): regression coverage for
+    // init_encoder_cache_async. The async path was previously
+    // untested; this test exercises the thread spawn + receiver
+    // round-trip. A failure to populate the channel would hang
+    // here (timeout).
     #[test]
-    fn nvidia_present_sets_flag() {
-        let runner = |program: &str, _args: &[&str]| -> Result<String, EncodeError> {
-            match program {
-                "ffmpeg" => Ok(ENCODERS_BASIC.to_string()),
-                "nvidia-smi" => Ok("GPU 0: NVIDIA GeForce RTX 4090\n".to_string()),
-                _ => Err(EncodeError::Probe(format!("unexpected {program}"))),
-            }
-        };
-        let cache = init_encoder_cache_impl(true, runner).unwrap();
-        assert!(cache.has_nvidia);
-    }
-
-    #[test]
-    fn nvidia_missing_silently_falls_back() {
-        let runner = |program: &str, _args: &[&str]| -> Result<String, EncodeError> {
-            match program {
-                "ffmpeg" => Ok(ENCODERS_BASIC.to_string()),
-                "nvidia-smi" => Err(EncodeError::Probe("not found".into())),
-                _ => Err(EncodeError::Probe(format!("unexpected {program}"))),
-            }
-        };
-        let cache = init_encoder_cache_impl(true, runner).unwrap();
-        assert!(!cache.has_nvidia);
-    }
-
-    #[test]
-    fn nvidia_empty_output_silently_falls_back() {
-        let runner = |program: &str, _args: &[&str]| -> Result<String, EncodeError> {
-            match program {
-                "ffmpeg" => Ok(ENCODERS_BASIC.to_string()),
-                "nvidia-smi" => Ok(String::new()),
-                _ => Err(EncodeError::Probe(format!("unexpected {program}"))),
-            }
-        };
-        let cache = init_encoder_cache_impl(true, runner).unwrap();
-        assert!(!cache.has_nvidia);
-    }
-
-    #[test]
-    fn ffmpeg_invoked_exactly_once() {
-        let ffmpeg_calls = Arc::new(AtomicUsize::new(0));
-        let f = ffmpeg_calls.clone();
-        let runner = move |program: &str, _args: &[&str]| -> Result<String, EncodeError> {
-            match program {
-                "ffmpeg" => {
-                    f.fetch_add(1, Ordering::SeqCst);
-                    Ok(ENCODERS_WITH_NVENC.to_string())
-                }
-                "nvidia-smi" => Ok("GPU 0: Test".to_string()),
-                _ => Err(EncodeError::Probe(format!("unexpected {program}"))),
-            }
-        };
-        let _cache = init_encoder_cache_impl(true, runner).unwrap();
-        assert_eq!(ffmpeg_calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn ffmpeg_failure_propagates() {
-        let runner = |_program: &str, _args: &[&str]| -> Result<String, EncodeError> {
-            Err(EncodeError::Probe("ffmpeg not found".into()))
-        };
-        let result = init_encoder_cache_impl(false, runner);
-        assert!(matches!(result, Err(EncodeError::Probe(_))));
+    fn init_encoder_cache_async_delivers_result() {
+        // Use a custom runner via init_encoder_cache_impl would
+        // require re-plumbing; instead we exercise the real path
+        // but tolerate the ffmpeg binary missing on the test host.
+        let rx = init_encoder_cache_async_with_capability(false);
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("init_encoder_cache_async channel closed without result");
+        // Either Ok (ffmpeg present) or Err (ffmpeg missing) is
+        // acceptable -- what we're testing is that the channel
+        // delivers a result within the timeout. The exact
+        // variant depends on the host.
+        let _ = result; // suppress unused warning
     }
 }

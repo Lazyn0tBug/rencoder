@@ -4,15 +4,20 @@
 //! 1. `should_skip_encoding` -- decide whether a source codec matches the
 //!    target format (and whether we should still transcode for fps reduction).
 //! 2. `build_ffmpeg_command` -- assemble argv, including the `-r <fps>`
-//!    output option placement.
+//!    and `-fps_mode` output option placement.
 //!
-//! `-r` is an FFmpeg **output option**: it must appear AFTER `-i <input>`
-//! and BEFORE the output path. Placing it before `-i` would force the input
-//! frame rate (origin §3.3 + R4). When `src_fps = None`, no `-r` is injected
-//! even if capping is enabled (R21): we'd rather not transcode with a
-//! guessed frame rate than corrupt the output.
+//! `-r` and `-fps_mode` are FFmpeg **output options**: they must appear
+//! AFTER `-i <input>` and BEFORE the output path. Placing them before
+//! `-i` would force the input frame rate (origin §3.3 + R4). When
+//! `src_fps = None`, neither is injected even if capping is enabled
+//! (R21): we'd rather not transcode with a guessed frame rate than
+//! corrupt the output.
 
-use crate::types::{EncodeParams, TranscodeTask, VideoFormat};
+use crate::config::app::FfmpegArgsConfig;
+use crate::types::{EncodeParams, FpsDecision, TranscodeTask, VideoFormat};
+
+#[cfg(test)]
+use crate::encoder::ffmpeg_arg::ExtraArg;
 
 /// Decide whether the source already matches the target encoding and
 /// no fps reduction is needed, in which case the file can be skipped.
@@ -41,17 +46,36 @@ fn codec_matches_format(codec: &str, format: VideoFormat) -> bool {
     }
 }
 
+/// Is this an NVIDIA hardware encoder?
+///
+/// NVENC's rate control is constant quality (`-cq`), not the CRF scale
+/// the software encoders use -- the two are not interchangeable.
+fn is_nvenc(encoder: &str) -> bool {
+    encoder.ends_with("_nvenc")
+}
+
 /// Build the argv for an `ffmpeg` invocation.
 ///
 /// Layout:
 /// ```text
-/// ffmpeg -y -i <input>
-///   -c:v <encoder> [-preset ...] [-crf ... | -b:v ...]
-///   -c:a libopus -b:a 32k
-///   [-r <MAX_FPS>]              # only when src_fps is Some AND need_reduce
+/// ffmpeg <pre_input...> -i <input>
+///   <post_input...>
+///   -c:v <encoder> [-preset <default_preset>] [-crf ... | -b:v ...]
+///   -c:a <default_audio_codec> -b:a <default_audio_bitrate>
+///   [-r <MAX_FPS> -fps_mode cfr]   # source exceeds the cap
+///   [-fps_mode passthrough]        # cap enabled, source within the cap
 ///   [... extra_args]
 ///   <output>
 /// ```
+///
+/// `pre_input` / `post_input` / `default_preset` / `default_audio_codec`
+/// / `default_audio_bitrate` come from `EncodeConfig.ffmpeg_args`
+/// (review fix #1: most flags moved out of Rust concatenation so the
+/// only Rust-built strings in the argv are `ffmpeg`, `-y`, `-i`, the
+/// input path, and the output path). `-y` is the one exception: it's
+/// always present (never want to prompt) and is the safest flag to
+/// keep Rust-side since it's the most important behavior we don't want
+/// users to accidentally disable.
 ///
 /// The `-r` block is the single most error-prone position; tests assert
 /// argv ordering by index, not just presence.
@@ -60,13 +84,21 @@ pub fn build_ffmpeg_command(
     params: &EncodeParams,
     encoder: &str,
     src_fps: Option<f64>,
+    ffmpeg_args: &FfmpegArgsConfig,
 ) -> Vec<String> {
     let mut argv: Vec<String> = Vec::with_capacity(16);
 
     argv.push("ffmpeg".to_string());
+    // `-y` is hardcoded (never user-overridable) so a user setting
+    // a bad config can't accidentally get ffmpeg to prompt.
     argv.push("-y".to_string());
+    argv.extend(ffmpeg_args.pre_input.iter().cloned());
     argv.push("-i".to_string());
-    argv.push(task.input.to_string_lossy().into_owned());
+    // `task.input` is an `InputPath`; the type system guarantees it
+    // doesn't start with `-` (review #109), so the lossy round-trip
+    // is safe to push verbatim.
+    argv.push(task.input.to_string());
+    argv.extend(ffmpeg_args.post_input.iter().cloned());
 
     argv.push("-c:v".to_string());
     argv.push(encoder.to_string());
@@ -78,34 +110,75 @@ pub fn build_ffmpeg_command(
         // builds). Gate on the encoder name so non-svt AV1 overrides
         // produce a clean command.
         if matches!(params.format, VideoFormat::Av1) && encoder.contains("svt") {
+            let preset = ffmpeg_args.default_preset.as_deref().unwrap_or("6");
             argv.push("-preset".to_string());
-            argv.push("6".to_string());
+            argv.push(preset.to_string());
         }
-        argv.push("-crf".to_string());
-        argv.push(params.bitrate_or_crf.to_string());
+        if is_nvenc(encoder) {
+            // NVENC is constant quality (`-cq`), not the x264/x265 CRF
+            // scale -- same numbers, different meaning. Matches
+            // `encode.zsh`'s ENC_SPEC, where the nvenc rows are "cq"
+            // mode (`-cq N -b:v 0`).
+            argv.push("-cq".to_string());
+            argv.push(params.bitrate_or_crf.to_string());
+            // `-b:v 0` pairs with `-cq`: constant quality, no rate cap.
+            argv.push("-b:v".to_string());
+            argv.push("0".to_string());
+        } else {
+            argv.push("-crf".to_string());
+            argv.push(params.bitrate_or_crf.to_string());
+        }
     } else {
         argv.push("-b:v".to_string());
         argv.push(format!("{}k", params.bitrate_or_crf));
     }
 
-    // Audio: passthrough encode as libopus; users override via
-    // `params.extra_args` if they need a specific audio codec.
-    argv.push("-c:a".to_string());
-    argv.push("libopus".to_string());
-    argv.push("-b:a".to_string());
-    argv.push("32k".to_string());
+    // Audio: passthrough encode as libopus by default; users
+    // override via `ffmpeg_args.default_audio_codec` / `default_audio_bitrate`
+    // or via `params.extra_args` if they need a specific codec.
+    if let Some(codec) = &ffmpeg_args.default_audio_codec {
+        argv.push("-c:a".to_string());
+        argv.push(codec.clone());
+    }
+    if let Some(bitrate) = &ffmpeg_args.default_audio_bitrate {
+        argv.push("-b:a".to_string());
+        argv.push(bitrate.clone());
+    }
 
-    // Frame-rate cap (R4 + R21): only injected when we have a real source
-    // fps AND the cap applies to it.
-    if let Some(src) = src_fps {
-        if params.max_fps.enabled() && params.max_fps.need_reduce(src) {
+    // Frame-rate handling (R4 + R21 + `encode.zsh` v10.2.0).
+    //
+    // The decision comes from `MaxFpsConfig::decide` so the skip
+    // predicate, this argv and the result record can never disagree
+    // about whether the source was reduced.
+    //
+    //   Reduce      → `-r <cap> -fps_mode cfr`
+    //   Passthrough → `-fps_mode passthrough`
+    //   Disabled / Unknown → nothing
+    //
+    // `-fps_mode` is not optional: without it ffmpeg applies its own
+    // vsync behaviour and may duplicate or drop frames to reach the
+    // container's nominal frame rate — lossy for VFR sources.
+    match params.max_fps.decide(src_fps) {
+        FpsDecision::Reduce { target } => {
             argv.push("-r".to_string());
-            argv.push(params.max_fps.max_fps.to_string());
+            argv.push(target.to_string());
+            argv.push("-fps_mode".to_string());
+            argv.push("cfr".to_string());
         }
+        FpsDecision::Passthrough => {
+            argv.push("-fps_mode".to_string());
+            argv.push("passthrough".to_string());
+        }
+        FpsDecision::Disabled | FpsDecision::Unknown => {}
     }
 
     // User passthrough args.
-    argv.extend(params.extra_args.iter().cloned());
+    // User-supplied extra flags. Each `ExtraArg` has already been
+    // validated by `ExtraArg::parse` at the boundary (CLI parse or
+    // future TOML deserialize) — no runtime check needed here.
+    for arg in &params.extra_args {
+        argv.push(arg.as_argv());
+    }
 
     // Output path always last.
     argv.push(
@@ -129,7 +202,7 @@ mod tests {
 
     fn task(input: &str, output: &str) -> TranscodeTask {
         TranscodeTask {
-            input: PathBuf::from(input),
+            input: crate::types::InputPath::new(&PathBuf::from(input)).unwrap(),
             output: Some(PathBuf::from(output)),
         }
     }
@@ -206,13 +279,19 @@ mod tests {
             &params_disabled(),
             "libx264",
             Some(30.0),
+            &FfmpegArgsConfig::default(),
         );
+        // argv[0] = "ffmpeg", argv[1] = "-y" (hardcoded). Then
+        // FfmpegArgsConfig::default().pre_input (["-hide_banner",
+        // "-loglevel", "info", "-nostats"]) sits between `-y` and `-i`.
+        // Position-based lookups so a future pre_input change doesn't
+        // break this assertion.
         assert_eq!(argv[0], "ffmpeg");
         assert_eq!(argv[1], "-y");
-        assert_eq!(argv[2], "-i");
-        assert_eq!(argv[3], "/in.mp4");
-        assert_eq!(argv[4], "-c:v");
-        assert_eq!(argv[5], "libx264");
+        let i_pos = argv.iter().position(|s| s == "-i").expect("-i present");
+        assert_eq!(argv[i_pos + 1], "/in.mp4");
+        let cv_pos = argv.iter().position(|s| s == "-c:v").expect("-c:v present");
+        assert_eq!(argv[cv_pos + 1], "libx264");
     }
 
     #[test]
@@ -222,6 +301,7 @@ mod tests {
             &params_disabled(),
             "libx264",
             Some(30.0),
+            &FfmpegArgsConfig::default(),
         );
         assert_eq!(argv.last().unwrap(), "/out.mkv");
     }
@@ -232,10 +312,15 @@ mod tests {
         let mut params = params_disabled();
         params.max_fps = MaxFpsConfig {
             max_fps: 30.0,
-            eps: 0.05,
+            eps: 0.01,
         };
-        let argv =
-            build_ffmpeg_command(&task("/in.mp4", "/out.mkv"), &params, "libx264", Some(60.0));
+        let argv = build_ffmpeg_command(
+            &task("/in.mp4", "/out.mkv"),
+            &params,
+            "libx264",
+            Some(60.0),
+            &FfmpegArgsConfig::default(),
+        );
         let i_pos = argv.iter().position(|s| s == "-i").expect("-i present");
         let r_pos = argv.iter().position(|s| s == "-r").expect("-r present");
         let out_pos = argv.len() - 1;
@@ -251,26 +336,114 @@ mod tests {
     }
 
     #[test]
+    fn fps_mode_placed_after_i_and_before_output() {
+        // `-fps_mode` is an output option too (encode.zsh v10.2.0).
+        let mut params = params_disabled();
+        params.max_fps = MaxFpsConfig {
+            max_fps: 30.0,
+            eps: 0.01,
+        };
+        let argv = build_ffmpeg_command(
+            &task("/in.mp4", "/out.mkv"),
+            &params,
+            "libx264",
+            Some(60.0),
+            &FfmpegArgsConfig::default(),
+        );
+        let i_pos = argv.iter().position(|s| s == "-i").expect("-i present");
+        let f_pos = argv
+            .iter()
+            .position(|s| s == "-fps_mode")
+            .expect("-fps_mode present");
+        let out_pos = argv.len() - 1;
+        assert!(
+            i_pos < f_pos && f_pos < out_pos,
+            "-fps_mode must sit between -i and the output (got i_pos={i_pos}, f_pos={f_pos}, out_pos={out_pos})"
+        );
+    }
+
+    #[test]
+    fn cfr_when_source_exceeds_cap() {
+        let mut params = params_disabled();
+        params.max_fps = MaxFpsConfig {
+            max_fps: 30.0,
+            eps: 0.01,
+        };
+        let argv = build_ffmpeg_command(
+            &task("/in.mp4", "/out.mkv"),
+            &params,
+            "libx264",
+            Some(60.0),
+            &FfmpegArgsConfig::default(),
+        );
+        let f_pos = argv
+            .iter()
+            .position(|s| s == "-fps_mode")
+            .expect("-fps_mode present");
+        assert_eq!(argv[f_pos + 1], "cfr");
+    }
+
+    #[test]
+    fn passthrough_when_source_within_cap() {
+        let mut params = params_disabled();
+        params.max_fps = MaxFpsConfig {
+            max_fps: 30.0,
+            eps: 0.01,
+        };
+        let argv = build_ffmpeg_command(
+            &task("/in.mp4", "/out.mkv"),
+            &params,
+            "libx264",
+            Some(25.0),
+            &FfmpegArgsConfig::default(),
+        );
+        let f_pos = argv
+            .iter()
+            .position(|s| s == "-fps_mode")
+            .expect("-fps_mode present");
+        assert_eq!(argv[f_pos + 1], "passthrough");
+    }
+
+    #[test]
     fn no_r_when_src_fps_none() {
         // R21: src_fps=None means no -r even if cap is enabled.
         let mut params = params_disabled();
         params.max_fps = MaxFpsConfig {
             max_fps: 30.0,
-            eps: 0.05,
+            eps: 0.01,
         };
-        let argv = build_ffmpeg_command(&task("/in.mp4", "/out.mkv"), &params, "libx264", None);
+        let argv = build_ffmpeg_command(
+            &task("/in.mp4", "/out.mkv"),
+            &params,
+            "libx264",
+            None,
+            &FfmpegArgsConfig::default(),
+        );
         assert!(
             !argv.contains(&"-r".to_string()),
             "argv must not contain -r when src_fps is None"
+        );
+        assert!(
+            !argv.contains(&"-fps_mode".to_string()),
+            "argv must not contain -fps_mode when src_fps is None"
         );
     }
 
     #[test]
     fn no_r_when_max_fps_disabled() {
         let params = params_disabled(); // max_fps = 0.0 (disabled)
-        let argv =
-            build_ffmpeg_command(&task("/in.mp4", "/out.mkv"), &params, "libx264", Some(60.0));
+        let argv = build_ffmpeg_command(
+            &task("/in.mp4", "/out.mkv"),
+            &params,
+            "libx264",
+            Some(60.0),
+            &FfmpegArgsConfig::default(),
+        );
         assert!(!argv.contains(&"-r".to_string()));
+        assert!(
+            !argv.contains(&"-fps_mode".to_string()),
+            "argv must not contain -fps_mode when the cap is disabled"
+        );
     }
 
     #[test]
@@ -278,13 +451,14 @@ mod tests {
         let mut params = params_disabled();
         params.max_fps = MaxFpsConfig {
             max_fps: 30.0,
-            eps: 0.05,
+            eps: 0.01,
         };
         let argv = build_ffmpeg_command(
             &task("/in.mp4", "/out.mkv"),
             &params,
             "libx264",
             Some(25.0), // below cap
+            &FfmpegArgsConfig::default(),
         );
         assert!(!argv.contains(&"-r".to_string()));
     }
@@ -293,7 +467,13 @@ mod tests {
     fn crf_mode_emits_crf_flag() {
         let mut params = params_disabled();
         params.bitrate_or_crf = 45;
-        let argv = build_ffmpeg_command(&task("/in.mp4", "/out.mkv"), &params, "libsvtav1", None);
+        let argv = build_ffmpeg_command(
+            &task("/in.mp4", "/out.mkv"),
+            &params,
+            "libsvtav1",
+            None,
+            &FfmpegArgsConfig::default(),
+        );
         let crf_pos = argv.iter().position(|s| s == "-crf").expect("-crf present");
         assert_eq!(argv[crf_pos + 1], "45");
     }
@@ -303,7 +483,13 @@ mod tests {
         let mut params = params_disabled();
         params.format = VideoFormat::Av1;
         params.bitrate_or_crf = 45;
-        let argv = build_ffmpeg_command(&task("/in.mp4", "/out.mkv"), &params, "libsvtav1", None);
+        let argv = build_ffmpeg_command(
+            &task("/in.mp4", "/out.mkv"),
+            &params,
+            "libsvtav1",
+            None,
+            &FfmpegArgsConfig::default(),
+        );
         let preset_pos = argv
             .iter()
             .position(|s| s == "-preset")
@@ -318,7 +504,13 @@ mod tests {
         let mut params = params_disabled();
         params.format = VideoFormat::Av1;
         params.bitrate_or_crf = 45;
-        let argv = build_ffmpeg_command(&task("/in.mp4", "/out.mkv"), &params, "libaom-av1", None);
+        let argv = build_ffmpeg_command(
+            &task("/in.mp4", "/out.mkv"),
+            &params,
+            "libaom-av1",
+            None,
+            &FfmpegArgsConfig::default(),
+        );
         assert!(!argv.contains(&"-preset".to_string()));
         assert!(argv.contains(&"-crf".to_string()));
     }
@@ -329,9 +521,53 @@ mod tests {
         let mut params = params_disabled();
         params.format = VideoFormat::Av1;
         params.bitrate_or_crf = 45;
-        let argv = build_ffmpeg_command(&task("/in.mp4", "/out.mkv"), &params, "av1_nvenc", None);
+        let argv = build_ffmpeg_command(
+            &task("/in.mp4", "/out.mkv"),
+            &params,
+            "av1_nvenc",
+            None,
+            &FfmpegArgsConfig::default(),
+        );
         assert!(!argv.contains(&"-preset".to_string()));
+    }
+
+    #[test]
+    fn nvenc_uses_constant_quality_instead_of_crf() {
+        // NVENC's rate control is `-cq` (constant quality), not the
+        // x264/x265 CRF scale -- the two numbers mean different things.
+        // Matches encode.zsh's ENC_SPEC, where the nvenc rows are "cq"
+        // mode: `-cq N -b:v 0`.
+        let mut params = params_disabled();
+        params.format = VideoFormat::Av1;
+        params.bitrate_or_crf = 45;
+        let argv = build_ffmpeg_command(
+            &task("/in.mp4", "/out.mkv"),
+            &params,
+            "av1_nvenc",
+            None,
+            &FfmpegArgsConfig::default(),
+        );
+        assert!(!argv.contains(&"-crf".to_string()));
+        let cq_pos = argv.iter().position(|s| s == "-cq").expect("-cq present");
+        assert_eq!(argv[cq_pos + 1], "45");
+        let bv_pos = argv.iter().position(|s| s == "-b:v").expect("-b:v present");
+        assert_eq!(argv[bv_pos + 1], "0");
+    }
+
+    #[test]
+    fn software_encoder_keeps_crf() {
+        let mut params = params_disabled();
+        params.format = VideoFormat::Av1;
+        params.bitrate_or_crf = 45;
+        let argv = build_ffmpeg_command(
+            &task("/in.mp4", "/out.mkv"),
+            &params,
+            "libsvtav1",
+            None,
+            &FfmpegArgsConfig::default(),
+        );
         assert!(argv.contains(&"-crf".to_string()));
+        assert!(!argv.contains(&"-cq".to_string()));
     }
 
     #[test]
@@ -339,31 +575,55 @@ mod tests {
         let mut params = params_disabled();
         params.is_crf = false;
         params.bitrate_or_crf = 5000;
-        let argv = build_ffmpeg_command(&task("/in.mp4", "/out.mkv"), &params, "libx264", None);
+        let argv = build_ffmpeg_command(
+            &task("/in.mp4", "/out.mkv"),
+            &params,
+            "libx264",
+            None,
+            &FfmpegArgsConfig::default(),
+        );
         let bv_pos = argv.iter().position(|s| s == "-b:v").expect("-b:v present");
         assert_eq!(argv[bv_pos + 1], "5000k");
         assert!(!argv.contains(&"-crf".to_string()));
     }
 
     #[test]
-    fn audio_defaults_to_copy() {
+    fn audio_defaults_to_opus_32k() {
+        // Audio defaults to libopus @ 32k (transcode, not copy).
+        // Users override via params.extra_args if they need a
+        // different codec.
         let argv = build_ffmpeg_command(
             &task("/in.mp4", "/out.mkv"),
             &params_disabled(),
             "libx264",
             None,
+            &FfmpegArgsConfig::default(),
         );
         let ca_pos = argv.iter().position(|s| s == "-c:a").expect("-c:a present");
-        assert_eq!(argv[ca_pos + 1], "copy");
+        assert_eq!(argv[ca_pos + 1], "libopus");
+        let ba_pos = argv.iter().position(|s| s == "-b:a").expect("-b:a present");
+        assert_eq!(argv[ba_pos + 1], "32k");
     }
 
     #[test]
     fn extra_args_passed_through_before_output() {
         let mut params = params_disabled();
-        params.extra_args = vec!["-ss".to_string(), "10".to_string(), "-metadata".to_string()];
-        let argv = build_ffmpeg_command(&task("/in.mp4", "/out.mkv"), &params, "libx264", None);
+        // Build via ExtraArg::parse so the test exercises the
+        // type-level boundary (Vec<ExtraArg>, not Vec<String>).
+        params.extra_args = vec![
+            ExtraArg::parse("-ss").unwrap(),
+            ExtraArg::parse("scale=720:-1").unwrap(), // bare value form
+            ExtraArg::parse("-metadata").unwrap(),
+        ];
+        let argv = build_ffmpeg_command(
+            &task("/in.mp4", "/out.mkv"),
+            &params,
+            "libx264",
+            None,
+            &FfmpegArgsConfig::default(),
+        );
         let ss_pos = argv.iter().position(|s| s == "-ss").expect("-ss present");
-        assert_eq!(argv[ss_pos + 1], "10");
+        assert_eq!(argv[ss_pos + 1], "scale=720:-1");
         let out_pos = argv.len() - 1;
         // -ss should be before output (passed through near the end)
         assert!(ss_pos < out_pos);
@@ -378,9 +638,17 @@ mod tests {
             max_fps: 30.0,
             eps: 0.05,
         };
-        params.extra_args = vec!["-metadata".to_string(), "title=foo".to_string()];
-        let argv =
-            build_ffmpeg_command(&task("/in.mp4", "/out.mkv"), &params, "libx264", Some(60.0));
+        params.extra_args = vec![
+            ExtraArg::parse("-metadata").unwrap(),
+            ExtraArg::parse("title=foo").unwrap(),
+        ];
+        let argv = build_ffmpeg_command(
+            &task("/in.mp4", "/out.mkv"),
+            &params,
+            "libx264",
+            Some(60.0),
+            &FfmpegArgsConfig::default(),
+        );
         let r_pos = argv.iter().position(|s| s == "-r").unwrap();
         let meta_pos = argv.iter().position(|s| s == "-metadata").unwrap();
         let out_pos = argv.len() - 1;

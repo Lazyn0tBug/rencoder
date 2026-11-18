@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "rencoder_lib",
     "rencoder_cli",
+    "rencoder_ui",
 ]
 
 [workspace.package]

@@ -5,7 +5,8 @@
 //! - rotating file under `<app_dir>/log/` (U18; `$RENENCODER_LOG_DIR` overrides)
 //!   default 10 MB, 7 days
 //!
-//! `tracing-log` bridges the library's `log` events into tracing.
+//! v1.2 follow-up #4: lib emits `tracing` events directly (was
+//! `log` bridged via `tracing-log`). The bridge is dropped here.
 //!
 //! Span events are enabled so each `info!` / `warn!` carries the span
 //! context (function name + entered spans). `#[instrument]` annotations
@@ -25,9 +26,6 @@ use crate::file_sink::FileSink;
 /// clean error message instead of panicking.
 pub fn init() -> anyhow::Result<()> {
     use anyhow::Context;
-
-    // Bridge log -> tracing so library events flow through our subscriber.
-    let _ = tracing_log::LogTracer::init();
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 

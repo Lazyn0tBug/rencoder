@@ -1,0 +1,50 @@
+[package]
+name = "rencoder_ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Dioxus desktop GUI for Rencoder (U21)."
+publish = false
+
+[dependencies]
+rencoder_lib = { path = "../rencoder_lib" }
+dioxus = { version = "0.6", features = ["desktop"] }
+dioxus-hooks = "0.6"
+crossbeam-channel = "0.5"
+# `rfd` (Rusty File Dialog) drives the native folder picker behind
+# `DirPicker` (§3.8.7). Default features pull in the platform backend
+# (rfd uses NSOpenPanel on macOS, IFileDialog on Windows, zenity /
+# kdialog / xdg-desktop-portal on Linux).
+#
+# v1.2 (review #133 follow-up): use `rfd::AsyncFileDialog` (not
+# the sync `FileDialog`). The sync version blocks the Dioxus
+# main thread for the entire duration the user spends in the
+# folder picker — the UI freezes (no re-renders, can't click
+# Exit, no animations). The async version returns a future;
+# we spawn it on tokio and dispatch the result back via
+# state.with_mut() when it resolves.
+rfd = "0.14"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# Unified logging (§3.8.7.5): v1.2 follow-up #4 — lib emits via
+# `tracing` directly (was `log` bridged via `tracing-log`). UI
+# consumes lib events the same way it consumes its own tracing
+# events — single subscriber, no bridge layer. Custom MakeWriter
+# pushes lines into `state.log` via crossbeam channel.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Toaster's auto-dismiss loop uses tokio::time::sleep inside
+# a `use_future` block. Dioxus 0.6 already pulls tokio in as a
+# transitive dep, but doesn't re-export it; we add it here for
+# direct use. Only the `time` feature is needed.
+tokio = { version = "1", features = ["time"] }
+
+[[bin]]
+name = "rencoder-ui"
+path = "src/main.rs"
+
+# Opt into cargo-dist. `publish = false` (U21) makes cargo-dist
+# skip this package by default; `dist = true` overrides. The CLI
+# is auto-detected (publish = true), the lib has no `[[bin]]`,
+# and the UI is the third package needing explicit opt-in.
+[package.metadata.dist]
+dist = true

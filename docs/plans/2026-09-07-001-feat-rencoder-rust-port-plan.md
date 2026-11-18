@@ -41,8 +41,8 @@ Traced from `docs/smart_code.md` §8 (21 confirmation items). All confirmed by t
 | R10 | `collect_files` uses `walkdir`, does not follow symlinks, does not depend on `fd`. |
 | R11 | Parallel analysis uses `rayon`; no `xargs`. |
 | R12 | NVIDIA detection is `--nv` AND `nvidia-smi -L` reporting a GPU. No `ffmpeg -encoders` inference. |
-| R13 | `ProcessOutput::Inherit` is default; `Piped` for the future GUI. |
-| R14 | Signal handling uses `ctrlc` plus `parking_lot::Mutex`. |
+| R13 | `ProcessOutput::Inherit` is default; `Piped` for the future GUI (kept; §3.8 GUI currently bypasses via `cmd.spawn()`). |
+| R14 | Signal handling uses `ctrlc` plus `parking_lot::Mutex` (cross-platform incl. Windows console events). |
 | R15 | `EncodeError` is `#[non_exhaustive]`. |
 | R16 | `FpsStats::new(total_files)` initializes the total count. |
 | R17 | The `c-probe` FFI bridge is stateless, re-entrant, and `rayon`-safe. |
@@ -254,7 +254,7 @@ The `-r` block is the single most error-prone position; the unit test in U5 must
 
 ### U8. CLI core: args + signal + logging
 
-- **Goal**: `clap`-derived args for `encode` and `analyze` subcommands; `ctrlc` handler that cleans up partial output; `env_logger` initialization.
+- **Goal**: `clap`-derived args for `encode` and `analyze` subcommands; `ctrlc`c` handler that cleans up partial output; `env_logger` initialization.
 - **Requirements**: R13, R14, R19.
 - **Dependencies**: U1.
 - **Files**:
@@ -336,14 +336,14 @@ The `-r` block is the single most error-prone position; the unit test in U5 must
   - 100 concurrent calls from `rayon` complete without UB (run under Miri or thread sanitizer if available).
 - **Verification**: `cargo test -p rencoder_lib --features c-probe` passes; `cargo build --features c-probe --release` succeeds on Linux and macOS.
 
-### U14. GUI prototype (optional, deferred)
+### U14. GUI prototype — SUPERSEDED by design.md §3.8
 
-- **Goal**: A standalone GUI process that uses `ProcessOutput::Piped` (R13) to drive a live progress UI.
-- **Requirements**: R13.
-- **Dependencies**: U8 (uses the same library surface).
-- **Files**: outside this workspace for now; a separate `rencoder_gui` crate.
-- **Approach**: Pick the GUI framework later (Tauri vs egui vs Slint); the only library contract is that `ProcessOutput::Piped` returns stdout/stderr streams that the GUI can attach to.
-- **Status**: deferred — origin marks Phase 17 as "optional". This plan leaves the library surface ready but does not scaffold the GUI.
+The original plan deferred this to a separate crate with a future framework choice. The implementation now lives in `rencoder_ui` (Dioxus desktop 0.6) with an actor model (Command/Event protocol). See **`docs/design.md` §3.8** for the committed design — supersedes this section.
+
+- **Goal**: superseded.
+- **Requirements**: R13 (Piped variant kept but unused by GUI; §3.8 uses `cmd.spawn()` instead).
+- **Files**: third workspace crate `rencoder_ui` (per §3.1 / §3.8).
+- **Approach**: Dioxus desktop 0.6, actor model with `mpsc` Command/Event channel (see §3.8.3–§3.8.6).
 
 ## Scope Boundaries
 

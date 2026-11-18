@@ -115,26 +115,44 @@ fn top_level_help_prints_subcommands() {
 fn encode_help_prints_options() {
     // U17 CLI surface: target (-f/-d), interactive, config path,
     // output path, passthrough. Format / bitrate / max-fps / crf /
-    // nv / ext have moved to the config file.
+    // ext have moved to the config file. `nv` is the deliberate
+    // exception -- the CLI can override it per run.
     let out = run(&["encode", "--help"]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for opt in ["--file", "--dir", "--config", "--output"] {
+    for opt in ["--file", "--dir", "--config", "--output", "--nv", "--no-nv"] {
         assert!(stdout.contains(opt), "expected {opt} in encode help");
     }
-    for removed in [
-        "--format",
-        "--bitrate",
-        "--max-fps",
-        "--nv",
-        "--crf",
-        "--ext",
-    ] {
+    for removed in ["--format", "--bitrate", "--max-fps", "--crf", "--ext"] {
         assert!(
             !stdout.contains(removed),
             "{removed} should have moved to config"
         );
     }
+}
+
+#[test]
+fn detect_subcommand_prints_a_report() {
+    // Writes the capability record next to the binary (the app dir);
+    // that is the point of the command.
+    let out = run(&["detect"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("NVENC capability"), "got: {stdout}");
+    assert!(stdout.contains("ffmpeg"), "got: {stdout}");
+}
+
+#[test]
+fn detect_flag_appears_in_the_help() {
+    let out = run(&["--help"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("--detect"), "expected --detect in help");
+    assert!(stdout.contains("detect"), "expected the detect subcommand");
 }
 
 #[test]

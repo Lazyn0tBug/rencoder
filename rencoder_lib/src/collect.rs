@@ -4,36 +4,63 @@
 //! the given extension allowlist. Symlinks are never followed (R10) so a
 //! loop in the filesystem doesn't recurse forever.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
 use crate::error::EncodeError;
-use crate::types::Target;
+use crate::types::{InputPath, Target};
 
-/// Collect input files for a transcode batch.
+/// Collect input files for a transcode batch, wrapped in [`InputPath`]
+/// (review #109 type-level boundary — dash-prefixed filenames are
+/// rejected at construction so ffmpeg can never parse them as options).
 ///
-/// - `Target::File(p)` returns `[p]` if `p` exists as a file and matches
-///   the extension filter (empty extensions = match all).
-/// - `Target::Dir(root)` walks the tree without following symlinks, returns
-///   every regular file that matches the filter.
+/// - `Target::File(p)` returns `[InputPath::new(p)]` if `p` exists as a
+///   file and matches the extension filter (empty extensions = match
+///   all). Bad paths are skipped with a warning.
+/// - `Target::Dir(root)` walks the tree without following symlinks,
+///   returns every regular file matching the filter, wrapped in
+///   `InputPath`. Dash-prefixed files are skipped with a warning.
 ///
-/// `extensions` is a case-insensitive allowlist; an empty slice means "all
-/// files".
-pub fn collect_files(target: &Target, extensions: &[String]) -> Result<Vec<PathBuf>, EncodeError> {
+/// `extensions` is a case-insensitive allowlist; an empty slice means
+/// "all files".
+///
+/// v1.2 follow-up #5: `max_batch_size` caps the result vec length.
+/// `collect_dir` short-circuits once `max + 1` files are seen so a
+/// misclicked root (`/`, `~`) doesn't allocate a giant Vec before
+/// bailing. `collect_single_file` (target = a single file) ignores
+/// the cap — passing a single path through the same limit would
+/// break the CLI `encode -f foo.mp4` UX.
+pub fn collect_files(
+    target: &Target,
+    extensions: &[String],
+    max_batch_size: u32,
+) -> Result<Vec<InputPath>, EncodeError> {
     match target {
         Target::File(p) => Ok(collect_single_file(p, extensions)),
-        Target::Dir(root) => collect_dir(root, extensions),
+        Target::Dir(root) => collect_dir(root, extensions, max_batch_size),
     }
 }
 
-fn collect_single_file(p: &Path, extensions: &[String]) -> Vec<PathBuf> {
+fn collect_single_file(p: &Path, extensions: &[String]) -> Vec<InputPath> {
     if p.is_file() && matches_extension(p, extensions) {
-        vec![p.to_path_buf()]
+        match InputPath::new(p) {
+            Ok(ip) => vec![ip],
+            Err(e) => {
+                tracing::warn!(path = %p.display(), error = %e, "skipping file");
+                vec![]
+            }
+        }
     } else {
         vec![]
     }
 }
 
-fn collect_dir(root: &Path, extensions: &[String]) -> Result<Vec<PathBuf>, EncodeError> {
+fn collect_dir(
+    root: &Path,
+    extensions: &[String],
+    max_batch_size: u32,
+) -> Result<Vec<InputPath>, EncodeError> {
     let mut results = Vec::new();
     let walker = walkdir::WalkDir::new(root).follow_links(false);
     for entry in walker {
@@ -45,7 +72,38 @@ fn collect_dir(root: &Path, extensions: &[String]) -> Result<Vec<PathBuf>, Encod
         // follow_links(false) walkdir reports symlinks with is_file()=false,
         // is_symlink()=true -- exactly what we want.
         if entry.file_type().is_file() && matches_extension(path, extensions) {
-            results.push(path.to_path_buf());
+            // Review fix #109 (type-level boundary): the runtime
+            // dash-prefix check that used to live here is gone. Each
+            // entry goes through `InputPath::new`, which rejects
+            // dash-prefixed filenames at construction time. The
+            // rejection surfaces as a warn-and-skip, matching the
+            // v1 collect_dir behavior.
+            match InputPath::new(path) {
+                Ok(ip) => {
+                    // v1.2 follow-up #5: cap. Check BEFORE pushing so
+                    // we never allocate beyond `max_batch_size + 1`
+                    // InputPath wrappers. The +1 lets `count` in the
+                    // error carry "you had at least `max + 1`" — the
+                    // user knows they overshot by 1+.
+                    //
+                    // v1.2 follow-up #5 fix: compare in `usize` (the
+                    // count's natural type), not `as u32`. A 64-bit
+                    // `walkdir` walk over a pathological root could
+                    // push `results.len() > u32::MAX`; the cast
+                    // would truncate, the comparison would misfire,
+                    // and the cap would never trip. Promoting
+                    // `max_batch_size` to usize is safe (u32 always
+                    // fits) and avoids the silent truncation.
+                    if results.len() >= max_batch_size as usize {
+                        return Err(EncodeError::BatchTooLarge {
+                            count: results.len() + 1,
+                            max: max_batch_size,
+                        });
+                    }
+                    results.push(ip);
+                }
+                Err(e) => tracing::warn!(path = %path.display(), error = %e, "skipping file"),
+            }
         }
     }
     Ok(results)
@@ -98,15 +156,16 @@ mod tests {
     fn file_target_with_matching_extension_is_collected() {
         let dir = fixture_dir("file_match");
         let f = touch(&dir, "movie.mp4");
-        let files = collect_files(&Target::File(f.clone()), &["mp4".into()]).unwrap();
-        assert_eq!(files, vec![f]);
+        let files = collect_files(&Target::File(f.clone()), &["mp4".into()], u32::MAX).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].as_path(), f);
     }
 
     #[test]
     fn file_target_with_non_matching_extension_is_skipped() {
         let dir = fixture_dir("file_miss");
         let f = touch(&dir, "movie.txt");
-        let files = collect_files(&Target::File(f.clone()), &["mp4".into()]).unwrap();
+        let files = collect_files(&Target::File(f.clone()), &["mp4".into()], u32::MAX).unwrap();
         assert!(files.is_empty());
     }
 
@@ -114,8 +173,25 @@ mod tests {
     fn file_target_with_empty_extensions_always_matches() {
         let dir = fixture_dir("file_empty");
         let f = touch(&dir, "anything.xyz");
-        let files = collect_files(&Target::File(f.clone()), &[]).unwrap();
-        assert_eq!(files, vec![f]);
+        let files = collect_files(&Target::File(f.clone()), &[], u32::MAX).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].as_path(), f);
+    }
+
+    #[test]
+    fn dir_target_skips_files_with_dash_prefixed_names() {
+        // Review fix #109 (type-level boundary): filenames starting
+        // with `-` are rejected by `InputPath::new` at construction
+        // time. collect_dir sees the rejection and skips with a
+        // warning; the runtime dash-prefix check that used to live
+        // here is gone.
+        let dir = fixture_dir("dir_dash");
+        let good = touch(&dir, "movie.mp4");
+        let bad = touch(&dir, "-vf_negate.mp4");
+        let files = collect_files(&Target::Dir(dir), &["mp4".into()], u32::MAX).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].as_path(), good);
+        assert!(!files.iter().any(|ip| ip.as_path() == bad));
     }
 
     #[test]
@@ -123,6 +199,7 @@ mod tests {
         let files = collect_files(
             &Target::File(PathBuf::from("/nonexistent/never.mp4")),
             &["mp4".into()],
+            u32::MAX,
         )
         .unwrap();
         assert!(files.is_empty());
@@ -132,8 +209,9 @@ mod tests {
     fn file_target_extension_match_is_case_insensitive() {
         let dir = fixture_dir("file_case");
         let f = touch(&dir, "movie.MP4");
-        let files = collect_files(&Target::File(f.clone()), &["mp4".into()]).unwrap();
-        assert_eq!(files, vec![f]);
+        let files = collect_files(&Target::File(f.clone()), &["mp4".into()], u32::MAX).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].as_path(), f);
     }
 
     // ---- directory target ----
@@ -144,11 +222,16 @@ mod tests {
         touch(&dir, "a.mp4");
         touch(&dir, "b.txt");
         touch(&dir, "c.mkv");
-        let files =
-            collect_files(&Target::Dir(dir.clone()), &["mp4".into(), "mkv".into()]).unwrap();
+        let files = collect_files(
+            &Target::Dir(dir.clone()),
+            &["mp4".into(), "mkv".into()],
+            u32::MAX,
+        )
+        .unwrap();
         assert_eq!(files.len(), 2);
-        assert!(files.iter().all(|p| {
-            p.extension()
+        assert!(files.iter().all(|ip| {
+            ip.as_path()
+                .extension()
                 .and_then(|e| e.to_str())
                 .is_some_and(|e| e == "mp4" || e == "mkv")
         }));
@@ -160,14 +243,14 @@ mod tests {
         touch(&dir, "a.mp4");
         touch(&dir, "b.txt");
         touch(&dir, "c.bin");
-        let files = collect_files(&Target::Dir(dir.clone()), &[]).unwrap();
+        let files = collect_files(&Target::Dir(dir.clone()), &[], u32::MAX).unwrap();
         assert_eq!(files.len(), 3);
     }
 
     #[test]
     fn dir_empty_returns_empty() {
         let dir = fixture_dir("dir_empty");
-        let files = collect_files(&Target::Dir(dir.clone()), &["mp4".into()]).unwrap();
+        let files = collect_files(&Target::Dir(dir.clone()), &["mp4".into()], u32::MAX).unwrap();
         assert!(files.is_empty());
     }
 
@@ -178,7 +261,7 @@ mod tests {
         fs::create_dir_all(&sub).unwrap();
         touch(&dir, "a.mp4");
         touch(&sub, "b.mp4");
-        let files = collect_files(&Target::Dir(dir.clone()), &["mp4".into()]).unwrap();
+        let files = collect_files(&Target::Dir(dir.clone()), &["mp4".into()], u32::MAX).unwrap();
         assert_eq!(files.len(), 2);
     }
 
@@ -198,10 +281,10 @@ mod tests {
             let _ = link;
             return;
         }
-        let files = collect_files(&Target::Dir(dir.clone()), &["mp4".into()]).unwrap();
+        let files = collect_files(&Target::Dir(dir.clone()), &["mp4".into()], u32::MAX).unwrap();
         assert_eq!(files.len(), 1);
-        assert!(files.contains(&real));
-        assert!(!files.contains(&link));
+        assert!(files.iter().any(|ip| ip.as_path() == real));
+        assert!(!files.iter().any(|ip| ip.as_path() == link));
     }
 
     #[test]
@@ -222,7 +305,7 @@ mod tests {
             let _ = link;
             return;
         }
-        let files = collect_files(&Target::Dir(dir.clone()), &["mp4".into()]).unwrap();
+        let files = collect_files(&Target::Dir(dir.clone()), &["mp4".into()], u32::MAX).unwrap();
         // outer.mp4 + inner.mp4; the symlink should NOT cause the walk to
         // revisit outer.mp4 a second time.
         assert_eq!(files.len(), 2);
@@ -234,7 +317,72 @@ mod tests {
         touch(&dir, "a.MP4");
         touch(&dir, "b.mp4");
         touch(&dir, "c.Mp4");
-        let files = collect_files(&Target::Dir(dir.clone()), &["mp4".into()]).unwrap();
+        let files = collect_files(&Target::Dir(dir.clone()), &["mp4".into()], u32::MAX).unwrap();
         assert_eq!(files.len(), 3);
+    }
+
+    // ---- v1.2 follow-up #5: batch size cap ----
+
+    #[test]
+    fn dir_cap_short_circuits_at_max_plus_one() {
+        // Create `max_batch_size + 5` files but cap at `max_batch_size`.
+        // collect_dir must return Err(BatchTooLarge { count, max })
+        // with count = max_batch_size + 1 (the first one past the cap).
+        let dir = fixture_dir("dir_cap");
+        let max = 5_u32;
+        for i in 0..(max + 5) {
+            touch(&dir, &format!("movie_{i}.mp4"));
+        }
+        let err = collect_files(&Target::Dir(dir.clone()), &["mp4".into()], max)
+            .expect_err("expected BatchTooLarge");
+        match err {
+            EncodeError::BatchTooLarge { count, max: m } => {
+                assert_eq!(m, max);
+                // count is max + 1 — the loop trips on the max+1-th
+                // entry. (We never allocate beyond max+1 because the
+                // check runs before the push.)
+                assert_eq!(count as u32, max + 1);
+            }
+            _ => panic!("expected BatchTooLarge, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn dir_cap_at_exact_boundary_succeeds() {
+        // Exactly `max_batch_size` files should pass through; the
+        // check is `results.len() >= max` so `== max` is still OK.
+        let dir = fixture_dir("dir_cap_exact");
+        let max = 3_u32;
+        for i in 0..max {
+            touch(&dir, &format!("m_{i}.mp4"));
+        }
+        let files = collect_files(&Target::Dir(dir), &["mp4".into()], max).expect("at boundary");
+        assert_eq!(files.len() as u32, max);
+    }
+
+    #[test]
+    fn dir_cap_one_over_boundary_fails() {
+        // `max + 1` files should trip the cap.
+        let dir = fixture_dir("dir_cap_over");
+        let max = 3_u32;
+        for i in 0..(max + 1) {
+            touch(&dir, &format!("m_{i}.mp4"));
+        }
+        let err = collect_files(&Target::Dir(dir), &["mp4".into()], max)
+            .expect_err("expected BatchTooLarge");
+        assert!(matches!(err, EncodeError::BatchTooLarge { .. }));
+    }
+
+    #[test]
+    fn file_target_ignores_cap() {
+        // Single-file target should pass even if `max = 0` — `encode
+        // -f foo.mp4` is a deliberate user choice. (Avoids breaking
+        // the CLI UX for one-off encodes.)
+        let dir = fixture_dir("file_ignore_cap");
+        let f = touch(&dir, "movie.mp4");
+        let files = collect_files(&Target::File(f.clone()), &["mp4".into()], 0)
+            .expect("single file bypasses cap");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].as_path(), f);
     }
 }

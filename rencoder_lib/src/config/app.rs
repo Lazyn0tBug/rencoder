@@ -33,7 +33,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::fs_perms;
 use crate::types::VideoFormat;
@@ -76,13 +76,23 @@ crf = 45
 # Default: 0.
 max_fps = 30
 
-# Enable NVIDIA hardware acceleration via NVENC. Falls back silently
-# to software encoding when nvidia-smi is missing or no GPU is detected.
+# Enable NVIDIA hardware acceleration via NVENC. When enabled, the NVENC
+# encoders this machine can actually run are detected by a capability probe
+# (a 1-frame test encode); unavailable ones fall back to software encoding
+# with a warning. The CLI's --nv / --no-nv overrides this setting.
 # Default: false.
 nv = false
 
 # Extension filter for `encode -d DIR`. Empty list = all files.
 extensions = ["mp4", "mov", "avi"]
+
+# Cap on number of input files per batch (v1.2 follow-up #5).
+# `collect_files` short-circuits at `max_batch_size + 1` so a
+# misclicked root (`/`, `~`) doesn't allocate a giant Vec of
+# InputPath. Default 5000 covers realistic batches; CI / one-off
+# runs can override via RENENCODER_MAX_BATCH_SIZE. Set to 1+
+# (0 is rejected — use a large number to effectively disable).
+# max_batch_size = 5000
 
 # Optional: directory where encoded outputs land. Not wired yet (output
 # paths are computed per-input); reserved for a future stage where
@@ -111,7 +121,7 @@ parallel = true
 
 /// Top-level user-facing config. Both sections are optional; missing
 /// sections fall back to their per-action defaults.
-#[derive(Debug, Default, Deserialize, PartialEq)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     #[serde(default)]
@@ -123,11 +133,66 @@ pub struct AppConfig {
 /// Default CRF value (libsvtav1 medium quality). Sentinel `0` switches
 /// to bitrate mode at the ffmpeg CLI layer; this default keeps the
 /// quality mode unless the user explicitly opts out.
+///
+/// Used by both the `#[serde(default = "...")]` attribute on
+/// `EncodeConfig::crf` (so a missing TOML key deserializes to 45) AND
+/// by the manual `Default` impl on `EncodeConfig` (so the in-memory
+/// `EncodeConfig::default()` matches the deserialized value). Without
+/// the manual impl, `Default` would fall through to `u32::default() = 0`
+/// — flipping `is_crf` to false and silently switching to bitrate mode.
 fn default_crf() -> u32 {
     45
 }
 
-#[derive(Debug, Default, Deserialize, PartialEq)]
+/// v1.2 follow-up #5: `collect_files` short-circuits at `max + 1` to
+/// protect against misclicked roots. Default 5000; override via
+/// `RENENCODER_MAX_BATCH_SIZE` env var (CI / one-off large runs).
+pub fn default_max_batch_size() -> u32 {
+    5000
+}
+
+/// Resolve the effective batch size cap.
+///
+/// Precedence (highest first):
+/// 1. `RENENCODER_MAX_BATCH_SIZE` env var — for CI / one-off
+///    overrides where editing `rencoder.toml` is impractical.
+///    Parse failures (non-numeric, empty, or `0`) emit a
+///    `tracing::warn!` and fall through to the next tier — the
+///    `0` case is rejected because `collect_dir` treats 0 as
+///    "every file rejected" (would always trip on entry #1).
+/// 2. `encode.max_batch_size` from the loaded config — the
+///    TOML override for normal users.
+/// 3. [`default_max_batch_size()`] — the lib default.
+///
+/// Centralised here so CLI (encode + analyze) and UI agree on
+/// precedence. Previously each site repeated the chain inline and
+/// the UI didn't read the env var at all (CI inconsistency).
+pub fn resolve_max_batch_size(encode: Option<&EncodeConfig>) -> u32 {
+    if let Some(s) = std::env::var_os("RENENCODER_MAX_BATCH_SIZE") {
+        match s.to_string_lossy().parse::<u32>() {
+            Ok(0) => {
+                tracing::warn!(
+                    "RENENCODER_MAX_BATCH_SIZE=0 is not allowed \
+                     (every file would trip the cap); using config or default"
+                );
+            }
+            Ok(n) => return n,
+            Err(e) => {
+                tracing::warn!(
+                    value = %s.to_string_lossy(),
+                    error = %e,
+                    "RENENCODER_MAX_BATCH_SIZE failed to parse; \
+                     using config or default"
+                );
+            }
+        }
+    }
+    encode
+        .map(|e| e.max_batch_size)
+        .unwrap_or_else(default_max_batch_size)
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct EncodeConfig {
     pub format: Option<FormatArg>,
@@ -144,13 +209,96 @@ pub struct EncodeConfig {
     /// or one of the documented set (24, 25, 30, 60). Other values are
     /// rejected at config-load time.
     pub max_fps: Option<u32>,
+    /// Enable NVIDIA hardware acceleration. When true, the NVENC
+    /// encoders this machine can actually run are determined by a
+    /// capability probe; unavailable ones fall back to software
+    /// encoding with a warning. The CLI's `--nv` / `--no-nv` overrides
+    /// this setting.
     pub nv: Option<bool>,
     pub extensions: Option<Vec<String>>,
+    /// v1.2 follow-up #5: hard cap on input files per batch.
+    /// `collect_files` returns `BatchTooLarge` once this is exceeded
+    /// (short-circuits at `max + 1` so memory stays bounded even
+    /// if the user picks `/` or `~`). Default 5000.
+    #[serde(default = "default_max_batch_size")]
+    pub max_batch_size: u32,
     pub output_dir: Option<PathBuf>,
     pub encoders: Option<EncodersConfig>,
+    /// ffmpeg argv construction knobs. Most of the previously hardcoded
+    /// flags move here so users can override the encoder/preset chain
+    /// without forking the binary. `build_ffmpeg_command` interpolates
+    /// only `ffmpeg`, `-y`, `-i`, the input path, and the output path;
+    /// everything else comes from these lists. (See review fix #1:
+    /// the path-injection surface is now the *only* Rust-concatenated
+    /// raw string in the argv.)
+    #[serde(default)]
+    pub ffmpeg_args: FfmpegArgsConfig,
 }
 
-#[derive(Debug, Default, Deserialize, PartialEq)]
+/// Ffmpeg argv construction knobs (Tiers follow-up review). All four
+/// lists are interpolated verbatim by `build_ffmpeg_command`; flags
+/// must already be valid for the chosen encoder.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FfmpegArgsConfig {
+    /// Flags before `-i <input>`. Default: `["-y", "-hide_banner",
+    /// "-loglevel", "info", "-nostats"]`.
+    pub pre_input: Vec<String>,
+    /// Flags after `-i <input>` and before any rate-control flags.
+    /// Default: `[]` (caller appends `-c:v`, `-crf`, audio, etc. via
+    /// their own knobs below).
+    pub post_input: Vec<String>,
+    /// `-preset` value when the libsvtav1 fallback is taken. Default:
+    /// `None` — the lib falls back to `"6"` (libsvtav1 medium).
+    pub default_preset: Option<String>,
+    /// Audio codec passed to `-c:a <codec>`. Default: `Some("libopus")`.
+    pub default_audio_codec: Option<String>,
+    /// Audio bitrate passed to `-b:a <bitrate>`. Default: `Some("32k")`.
+    pub default_audio_bitrate: Option<String>,
+}
+
+impl Default for FfmpegArgsConfig {
+    fn default() -> Self {
+        Self {
+            pre_input: vec![
+                "-y".into(),
+                "-hide_banner".into(),
+                "-loglevel".into(),
+                "info".into(),
+                "-nostats".into(),
+            ],
+            post_input: vec![],
+            default_preset: None,
+            default_audio_codec: Some("libopus".into()),
+            default_audio_bitrate: Some("32k".into()),
+        }
+    }
+}
+
+// Manual `Default` so the in-memory default matches the TOML
+// deserialization default. `#[derive(Default)]` would use `u32::default()
+// = 0` for `crf`, flipping `is_crf` to false and silently switching
+// to bitrate mode. The doc on `default_crf` explains the why.
+impl Default for EncodeConfig {
+    fn default() -> Self {
+        Self {
+            format: None,
+            bitrate: None,
+            crf: default_crf(),
+            max_fps: None,
+            nv: None,
+            extensions: None,
+            // v1.2 follow-up #5: must match `default_max_batch_size()`
+            // (serde runs that fn when the field is missing in TOML).
+            max_batch_size: default_max_batch_size(),
+            output_dir: None,
+            encoders: None,
+            ffmpeg_args: FfmpegArgsConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AnalyzeConfig {
     pub format: Option<AnalyzeFormatArg>,
@@ -159,7 +307,7 @@ pub struct AnalyzeConfig {
     pub output: Option<PathBuf>,
 }
 
-#[derive(Debug, Default, Deserialize, PartialEq)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct EncodersConfig {
     pub av1: Option<String>,
@@ -183,11 +331,11 @@ impl AppConfig {
             let content = DEFAULT_CONFIG_TOML;
             write_atomic(path, content.as_bytes())?;
             // Surface auto-create via the project's log infrastructure
-            // (design doc §2.3: lib uses `log`, CLI bridges via
-            // `tracing-log`). User can silence via RUST_LOG.
-            log::info!(
-                "rencoder: created {} (no config found; edit to customize)",
-                path.display()
+            // v1.2 follow-up #4: lib uses `tracing` directly (was `log`).
+            // User can silence via RUST_LOG.
+            tracing::info!(
+                config_path = %path.display(),
+                "rencoder: created default config (no config found; edit to customize)"
             );
             // Re-parse the constant as a self-consistency check: catches
             // drift between DEFAULT_CONFIG_TOML and the schema. If the
@@ -200,6 +348,22 @@ impl AppConfig {
         let cfg: Self = toml::from_str(&raw)?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Save this config back to `path` (typically the path that
+    /// [`AppConfig::load`] read from). Uses the same atomic tmp +
+    /// rename pattern as the auto-create path in `load`, so a
+    /// concurrent reader either sees the old file or the new one
+    /// — never half-written bytes.
+    ///
+    /// Returns `ConfigError::TomlSer` if the in-memory config can't
+    /// be serialized (e.g. invalid `format` enum). The error is
+    /// raised from `save` rather than from a future editor so the
+    /// UI surfaces it next to the Save button rather than at
+    /// arbitrary edit time.
+    pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
+        let toml = toml::to_string_pretty(self)?;
+        write_atomic(path, toml.as_bytes())
     }
 
     /// Validate that all set values are sensible. Today this checks
@@ -230,12 +394,23 @@ impl AppConfig {
                     value: enc.crf.to_string(),
                 });
             }
+            // v1.2 follow-up #5: `0` would disable the cap entirely,
+            // which contradicts the doc's "0 is rejected" guidance.
+            // We reject 0 outright so users who want "no cap" must
+            // pick an explicit large number (defense in depth against
+            // accidentally picking a root dir).
+            if enc.max_batch_size == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "encode.max_batch_size".into(),
+                    value: "0".into(),
+                });
+            }
         }
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum FormatArg {
     X264,
@@ -259,7 +434,7 @@ impl From<FormatArg> for VideoFormat {
 /// `AnalyzeFormatArg` (defined in `rencoder_cli/src/args.rs`) but with
 /// serde-derived `Deserialize` for TOML. The two stay in sync; a small
 /// mapping in `main.rs` is the bridge.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum AnalyzeFormatArg {
     Csv,
@@ -274,6 +449,8 @@ pub enum ConfigError {
     Io(#[from] std::io::Error),
     #[error("toml parse error: {0}")]
     Toml(#[from] toml::de::Error),
+    #[error("toml serialize error: {0}")]
+    TomlSer(#[from] toml::ser::Error),
     #[error("invalid value for {field}: {value}")]
     InvalidValue { field: String, value: String },
 }
@@ -311,14 +488,23 @@ fn write_atomic(path: &Path, content: &[u8]) -> Result<(), ConfigError> {
     result
 }
 
-/// Tmp path: `<target>.tmp` in the same directory. Falls back to a
-/// stable sibling if `path` has no usable file_name (shouldn't happen
+/// Tmp path: `<target>.<pid>.tmp` in the same directory. Falls back to
+/// a stable sibling if `path` has no usable file_name (shouldn't happen
 /// for normal config paths, but defensive).
+///
+/// The pid is part of the name on purpose: the config auto-create can
+/// run in several processes at once (the CLI integration tests spawn
+/// the binary in parallel; the GUI and the CLI can share an app dir).
+/// With a fixed `<target>.tmp` name, one process renames the file away
+/// while another's rename is still pending, and the loser fails with
+/// ENOENT -- "failed to load config from ...". Distinct names per
+/// process make the race harmless: both write the same content, the
+/// last rename wins.
 fn tmp_path_for(path: &Path) -> PathBuf {
     let mut tmp = path.to_path_buf();
     let name = match path.file_name() {
-        Some(n) => format!("{}.tmp", n.to_string_lossy()),
-        None => "rencoder.tmp".to_string(),
+        Some(n) => format!("{}.{}.tmp", n.to_string_lossy(), std::process::id()),
+        None => format!("rencoder.{}.tmp", std::process::id()),
     };
     tmp.set_file_name(name);
     tmp
@@ -330,6 +516,69 @@ mod tests {
 
     fn unique_temp_dir(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("rencoder_test_{label}_{}", std::process::id()))
+    }
+
+    #[test]
+    fn save_roundtrip_preserves_user_changes() {
+        // Load default config (auto-creates), mutate encode
+        // fields, save, reload, verify the mutations round-trip.
+        let dir = unique_temp_dir("save_roundtrip");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rencoder.toml");
+
+        let mut cfg = AppConfig::load(&path).expect("load");
+        cfg.encode.as_mut().unwrap().crf = 23;
+        cfg.encode.as_mut().unwrap().bitrate = Some(8000);
+        cfg.encode.as_mut().unwrap().max_fps = Some(60);
+        cfg.encode.as_mut().unwrap().extensions = Some(vec!["mp4".into(), "mov".into()]);
+
+        cfg.save(&path).expect("save");
+
+        let reloaded = AppConfig::load(&path).expect("reload after save");
+        assert_eq!(reloaded.encode.as_ref().unwrap().crf, 23);
+        assert_eq!(reloaded.encode.as_ref().unwrap().bitrate, Some(8000));
+        assert_eq!(reloaded.encode.as_ref().unwrap().max_fps, Some(60));
+        assert_eq!(
+            reloaded
+                .encode
+                .as_ref()
+                .unwrap()
+                .extensions
+                .as_ref()
+                .unwrap(),
+            &vec!["mp4".to_string(), "mov".to_string()]
+        );
+
+        // Atomic write: no .tmp file should be left behind.
+        let tmp = path.with_extension("toml.tmp");
+        assert!(!tmp.exists(), "atomic write must consume the tmp");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn save_overwrites_existing_file_atomically() {
+        // Write a file, modify via save (should rename-replace the
+        // existing file, not leave the old content lying around).
+        let dir = unique_temp_dir("save_overwrite");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rencoder.toml");
+
+        let _ = AppConfig::load(&path); // auto-create
+        let original = std::fs::read_to_string(&path).unwrap();
+        assert!(original.contains("crf"));
+
+        let mut cfg = AppConfig::load(&path).expect("reload");
+        cfg.encode.as_mut().unwrap().crf = 17; // change one field
+        cfg.save(&path).unwrap();
+
+        let new = std::fs::read_to_string(&path).unwrap();
+        assert!(new.contains("crf = 17"));
+        assert_ne!(original, new);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
@@ -515,8 +764,10 @@ mod tests {
                     max_fps: Some(bad),
                     nv: None,
                     extensions: None,
+                    max_batch_size: default_max_batch_size(),
                     output_dir: None,
                     encoders: None,
+                    ffmpeg_args: FfmpegArgsConfig::default(),
                 }),
                 analyze: None,
             };
@@ -542,8 +793,10 @@ mod tests {
                     max_fps: Some(good),
                     nv: None,
                     extensions: None,
+                    max_batch_size: default_max_batch_size(),
                     output_dir: None,
                     encoders: None,
+                    ffmpeg_args: FfmpegArgsConfig::default(),
                 }),
                 analyze: None,
             };
@@ -564,8 +817,10 @@ mod tests {
                 max_fps: None,
                 nv: None,
                 extensions: None,
+                max_batch_size: default_max_batch_size(),
                 output_dir: None,
                 encoders: None,
+                ffmpeg_args: FfmpegArgsConfig::default(),
             }),
             analyze: None,
         };
@@ -586,8 +841,12 @@ mod tests {
                 max_fps: None,
                 nv: None,
                 extensions: None,
+                // v1.2 follow-up #5: cap doesn't trigger at default
+                // 5000 in this test (1 file).
+                max_batch_size: default_max_batch_size(),
                 output_dir: None,
                 encoders: None,
+                ffmpeg_args: FfmpegArgsConfig::default(),
             }),
             analyze: None,
         };

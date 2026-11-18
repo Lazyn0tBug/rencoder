@@ -5,9 +5,13 @@ Rust rewrite of `encode.zsh` and `video_fps_stats.zsh`: smart video transcoding 
 ## Workspace
 
 - `rencoder_lib` -- core library (`thiserror`, `walkdir`, `rayon`, `toml`); `publish = false` (U18, internal lib not on crates.io)
-- `rencoder_cli` -- CLI frontend (`clap`, `dialoguer`, `ctrlc`, `parking_lot`)
+- `rencoder_cli` -- CLI frontend (`clap`, `dialoguer`, `parking_lot`; `signal-hook` on Unix, `windows-sys` on Windows)
 
 Design source of truth: `docs/design.md`. Update the doc first when behavior changes.
+
+**Doc scope split:**
+- `docs/design.md` describes **WHAT/WHY** (architecture, contracts, constraints, design rationale). New abstractions get a one-line entry in §3.8.6's "新增" table.
+- Implementation details (signatures, struct fields, work flows, thresholds) live in **`///` rustdoc comments** in the code itself. Generated with `cargo doc --no-deps`. Reviewers should reject design-doc additions that duplicate what rustdoc already says.
 
 ## Single-directory app (U18)
 
@@ -57,6 +61,13 @@ Concrete: `rencoder_lib::config::fs_perms` exposes
 `set_config_file_mode` (Unix: `0o644`) and `set_app_dir_mode` (Unix:
 `0o755`); non-Unix is a no-op placeholder.
 
+Exception (CLI only): `rencoder_cli::signal` has a Windows branch --
+Unix uses `signal-hook` (SIGINT/SIGTERM/SIGHUP), Windows uses
+`SetConsoleCtrlHandler` (console events). The divergence stays in that
+one file; `install_handler()` keeps one signature everywhere. The
+Windows path is written but **not compiler-verified here** (this
+machine's toolchain has no Windows std) -- verify it on a Windows host.
+
 ## Build
 
 ```bash
@@ -65,11 +76,21 @@ cargo build --release
 cargo build -p rencoder_lib --features parallel-analyze
 ```
 
+`c-probe` (native libavformat probing) is **opt-in**: it needs pkg-config +
+libavformat dev headers, so it is off by default and the default build
+probes via the `ffprobe` subprocess. Enable it on a host that has the
+dev packages:
+
+```bash
+cargo build --features c-probe        # macOS: brew install pkg-config ffmpeg
+                                        # Debian: apt-get install pkg-config libavformat-dev
+```
+
 ## Test
 
 ```bash
-cargo test
 cargo clippy --all-targets -- -D warnings
+cargo test
 cargo fmt --check
 ```
 
@@ -79,7 +100,7 @@ cargo fmt --check
 |--------------|----------|-------|
 | `ffmpeg`     | yes      | always |
 | `ffprobe`    | yes      | always |
-| `nvidia-smi` | optional | only consulted when `[encode].nv = true` in `rencoder.toml`; missing or no GPUs = silent fallback to software encoding |
+| `nvidia-smi` | not needed | NVENC capability is probed with ffmpeg itself (1-frame test encode); `nvidia-smi` is never called |
 
 ## Conventions
 
@@ -88,9 +109,39 @@ cargo fmt --check
 - `-r <fps>` is an FFmpeg output option: `build_ffmpeg_command` must place it after `-i`, before the output path.
 - Phase 2 (this commit) covers workspace + base data structures. Subsequent phases per `docs/design.md` §7.
 
+## Review checklist
+
+The rules live in `docs/design.md` §3.10; these are the checks to run *before*
+saying a change is done.
+
+- [ ] **Requirement first.** A new requirement, a new shared state, or a change
+      to the concurrency structure gets written into `docs/design.md` **before**
+      the code (the RwLock episode: nobody could tell whether it was right
+      because the requirement was never written down).
+- [ ] **Shared state answered.** For every new shared state: how many readers,
+      how many writers, how long is the lock held. If the answer is "one owner",
+      it is a plain variable, not a lock (design doc §3.10.1).
+- [ ] **Concurrency structure updated.** Changing the actor/worker structure
+      means updating §3.10.1's shared-state inventory and thread list in the
+      same commit.
+- [ ] **Parameter bags.** A function with more than ~5 parameters is asked
+      "is this a context object?" (design doc §3.10.4). The test: a group
+      becomes an object only if it appears in >= 3 signatures, has exactly one
+      owner, and is not mutated in more than one place.
+- [ ] **No shadow implementations.** A test double must not re-implement the
+      thing it tests -- it replaces one step and drives the same code
+      (design doc §3.10.4 rule 2). A duplicated actor let a real bug
+      ("cancel never reached the encoder") pass with green tests.
+- [ ] **Every `✅` in the doc points at code.** A design-doc row marked done
+      must name something that exists. `Event::ActorExited` was specced, marked
+      done, and never implemented.
+- [ ] **Benign outcomes do not travel on fatal channels.** A rejected command
+      is not an error: `Event::Error` is fatal-only and the UI finalizes the
+      running batch when it sees one.
+
 ## TODO
 
-- `MaxFpsConfig::need_reduce` in `rencoder_lib/src/types.rs` -- the source-fps > cap predicate. Awaiting design input on epsilon tolerance semantics (strict vs. non-strict, which side of the comparison the eps lives on).
+- (none open)
 
 ## Refactor / rename methodology
 
@@ -121,8 +172,8 @@ call sites. Use this workflow instead:
 4. **Verify before each commit:**
    - `git status --short` — what actually changed?
    - `git diff <file> --` — what did the edit produce?
-   - `cargo test --workspace` — is the workspace green?
    - `cargo clippy --workspace --all-targets` — are there lints?
+   - `cargo test --workspace` — is the workspace green?
 
 5. **When stuck, diagnose the path first.** If a file edit fails because
    "file not found", `cat` the path or run `git ls-files | grep <name>`
@@ -132,3 +183,42 @@ call sites. Use this workflow instead:
    in the old module preserve the existing import surface so the public
    API doesn't change during a refactor. The cleanup of those bridges is
    the final stage of the refactor (here: U16 Stage 5).
+
+<!-- code-review-graph MCP tools -->
+## MCP Tools: code-review-graph
+
+**IMPORTANT: This project has a knowledge graph. ALWAYS use the
+code-review-graph MCP tools BEFORE using Grep/Glob/Read to explore
+the codebase.** The graph is faster, cheaper (fewer tokens), and gives
+you structural context (callers, dependents, test coverage) that file
+scanning cannot.
+
+### When to use graph tools FIRST
+
+- **Exploring code**: `semantic_search_nodes` or `query_graph` instead of Grep
+- **Understanding impact**: `get_impact_radius` instead of manually tracing imports
+- **Code review**: `detect_changes` + `get_review_context` instead of reading entire files
+- **Finding relationships**: `query_graph` with callers_of/callees_of/imports_of/tests_for
+- **Architecture questions**: `get_architecture_overview` + `list_communities`
+
+Fall back to Grep/Glob/Read **only** when the graph doesn't cover what you need.
+
+### Key Tools
+
+| Tool | Use when |
+| ------ | ---------- |
+| `detect_changes` | Reviewing code changes — gives risk-scored analysis |
+| `get_review_context` | Need source snippets for review — token-efficient |
+| `get_impact_radius` | Understanding blast radius of a change |
+| `get_affected_flows` | Finding which execution paths are impacted |
+| `query_graph` | Tracing callers, callees, imports, tests, dependencies |
+| `semantic_search_nodes` | Finding functions/classes by name or keyword |
+| `get_architecture_overview` | Understanding high-level codebase structure |
+| `refactor_tool` | Planning renames, finding dead code |
+
+### Workflow
+
+1. The graph auto-updates on file changes (via hooks).
+2. Use `detect_changes` for code review.
+3. Use `get_affected_flows` to understand impact.
+4. Use `query_graph` pattern="tests_for" to check coverage.

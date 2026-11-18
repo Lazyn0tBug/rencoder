@@ -10,35 +10,18 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::error::EncodeError;
-use crate::types::{MaxFpsConfig, VideoFormat};
-
-/// Allowed values for `max_fps`. Includes 0 (capping disabled) plus the
-/// canonical video frame rates. Any other value is rejected at config-load
-/// time: arbitrary rates like 0.5 or 29.97 aren't meaningful as caps.
-const ALLOWED_MAX_FPS: &[f64] = &[0.0, 24.0, 25.0, 30.0, 60.0];
+use crate::types::VideoFormat;
 
 /// Top-level config. Flat scalar knobs plus a nested `encoders` block
 /// (added in Phase 4's `select_encoder` plumbing).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Config {
-    /// Cap source FPS at this value when > 0. Must be 0 (disabled) or one
-    /// of `ALLOWED_MAX_FPS`. Config::load rejects anything else.
-    pub max_fps: f64,
-    /// Tolerance band around `max_fps` (matches `encode.zsh` semantics:
-    /// a 29.97 source at cap=30 is NOT reduced because 29.97 < 30 + 0.05).
-    pub max_fps_eps: f64,
     /// Per-format encoder overrides. `None` means "use built-in default".
     pub encoders: EncoderConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            max_fps: 0.0,
-            max_fps_eps: 0.05,
-            encoders: EncoderConfig::default(),
-        }
-    }
+    /// ffmpeg argv construction knobs (Tiers follow-up review). Mirrors
+    /// `EncodeConfig.ffmpeg_args` in the user-facing AppConfig; defaults
+    /// are populated by `Config::from_encode_config`.
+    pub ffmpeg_args: crate::config::app::FfmpegArgsConfig,
 }
 
 /// Per-format encoder overrides. Each field names the encoder to use for
@@ -66,9 +49,12 @@ impl EncoderConfig {
 
 impl Config {
     /// Load from a JSON file. Missing file returns `Default::default()`.
-    /// `max_fps` must be one of `ALLOWED_MAX_FPS` (0 for disabled, plus
-    /// the canonical video frame rates). Anything else surfaces as
-    /// `EncodeError::InvalidParam`.
+    ///
+    /// Legacy path: the user-facing config is TOML (`AppConfig`), and the
+    /// frame-rate cap lives there — it is *not* mirrored here (see
+    /// design doc §3.10.2: one field, one conversion entry point).
+    /// This JSON path only carries the encoder overrides and the ffmpeg
+    /// argv knobs, and is kept for the lib's internal tests.
     pub fn load(path: &Path) -> Result<Self, EncodeError> {
         if !path.exists() {
             return Ok(Self::default());
@@ -76,36 +62,14 @@ impl Config {
         let raw = std::fs::read_to_string(path)?;
         let v: Value = serde_json::from_str(&raw)
             .map_err(|e| EncodeError::InvalidParam(format!("config parse: {e}")))?;
-        let cfg = Self::from_value(&v);
-        if !ALLOWED_MAX_FPS.contains(&cfg.max_fps) {
-            return Err(EncodeError::InvalidParam(format!(
-                "max_fps must be one of {:?} (0 = disabled)",
-                ALLOWED_MAX_FPS
-            )));
-        }
-        Ok(cfg)
+        Ok(Self::from_value(&v))
     }
 
     fn from_value(v: &Value) -> Self {
         let defaults = Self::default();
         Self {
-            max_fps: v
-                .get("max_fps")
-                .and_then(Value::as_f64)
-                .unwrap_or(defaults.max_fps),
-            max_fps_eps: v
-                .get("max_fps_eps")
-                .and_then(Value::as_f64)
-                .unwrap_or(defaults.max_fps_eps),
+            ffmpeg_args: defaults.ffmpeg_args,
             encoders: parse_encoders(v.get("encoders")),
-        }
-    }
-
-    /// Build the runtime `MaxFpsConfig` from this config.
-    pub fn max_fps_config(&self) -> MaxFpsConfig {
-        MaxFpsConfig {
-            max_fps: self.max_fps,
-            eps: self.max_fps_eps,
         }
     }
 }
@@ -152,13 +116,12 @@ impl Config {
             return Self::default();
         };
         Self {
-            max_fps: enc.max_fps.unwrap_or(0) as f64,
-            max_fps_eps: 0.05,
             encoders: enc
                 .encoders
                 .as_ref()
                 .map(EncoderConfig::from)
                 .unwrap_or_default(),
+            ffmpeg_args: enc.ffmpeg_args.clone(),
         }
     }
 }
@@ -170,8 +133,6 @@ mod tests {
     #[test]
     fn missing_file_returns_defaults() {
         let cfg = Config::load(Path::new("/nonexistent/never.json")).unwrap();
-        assert_eq!(cfg.max_fps, 0.0);
-        assert_eq!(cfg.max_fps_eps, 0.05);
         assert!(cfg.encoders.av1.is_none());
     }
 
@@ -179,35 +140,17 @@ mod tests {
     fn empty_object_uses_all_defaults() {
         let v: Value = serde_json::from_str("{}").unwrap();
         let cfg = Config::from_value(&v);
-        assert_eq!(cfg.max_fps, 0.0);
-        assert_eq!(cfg.max_fps_eps, 0.05);
-    }
-
-    #[test]
-    fn reads_max_fps_and_eps() {
-        let v: Value = serde_json::from_str(r#"{"max_fps": 30, "max_fps_eps": 0.1}"#).unwrap();
-        let cfg = Config::from_value(&v);
-        assert_eq!(cfg.max_fps, 30.0);
-        assert_eq!(cfg.max_fps_eps, 0.1);
+        assert!(cfg.encoders.av1.is_none());
     }
 
     #[test]
     fn unknown_keys_are_ignored() {
+        // The frame-rate cap is not mirrored here any more (design doc
+        // §3.10.2): it lives in the TOML config and reaches the run
+        // through `EncodeParams::from_app_config`.
         let v: Value = serde_json::from_str(r#"{"max_fps": 60, "future_field": true}"#).unwrap();
         let cfg = Config::from_value(&v);
-        assert_eq!(cfg.max_fps, 60.0);
-    }
-
-    #[test]
-    fn max_fps_config_conversion() {
-        let cfg = Config {
-            max_fps: 30.0,
-            max_fps_eps: 0.1,
-            ..Default::default()
-        };
-        let m = cfg.max_fps_config();
-        assert_eq!(m.max_fps, 30.0);
-        assert_eq!(m.eps, 0.1);
+        assert!(cfg.encoders.av1.is_none());
     }
 
     #[test]
@@ -233,7 +176,6 @@ mod tests {
         );
         assert_eq!(cfg.encoders.for_format(VideoFormat::X264), None);
         assert_eq!(cfg.encoders.for_format(VideoFormat::Hevc), None);
-        assert_eq!(cfg.max_fps, 30.0);
     }
 
     #[test]
@@ -257,75 +199,6 @@ mod tests {
         let v: Value = serde_json::from_str(r#"{"encoders": {"av1": ""}}"#).unwrap();
         let cfg = Config::from_value(&v);
         assert!(cfg.encoders.av1.is_none());
-    }
-
-    #[test]
-    fn negative_max_fps_rejected_on_load() {
-        let dir = std::env::temp_dir().join("rencoder_test_negative_fps");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("cfg.json");
-        std::fs::write(&path, r#"{"max_fps": -30}"#).unwrap();
-        let err = Config::load(&path).unwrap_err();
-        assert!(matches!(err, EncodeError::InvalidParam(_)));
-        std::fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn sub_one_max_fps_rejected_on_load() {
-        // 0.5 is not a canonical video frame rate; the cap value would
-        // produce a nonsensical `-r 0.5` command.
-        let dir = std::env::temp_dir().join("rencoder_test_subone_fps");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("cfg.json");
-        std::fs::write(&path, r#"{"max_fps": 0.5}"#).unwrap();
-        let err = Config::load(&path).unwrap_err();
-        assert!(matches!(err, EncodeError::InvalidParam(_)));
-        std::fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn zero_max_fps_accepted_as_disabled() {
-        let dir = std::env::temp_dir().join("rencoder_test_zero_fps");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("cfg.json");
-        std::fs::write(&path, r#"{"max_fps": 0}"#).unwrap();
-        let cfg = Config::load(&path).unwrap();
-        assert_eq!(cfg.max_fps, 0.0);
-        assert!(!cfg.max_fps_config().enabled());
-        std::fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn canonical_max_fps_values_accepted() {
-        // 24, 25, 30, 60 are the canonical video frame rates.
-        let dir = std::env::temp_dir().join("rencoder_test_canonical_fps");
-        std::fs::create_dir_all(&dir).unwrap();
-        for &fps in &[24.0, 25.0, 30.0, 60.0] {
-            let path = dir.join(format!("cfg_{fps}.json"));
-            std::fs::write(&path, format!(r#"{{"max_fps": {fps}}}"#)).unwrap();
-            let cfg = Config::load(&path).unwrap();
-            assert_eq!(cfg.max_fps, fps, "expected {fps} to be accepted");
-            assert!(cfg.max_fps_config().enabled());
-            std::fs::remove_file(&path).ok();
-        }
-    }
-
-    #[test]
-    fn non_canonical_max_fps_rejected() {
-        // NTSC variants (29.97), common but non-canonical rates (23, 50, 120),
-        // and arbitrary sub-canonical values must all be rejected.
-        let dir = std::env::temp_dir().join("rencoder_test_noncanonical_fps");
-        std::fs::create_dir_all(&dir).unwrap();
-        for &fps in &[1.0, 23.0, 29.0, 29.97, 50.0, 120.0] {
-            let path = dir.join(format!("cfg_{fps}.json"));
-            std::fs::write(&path, format!(r#"{{"max_fps": {fps}}}"#)).unwrap();
-            let err = Config::load(&path).unwrap_err();
-            assert!(
-                matches!(err, EncodeError::InvalidParam(_)),
-                "expected reject for {fps}, got {err:?}"
-            );
-            std::fs::remove_file(&path).ok();
-        }
     }
 }
 
