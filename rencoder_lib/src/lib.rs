@@ -13,6 +13,7 @@ pub mod encoder;
 pub mod error;
 pub mod job;
 pub mod pipeline;
+pub mod test_support;
 pub mod types;
 pub mod utils;
 

@@ -209,6 +209,28 @@ pub fn resolve_with<F>(
 where
     F: Fn(&[&str]) -> Result<String, EncodeError>,
 {
+    resolve_with_clock(path, force, runner, Utc::now())
+}
+
+/// Resolve with an injectable runner **and** an injectable clock.
+///
+/// The clock is what makes the 30-day review window testable: a test
+/// hands in a time it chooses, advances it past the review date, and
+/// watches the record go stale -- without waiting a month and without
+/// the flow reading the wall clock behind the test's back.
+///
+/// `now` is used for every timestamp this call produces: the review
+/// check, the record's `probed_at` and `next_review_at`, and the
+/// deferred review date when the record is stored back.
+pub fn resolve_with_clock<F>(
+    path: Option<&Path>,
+    force: bool,
+    runner: F,
+    now: DateTime<Utc>,
+) -> Result<Resolution, EncodeError>
+where
+    F: Fn(&[&str]) -> Result<String, EncodeError>,
+{
     let encoders_output = runner(&["-encoders"])?;
     let version = runner(&["-version"])?;
     let ffmpeg_version = version.lines().next().unwrap_or("").trim().to_string();
@@ -221,7 +243,7 @@ where
 
     if !force {
         if let Some(record) = usable_stored {
-            let review_due = record.review_due(Utc::now());
+            let review_due = record.review_due(now);
             return Ok(Resolution {
                 encoders_output,
                 support: record.support().to_vec(),
@@ -234,7 +256,6 @@ where
 
     // Probe now.
     let support = probe_with(&encoders_output, &runner);
-    let now = Utc::now();
     let record = CapabilityRecord {
         version: RECORD_VERSION,
         ffmpeg_version,
@@ -285,8 +306,24 @@ pub fn resolve_and_store_with<F>(
 where
     F: Fn(&[&str]) -> Result<String, EncodeError>,
 {
-    let mut resolution = resolve_with(path, force, runner)?;
-    if let Some(record) = record_to_store(&resolution) {
+    resolve_and_store_with_clock(path, force, runner, Utc::now())
+}
+
+/// Resolve **and store** with an injectable runner and clock.
+///
+/// Same as [`resolve_and_store_with`], but the call chooses "now" -- so
+/// the deferred review date is the test's, not the wall clock's.
+pub fn resolve_and_store_with_clock<F>(
+    path: Option<&Path>,
+    force: bool,
+    runner: F,
+    now: DateTime<Utc>,
+) -> Result<Resolution, EncodeError>
+where
+    F: Fn(&[&str]) -> Result<String, EncodeError>,
+{
+    let mut resolution = resolve_with_clock(path, force, runner, now)?;
+    if let Some(record) = record_to_store(&resolution, now) {
         resolution.record = record.clone();
         if let Some(path) = path {
             if let Err(e) = save(path, &record) {
@@ -307,13 +344,16 @@ where
 /// * an expired record -> the same record with its review date pushed
 ///   30 days out (the advisory has been shown; do not repeat it);
 /// * a fresh stored record -> nothing to write.
-fn record_to_store(resolution: &Resolution) -> Option<CapabilityRecord> {
+///
+/// `now` is the caller's time: the deferred review date is measured
+/// from it, so a test can watch the advisory fire exactly once.
+fn record_to_store(resolution: &Resolution, now: DateTime<Utc>) -> Option<CapabilityRecord> {
     if resolution.probed {
         return Some(resolution.record.clone());
     }
     if resolution.review_due {
         let mut record = resolution.record.clone();
-        record.defer_review(Utc::now());
+        record.defer_review(now);
         return Some(record);
     }
     None
@@ -737,7 +777,8 @@ mod tests {
             probed: false,
             review_due: true,
         };
-        let stored = record_to_store(&resolution).expect("an expired record must be re-stored");
+        let stored =
+            record_to_store(&resolution, Utc::now()).expect("an expired record must be re-stored");
         assert!(
             stored.next_review_at > Utc::now() + Duration::days(29),
             "the review date must be pushed ~30 days out: {:?}",
@@ -756,7 +797,7 @@ mod tests {
             review_due: false,
         };
         assert!(
-            record_to_store(&resolution).is_none(),
+            record_to_store(&resolution, Utc::now()).is_none(),
             "a fresh record needs no write"
         );
     }
@@ -771,7 +812,8 @@ mod tests {
             probed: true,
             review_due: false,
         };
-        let stored = record_to_store(&resolution).expect("a fresh probe must be stored");
+        let stored =
+            record_to_store(&resolution, Utc::now()).expect("a fresh probe must be stored");
         assert_eq!(stored.probed_at, record.probed_at);
     }
 
