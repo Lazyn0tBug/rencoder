@@ -125,11 +125,32 @@ mod tests {
     // tests. The mutex is held throughout env mutation + restoration.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Run `f` with exclusive access to the process environment.
+    ///
+    /// Every env mutation has to happen **inside** this lock: the
+    /// environment is process-global, so a test that writes a variable
+    /// outside the lock corrupts the state of every test running
+    /// beside it (that is how `env_override_restored_after_test` used
+    /// to make `resolve_config_defaults_to_app_dir_when_no_env_override`
+    /// fail intermittently).
+    fn with_env_lock<F: FnOnce()>(f: F) {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        f()
+    }
+
     /// Set env var to `value` (or remove if `None`) for the duration of `f`.
     /// Restores the prior value even if `f` panics. Caller can run tests
     /// without worrying about leaking env state to sibling tests.
+    ///
+    /// Takes the env lock itself; use [`with_env_var_locked`] when the
+    /// lock is already held (the lock is not reentrant).
     fn with_env_var<F: FnOnce()>(key: &str, value: Option<&str>, f: F) {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        with_env_lock(|| with_env_var_locked(key, value, f));
+    }
+
+    /// [`with_env_var`] without the locking -- the caller must already
+    /// hold the env lock.
+    fn with_env_var_locked<F: FnOnce()>(key: &str, value: Option<&str>, f: F) {
         let prior = env::var_os(key);
         match value {
             Some(v) => env::set_var(key, v),
@@ -142,7 +163,6 @@ mod tests {
             Some(v) => env::set_var(key, v),
             None => env::remove_var(key),
         }
-        // _guard drops here.
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }
@@ -224,16 +244,22 @@ mod tests {
     fn env_override_restored_after_test() {
         // Regression guard: helper must restore prior state. Set a sentinel,
         // run a no-op test body, then verify the sentinel is gone.
-        env::set_var("RENENCODER_CONFIG", "/tmp/leak_check.toml");
-        with_env_var("RENENCODER_CONFIG", None, || {
-            // During the closure, RENENCODER_CONFIG is unset.
-            assert!(env::var_os("RENENCODER_CONFIG").is_none());
+        //
+        // The whole test runs under the env lock: it writes the variable
+        // itself, so writing it outside the lock would race every other
+        // env test running in parallel.
+        with_env_lock(|| {
+            env::set_var("RENENCODER_CONFIG", "/tmp/leak_check.toml");
+            with_env_var_locked("RENENCODER_CONFIG", None, || {
+                // During the closure, RENENCODER_CONFIG is unset.
+                assert!(env::var_os("RENENCODER_CONFIG").is_none());
+            });
+            // After the closure, the sentinel we set above must be restored.
+            assert_eq!(
+                env::var_os("RENENCODER_CONFIG").as_deref(),
+                Some(std::ffi::OsStr::new("/tmp/leak_check.toml"))
+            );
+            env::remove_var("RENENCODER_CONFIG");
         });
-        // After the closure, the sentinel we set above must be restored.
-        assert_eq!(
-            env::var_os("RENENCODER_CONFIG").as_deref(),
-            Some(std::ffi::OsStr::new("/tmp/leak_check.toml"))
-        );
-        env::remove_var("RENENCODER_CONFIG");
     }
 }
