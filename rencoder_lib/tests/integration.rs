@@ -11,10 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rencoder_lib::{
     data::extract::probe_video_metadata,
-    pipeline::{
-        batch::{transcode_batch, transcode_single},
-        cache::init_encoder_cache,
-    },
+    pipeline::batch::{transcode_batch, transcode_single},
     types::{EncodeParams, EncoderCache, ProcessOutput, Target, TranscodeTask, VideoFormat},
 };
 
@@ -152,7 +149,6 @@ fn transcode_batch_end_to_end_produces_output_files() {
     // doesn't trip the existence-skip check.
     let cache = EncoderCache {
         encoders_output: "V..... libsvtav1            libsvtav1 SVT-AV1\n".to_string(),
-        nvenc: Vec::new(),
     };
     let params = EncodeParams {
         format: VideoFormat::Av1,
@@ -168,7 +164,7 @@ fn transcode_batch_end_to_end_produces_output_files() {
     let mut ctx = rencoder_lib::pipeline::context::BatchContext::new(
         params,
         std::sync::Arc::new(cache),
-        rencoder_lib::encoder::nvenc::CapabilityVerdicts::default(),
+        rencoder_lib::encoder::nvenc::Capability::default(),
     );
     let results = transcode_batch(&files, &mut ctx, ProcessOutput::Null, None, None);
 
@@ -224,7 +220,6 @@ fn transcode_batch_reencodes_when_output_exists() {
     // selectable.
     let cache = EncoderCache {
         encoders_output: " V..... libx264              libx264 H.264\n".to_string(),
-        nvenc: Vec::new(),
     };
     let params = EncodeParams {
         format: VideoFormat::X264,
@@ -240,7 +235,7 @@ fn transcode_batch_reencodes_when_output_exists() {
     let mut ctx = rencoder_lib::pipeline::context::BatchContext::new(
         params,
         std::sync::Arc::new(cache),
-        rencoder_lib::encoder::nvenc::CapabilityVerdicts::default(),
+        rencoder_lib::encoder::nvenc::Capability::default(),
     );
     let result = transcode_single(&task, &mut ctx, ProcessOutput::Null)
         .expect("transcode_single should succeed");
@@ -300,7 +295,18 @@ fn actor_cancel_aborts_the_batch_and_removes_the_partial_output() {
     // lands (the cancel is sent after the first progress event).
     let input = make_video_with_codec(&dir, "in.mp4", "mpeg4", 120);
 
-    let (cmd_tx, evt_rx) = rencoder_lib::job::start_controller().into_split();
+    // The real actor, but with the app directory redirected: the
+    // capability record, the config and the history must not land in
+    // the developer's app directory (design doc §3.10.4).
+    let env = rencoder_lib::job::ActorEnv {
+        app_config: std::sync::Arc::new(rencoder_lib::config::app::AppConfig::default()),
+        config_path: dir.join("rencoder.toml"),
+        data_dir: Some(dir.clone()),
+        nvenc_cache_path: Some(dir.join("nvenc-capability.json")),
+        file_encoder: std::sync::Arc::new(rencoder_lib::pipeline::batch::FfmpegFileEncoder),
+        detect_runner: std::sync::Arc::new(rencoder_lib::encoder::nvenc::run_ffmpeg),
+    };
+    let (cmd_tx, evt_rx) = rencoder_lib::job::start_controller_with(env).into_split();
 
     let params = EncodeParams {
         format: VideoFormat::X264,
@@ -368,22 +374,9 @@ fn actor_cancel_aborts_the_batch_and_removes_the_partial_output() {
     );
 }
 
-// ---- init_encoder_cache ----
-
-#[test]
-fn init_encoder_cache_works_without_nvidia_smi() {
-    // On macOS or any system without nvidia-smi, this should still succeed
-    // with has_nvidia=false (R20).
-    let cache = init_encoder_cache().expect("init should succeed");
-    // We can't assert has_nvidia directly (depends on env), but the call
-    // must not have returned Err.
-    assert!(
-        cache.encoders_output.contains("libx264")
-            || cache.encoders_output.is_empty()
-            || !cache.encoders_output.is_empty(),
-        "encoders output should be populated (or empty if ffmpeg missing)"
-    );
-}
+// The capability flow (which used to have its own cache-init entry
+// point) is covered by `tests/nvenc_baseline.rs` -- the check's
+// conclusion, the record and the encoder choice.
 
 // ---- c-probe FFI bridge (only with the feature) ----
 

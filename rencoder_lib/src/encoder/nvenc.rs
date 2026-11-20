@@ -35,11 +35,40 @@ pub const REVIEW_INTERVAL_DAYS: i64 = 30;
 
 /// Version of the on-disk format. A record with a different version is
 /// ignored (and re-probed) rather than misread.
-const RECORD_VERSION: u32 = 1;
+///
+/// v2: the record carries one entry per NVENC candidate -- an encoder
+/// the build lacks is listed as unusable, with the build's absence as
+/// the reason. v1 records listed only the encoders that were probed,
+/// so their shape depended on the machine.
+pub const RECORD_VERSION: u32 = 2;
 
 /// NVENC encoders that may exist in an ffmpeg build. Only the ones
 /// actually present in `ffmpeg -encoders` get probed.
 const NVENC_CANDIDATES: [&str; 3] = ["h264_nvenc", "hevc_nvenc", "av1_nvenc"];
+
+impl NvencSupport {
+    /// Is this verdict "the ffmpeg build does not have this encoder"?
+    ///
+    /// The capability check has two levels (design doc §3.10.5): the
+    /// build's encoder list, then the machine. An encoder the build
+    /// lacks fails the check before any hardware is involved -- and
+    /// that failure is the *reason* behind the "unusable" verdict, not
+    /// a verdict of its own.
+    pub fn is_build_absent(&self) -> bool {
+        !self.usable && self.reason.as_deref() == Some(build_absent_reason(&self.encoder).as_str())
+    }
+}
+
+/// The reason recorded for an encoder this ffmpeg build does not have.
+///
+/// One wording, one place: the probe writes it and the display reads
+/// it back to decide whether a verdict means "the build lacks it".
+pub fn build_absent_reason(encoder: &str) -> String {
+    format!("this ffmpeg build has no {encoder} encoder")
+}
+
+/// The one-line summary for a build without any NVENC encoder.
+pub const BUILD_ABSENT_SUMMARY: &str = "this ffmpeg build has no NVENC encoders";
 
 /// NVENC verdicts for one run: which encoders are known to be unusable.
 ///
@@ -97,6 +126,168 @@ impl CapabilityVerdicts {
             .map(|(encoder, usable)| (encoder.clone(), *usable))
             .collect()
     }
+
+    /// Is any encoder known to be usable?
+    ///
+    /// The overall conclusion, in the form the encoder selection needs
+    /// it: a machine that cannot run any of them goes straight to
+    /// software encoding.
+    pub fn any_usable(&self) -> bool {
+        self.map.values().any(|usable| *usable)
+    }
+}
+
+/// This machine's NVENC capability: one check's conclusion, plus the
+/// corrections the run made to it.
+///
+/// One type, two parts:
+///
+/// - `support` -- what the check found: per encoder, can it run, and
+///   if not, why;
+/// - `verdicts` -- what the run found afterwards: an encoder that
+///   turned out to be broken at runtime.
+///
+/// The overall conclusion ([`Capability::any_usable`]) merges the two.
+/// It is the one answer the whole chain shares: the encoder selection
+/// reads it, the runtime fallback updates it, and the actor keeps the
+/// authoritative copy (design doc §3.10.5).
+#[derive(Clone, Debug, Default)]
+pub struct Capability {
+    support: Vec<NvencSupport>,
+    probed_at: Option<DateTime<Utc>>,
+    review_due: bool,
+    verdicts: CapabilityVerdicts,
+}
+
+impl Capability {
+    /// Build a capability from a check's result.
+    ///
+    /// The runtime corrections start empty: they hold what the *run*
+    /// finds, not what the check found. The check's conclusion is the
+    /// `support` part.
+    pub fn from_support(support: Vec<NvencSupport>) -> Self {
+        Self::from_check(support, None, false)
+    }
+
+    /// Build a capability from a check's result and when it was made.
+    ///
+    /// `probed_at` and `review_due` are the check's metadata: when it
+    /// ran, and whether the stored result is past its review date.
+    pub fn from_check(
+        support: Vec<NvencSupport>,
+        probed_at: Option<DateTime<Utc>>,
+        review_due: bool,
+    ) -> Self {
+        Self {
+            support,
+            probed_at,
+            review_due,
+            verdicts: CapabilityVerdicts::default(),
+        }
+    }
+
+    /// When the check ran (`None` when unknown).
+    pub fn probed_at(&self) -> Option<DateTime<Utc>> {
+        self.probed_at
+    }
+
+    /// Is the stored result past its review date (30 days)?
+    pub fn review_due(&self) -> bool {
+        self.review_due
+    }
+
+    /// The overall conclusion: can this machine do hardware encoding?
+    ///
+    /// `false` when no NVENC encoder is usable -- the build has none,
+    /// or none of them runs here. The encoder selection then goes
+    /// straight to software.
+    pub fn any_usable(&self) -> bool {
+        self.support.iter().any(|entry| self.usable(&entry.encoder))
+    }
+
+    /// Did the check conclude that this encoder cannot run?
+    ///
+    /// A definitive answer ("this machine cannot run it"), as opposed
+    /// to "the check said it can" -- which after a failed encode is
+    /// exactly what has to be checked again on the spot.
+    pub fn check_says_unusable(&self, encoder: &str) -> bool {
+        self.support
+            .iter()
+            .any(|entry| entry.encoder == encoder && !entry.usable)
+    }
+
+    /// Can this encoder run **right now**?
+    ///
+    /// The runtime correction wins over the check's conclusion: an
+    /// encoder that failed during this run is not tried again.
+    pub fn usable(&self, encoder: &str) -> bool {
+        match self.verdicts.known(encoder) {
+            Some(usable) => usable,
+            None => self
+                .support
+                .iter()
+                .find(|entry| entry.encoder == encoder)
+                .is_some_and(|entry| entry.usable),
+        }
+    }
+
+    /// Why this encoder cannot run (`None` when it can, or when the
+    /// check never looked at it).
+    pub fn reason(&self, encoder: &str) -> Option<&str> {
+        self.support
+            .iter()
+            .find(|entry| entry.encoder == encoder)
+            .and_then(|entry| entry.reason.as_deref())
+    }
+
+    /// What the check found, per encoder.
+    pub fn support(&self) -> &[NvencSupport] {
+        &self.support
+    }
+
+    /// The runtime corrections.
+    pub fn verdicts(&self) -> &CapabilityVerdicts {
+        &self.verdicts
+    }
+
+    /// The runtime corrections, mutably -- the fallback writes here.
+    pub fn verdicts_mut(&mut self) -> &mut CapabilityVerdicts {
+        &mut self.verdicts
+    }
+
+    /// One line per encoder, same wording for every frontend.
+    ///
+    /// The CLI's report and the UI's capability list describe the same
+    /// facts; when both formatted them separately they drifted
+    /// (different separators, different wording for the same verdict).
+    /// The wording lives here so there is one of it.
+    ///
+    /// A build without any NVENC encoder collapses to one line: three
+    /// identical "unusable" lines say less than the single fact they
+    /// all mean.
+    pub fn lines(&self) -> Vec<String> {
+        if self.support.is_empty() {
+            return vec![BUILD_ABSENT_SUMMARY.to_string()];
+        }
+        if self.support.iter().all(NvencSupport::is_build_absent) {
+            return vec![BUILD_ABSENT_SUMMARY.to_string()];
+        }
+        self.support
+            .iter()
+            .map(|entry| match (&entry.usable, &entry.reason) {
+                (true, _) => format!("{}: usable", entry.encoder),
+                (false, Some(reason)) => format!("{}: unusable — {reason}", entry.encoder),
+                (false, None) => format!("{}: unusable", entry.encoder),
+            })
+            .collect()
+    }
+
+    /// The advisory shown when the stored result is past its review
+    /// date. `None` when it is still fresh.
+    pub fn review_advisory(&self) -> Option<String> {
+        self.review_due
+            .then(|| "detected over 30 days ago — recommend re-detecting".to_string())
+    }
 }
 
 /// Can this machine run the NVENC encoder *right now*?
@@ -107,14 +298,30 @@ impl CapabilityVerdicts {
 /// argument fails it too), and the CLI cannot tell them apart because
 /// ffmpeg's stderr is inherited rather than captured.
 ///
-/// The verdict is recorded in `verdicts`: the second failure of the
-/// same encoder does not probe again.
-pub fn verify_capability(verdicts: &mut CapabilityVerdicts, encoder: &str) -> bool {
-    if let Some(known) = verdicts.known(encoder) {
+/// Three cases, in order:
+///
+/// 1. **The run already knows** -- a verdict from an earlier failure
+///    in this run: use it, no probe (the second failure of the same
+///    encoder does not probe again).
+/// 2. **The check already said no** -- a definitive "this machine
+///    cannot run it": adopt it, no probe. The check is the same
+///    question, asked at startup.
+/// 3. **The check said yes, and the encode still failed** -- the
+///    device may have just dropped out (a driver reset, a GPU gone
+///    away): probe again, on the spot.
+///
+/// The verdict is recorded in the capability's runtime corrections, so
+/// the next file sees it.
+pub fn verify_capability(capability: &mut Capability, encoder: &str) -> bool {
+    if let Some(known) = capability.verdicts().known(encoder) {
         return known;
     }
+    if capability.check_says_unusable(encoder) {
+        capability.verdicts_mut().set(encoder, false);
+        return false;
+    }
     let usable = probe_one(encoder).is_ok();
-    verdicts.set(encoder, usable);
+    capability.verdicts_mut().set(encoder, usable);
     usable
 }
 
@@ -178,6 +385,21 @@ pub struct Resolution {
     pub probed: bool,
     /// The stored record is past its review date: advise the user.
     pub review_due: bool,
+}
+
+impl Resolution {
+    /// This machine's capability -- the one answer the whole chain
+    /// shares (design doc §3.10.5).
+    ///
+    /// The encoder selection reads it, the runtime fallback updates
+    /// it, and the frontends show it.
+    pub fn capability(&self) -> Capability {
+        Capability::from_check(
+            self.support.clone(),
+            Some(self.record.probed_at),
+            self.review_due,
+        )
+    }
 }
 
 /// Resolve the NVENC capability for this run.
@@ -342,11 +564,15 @@ where
 ///
 /// * a fresh probe -> the new record;
 /// * an expired record -> the same record with its review date pushed
-///   30 days out (the advisory has been shown; do not repeat it);
+///   30 days out (the advisory is about to be shown; do not repeat it);
 /// * a fresh stored record -> nothing to write.
 ///
-/// `now` is the caller's time: the deferred review date is measured
-/// from it, so a test can watch the advisory fire exactly once.
+/// The review cycle lives here, in the lib, so the frontends do not
+/// have to differ: the resolution says `review_due`, the caller shows
+/// the advisory, and the next run is quiet for another 30 days. A
+/// caller that resolves and does **not** show the advisory breaks that
+/// promise -- the date already moved -- so showing it is the caller's
+/// obligation whenever the resolution says `review_due`.
 fn record_to_store(resolution: &Resolution, now: DateTime<Utc>) -> Option<CapabilityRecord> {
     if resolution.probed {
         return Some(resolution.record.clone());
@@ -377,7 +603,17 @@ where
     let mut support = Vec::new();
     for encoder in NVENC_CANDIDATES {
         if !encoders_output.contains(encoder) {
-            // Not compiled into this ffmpeg -- nothing to probe.
+            // Level 1 of the capability check: this ffmpeg build does
+            // not have the encoder, so there is nothing to try. The
+            // verdict is "unusable" and the build's absence is the
+            // reason behind it -- the record keeps one entry per
+            // candidate, so its shape does not depend on the machine
+            // (design doc §3.10.5).
+            support.push(NvencSupport {
+                encoder: encoder.to_string(),
+                usable: false,
+                reason: Some(build_absent_reason(encoder)),
+            });
             continue;
         }
         match probe_encoder(&runner, encoder) {
@@ -511,7 +747,8 @@ fn tmp_path_for(path: &Path) -> PathBuf {
 }
 
 /// A human-readable report of the stored capability.
-pub fn report(record: &CapabilityRecord) -> String {
+pub fn report(resolution: &Resolution) -> String {
+    let record = &resolution.record;
     let mut out = String::new();
     out.push_str(&format!(
         "NVENC capability (probed {})\n",
@@ -520,23 +757,18 @@ pub fn report(record: &CapabilityRecord) -> String {
     out.push_str(&format!("  ffmpeg      : {}\n", record.ffmpeg_version));
     // Same wording as the UI's capability list -- both render
     // `NvencCapability::lines()`.
-    for line in capability_of(record).lines() {
+    for line in resolution.capability().lines() {
         out.push_str(&format!("  {line}\n"));
     }
     out
 }
 
-/// The capability of this machine, in the shape the frontends render.
-pub fn capability_of(record: &CapabilityRecord) -> crate::types::NvencCapability {
-    crate::types::NvencCapability {
-        support: record.encoders.clone(),
-        probed_at: Some(record.probed_at),
-        review_due: record.review_due(Utc::now()),
-    }
-}
-
 /// Run ffmpeg and return its stdout.
-pub(crate) fn run_ffmpeg(args: &[&str]) -> Result<String, EncodeError> {
+///
+/// Public because it is the production runner a test needs when it
+/// drives the real actor (only the *paths* are redirected then -- see
+/// [`crate::job::ActorEnv`]).
+pub fn run_ffmpeg(args: &[&str]) -> Result<String, EncodeError> {
     let output = std::process::Command::new("ffmpeg")
         .args(args)
         .output()
@@ -745,14 +977,30 @@ mod tests {
 
     #[test]
     fn verify_capability_uses_the_cached_verdict() {
-        // A cached verdict must not trigger another probe -- the probe
-        // spawns ffmpeg, and the second failure of the same encoder
-        // must not cost another spawn.
+        // A verdict from an earlier failure in this run must not
+        // trigger another probe -- the probe spawns ffmpeg, and the
+        // second failure of the same encoder must not cost another
+        // spawn.
         let encoder = "cached_test_nvenc";
-        let mut verdicts = CapabilityVerdicts::default();
-        verdicts.set(encoder, false);
-        assert!(!verify_capability(&mut verdicts, encoder));
-        assert_eq!(verdicts.known(encoder), Some(false));
+        let mut capability = Capability::default();
+        capability.verdicts_mut().set(encoder, false);
+        assert!(!verify_capability(&mut capability, encoder));
+        assert_eq!(capability.verdicts().known(encoder), Some(false));
+    }
+
+    #[test]
+    fn verify_capability_adopts_a_negative_check() {
+        // The check said this machine cannot run it: that is the same
+        // question, asked at startup -- adopt it, do not probe again.
+        let encoder = "build_absent_nvenc";
+        let mut capability = Capability::from_support(vec![NvencSupport {
+            encoder: encoder.to_string(),
+            usable: false,
+            reason: Some(build_absent_reason(encoder)),
+        }]);
+        assert!(capability.check_says_unusable(encoder));
+        assert!(!verify_capability(&mut capability, encoder));
+        assert_eq!(capability.verdicts().known(encoder), Some(false));
     }
 
     #[test]
@@ -765,24 +1013,56 @@ mod tests {
     }
 
     #[test]
-    fn expired_record_pushes_the_review_date_when_stored() {
-        // The advisory is shown once per 30 days: reporting it pushes
-        // the date, so the next start stays quiet.
+    fn an_expired_record_is_re_stored_with_a_pushed_review_date() {
+        // The review cycle is the lib's: resolving a due record pushes
+        // its review date and writes it back, so the advisory is shown
+        // once and the next run is quiet. The frontends only display
+        // it -- there is no state machine in them.
+        let path = store_path("expired_restored");
         let mut record = sample_record();
+        // A record of THIS build, so it is reused rather than re-probed.
+        record.ffmpeg_fingerprint = fingerprint(FFMPEG_VERSION, ENCODERS_WITH_NVENC);
         record.next_review_at = Utc::now() - Duration::days(1);
-        let resolution = Resolution {
-            encoders_output: String::new(),
-            support: record.support().to_vec(),
-            record: record.clone(),
-            probed: false,
-            review_due: true,
-        };
-        let stored =
-            record_to_store(&resolution, Utc::now()).expect("an expired record must be re-stored");
+        save(&path, &record).unwrap();
+        let due_at = record.next_review_at;
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let runner = fake_ffmpeg(ENCODERS_WITH_NVENC, FFMPEG_VERSION, true, calls.clone());
+        let resolution = resolve_and_store_with(Some(&path), false, runner).unwrap();
+
+        assert!(resolution.review_due, "the record is due");
+        assert!(
+            resolution.record.next_review_at > Utc::now() + Duration::days(29),
+            "the resolution must carry the pushed date: {:?}",
+            resolution.record.next_review_at
+        );
+        let stored = load(&path).expect("the record must be there");
         assert!(
             stored.next_review_at > Utc::now() + Duration::days(29),
             "the review date must be pushed ~30 days out: {:?}",
             stored.next_review_at
+        );
+        assert_ne!(stored.next_review_at, due_at, "the date must have moved");
+    }
+
+    #[test]
+    fn a_fresh_record_keeps_its_review_date() {
+        // Nothing was stale, so there is nothing to push.
+        let path = store_path("fresh_not_rewritten");
+        let mut record = sample_record();
+        record.ffmpeg_fingerprint = fingerprint(FFMPEG_VERSION, ENCODERS_WITH_NVENC);
+        save(&path, &record).unwrap();
+        let due_at = record.next_review_at;
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let runner = fake_ffmpeg(ENCODERS_WITH_NVENC, FFMPEG_VERSION, true, calls.clone());
+        let resolution = resolve_and_store_with(Some(&path), false, runner).unwrap();
+
+        assert!(!resolution.review_due, "a fresh record is not due");
+        let stored = load(&path).expect("the record must be there");
+        assert_eq!(
+            stored.next_review_at, due_at,
+            "the review date must not move"
         );
     }
 
@@ -874,8 +1154,24 @@ Encoders:
 
         let resolution = resolve_with(Some(&path), false, runner).unwrap();
         assert!(resolution.probed, "a missing record must be probed");
-        assert_eq!(resolution.support.len(), 1);
-        assert!(resolution.support[0].usable);
+        // One entry per candidate: the probed one and the two this
+        // build does not have.
+        assert_eq!(resolution.support.len(), NVENC_CANDIDATES.len());
+        let av1 = resolution
+            .support
+            .iter()
+            .find(|s| s.encoder == "av1_nvenc")
+            .expect("av1_nvenc must be listed");
+        assert!(av1.usable);
+        for absent in ["h264_nvenc", "hevc_nvenc"] {
+            let entry = resolution
+                .support
+                .iter()
+                .find(|s| s.encoder == absent)
+                .expect("every candidate must be listed");
+            assert!(!entry.usable);
+            assert!(entry.is_build_absent(), "{absent}: {entry:?}");
+        }
         // The probe ran (one call per NVENC encoder in the build).
         assert!(calls
             .lock()
@@ -961,20 +1257,43 @@ Encoders:
         let path = store_path("probe_failed");
 
         let resolution = resolve_with(Some(&path), false, runner).unwrap();
-        assert_eq!(resolution.support.len(), 1);
-        assert!(!resolution.support[0].usable);
-        assert!(resolution.support[0]
+        assert_eq!(resolution.support.len(), NVENC_CANDIDATES.len());
+        // The probed encoder failed the test -- with ffmpeg's reason.
+        let av1 = resolution
+            .support
+            .iter()
+            .find(|s| s.encoder == "av1_nvenc")
+            .expect("av1_nvenc must be listed");
+        assert!(!av1.usable);
+        assert!(!av1.is_build_absent());
+        assert!(av1
             .reason
             .as_deref()
             .unwrap_or_default()
             .contains("No NVENC capable devices found"));
+        // The encoders this build does not have failed for a different
+        // reason: the build, not the machine.
+        let h264 = resolution
+            .support
+            .iter()
+            .find(|s| s.encoder == "h264_nvenc")
+            .expect("every candidate must be listed");
+        assert!(h264.is_build_absent(), "{h264:?}");
     }
 
     #[test]
     fn report_lists_usable_and_unusable_encoders() {
         // The wording is the shared one (`NvencCapability::lines`) --
         // the CLI report and the UI list must not drift apart.
-        let text = report(&sample_record());
+        let record = sample_record();
+        let resolution = Resolution {
+            encoders_output: String::new(),
+            support: record.support().to_vec(),
+            record: record.clone(),
+            probed: false,
+            review_due: false,
+        };
+        let text = report(&resolution);
         assert!(text.contains("h264_nvenc: usable"), "{text}");
         assert!(text.contains("av1_nvenc: unusable — "), "{text}");
         assert!(text.contains("No NVENC capable devices found"));

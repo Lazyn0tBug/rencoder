@@ -21,7 +21,7 @@ use rencoder_lib::{
     collect::collect_files,
     config::{AnalyzeFormatArg, AppConfig},
     data::extract::probe_video_metadata,
-    encoder::nvenc::{self, CapabilityVerdicts},
+    encoder::nvenc::{self},
     pipeline::context::BatchContext,
     pipeline::{batch::transcode_batch, cache::cache_from_resolution},
     types::{EncodeParams, EncodingOutcome, ProcessOutput, Target},
@@ -50,7 +50,7 @@ fn detect_cmd() -> Result<()> {
     let cache_path = rencoder_lib::config::path::resolve_nvenc_cache();
     let resolution =
         nvenc::resolve_and_store(cache_path.as_deref(), true).context("NVENC detection failed")?;
-    print!("{}", nvenc::report(&resolution.record));
+    print!("{}", nvenc::report(&resolution));
     Ok(())
 }
 
@@ -68,8 +68,9 @@ enum Refresh {
 /// Advise the user that the stored NVENC capability may be stale.
 ///
 /// The record stays valid until the user says otherwise -- nobody knows
-/// the state of a machine better than its owner. A decline pushes the
-/// next advice 30 days out so we never nag on every run.
+/// the state of a machine better than its owner. The lib pushed the
+/// review date when it reported the stale record, so a decline keeps
+/// the next advice 30 days out.
 fn advise_refresh() -> Result<Refresh> {
     if !std::io::stdin().is_terminal() {
         println!(
@@ -188,21 +189,22 @@ fn encode_cmd(args: args::EncodeArgs, force_detect: bool) -> Result<()> {
     let mut resolution = nvenc::resolve_and_store(cache_path.as_deref(), force_detect)
         .context("NVENC detection failed")?;
 
-    // The staleness advisory only matters when this run actually uses
-    // NVENC -- otherwise the user is asked about a knob they don't
-    // touch.
-    if resolution.review_due && !force_detect && enable_nv {
+    // The staleness advisory. The review cycle belongs to the lib: the
+    // resolve already pushed the review date when the record was due,
+    // so the advisory is shown once and the next run is quiet. Showing
+    // it is this front end's part of the contract -- the CLI asks in
+    // the terminal, the GUI shows a line with a "re-detect" button.
+    if resolution.review_due && !force_detect {
         match advise_refresh()? {
             Refresh::Yes => {
                 resolution = nvenc::resolve_and_store(cache_path.as_deref(), true)
                     .context("NVENC detection failed")?;
             }
-            Refresh::No => {
-                // Nothing to do: `resolve_and_store` already pushed
-                // the review date 30 days out when it reported the
-                // expired record, so the next run stays quiet.
+            Refresh::No | Refresh::Skip => {
+                // Declined (or not asked in a non-interactive shell):
+                // the date is already pushed, so the next run stays
+                // quiet for another 30 days.
             }
-            Refresh::Skip => {}
         }
     }
 
@@ -214,14 +216,9 @@ fn encode_cmd(args: args::EncodeArgs, force_detect: bool) -> Result<()> {
     let current_output = signal::install_handler();
 
     // The batch context: this command's parameters, the encoder
-    // cache, the runtime config and the NVENC verdicts (an encoder
-    // that fails at runtime is not tried again for the rest of the
-    // command).
-    let mut ctx = BatchContext::new(
-        params,
-        std::sync::Arc::new(cache),
-        CapabilityVerdicts::default(),
-    );
+    // cache and this machine's NVENC capability (an encoder that
+    // fails at runtime is not tried again for the rest of the command).
+    let mut ctx = BatchContext::new(params, std::sync::Arc::new(cache), resolution.capability());
 
     let records = transcode_batch(
         &files,

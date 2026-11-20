@@ -319,7 +319,7 @@ where
     if run_result.is_err() {
         if let Some(encoder) = extract_encoder_from_argv(plan.argv()) {
             if nvenc::is_nvenc_encoder(&encoder)
-                && !nvenc::verify_capability(ctx.verdicts_mut(), &encoder)
+                && !nvenc::verify_capability(ctx.capability_mut(), &encoder)
             {
                 let (_, message, stderr_tail) = run_result.clone().unwrap_err();
                 tracing::warn!(
@@ -845,7 +845,7 @@ fn build_argv(
     // The context is unpacked here: the leaf selector keeps flat
     // parameters (design doc §3.10.4) so `encoder` does not depend on
     // `pipeline`.
-    let encoder = select_encoder(params.format, ctx.cache(), params, ctx.verdicts())?;
+    let encoder = select_encoder(params.format, ctx.cache(), params, ctx.capability())?;
     Ok(build_ffmpeg_command(task, params, &encoder, src_fps))
 }
 
@@ -1351,7 +1351,7 @@ pub fn probe_input(path: &Path) -> Result<crate::types::VideoMetadata, EncodeErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encoder::nvenc::CapabilityVerdicts;
+    use crate::encoder::nvenc::Capability;
     use crate::types::EncoderCache;
     use crate::types::VideoFormat;
     use std::sync::Arc;
@@ -1410,7 +1410,6 @@ Encoders:
  V..... libsvtav1            libsvtav1 SVT-AV1
 "
             .to_string(),
-            nvenc: Vec::new(),
         }
     }
 
@@ -1579,8 +1578,8 @@ Encoders:
         let params = params_x264_crf();
         let cache = cache_with_libx264_and_svtav1();
 
-        let verdicts = CapabilityVerdicts::default();
-        let mut ctx = BatchContext::new(params, Arc::new(cache), verdicts);
+        let capability = Capability::default();
+        let mut ctx = BatchContext::new(params, Arc::new(cache), capability);
         let record = transcode_single(&task, &mut ctx, ProcessOutput::Null)
             .expect("transcode_single should succeed");
         assert_eq!(record.outcome, EncodingOutcome::Succeeded);
@@ -1610,8 +1609,8 @@ Encoders:
         let params = params_x264_crf();
         let cache = cache_with_libx264_and_svtav1();
 
-        let verdicts = CapabilityVerdicts::default();
-        let mut ctx = BatchContext::new(params, Arc::new(cache), verdicts);
+        let capability = Capability::default();
+        let mut ctx = BatchContext::new(params, Arc::new(cache), capability);
         let record = transcode_single(&task, &mut ctx, ProcessOutput::Null)
             .expect("transcode_single should succeed");
         assert_eq!(record.outcome, EncodingOutcome::Failed);
@@ -1651,7 +1650,6 @@ Encoders:
  V..... libx264              libx264 H.264
 "
             .to_string(),
-            nvenc: Vec::new(),
         };
 
         // A fake NVENC encoder name: `is_nvenc_encoder` only looks at
@@ -1660,15 +1658,15 @@ Encoders:
         //
         // The verdict is pre-seeded as "unusable" so the fallback path
         // does not have to spawn a real ffmpeg probe.
-        let mut verdicts = CapabilityVerdicts::default();
-        verdicts.set("test_nvenc", false);
+        let mut capability = Capability::default();
+        capability.verdicts_mut().set("test_nvenc", false);
         let nvenc_argv = vec![
             "ffmpeg".to_string(),
             "-c:v".to_string(),
             "test_nvenc".to_string(),
         ];
 
-        let mut ctx = BatchContext::new(params, Arc::new(cache), verdicts);
+        let mut ctx = BatchContext::new(params, Arc::new(cache), capability);
         let plan = FilePlan::new(
             VideoMetadata::default(),
             nvenc_argv,
@@ -1704,7 +1702,7 @@ Encoders:
         assert!(calls[0].contains(&"test_nvenc".to_string()));
         assert!(calls[1].contains(&"libx264".to_string()));
         // The encoder that failed is remembered for this run.
-        assert!(ctx.verdicts().is_disabled("test_nvenc"));
+        assert!(ctx.capability().verdicts().is_disabled("test_nvenc"));
         // The record carries the argv that actually ran.
         assert_eq!(record.ffmpeg_argv, calls[1]);
         // ... and the record says the NVENC attempt happened and why.
@@ -1723,8 +1721,8 @@ Encoders:
         // The encode failed, but the encoder itself works -- so the
         // failure was something else (disk full, bad arguments). Falling
         // back would double the work and hide the real problem.
-        let mut verdicts = CapabilityVerdicts::default();
-        verdicts.set("usable_nvenc", true);
+        let mut capability = Capability::default();
+        capability.verdicts_mut().set("usable_nvenc", true);
 
         let dir = std::env::temp_dir().join("rencoder_batch_nvenc_usable");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1744,10 +1742,9 @@ Encoders:
  V..... libx264              libx264 H.264
 "
             .to_string(),
-            nvenc: Vec::new(),
         };
 
-        let mut ctx = BatchContext::new(params, Arc::new(cache), verdicts);
+        let mut ctx = BatchContext::new(params, Arc::new(cache), capability);
         let plan = FilePlan::new(
             VideoMetadata::default(),
             vec![
@@ -1786,15 +1783,15 @@ Encoders:
         assert_eq!(calls.len(), 1);
         assert_eq!(record.outcome, EncodingOutcome::Failed);
         // The encoder is not blacklisted -- it works.
-        assert!(!ctx.verdicts().is_disabled("usable_nvenc"));
+        assert!(!ctx.capability().verdicts().is_disabled("usable_nvenc"));
     }
 
     #[test]
     fn failed_fallback_reports_both_failures() {
         // Both attempts fail: the record has to name both, otherwise it
         // blames the software encoder for a hardware problem.
-        let mut verdicts = CapabilityVerdicts::default();
-        verdicts.set("bothfail_nvenc", false);
+        let mut capability = Capability::default();
+        capability.verdicts_mut().set("bothfail_nvenc", false);
 
         let dir = std::env::temp_dir().join("rencoder_batch_nvenc_both_fail");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1814,10 +1811,9 @@ Encoders:
  V..... libx264              libx264 H.264
 "
             .to_string(),
-            nvenc: Vec::new(),
         };
 
-        let mut ctx = BatchContext::new(params, Arc::new(cache), verdicts);
+        let mut ctx = BatchContext::new(params, Arc::new(cache), capability);
         let plan = FilePlan::new(
             VideoMetadata::default(),
             vec![
@@ -1888,7 +1884,7 @@ Encoders:
             "-i".into(),
             "x".into(),
         ];
-        let mut ctx = BatchContext::new(params, Arc::new(_cache), CapabilityVerdicts::default());
+        let mut ctx = BatchContext::new(params, Arc::new(_cache), Capability::default());
         let plan = FilePlan::new(
             VideoMetadata::default(),
             argv,

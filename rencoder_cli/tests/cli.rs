@@ -27,9 +27,36 @@ fn ffmpeg_available() -> bool {
         .unwrap_or(false)
 }
 
+/// A per-process scratch directory for the spawned binary.
+///
+/// The binary keeps its config, its history, its logs and its NVENC
+/// capability record in its app directory. In a test that must not be
+/// the build directory: the child gets env vars pointing at a scratch
+/// directory instead -- they exist for exactly this ("explicit
+/// override for debugging / CI").
+fn scratch_dir() -> PathBuf {
+    use std::sync::OnceLock;
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("rencoder_cli_env_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the scratch dir must be created");
+        dir
+    })
+    .clone()
+}
+
 fn run(args: &[&str]) -> std::process::Output {
+    let scratch = scratch_dir();
     Command::new(bin())
         .args(args)
+        .env("RENENCODER_CONFIG", scratch.join("rencoder.toml"))
+        .env("RENENCODER_DATA_DIR", scratch.join("data"))
+        .env("RENENCODER_LOG_DIR", scratch.join("log"))
+        .env(
+            "RENENCODER_NVENC_CACHE",
+            scratch.join("nvenc-capability.json"),
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()

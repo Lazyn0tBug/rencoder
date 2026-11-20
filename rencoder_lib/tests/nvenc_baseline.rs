@@ -13,7 +13,6 @@
 //! are all the production code's (design doc §3.10.4 rule 2).
 
 use rencoder_lib::encoder::nvenc;
-use rencoder_lib::encoder::nvenc::CapabilityVerdicts;
 use rencoder_lib::encoder::select::select_encoder;
 use rencoder_lib::test_support::{Clock, ScriptedFfmpeg, TempDir};
 use rencoder_lib::types::{EncodeParams, EncoderCache, NvencSupport, VideoFormat};
@@ -43,6 +42,18 @@ fn machine_without_nvenc() -> ScriptedFfmpeg {
         .probe_fail("av1_nvenc", "No NVENC capable devices found")
 }
 
+/// The verdict for `encoder` in a support list.
+///
+/// Every NVENC candidate is listed, whatever the machine looks like --
+/// an encoder the build lacks is there too, marked unusable with the
+/// build's absence as the reason (design doc §3.10.5).
+fn entry<'a>(support: &'a [NvencSupport], encoder: &str) -> &'a NvencSupport {
+    support
+        .iter()
+        .find(|s| s.encoder == encoder)
+        .unwrap_or_else(|| panic!("{encoder} must be listed"))
+}
+
 // ---- the capability record ----
 
 #[test]
@@ -60,15 +71,19 @@ fn the_first_run_probes_the_machine_and_stores_the_record() {
         resolution.probed,
         "no record yet -> the machine must be probed"
     );
-    assert_eq!(resolution.support.len(), 1);
-    assert_eq!(resolution.support[0].encoder, "av1_nvenc");
-    assert!(resolution.support[0].usable);
+    // One entry per candidate: the probed one, and the two this build
+    // does not have.
+    assert_eq!(resolution.support.len(), 3);
+    let av1 = entry(&resolution.support, "av1_nvenc");
+    assert!(av1.usable);
+    assert!(entry(&resolution.support, "h264_nvenc").is_build_absent());
+    assert!(entry(&resolution.support, "hevc_nvenc").is_build_absent());
     assert!(!resolution.review_due, "a fresh probe is never due");
 
     // The record is on disk, bound to this ffmpeg build.
     let stored = nvenc::load(&path).expect("the record must be stored");
     assert_eq!(stored.ffmpeg_version, FFMPEG_VERSION);
-    assert_eq!(stored.encoders.len(), 1);
+    assert_eq!(stored.encoders.len(), 3);
     assert_eq!(
         stored.ffmpeg_fingerprint,
         nvenc::fingerprint(FFMPEG_VERSION, ENCODERS_WITH_NVENC),
@@ -100,8 +115,8 @@ fn the_second_run_reuses_the_record_without_probing() {
         second.calls()
     );
     // The stored answer comes back unchanged.
-    assert_eq!(resolution.support.len(), 1);
-    assert!(resolution.support[0].usable);
+    assert_eq!(resolution.support.len(), 3);
+    assert!(entry(&resolution.support, "av1_nvenc").usable);
 }
 
 #[test]
@@ -132,6 +147,38 @@ fn a_record_from_another_ffmpeg_build_is_not_reused() {
 }
 
 #[test]
+fn a_build_without_nvenc_is_answered_without_any_hardware_check() {
+    // Level 1 (does this ffmpeg build have NVENC at all?) decides it.
+    // A build without the encoders can never run them, so no 1-frame
+    // probe may happen -- on this machine the answer ends here.
+    let dir = TempDir::new("nvenc_build_without_nvenc");
+    let path = dir.file(nvenc::CAPABILITY_FILE_NAME);
+    let clock = Clock::starting_now();
+    let ffmpeg = ScriptedFfmpeg::new()
+        .encoders("Encoders:\n V..... libsvtav1  libsvtav1 SVT-AV1\n")
+        .version(FFMPEG_VERSION);
+
+    let resolution =
+        nvenc::resolve_and_store_with_clock(Some(&path), false, ffmpeg.runner(), clock.now())
+            .expect("a build without NVENC is not an error");
+
+    // Every candidate is listed, and every one of them failed the test
+    // for the same reason: the build does not have it.
+    assert_eq!(resolution.support.len(), 3);
+    for encoder in ["h264_nvenc", "hevc_nvenc", "av1_nvenc"] {
+        let verdict = entry(&resolution.support, encoder);
+        assert!(!verdict.usable, "{encoder}");
+        assert!(verdict.is_build_absent(), "{encoder}: {verdict:?}");
+    }
+    assert_eq!(
+        ffmpeg.calls_containing("-c:v").len(),
+        0,
+        "level 1 decides it -- no hardware probe may run: {:?}",
+        ffmpeg.calls()
+    );
+}
+
+#[test]
 fn a_failed_probe_marks_the_encoder_unusable_with_the_reason() {
     let dir = TempDir::new("nvenc_probe_failed");
     let path = dir.file(nvenc::CAPABILITY_FILE_NAME);
@@ -142,17 +189,21 @@ fn a_failed_probe_marks_the_encoder_unusable_with_the_reason() {
         nvenc::resolve_and_store_with_clock(Some(&path), false, ffmpeg.runner(), clock.now())
             .expect("a failing probe is not an error");
 
-    assert_eq!(resolution.support.len(), 1);
-    assert!(!resolution.support[0].usable);
+    assert_eq!(resolution.support.len(), 3);
+    // The probed encoder failed the test -- with ffmpeg's reason.
+    let av1 = entry(&resolution.support, "av1_nvenc");
+    assert!(!av1.usable);
+    assert!(!av1.is_build_absent());
     assert!(
-        resolution.support[0]
-            .reason
+        av1.reason
             .as_deref()
             .unwrap_or_default()
             .contains("No NVENC capable devices found"),
-        "the reason must survive into the record: {:?}",
-        resolution.support[0]
+        "the reason must survive into the record: {av1:?}"
     );
+    // The encoders the build does not have failed for a different
+    // reason: the build, not the machine.
+    assert!(entry(&resolution.support, "h264_nvenc").is_build_absent());
 }
 
 #[test]
@@ -185,39 +236,94 @@ fn an_expired_record_is_reused_but_flagged_for_review() {
     );
 }
 
+#[test]
+fn the_lib_owns_the_review_cycle() {
+    // The review cycle is the lib's: resolving a due record pushes its
+    // review date and writes it back, so the advisory is shown once
+    // and the next run is quiet. The frontends only display it -- there
+    // is no state machine in them (design doc §2).
+    let dir = TempDir::new("nvenc_review_cycle");
+    let path = dir.file(nvenc::CAPABILITY_FILE_NAME);
+    let clock = Clock::starting_now();
+
+    let first = working_machine();
+    nvenc::resolve_and_store_with_clock(Some(&path), false, first.runner(), clock.now())
+        .expect("the first run must resolve");
+
+    // Thirty-one days later: the record is due.
+    clock.advance(chrono::Duration::days(31));
+    let due_at = nvenc::load(&path)
+        .expect("the record must be there")
+        .next_review_at;
+
+    // The next run reports the advisory and pushes the date.
+    let second = working_machine();
+    let resolution =
+        nvenc::resolve_and_store_with_clock(Some(&path), false, second.runner(), clock.now())
+            .expect("the second run must resolve");
+    assert!(resolution.review_due, "the record is due");
+    assert!(
+        nvenc::load(&path)
+            .expect("the record must be there")
+            .next_review_at
+            > clock.now() + chrono::Duration::days(29),
+        "the review date must be pushed ~30 days out"
+    );
+    assert_ne!(
+        nvenc::load(&path)
+            .expect("the record must be there")
+            .next_review_at,
+        due_at,
+        "the date must have moved"
+    );
+
+    // And the run after that is quiet again -- the push bought 30
+    // days from the moment it happened (which was 31 days ahead of
+    // the first run's clock), so 29 more days is still inside it.
+    clock.advance(chrono::Duration::days(29));
+    let third = working_machine();
+    let resolution =
+        nvenc::resolve_and_store_with_clock(Some(&path), false, third.runner(), clock.now())
+            .expect("the third run must resolve");
+    assert!(
+        !resolution.review_due,
+        "the advisory must not fire twice in a row"
+    );
+}
+
 // ---- encoder selection ----
 
-fn cache_with(usable: bool) -> EncoderCache {
+fn cache() -> EncoderCache {
     EncoderCache {
         encoders_output: ENCODERS_WITH_NVENC.to_string(),
-        nvenc: vec![NvencSupport {
-            encoder: "av1_nvenc".to_string(),
-            usable,
-            reason: if usable {
-                None
-            } else {
-                Some("No NVENC capable devices found".to_string())
-            },
-        }],
     }
+}
+
+/// The capability of a machine that can (`usable`) or cannot run
+/// av1_nvenc.
+fn capability_with(usable: bool) -> nvenc::Capability {
+    nvenc::Capability::from_support(vec![NvencSupport {
+        encoder: "av1_nvenc".to_string(),
+        usable,
+        reason: if usable {
+            None
+        } else {
+            Some("No NVENC capable devices found".to_string())
+        },
+    }])
 }
 
 #[test]
 fn the_software_encoder_is_chosen_when_nv_is_off() {
     // The machine could do hardware -- but this run did not ask for it.
-    let cache = cache_with(true);
+    let cache = cache();
     let params = EncodeParams {
         nv: false,
         ..EncodeParams::default()
     };
 
-    let chosen = select_encoder(
-        VideoFormat::Av1,
-        &cache,
-        &params,
-        &CapabilityVerdicts::default(),
-    )
-    .expect("an encoder must be chosen");
+    let chosen = select_encoder(VideoFormat::Av1, &cache, &params, &capability_with(true))
+        .expect("an encoder must be chosen");
 
     assert_eq!(chosen, "libsvtav1", "nv off -> software encoding");
 }
@@ -225,19 +331,14 @@ fn the_software_encoder_is_chosen_when_nv_is_off() {
 #[test]
 fn the_software_encoder_is_chosen_when_the_nvenc_encoder_is_unusable() {
     // The run asked for hardware; the machine cannot deliver it.
-    let cache = cache_with(false);
+    let cache = cache();
     let params = EncodeParams {
         nv: true,
         ..EncodeParams::default()
     };
 
-    let chosen = select_encoder(
-        VideoFormat::Av1,
-        &cache,
-        &params,
-        &CapabilityVerdicts::default(),
-    )
-    .expect("an encoder must be chosen");
+    let chosen = select_encoder(VideoFormat::Av1, &cache, &params, &capability_with(false))
+        .expect("an encoder must be chosen");
 
     assert_eq!(
         chosen, "libsvtav1",
@@ -247,19 +348,14 @@ fn the_software_encoder_is_chosen_when_the_nvenc_encoder_is_unusable() {
 
 #[test]
 fn the_nvenc_encoder_is_chosen_when_nv_is_on_and_the_machine_can_run_it() {
-    let cache = cache_with(true);
+    let cache = cache();
     let params = EncodeParams {
         nv: true,
         ..EncodeParams::default()
     };
 
-    let chosen = select_encoder(
-        VideoFormat::Av1,
-        &cache,
-        &params,
-        &CapabilityVerdicts::default(),
-    )
-    .expect("an encoder must be chosen");
+    let chosen = select_encoder(VideoFormat::Av1, &cache, &params, &capability_with(true))
+        .expect("an encoder must be chosen");
 
     assert_eq!(chosen, "av1_nvenc");
 }
@@ -303,7 +399,7 @@ fn real_ffmpeg(args: &[&str]) -> String {
 }
 
 #[test]
-fn the_real_probe_agrees_with_the_build() {
+fn the_real_build_answers_level_one() {
     if !ffmpeg_available() {
         eprintln!("skipping: ffmpeg not available");
         return;
@@ -312,32 +408,38 @@ fn the_real_probe_agrees_with_the_build() {
     let encoders_output = real_ffmpeg(&["-encoders"]);
     let support = nvenc::probe(&encoders_output);
 
+    // Every candidate is listed. The verdict must agree with the
+    // build: an encoder the build lacks is unusable with the build's
+    // absence as the reason; one the build has was really probed.
+    assert_eq!(support.len(), 3);
     for encoder in ["h264_nvenc", "hevc_nvenc", "av1_nvenc"] {
         let in_build = encoders_output.contains(encoder);
-        let entry = support.iter().find(|s| s.encoder == encoder);
-        assert_eq!(
-            entry.is_some(),
-            in_build,
-            "{encoder}: the probe must report exactly the encoders this build has \
-             (build says {in_build})"
-        );
-        if let Some(entry) = entry {
-            if !entry.usable {
+        let verdict = entry(&support, encoder);
+        if in_build {
+            assert!(
+                !verdict.is_build_absent(),
+                "{encoder}: the build has it, so it was probed, not skipped"
+            );
+            if !verdict.usable {
                 assert!(
-                    entry
+                    verdict
                         .reason
                         .as_deref()
                         .is_some_and(|r| !r.trim().is_empty()),
-                    "{encoder}: an unusable encoder must carry ffmpeg's reason: {:?}",
-                    entry
+                    "{encoder}: an unusable encoder must carry ffmpeg's reason: {verdict:?}"
                 );
             }
+        } else {
+            assert!(
+                verdict.is_build_absent(),
+                "{encoder}: the build does not have it, so the verdict must say so: {verdict:?}"
+            );
         }
     }
 }
 
 #[test]
-fn the_real_run_picks_an_encoder_the_machine_can_actually_run() {
+fn the_real_machine_answers_level_two() {
     if !ffmpeg_available() {
         eprintln!("skipping: ffmpeg not available");
         return;
@@ -347,25 +449,20 @@ fn the_real_run_picks_an_encoder_the_machine_can_actually_run() {
     let support = nvenc::probe(&encoders_output);
     let cache = EncoderCache {
         encoders_output: encoders_output.clone(),
-        nvenc: support,
     };
     let params = EncodeParams {
         nv: true,
         ..EncodeParams::default()
     };
 
-    let chosen = select_encoder(
-        VideoFormat::Av1,
-        &cache,
-        &params,
-        &CapabilityVerdicts::default(),
-    )
-    .expect("an encoder must be chosen");
+    let capability = nvenc::Capability::from_support(support);
+    let chosen = select_encoder(VideoFormat::Av1, &cache, &params, &capability)
+        .expect("an encoder must be chosen");
 
     // The machine either can run AV1 in hardware, or it cannot -- and
     // then the software encoder is what the run has to use. What it
     // must never be is an NVENC encoder the probe rejected.
-    if cache.nvenc_usable("av1_nvenc") {
+    if capability.usable("av1_nvenc") {
         assert_eq!(chosen, "av1_nvenc");
     } else {
         assert_eq!(
@@ -383,6 +480,13 @@ fn the_real_run_picks_an_encoder_the_machine_can_actually_run() {
 /// that changed hardware keeps answering with the old machine's
 /// capabilities.
 ///
+/// The two-level model says where the device belongs: level 1 (does
+/// the build have NVENC?) is a property of the build alone, and the
+/// key already covers it; level 2 (can this machine run it?) is a
+/// property of build **and** device, so the key needs the device --
+/// but only when level 1 passed. A build without NVENC needs no device
+/// information at all: its answer can never change.
+///
 /// The production side does not exist yet -- `nvenc::fingerprint` hashes
 /// the version string and the encoder list, nothing about the device.
 /// The test is kept (and ignored) so the expectation is on record and
@@ -391,7 +495,10 @@ fn the_real_run_picks_an_encoder_the_machine_can_actually_run() {
 /// TODO(step 3): let the fixture script the device/driver information
 /// the probe reads, store a record for device A, then resolve again
 /// with device B scripted -- and assert that the record is re-probed
-/// instead of reused.
+/// instead of reused. The counterpart -- a build without NVENC keeps
+/// reusing its record even when the device information changes -- is
+/// already covered by
+/// `a_build_without_nvenc_is_answered_without_any_hardware_check`.
 #[test]
 #[ignore = "needs the device-aware capability cache key from §3.10.6 step 3"]
 fn the_capability_cache_key_changes_with_the_device() {

@@ -33,7 +33,7 @@ use crate::analyzer::records::{analyze_records_with_probe_and_progress_parallel,
 use crate::config::app::AppConfig;
 use crate::config::path::resolve_config;
 use crate::data::extract::probe_video_metadata_auto;
-use crate::encoder::nvenc::CapabilityVerdicts;
+use crate::encoder::nvenc::{Capability, CapabilityVerdicts};
 use crate::error::EncodeError;
 use crate::pipeline::batch::{FfmpegFileEncoder, FfmpegProgress, FileEncoder};
 use crate::pipeline::cancel::CancelToken;
@@ -233,7 +233,7 @@ pub enum Event {
     /// The NVENC capability of this machine (after a `Command::Detect`
     /// or the startup resolve). The UI shows it next to the NVENC
     /// switch: which hardware encoders run here, and why not.
-    NvencCapability(crate::types::NvencCapability),
+    NvencCapability(crate::encoder::nvenc::Capability),
 
     // ---- Analyze topic (U22 / Tier 3 #9) ----
     // See docs/design.md §3.4 "分析进度上报" for the full protocol
@@ -779,7 +779,10 @@ pub fn start_controller() -> ControllerHandle {
     // The capability does NOT depend on the `nv` switch: it is a fact
     // about the machine, and `nv` is this run's choice (design doc
     // §3.10.5). So the resolution happens either way.
-    let cache_rx = crate::pipeline::cache::init_encoder_cache_async_with_capability();
+    let cache_rx = crate::pipeline::cache::init_encoder_cache_async_with_capability_at(
+        env.nvenc_cache_path.clone(),
+        crate::encoder::nvenc::run_ffmpeg,
+    );
 
     std::thread::Builder::new()
         .name("renencoder-controller".into())
@@ -807,12 +810,15 @@ pub fn start_controller_with(env: ActorEnv) -> ControllerHandle {
     let (evt_tx, evt_rx) = bounded::<Event>(EVT_TX_CAPACITY);
 
     // The cache init goes through the injected runner, so a test never
-    // spawns ffmpeg (the fake runner answers every invocation).
+    // spawns ffmpeg (the fake runner answers every invocation). The
+    // record path travels with it: a test must not write the
+    // capability record into the real app directory (design doc
+    // §3.10.4).
     let detect_runner_for_cache = Arc::clone(&env.detect_runner);
-    let cache_rx =
-        crate::pipeline::cache::init_encoder_cache_async_with_capability_runner(move |args| {
-            detect_runner_for_cache(args)
-        });
+    let cache_rx = crate::pipeline::cache::init_encoder_cache_async_with_capability_at(
+        env.nvenc_cache_path.clone(),
+        move |args| detect_runner_for_cache(args),
+    );
 
     let app_config = Arc::clone(&env.app_config);
     let config_path = env.config_path.clone();
@@ -887,17 +893,6 @@ fn replace_encoder_cache(cache_cell: &CacheCell, resolution: &crate::encoder::nv
     let cache = crate::pipeline::cache::cache_from_resolution(resolution);
     let mut guard = cache_cell.lock();
     *guard = Some(Ok(Arc::new(cache)));
-}
-
-/// Summarize a capability resolution for the UI.
-fn nvenc_capability_of(
-    resolution: &crate::encoder::nvenc::Resolution,
-) -> crate::types::NvencCapability {
-    crate::types::NvencCapability {
-        support: resolution.support.clone(),
-        probed_at: Some(resolution.record.probed_at),
-        review_due: resolution.review_due,
-    }
 }
 
 // =====================================================================
@@ -1103,7 +1098,7 @@ fn make_encode_processor(
        + 'static {
     // What the actor already knows: the verdicts this batch started
     // with. The comparison tells us what the encode changed.
-    let mut reported = batch_ctx.verdicts().clone();
+    let mut reported = batch_ctx.capability().verdicts().clone();
     move |task: &TranscodeTask, ctx: &crate::pipeline::task::TaskContext| {
         // FileStarted uses 0-indexed (matches the v1 UI contract).
         // TaskManager passes 1-indexed in `ctx.index`; convert.
@@ -1153,10 +1148,10 @@ fn make_encode_processor(
         // NVENC encode failed and the encoder turned out to be
         // unusable). The actor merges them into its authoritative copy
         // so the next batch inherits them.
-        for change in batch_ctx.verdicts().changes_since(&reported) {
+        for change in batch_ctx.capability().verdicts().changes_since(&reported) {
             let _ = update_tx.send(change);
         }
-        reported.clone_from(batch_ctx.verdicts());
+        reported.clone_from(batch_ctx.capability().verdicts());
 
         match res {
             Ok(record) => {
@@ -1319,6 +1314,10 @@ fn run_actor(
         };
         // The NVENC capability as resolved at startup -- the UI shows
         // it without the user having to ask for it.
+        //
+        // The review cycle is the lib's: the resolution already pushed
+        // the review date when the record was due, so the UI's
+        // advisory is shown once and the next start is quiet.
         if let Some(capability) = init.capability {
             send_evt_lossy(
                 &evt_tx_for_init,
@@ -1355,10 +1354,10 @@ fn run_actor(
     // "This batch is done" signals. The worker sends one when it
     // finishes; the actor reopens the busy gate when it reads one.
     let (done_tx, done_rx) = bounded::<BatchDone>(1);
-    // The authoritative NVENC verdicts: which encoders this session
-    // already found to be unusable. Each batch worker gets a snapshot
-    // and reports its changes back (the done signal carries them).
-    let mut verdicts = CapabilityVerdicts::default();
+    // The authoritative capability: this machine's NVENC capability as
+    // the session knows it. Each batch worker gets a snapshot and
+    // reports its changes back (the done signal carries them).
+    let mut capability = Capability::default();
 
     loop {
         // Wait for the next command OR for a worker to report "done".
@@ -1367,7 +1366,7 @@ fn run_actor(
             recv(cmd_rx) -> cmd => cmd,
             recv(done_rx) -> done => {
                 if let Ok(BatchDone { updates }) = done {
-                    apply_verdict_updates(&mut verdicts, updates);
+                    apply_verdict_updates(capability.verdicts_mut(), updates);
                     batch_running = false;
                 }
                 continue;
@@ -1393,7 +1392,7 @@ fn run_actor(
             Command::StartBatch { .. } | Command::DryRun { .. } | Command::Analyze { .. }
         ) {
             let (finished, updates) = drain_batch_done(&done_rx);
-            apply_verdict_updates(&mut verdicts, updates);
+            apply_verdict_updates(capability.verdicts_mut(), updates);
             if finished {
                 batch_running = false;
             }
@@ -1465,9 +1464,9 @@ fn run_actor(
                 let evt_tx_for_worker = evt_tx.clone();
                 let dropped_for_worker = DropCounter::default();
                 // The worker gets a snapshot of the authoritative
-                // verdicts; whatever it changes is reported back
+                // capability; whatever it changes is reported back
                 // through the update channel.
-                let verdicts_for_worker = verdicts.clone();
+                let capability_for_worker = capability.clone();
                 let file_encoder_for_worker = Arc::clone(&file_encoder);
                 let make_processor = move |update_tx: Sender<(String, bool)>| {
                     // The context is built here, in the worker: the
@@ -1479,7 +1478,7 @@ fn run_actor(
                     ))?;
                     let cache = cache_from_slot(slot)?;
                     let batch_ctx =
-                        BatchContext::new(params_for_worker, cache, verdicts_for_worker);
+                        BatchContext::new(params_for_worker, cache, capability_for_worker);
                     Ok(make_encode_processor(
                         batch_ctx,
                         cancel_for_worker,
@@ -1514,9 +1513,9 @@ fn run_actor(
                 let cache_cell_for_worker = Arc::clone(&cache_cell);
                 let evt_tx_for_worker = evt_tx.clone();
                 let dropped_for_worker = DropCounter::default();
-                // A dry run never encodes, so it cannot change a
-                // verdict -- it only reads them.
-                let verdicts_for_worker = verdicts.clone();
+                // A dry run never encodes, so it cannot change the
+                // capability -- it only reads it.
+                let capability_for_worker = capability.clone();
                 batch_running = true;
                 spawn_batch_job(
                     move || {
@@ -1548,7 +1547,7 @@ fn run_actor(
                                 return;
                             }
                         };
-                        let batch_ctx = BatchContext::new(params, cache, verdicts_for_worker);
+                        let batch_ctx = BatchContext::new(params, cache, capability_for_worker);
                         let records =
                             crate::pipeline::batch::dry_run_batch(&batch_ctx, files.iter());
                         send_evt_lossy(
@@ -1637,7 +1636,7 @@ fn run_actor(
                                 replace_encoder_cache(&cache_cell_for_detect, &resolution);
                                 send_evt_lossy(
                                     &evt_tx_detect,
-                                    Event::NvencCapability(nvenc_capability_of(&resolution)),
+                                    Event::NvencCapability(resolution.capability()),
                                     &dropped_detect,
                                 );
                             }
@@ -1872,6 +1871,33 @@ mod mock_tests {
             + Sync
             + 'static,
     {
+        run_test_controller_with_capability(mock_fn, data_dir, None)
+    }
+
+    /// [`run_test_controller`] with the NVENC capability the cache
+    /// init hands to the UI.
+    ///
+    /// The production actor resolves the capability at startup and
+    /// reports it in an `Event::NvencCapability`; the test harness
+    /// pre-populates the cache channel instead, so a test that cares
+    /// about that event (or about the review-date deferral it
+    /// triggers) passes the capability in here.
+    fn run_test_controller_with_capability<F>(
+        mock_fn: F,
+        data_dir: Option<PathBuf>,
+        capability: Option<Capability>,
+    ) -> (Sender<Command>, Receiver<Event>)
+    where
+        F: Fn(
+                &TranscodeTask,
+                &BatchContext,
+                &CancelToken,
+                &mut dyn FnMut(FfmpegProgress),
+            ) -> Result<EncodingRecord, EncodeError>
+            + Send
+            + Sync
+            + 'static,
+    {
         let (cmd_tx, cmd_rx) = unbounded::<Command>();
         let (evt_tx, evt_rx) = unbounded::<Event>();
 
@@ -1883,9 +1909,8 @@ mod mock_tests {
             .send(crate::pipeline::cache::CacheInit {
                 cache: Ok(EncoderCache {
                     encoders_output: String::new(),
-                    nvenc: Vec::new(),
                 }),
-                capability: None,
+                capability,
             })
             .expect("send the pre-populated cache");
 
@@ -2826,6 +2851,49 @@ mod mock_tests {
             partial_check_b.display()
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn the_capability_reaches_the_ui_at_startup() {
+        // The GUI's half of the review cycle: the capability (with the
+        // advisory flag) reaches the UI without the user asking for it.
+        //
+        // Pushing the review date is the lib's job -- the resolve
+        // does it, so there is no state machine in the frontend
+        // (`nvenc::tests::an_expired_record_is_re_stored_with_a_pushed_review_date`
+        // covers that half).
+        let dir = unique_tmp("capability_event");
+        std::fs::create_dir_all(&dir).expect("the temp dir must be created");
+
+        let capability = Capability::from_check(
+            Vec::new(),
+            Some(chrono::Utc::now() - chrono::Duration::days(40)),
+            true,
+        );
+
+        let (_cmd_tx, evt_rx) = run_test_controller_with_capability(
+            make_succeeding_mock().0,
+            Some(dir.clone()),
+            Some(capability),
+        );
+
+        let mut reported = None;
+        for _ in 0..50 {
+            match evt_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(Event::NvencCapability(capability)) => {
+                    reported = Some(capability);
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        let capability = reported.expect("the capability must reach the UI");
+        assert!(
+            capability.review_due(),
+            "the UI needs the advisory flag to show the advisory"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

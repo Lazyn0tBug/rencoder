@@ -211,7 +211,7 @@ pub struct AppState {
     /// (`Event::NvencCapability`). `None` until the first report
     /// arrives — the lib resolves it at startup and on every
     /// `Command::Detect`.
-    pub nvenc_capability: Option<rencoder_lib::types::NvencCapability>,
+    pub nvenc_capability: Option<rencoder_lib::encoder::nvenc::Capability>,
 }
 
 /// Cap on the toasts queue. Older toasts are popped when the
@@ -1371,24 +1371,22 @@ mod tests {
         let (tx, _rx) = unbounded::<Command>();
         let mut state = fresh_state();
         assert!(state.nvenc_capability.is_none());
-        let capability = rencoder_lib::types::NvencCapability {
-            support: vec![rencoder_lib::types::NvencSupport {
+        let capability = rencoder_lib::encoder::nvenc::Capability::from_support(vec![
+            rencoder_lib::types::NvencSupport {
                 encoder: "av1_nvenc".into(),
                 usable: false,
                 reason: Some("No NVENC capable devices found".into()),
-            }],
-            probed_at: Some(DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap()),
-            review_due: true,
-        };
+            },
+        ]);
         reduce(
             &mut state,
             Msg::Lib(Event::NvencCapability(capability.clone())),
             &tx,
         );
         let stored = state.nvenc_capability.expect("capability should be stored");
-        assert_eq!(stored.support.len(), 1);
-        assert!(stored.review_due);
-        assert_eq!(stored.support[0].encoder, "av1_nvenc");
+        assert_eq!(stored.support().len(), 1);
+        assert!(!stored.usable("av1_nvenc"));
+        assert_eq!(stored.support()[0].encoder, "av1_nvenc");
     }
 
     #[test]
