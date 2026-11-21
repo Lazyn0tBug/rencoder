@@ -3767,6 +3767,9 @@ AppConfig ──EncodeConfig──→ EncodeParams::from_app_config ──→ En
 | 能力解析 + 存盘 | lib | `nvenc::resolve_and_store*`：唯一会写能力记录的地方 |
 | 解析结果 → 能力摘要 | lib | `Resolution::capability()`：唯一把解析变成"前端显示什么"的地方 |
 | 记录放在哪、要不要强制重探 | 前端 | CLI 的 `resolve_nvenc_cache()`；GUI 的 `ActorEnv.nvenc_cache_path` |
+| 记录怎么落盘 | lib | `data::store::write_records`（格式分派）与 `default_encoding_path`（默认路径） |
+| 摘要的计数与措辞 | lib | `data::store::summary_lines`；前端各自排版 |
+| 什么时候落盘 | 前端 | CLI 在编码命令结束时；actor 在批次终态时 |
 | 怎么问用户 | 前端 | CLI 在终端问 y/N；GUI 给一个"重新检测"按钮 |
 | 怎么显示 | 前端 | CLI 打印报告；GUI 渲染成行 |
 
@@ -4024,6 +4027,12 @@ Capability {
 
 批次执行返回 `BatchReport<R> { records, termination }`（`R` 是记录元素类型，编码批为 `EncodingRecord`）。`termination` 区分 `Completed`、`Cancelled` 和 `Failed(error)`。逐文件错误写入记录，允许其余文件继续。任何终态都保留已完成文件的记录，由 CLI 和 GUI 按同一规则保存。执行层组装唯一的报告，CLI 直接消费，actor 以该报告生成带批次 ID 的终态事件。未开始的任务不计为完成，正常处理完毕的失败文件计为完成但不计为成功。
 
+**一批做完要落盘，两个前端都一样**。记录的落盘是 lib 的事（§3.10.3）：格式分派（parquet / jsonl / csv，按扩展名）、默认路径（`<data_dir>/encoding-<时间戳>.parquet`）、目录与权限，都在 `data::store` 里。**谁决定落盘**是前端的事——CLI 在编码命令结束时落，actor 在批次终态时落——但**怎么落**只有一份实现。
+
+不落盘的后果很具体：GUI 的历史面板永远是空的（它读的是 `<data_dir>/encoding-*.parquet`，而只有 CLI 在写）。这不是"两个前端风格不同"，是少了一个功能。
+
+**摘要的措辞也在 lib**：`Summary: Total / Success / Reduced / Failed` 的计数与措辞是同一份事实，CLI 打印它、GUI 渲染它（排版各自）。CLI 现在自己数一遍 Succeeded / Reduced / Failed，GUI 自己数一遍——两遍数字迟早对不上。
+
 #### 3.11.5 实施顺序与验收
 
 1. NVENC 夹具、配置解析与能力对象按 §3.10.6 步骤 1-3 推进。GUI 草稿语义迁移及预演失效单列实现和验收。
@@ -4199,6 +4208,9 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 88 | **能力判定分两级**（§3.10.5）：一级=构建带不带 NVENC，二级=机器能不能跑；记录存的是测试结果，一级失败是它的原因；每个候选都有一项，记录形状不随机器变化（磁盘格式升到 v2，旧记录作废重探） | ✅ |
 | 89 | **复审周期由 lib 掌管**（§2）：记录到期时解析把它推后 30 天并落盘，前端只负责显示提示；两个前端（及以后的前端）不必各自记着延期这件事 | ✅ |
 | 90 | **能力是一个对象**（§3.10.5）：检查的结论与运行时的修正合成一个 `Capability`，整条链共享（选型读、回退写、actor 持权威副本）；`EncoderCache` 只剩 ffmpeg 的编码器列表；自己探一次的独立入口删除 | ✅ |
+| 91 | **记录落盘归 lib**（§3.11.4）：格式分派与默认路径进 `data::store`；actor 在批次终态时落盘——**GUI 的历史面板不再永远是空的** | future |
+| 92 | **摘要的计数与措辞归 lib**（§3.10.3）：两个前端不再各数一遍 | future |
+| 93 | **`BatchReport` 落地**（§3.11.4）：执行层组装唯一的报告，CLI 直接消费，actor 据此发终态事件——"这一批结束了"只有一种理解 | future |
 
 ---
 
