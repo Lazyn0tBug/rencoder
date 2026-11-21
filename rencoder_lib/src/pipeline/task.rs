@@ -40,11 +40,10 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::EncodeError;
-use crate::pipeline::partial_output::{self, PartialOutputHandle};
+use crate::pipeline::cancel::CancelToken;
 use crate::types::TranscodeTask;
 
-/// Task metadata passed alongside the per-task closure. Mirrors what
-/// the signal-handler reads from [`PartialOutputHandle`].
+/// Task metadata passed alongside the per-task closure.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskContext {
     /// 1-based index in the batch (`3` of `task 3/58`).
@@ -60,26 +59,28 @@ pub struct TaskContext {
     pub batch_path: PathBuf,
     /// Source (input) file path -- what the operator cares about.
     pub source: crate::types::InputPath,
-    /// Output file path -- what the signal handler removes on SIGINT.
-    /// `None` for read-only tasks (analyze); the signal handler sees
-    /// `None` and skips the removal.
+    /// Output file path -- what a cancelled task leaves behind, and
+    /// what the lib removes when it stops.
+    /// `None` for read-only tasks (analyze).
     pub output: Option<PathBuf>,
 }
 
-/// Owns the [`PartialOutputHandle`] for the lifetime of a batch run.
-/// One `TaskManager` per process; `run` may be called multiple times
-/// serially (no parallel `run` calls -- the handle is process-singleton
-/// per U18 §3.4.5).
-pub struct TaskManager {
-    handle: Option<PartialOutputHandle>,
+/// Runs a batch of tasks.
+///
+/// One `TaskManager` per batch; `run` may be called multiple times
+/// serially.
+pub struct TaskManager;
+
+impl Default for TaskManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TaskManager {
-    /// Construct a manager bound to an optional signal-handler handle.
-    /// Pass `None` for read-only task sets (analyze) where there is
-    /// no partial file for SIGINT to remove.
-    pub fn new(handle: Option<PartialOutputHandle>) -> Self {
-        Self { handle }
+    /// Construct a manager.
+    pub fn new() -> Self {
+        Self
     }
 
     /// Iterate `tasks`, emitting scaffold logs and (for tasks with an
@@ -131,6 +132,7 @@ impl TaskManager {
         tasks: &[TranscodeTask],
         label: &str,
         batch_path: &Path,
+        cancel: &CancelToken,
         mut processor: P,
     ) -> BatchReport<R>
     where
@@ -165,15 +167,21 @@ impl TaskManager {
                 "task start"
             );
 
-            // The Guard lives only across the processor call so the
-            // handle is cleared between tasks -- a SIGINT after the
-            // processor returns cannot delete a successfully-written
-            // file (the next task's Guard overwrites, or the manager
-            // drops the handle when run() returns).
-            let result = {
-                let _guard = partial_output::Guard::new(self.handle.as_ref(), ctx.clone());
-                processor(task, &ctx)
-            };
+            // Cancel check between files: the in-flight task is
+            // stopped by the processor (it polls the token), and the
+            // batch stops here. The records of the files that
+            // finished are kept (design doc §3.11.4).
+            if cancel.is_cancelled() {
+                tracing::warn!(
+                    task_idx = ctx.index,
+                    total = ctx.total,
+                    source = %ctx.source.display(),
+                    "batch cancelled at task"
+                );
+                return BatchReport::cancelled(results, idx, total);
+            }
+
+            let result = processor(task, &ctx);
 
             tracing::info!(
                 task_idx = ctx.index,
@@ -372,9 +380,9 @@ mod tests {
 
     #[test]
     fn run_returns_one_result_per_task() {
-        let mgr = TaskManager::new(None);
+        let mgr = TaskManager::new();
         let tasks = make_tasks(3);
-        let results = mgr.run(&tasks, "encoding", Path::new("/in"), |_task, _ctx| {
+        let results = mgr.run(&tasks, "encoding", Path::new("/in"), &CancelToken::new(), |_task, _ctx| {
             Ok::<usize, EncodeError>(42)
         });
         assert_eq!(results.records.len(), 3);
@@ -382,10 +390,10 @@ mod tests {
 
     #[test]
     fn run_passes_correct_task_context() {
-        let mgr = TaskManager::new(None);
+        let mgr = TaskManager::new();
         let tasks = make_tasks(2);
         let mut seen: Vec<TaskContext> = Vec::new();
-        let _ = mgr.run(&tasks, "probing", Path::new("/in"), |_task, ctx| {
+        let _ = mgr.run(&tasks, "probing", Path::new("/in"), &CancelToken::new(), |_task, ctx| {
             seen.push(ctx.clone());
             Ok::<(), EncodeError>(())
         });
@@ -409,13 +417,67 @@ mod tests {
     #[test]
     fn run_with_no_handle_does_not_panic() {
         // Analyze-style call (no signal handler installed).
-        let mgr = TaskManager::new(None);
+        let mgr = TaskManager::new();
         let tasks = make_tasks(1);
         // Should not panic; Guard is a no-op when handle is None.
-        let results = mgr.run(&tasks, "probing", Path::new("/in"), |_, _| {
+        let results = mgr.run(&tasks, "probing", Path::new("/in"), &CancelToken::new(), |_, _| {
             Ok::<(), EncodeError>(())
         });
         assert_eq!(results.records.len(), 1);
+    }
+
+    #[test]
+    fn a_cancelled_batch_stops_and_keeps_what_it_finished() {
+        // The cancel contract: the batch stops at the next file
+        // boundary, and the records of the files that finished are
+        // kept (design doc §3.11.2/§3.11.4).
+        let mgr = TaskManager::new();
+        let tasks = make_tasks(3);
+        let cancel = CancelToken::new();
+        let mut attempted = 0;
+
+        let report = mgr.run(&tasks, "encoding", Path::new("/in"), &cancel, |_t, _c| {
+            attempted += 1;
+            if attempted == 2 {
+                // The cancel lands while the second file runs.
+                cancel.cancel();
+            }
+            Ok::<usize, EncodeError>(42)
+        });
+
+        assert!(!report.is_completed());
+        // The first two files finished (the cancel landed while the
+        // second one ran) -- both records are kept.
+        assert_eq!(
+            report.records.len(),
+            2,
+            "the files that finished before the cancel must be kept"
+        );
+        match report.termination {
+            Termination::Cancelled { completed, total } => {
+                assert_eq!(completed, 2, "stopped before the third file");
+                assert_eq!(total, 3);
+            }
+            other => panic!("expected a cancelled termination, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_cancelled_batch_before_the_first_file_does_nothing() {
+        let mgr = TaskManager::new();
+        let tasks = make_tasks(3);
+        let cancel = CancelToken::new();
+        cancel.cancel();
+
+        let report = mgr.run(&tasks, "encoding", Path::new("/in"), &cancel, |_t, _c| -> Result<usize, EncodeError> {
+            panic!("no task may run after the cancel");
+        });
+
+        assert!(report.records.is_empty());
+        assert!(matches!(
+            report.termination,
+            Termination::Cancelled { completed: 0, total: 3 }
+        ));
     }
 
     #[test]
@@ -423,9 +485,9 @@ mod tests {
         // Review #120: processor Err used to panic; now `run`
         // returns `Err((idx, e))` so the caller can decide. This
         // test verifies the abort position + the error round-trip.
-        let mgr = TaskManager::new(None);
+        let mgr = TaskManager::new();
         let tasks = make_tasks(3);
-        let result = mgr.run(&tasks, "encoding", Path::new("/in"), |task, _ctx| {
+        let result = mgr.run(&tasks, "encoding", Path::new("/in"), &CancelToken::new(), |task, _ctx| {
             if task.input.to_string().ends_with("1.mp4") {
                 Err(EncodeError::Ffmpeg("boom".into()))
             } else {
@@ -449,10 +511,10 @@ mod tests {
         // Companion test: abort happens at the failing task, not
         // earlier or later. The first task succeeds, the second
         // fails, no further tasks run.
-        let mgr = TaskManager::new(None);
+        let mgr = TaskManager::new();
         let tasks = make_tasks(3);
         let mut attempted = Vec::new();
-        let result = mgr.run(&tasks, "encoding", Path::new("/in"), |task, _ctx| {
+        let result = mgr.run(&tasks, "encoding", Path::new("/in"), &CancelToken::new(), |task, _ctx| {
             attempted.push(task.input.to_string());
             if task.input.to_string().ends_with("1.mp4") {
                 Err(EncodeError::Ffmpeg("boom".into()))

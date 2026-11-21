@@ -26,7 +26,7 @@ use crate::encoder::{command::build_ffmpeg_command, nvenc, select::select_encode
 use crate::error::EncodeError;
 use crate::pipeline::cancel::CancelToken;
 use crate::pipeline::context::{BatchContext, FilePlan};
-use crate::pipeline::partial_output::PartialOutputHandle;
+use crate::pipeline::task::BatchReport;
 use crate::pipeline::task::TaskManager;
 use crate::types::{
     EncodeParams, EncodingOutcome, EncodingRecord, ErrorCategory, ErrorContext, FpsDecision,
@@ -69,15 +69,18 @@ type ResultCallback = dyn Fn(&EncodingRecord);
 ///
 /// # Lifecycle integration (U19)
 ///
-/// No `current_output` or `task_ctx` params. Lifecycle logging and
-/// signal-handler Guard construction live in
+/// No `task_ctx` param. Lifecycle logging lives in
 /// [`crate::pipeline::task::TaskManager::run`]; `transcode_single`
 /// focuses on encode. Callers (CLI / tests) wrap the call via
-/// `TaskManager` when they need scaffold logs and Guard registration.
+/// `TaskManager` when they need scaffold logs.
+///
+/// `cancel` is the run's cancel token: the ffmpeg child is killed and
+/// reaped when it is set (design doc §3.11.2).
 pub fn transcode_single(
     task: &TranscodeTask,
     ctx: &mut BatchContext,
     output: ProcessOutput,
+    cancel: &CancelToken,
 ) -> Result<EncodingRecord, EncodeError> {
     let started_at_meta = Utc::now();
     let started_at_instant = Instant::now();
@@ -86,7 +89,7 @@ pub fn transcode_single(
     let prepare = encode_prepare(task, ctx, started_at_meta, started_at_instant);
     match prepare {
         EncodePrepareResult::Failed(r) => Ok(*r),
-        EncodePrepareResult::Ready(plan) => transcode_with_argv(task, plan, ctx, output),
+        EncodePrepareResult::Ready(plan) => transcode_with_argv(task, plan, ctx, output, cancel),
     }
 }
 
@@ -394,13 +397,14 @@ fn transcode_with_argv(
     plan: FilePlan,
     ctx: &mut BatchContext,
     output: ProcessOutput,
+    cancel: &CancelToken,
 ) -> Result<EncodingRecord, EncodeError> {
     let metadata = plan.metadata().clone();
     transcode_inner(
         task,
         plan,
         ctx,
-        |argv| run_ffmpeg_with_stderr(&argv, output),
+        |argv| run_ffmpeg_with_stderr(&argv, output, cancel),
         |ctx| rebuild_argv_after_nvenc_failure(task, ctx, &metadata),
     )
 }
@@ -599,6 +603,11 @@ fn build_encode_record(
             })
         }
         Err((category, message, stderr_tail)) => {
+            // A cancel is not a failed file: the batch is stopping, and
+            // the report says so (design doc §3.11.2).
+            if category == ErrorCategory::Cancelled {
+                return Err(EncodeError::UserCancel);
+            }
             // When the NVENC attempt was replaced by a software retry,
             // the record has to carry both failures -- otherwise the
             // record blames the software encoder for a hardware
@@ -670,9 +679,9 @@ pub fn transcode_batch(
     files: &[crate::types::InputPath],
     ctx: &mut BatchContext,
     output: ProcessOutput,
-    current_output: Option<&PartialOutputHandle>,
+    cancel: &CancelToken,
     result_callback: Option<&ResultCallback>,
-) -> Vec<EncodingRecord> {
+) -> BatchReport<EncodingRecord> {
     // U19 step 4: route the batch through `TaskManager::run`. The
     // Review #122: hoist `format.default_extension()` out of the
     // per-task loop. The extension doesn't change across tasks;
@@ -700,17 +709,16 @@ pub fn transcode_batch(
     // (U19 step 10). The path is the user's target (file or dir),
     // surfaced from EncodeParams.target.
     let batch_path = batch_target_path(&params.target);
-    let manager = TaskManager::new(current_output.cloned());
+    let manager = TaskManager::new();
     // Review #120: TaskManager::run now returns
     // Result<Vec<R>, (usize, EncodeError)>. The CLI's `transcode_batch`
     // is best-effort: per-file failures are already encoded as
     // `Ok(record)` with `outcome = Failed` by `transcode_single`,
-    // so a `Result::Err` here means the batch aborted mid-flight
-    // (UI disconnected in the GUI path; rare in the CLI path).
-    // We log + return what we have so the caller still gets the
-    // partial records.
-    let report = manager.run(&tasks, "encoding", &batch_path, |task, _ctx| {
-        transcode_single(task, ctx, output)
+    // so an abort here means the batch stopped mid-flight (cancel,
+    // or the UI disconnected). The report keeps the records of the
+    // files that finished and says how the batch ended.
+    let report = manager.run(&tasks, "encoding", &batch_path, cancel, |task, _ctx| {
+        transcode_single(task, ctx, output, cancel)
     });
     if let crate::pipeline::task::Termination::Cancelled { completed, total } = report.termination {
         tracing::warn!(
@@ -719,14 +727,12 @@ pub fn transcode_batch(
             "batch stopped early; keeping the records that finished"
         );
     }
-    let records = report.records;
-
     if let Some(cb) = result_callback {
-        for record in &records {
+        for record in &report.records {
             cb(record);
         }
     }
-    records
+    report
 }
 
 /// Dry-run a batch: same per-file `encode_prepare` (probe + partial
@@ -743,13 +749,19 @@ pub fn transcode_batch(
 ///
 /// `encode.nv` (GPU enable) is ignored — it's only consulted when
 /// actually running ffmpeg, which dry-run skips.
-pub fn dry_run_batch<'a, I>(ctx: &BatchContext, files: I) -> Vec<EncodingRecord>
+pub fn dry_run_batch<'a, I>(
+    ctx: &BatchContext,
+    files: I,
+    cancel: &CancelToken,
+) -> BatchReport<EncodingRecord>
 where
     I: IntoIterator<Item = &'a crate::types::InputPath>,
 {
     // Review #122: hoist extension out of the per-file loop.
     let params = ctx.params();
     let _ext = params.format.default_extension();
+    let files: Vec<&crate::types::InputPath> = files.into_iter().collect();
+    let total = files.len();
     let mut records = Vec::new();
     for file in files {
         // v1.2 follow-up #3: route through output_path_for
@@ -775,8 +787,14 @@ where
                 records.push(*r);
             }
         }
+        // The cancel check between files: a dry run is probe-only, so
+        // there is no child to kill -- it just stops.
+        if cancel.is_cancelled() {
+            let done = records.len();
+            return BatchReport::cancelled(records, done, total);
+        }
     }
-    records
+    BatchReport::completed(records)
 }
 
 /// Build a "dry-run planned success" record: the source fields are
@@ -903,6 +921,7 @@ fn make_failed_record(
 fn run_ffmpeg_with_stderr(
     argv: &[String],
     output: ProcessOutput,
+    cancel: &CancelToken,
 ) -> Result<(), (ErrorCategory, String, String)> {
     if argv.is_empty() {
         return Err((
@@ -929,6 +948,56 @@ fn run_ffmpeg_with_stderr(
             cmd.stderr(Stdio::null());
         }
     };
+    if matches!(output, ProcessOutput::Inherit) {
+        // The CLI path: the terminal sees ffmpeg's output, so the
+        // child is supervised here instead of being captured. The
+        // cancel token is polled; a cancel kills and reaps the child
+        // and removes the half-written file (design doc §3.11.2).
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                return Err((
+                    ErrorCategory::FfmpegSpawnFailed,
+                    format!("spawn {program}: {e}"),
+                    String::new(),
+                ))
+            }
+        };
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        return Err((
+                            ErrorCategory::FfmpegNonzeroExit,
+                            format!("{program} exited {status}"),
+                            String::new(),
+                        ));
+                    }
+                    return Ok(());
+                }
+                Ok(None) => {
+                    if cancel.is_cancelled() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        cleanup_partial_output_from_argv(argv);
+                        return Err((
+                            ErrorCategory::Cancelled,
+                            "cancelled".to_string(),
+                            String::new(),
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => {
+                    return Err((
+                        ErrorCategory::FfmpegSpawnFailed,
+                        format!("wait {program}: {e}"),
+                        String::new(),
+                    ))
+                }
+            }
+        }
+    }
     let output_run = cmd.output();
     let output_run = match output_run {
         Ok(o) => o,
@@ -1489,9 +1558,9 @@ Encoders:
             input: task.input.clone(),
             output: task.output.clone(),
         }];
-        let manager = super::TaskManager::new(None);
+        let manager = super::TaskManager::new();
         let records: Vec<EncodingRecord> = manager
-            .run(&tasks, "encoding", Path::new("/test"), |_task, _ctx| {
+            .run(&tasks, "encoding", Path::new("/test"), &CancelToken::new(), |_task, _ctx| {
                 Ok(test_succeeded_record(&task, &params))
             })
             .records;
@@ -1577,7 +1646,7 @@ Encoders:
 
         let capability = Capability::default();
         let mut ctx = BatchContext::new(params, Arc::new(cache), capability);
-        let record = transcode_single(&task, &mut ctx, ProcessOutput::Null)
+        let record = transcode_single(&task, &mut ctx, ProcessOutput::Null, &CancelToken::new())
             .expect("transcode_single should succeed");
         assert_eq!(record.outcome, EncodingOutcome::Succeeded);
         assert!(record.output_path.is_some(), "the record names the output");
@@ -1608,7 +1677,7 @@ Encoders:
 
         let capability = Capability::default();
         let mut ctx = BatchContext::new(params, Arc::new(cache), capability);
-        let record = transcode_single(&task, &mut ctx, ProcessOutput::Null)
+        let record = transcode_single(&task, &mut ctx, ProcessOutput::Null, &CancelToken::new())
             .expect("transcode_single should succeed");
         assert_eq!(record.outcome, EncodingOutcome::Failed);
         let err = record.error.expect("failed record must carry an error");
@@ -1889,7 +1958,7 @@ Encoders:
             Utc::now(),
             Instant::now(),
         );
-        let record = transcode_with_argv(&task, plan, &mut ctx, ProcessOutput::Null)
+        let record = transcode_with_argv(&task, plan, &mut ctx, ProcessOutput::Null, &CancelToken::new())
             .expect("transcode_with_argv should return Ok(EncodingRecord)");
 
         assert_eq!(record.outcome, EncodingOutcome::Failed);

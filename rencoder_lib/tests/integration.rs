@@ -166,7 +166,14 @@ fn transcode_batch_end_to_end_produces_output_files() {
         std::sync::Arc::new(cache),
         rencoder_lib::encoder::nvenc::Capability::default(),
     );
-    let results = transcode_batch(&files, &mut ctx, ProcessOutput::Null, None, None);
+    let report = transcode_batch(
+        &files,
+        &mut ctx,
+        ProcessOutput::Null,
+        &rencoder_lib::pipeline::cancel::CancelToken::new(),
+        None,
+    );
+    let results = report.records;
 
     assert_eq!(results.len(), 2);
     for record in &results {
@@ -237,8 +244,13 @@ fn transcode_batch_reencodes_when_output_exists() {
         std::sync::Arc::new(cache),
         rencoder_lib::encoder::nvenc::Capability::default(),
     );
-    let result = transcode_single(&task, &mut ctx, ProcessOutput::Null)
-        .expect("transcode_single should succeed");
+    let result = transcode_single(
+        &task,
+        &mut ctx,
+        ProcessOutput::Null,
+        &rencoder_lib::pipeline::cancel::CancelToken::new(),
+    )
+    .expect("transcode_single should succeed");
     // The encode ran and overwrote the existing output.
     assert!(matches!(
         result.outcome,

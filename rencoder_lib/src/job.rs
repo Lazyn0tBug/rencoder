@@ -193,8 +193,8 @@ pub enum Event {
     DryRunFinished { records: Vec<EncodingRecord> },
     /// The batch was cancelled (by `Command::Cancel` or SIGINT).
     /// `completed` is how many files finished before the cancel
-    /// landed. Per §3.8.3 item 31: no partial-output cleanup is
-    /// needed beyond the existing `PartialOutputHandle` mechanism.
+    /// landed. The partial output of the cancelled file was removed by
+    /// the lib's execution path (design doc §3.11.2).
     BatchCancelled { completed: usize, total: usize },
 
     // ---- Progress topic (~2 events/sec per active file) ----
@@ -1016,6 +1016,9 @@ fn spawn_task_batch<P, F>(
     // Where the finished batch's records are written (the app's data
     // directory; `None` = no history).
     data_dir: Option<PathBuf>,
+    // The batch's cancel token: `Command::Cancel` sets it, the
+    // worker polls it (design doc §3.11.2).
+    cancel_token: CancelToken,
     make_processor: F,
     updates: BatchUpdates,
     evt_tx: Sender<Event>,
@@ -1059,7 +1062,8 @@ fn spawn_task_batch<P, F>(
             // deletes the partial output itself.
             // One report, one meaning of "this batch is over"
             // (design doc §3.11.4).
-            let report = TaskManager::new(None).run(&tasks, label, &batch_path, &mut processor);
+            let report =
+                TaskManager::new().run(&tasks, label, &batch_path, &cancel_token, &mut processor);
             // The batch is done: persist its records, so the history
             // has something to read (§3.11.4). The mechanics are the
             // lib's; the decision to persist is the frontend's -- and
@@ -1224,6 +1228,14 @@ fn make_encode_processor(
                 Ok(record)
             }
             Err(e) => {
+                // A cancel is not a per-file failure: the batch is
+                // stopping, and the report says so (design doc
+                // §3.11.2). The Ok arm above catches the cancels that
+                // come back as a record; this one catches the ones
+                // that come back as an error.
+                if matches!(e, EncodeError::UserCancel) {
+                    return Err(e);
+                }
                 send_evt_lossy(
                     &evt_tx,
                     Event::Error {
@@ -1515,6 +1527,10 @@ fn run_actor(
                 // through the update channel.
                 let capability_for_worker = capability.clone();
                 let file_encoder_for_worker = Arc::clone(&file_encoder);
+                // The processor and the worker each hold a handle on
+                // the same token (the `move` closure would otherwise
+                // take it).
+                let cancel_for_processor = cancel_for_worker.clone();
                 let make_processor = move |update_tx: Sender<(String, bool)>| {
                     // The context is built here, in the worker: the
                     // cache may still be initializing, and waiting for
@@ -1528,7 +1544,7 @@ fn run_actor(
                         BatchContext::new(params_for_worker, cache, capability_for_worker);
                     Ok(make_encode_processor(
                         batch_ctx,
-                        cancel_for_worker,
+                        cancel_for_processor,
                         evt_tx_for_worker,
                         dropped_for_worker,
                         update_tx,
@@ -1545,6 +1561,7 @@ fn run_actor(
                     "encoding",
                     batch_path,
                     data_dir.clone(),
+                    cancel_for_worker.clone(),
                     make_processor,
                     BatchUpdates::new(),
                     evt_tx.clone(),
@@ -1564,6 +1581,7 @@ fn run_actor(
                 // A dry run never encodes, so it cannot change the
                 // capability -- it only reads it.
                 let capability_for_worker = capability.clone();
+                let cancel_for_worker = cancel_token.clone();
                 batch_running = true;
                 spawn_batch_job(
                     move || {
@@ -1596,11 +1614,16 @@ fn run_actor(
                             }
                         };
                         let batch_ctx = BatchContext::new(params, cache, capability_for_worker);
-                        let records =
-                            crate::pipeline::batch::dry_run_batch(&batch_ctx, files.iter());
+                        let report = crate::pipeline::batch::dry_run_batch(
+                            &batch_ctx,
+                            files.iter(),
+                            &cancel_for_worker,
+                        );
                         send_evt_lossy(
                             &evt_tx_for_worker,
-                            Event::DryRunFinished { records },
+                            Event::DryRunFinished {
+                                records: report.records,
+                            },
                             &dropped_for_worker,
                         );
                     },

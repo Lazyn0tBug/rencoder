@@ -211,22 +211,27 @@ fn encode_cmd(args: args::EncodeArgs, force_detect: bool) -> Result<()> {
     // `resolve_and_store` already persisted a freshly probed record.
     let cache = cache_from_resolution(&resolution);
 
-    // Install signal handler; the per-batch loop registers/unregisters
-    // the current output path so a SIGINT cleans up the partial file.
-    let current_output = signal::install_handler();
+    // The signal handler only sets the cancel token: the lib's
+    // execution path kills the in-flight ffmpeg, removes its partial
+    // output and stops the batch at the next file boundary -- and the
+    // records of the files that finished are written below (design doc
+    // §3.11.2).
+    let cancel = rencoder_lib::pipeline::cancel::CancelToken::new();
+    signal::install_handler(&cancel);
 
     // The batch context: this command's parameters, the encoder
     // cache and this machine's NVENC capability (an encoder that
     // fails at runtime is not tried again for the rest of the command).
     let mut ctx = BatchContext::new(params, std::sync::Arc::new(cache), resolution.capability());
 
-    let records = transcode_batch(
+    let report = transcode_batch(
         &files,
         &mut ctx,
         ProcessOutput::Inherit,
-        Some(&current_output),
+        &cancel,
         None,
     );
+    let records = report.records;
 
     // Default output: timestamped Parquet in <app_dir>/data/ (U18; honors
     // $RENENCODER_DATA_DIR). Extension of -o picks the format: .parquet
@@ -239,6 +244,16 @@ fn encode_cmd(args: args::EncodeArgs, force_detect: bool) -> Result<()> {
         .with_context(|| format!("failed to write {}", output_path.display()))?;
     eprintln!("Wrote {} record(s) to {}", records.len(), output_path.display());
     print_encode_summary(&records);
+
+    // An interrupted run is not a successful one: the records are on
+    // disk, but the exit code says the batch did not finish (130 =
+    // 128 + SIGINT, the shell convention).
+    if matches!(
+        report.termination,
+        rencoder_lib::pipeline::task::Termination::Cancelled { .. }
+    ) {
+        std::process::exit(130);
+    }
 
     Ok(())
 }
@@ -301,9 +316,14 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
                 output: None,
             })
             .collect();
-        let manager = rencoder_lib::pipeline::task::TaskManager::new(None);
+        let manager = rencoder_lib::pipeline::task::TaskManager::new();
         manager
-            .run(&tasks, "analyze", target_path(&target), |task, _ctx| {
+            .run(
+                &tasks,
+                "analyze",
+                target_path(&target),
+                &rencoder_lib::pipeline::cancel::CancelToken::new(),
+                |task, _ctx| {
                 let file_bytes = std::fs::metadata(task.input.as_path())
                     .map(|m| m.len())
                     .unwrap_or(0);
