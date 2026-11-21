@@ -1013,6 +1013,9 @@ fn spawn_task_batch<P, F>(
     tasks: Vec<TranscodeTask>,
     label: &'static str,
     batch_path: PathBuf,
+    // Where the finished batch's records are written (the app's data
+    // directory; `None` = no history).
+    data_dir: Option<PathBuf>,
     make_processor: F,
     updates: BatchUpdates,
     evt_tx: Sender<Event>,
@@ -1051,28 +1054,72 @@ fn spawn_task_batch<P, F>(
                     return;
                 }
             };
-            let total = tasks.len();
             // `TaskManager::new(None)`: the actor path has no signal
             // handler — the cancel branch of `run_ffmpeg_with_progress`
             // deletes the partial output itself.
-            let run_result = TaskManager::new(None).run(&tasks, label, &batch_path, &mut processor);
-            match run_result {
-                Ok(records) => {
-                    send_evt_lossy(&evt_tx, Event::BatchCompleted { records }, &dropped_counter)
-                }
-                // The processor asked to abort (cancel). `idx` is the
-                // 0-based index of the task the batch stopped at.
-                Err((idx, _)) => send_evt_lossy(
+            // One report, one meaning of "this batch is over"
+            // (design doc §3.11.4).
+            let report = TaskManager::new(None).run(&tasks, label, &batch_path, &mut processor);
+            // The batch is done: persist its records, so the history
+            // has something to read (§3.11.4). The mechanics are the
+            // lib's; the decision to persist is the frontend's -- and
+            // the GUI has no other place to do it.
+            persist_batch_records(&report.records, data_dir.as_deref());
+            match report.termination {
+                crate::pipeline::task::Termination::Completed => send_evt_lossy(
                     &evt_tx,
-                    Event::BatchCancelled {
-                        completed: idx,
-                        total,
+                    Event::BatchCompleted {
+                        records: report.records,
+                    },
+                    &dropped_counter,
+                ),
+                // The processor asked to abort (cancel). `completed`
+                // is the 0-based index of the task the batch stopped
+                // at.
+                crate::pipeline::task::Termination::Cancelled { completed, total } => {
+                    send_evt_lossy(
+                        &evt_tx,
+                        Event::BatchCancelled { completed, total },
+                        &dropped_counter,
+                    )
+                }
+                crate::pipeline::task::Termination::Failed(error) => send_evt_lossy(
+                    &evt_tx,
+                    Event::Error {
+                        category: ErrorCategory::ConfigError,
+                        message: error,
                     },
                     &dropped_counter,
                 ),
             }
         })
         .expect("spawn batch worker");
+}
+
+/// Write a finished batch's records to the default history file.
+///
+/// The mechanics are the lib's (`data::store`); the failure is not
+/// fatal -- a batch that could not be written to disk still finished,
+/// and the UI still shows its records.
+fn persist_batch_records(records: &[EncodingRecord], data_dir: Option<&std::path::Path>) {
+    if records.is_empty() {
+        return;
+    }
+    let Some(dir) = data_dir else {
+        return;
+    };
+    let path = match crate::data::store::default_encoding_path_in(dir) {
+        Ok(path) => path,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not resolve the history path");
+            return;
+        }
+    };
+    if let Err(e) = crate::data::store::write_records(records, &path) {
+        tracing::warn!(error = %e, path = %path.display(), "could not write the batch records");
+    } else {
+        tracing::info!(path = %path.display(), records = records.len(), "wrote the batch records");
+    }
 }
 
 /// Build the per-file processor for an encode batch.
@@ -1497,6 +1544,7 @@ fn run_actor(
                     tasks,
                     "encoding",
                     batch_path,
+                    data_dir.clone(),
                     make_processor,
                     BatchUpdates::new(),
                     evt_tx.clone(),
@@ -2372,6 +2420,47 @@ mod mock_tests {
         }
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_finished_batch_writes_its_records_to_the_history_file() {
+        // The GUI's history reads `<data_dir>/encoding-*.parquet`; if
+        // nobody writes it, the history stays empty forever (design
+        // doc §3.11.4).
+        let dir = unique_tmp("batch_records");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (cmd_tx, evt_rx) = run_test_controller(make_succeeding_mock().0, Some(dir.clone()));
+        cmd_tx
+            .send(Command::StartBatch {
+                params: EncodeParams::default(),
+                files: vec![input("/in/a.mp4")],
+            })
+            .unwrap();
+        drop(cmd_tx);
+
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(5));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::BatchCompleted { .. })),
+            "expected a BatchCompleted event, got {events:?}"
+        );
+
+        // The records are on disk, under the name the history reader
+        // recognises.
+        let written: Vec<_> = std::fs::read_dir(&dir)
+            .expect("the data dir must be readable")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("encoding-") && name.ends_with(".parquet"))
+            .collect();
+        assert_eq!(
+            written.len(),
+            1,
+            "the batch's records must be written: {written:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(feature = "parallel-analyze")]

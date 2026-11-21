@@ -162,8 +162,8 @@ pub struct AppState {
     /// Session-completed tasks, newest-first. Inserted on
     /// BatchCompleted / BatchCancelled / Encoding-phase Error.
     /// `task_history` is session UX cache; the primary store is
-    /// Parquet (`encoding-*.parquet`, written by lib on every
-    /// `BatchCompleted`). v1.1 reload via `Command::LoadHistory`
+    /// Parquet (`encoding-*.parquet`, written by the lib when the batch
+    /// completes). v1.1 reload via `Command::LoadHistory`
     /// gives cross-session `state.history` (per-file records).
     pub task_history: Vec<TaskInfo>,
     /// Active page tab (§3.8.7.2). Default `Setup`. Tab clicks

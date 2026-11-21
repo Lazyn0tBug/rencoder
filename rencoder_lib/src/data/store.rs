@@ -440,6 +440,87 @@ fn parse_error_category(s: &str) -> ErrorCategory {
     }
 }
 
+/// Write the batch records to `path`.
+///
+/// The extension picks the format -- the same three the writers above
+/// produce: `.parquet`, `.jsonl` (or `.ndjson`) and `.csv`. Anything
+/// else is a parameter error.
+///
+/// The mechanics of "where the records go" live here, so both
+/// frontends write the same file the same way (design doc §3.11.4).
+pub fn write_records(records: &[EncodingRecord], path: &Path) -> Result<(), EncodeError> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                EncodeError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("failed to create directory {}: {e}", parent.display()),
+                ))
+            })?;
+        }
+    }
+    let bytes: Vec<u8> = match path.extension().and_then(|e| e.to_str()) {
+        Some("parquet") => records_to_parquet(records)
+            .map_err(|e| EncodeError::Probe(format!("parquet encode: {e}")))?,
+        Some("jsonl") | Some("ndjson") => records_to_jsonl(records).into_bytes(),
+        Some("csv") => records_to_csv(records).into_bytes(),
+        other => {
+            return Err(EncodeError::InvalidParam(format!(
+                "unsupported output extension {other:?}; use .parquet, .jsonl, or .csv"
+            )))
+        }
+    };
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
+/// The default path for a batch's records: `<data_dir>/encoding-<ts>.parquet`.
+///
+/// One place decides the name -- so the CLI and the actor write files
+/// the history reader recognises (design doc §3.11.4).
+pub fn default_encoding_path() -> Result<std::path::PathBuf, EncodeError> {
+    let dir =
+        crate::config::path::resolve_data_dir().unwrap_or_else(|| std::path::PathBuf::from("data"));
+    default_encoding_path_in(&dir)
+}
+
+/// The default path for a batch's records, in `dir`.
+///
+/// The caller says *where* -- the app's data directory in production,
+/// a temporary one in a test. The name is the lib's, so every writer
+/// produces a file the history reader recognises (design doc §3.11.4).
+pub fn default_encoding_path_in(dir: &Path) -> Result<std::path::PathBuf, EncodeError> {
+    std::fs::create_dir_all(dir)?;
+    crate::config::fs_perms::set_app_dir_mode(dir)?;
+    Ok(dir.join(format!(
+        "encoding-{}.parquet",
+        crate::utils::time::utc_timestamp()
+    )))
+}
+
+/// The batch summary: one line per count.
+///
+/// The same wording for every frontend (design doc §3.10.3): the CLI
+/// prints it, the GUI renders it. The frontends lay it out, the lib
+/// decides what it says.
+pub fn summary_lines(records: &[EncodingRecord]) -> Vec<String> {
+    let total = records.len();
+    let count = |f: fn(&EncodingRecord) -> bool| records.iter().filter(|r| f(r)).count();
+    let success = count(|r| matches!(r.outcome, EncodingOutcome::Succeeded));
+    let reduced = count(|r| matches!(r.outcome, EncodingOutcome::ReducedFps));
+    // No `Skipped` / `PartialSkip` counters: re-encoding is the rule
+    // (design doc §3.3.4), so nothing is skipped any more. The
+    // `SkippedReason` variants stay in the record schema for history
+    // written by older versions.
+    let failed = count(|r| matches!(r.outcome, EncodingOutcome::Failed));
+    vec![
+        format!("Total:       {total}"),
+        format!("Success:     {success}"),
+        format!("Reduced:     {reduced}"),
+        format!("Failed:      {failed}"),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -132,7 +132,7 @@ impl TaskManager {
         label: &str,
         batch_path: &Path,
         mut processor: P,
-    ) -> Result<Vec<R>, (usize, EncodeError)>
+    ) -> BatchReport<R>
     where
         P: FnMut(&TranscodeTask, &TaskContext) -> Result<R, EncodeError>,
     {
@@ -199,7 +199,16 @@ impl TaskManager {
                         error = %e,
                         "batch aborted at task"
                     );
-                    return Err((idx, e));
+                    // The records of the files that finished are
+                    // kept: a stopped batch still produced work
+                    // (design doc §3.11.4).
+                    return match e {
+                        // The user stopped it.
+                        EncodeError::UserCancel => BatchReport::cancelled(results, idx, total),
+                        // Something else ended the batch -- the
+                        // reason travels with the report.
+                        other => BatchReport::failed(results, other.to_string()),
+                    };
                 }
             }
         }
@@ -210,7 +219,76 @@ impl TaskManager {
             successful = results.len(),
             "batch end"
         );
-        Ok(results)
+        BatchReport::completed(results)
+    }
+}
+
+/// How a batch ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Termination {
+    /// Every file was attempted.
+    Completed,
+    /// The batch was stopped before the last file.
+    ///
+    /// The files that finished are in the report -- a cancelled batch
+    /// still produced work.
+    Cancelled {
+        /// How many files were finished (0-based index of the one
+        /// that was in flight when it stopped).
+        completed: usize,
+        /// How many files the batch had.
+        total: usize,
+    },
+    /// The batch could not run at all.
+    Failed(String),
+}
+
+/// What a batch produced, and how it ended.
+///
+/// One shape for every batch, whoever ran it: the CLI consumes it
+/// directly, the actor turns it into the terminal event (design doc
+/// §3.11.4). "This batch is over" has one meaning, not one per
+/// frontend.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BatchReport<R> {
+    /// The records the batch produced (all of them, or the ones that
+    /// finished before it stopped).
+    pub records: Vec<R>,
+    /// How it ended.
+    pub termination: Termination,
+}
+
+impl<R> BatchReport<R> {
+    /// A batch that ran to the end.
+    pub fn completed(records: Vec<R>) -> Self {
+        Self {
+            records,
+            termination: Termination::Completed,
+        }
+    }
+
+    /// A batch that was stopped before the last file.
+    pub fn cancelled(records: Vec<R>, completed: usize, total: usize) -> Self {
+        Self {
+            records,
+            termination: Termination::Cancelled { completed, total },
+        }
+    }
+
+    /// A batch that could not run to the end.
+    ///
+    /// The records of the files that finished are kept -- the batch
+    /// did produce work before it stopped.
+    pub fn failed(records: Vec<R>, error: impl Into<String>) -> Self {
+        Self {
+            records,
+            termination: Termination::Failed(error.into()),
+        }
+    }
+
+    /// Did the batch run to the end?
+    pub fn is_completed(&self) -> bool {
+        matches!(self.termination, Termination::Completed)
     }
 }
 
@@ -299,7 +377,7 @@ mod tests {
         let results = mgr.run(&tasks, "encoding", Path::new("/in"), |_task, _ctx| {
             Ok::<usize, EncodeError>(42)
         });
-        assert_eq!(results.unwrap().len(), 3);
+        assert_eq!(results.records.len(), 3);
     }
 
     #[test]
@@ -337,7 +415,7 @@ mod tests {
         let results = mgr.run(&tasks, "probing", Path::new("/in"), |_, _| {
             Ok::<(), EncodeError>(())
         });
-        assert_eq!(results.unwrap().len(), 1);
+        assert_eq!(results.records.len(), 1);
     }
 
     #[test]
@@ -354,10 +432,12 @@ mod tests {
                 Ok::<(), EncodeError>(())
             }
         });
-        let (idx, err) = result.expect_err("expected abort on processor Err");
-        assert_eq!(idx, 1, "aborted at the failing task index (0-based)");
+        // The abort is not a cancel: it carries the reason.
+        let Termination::Failed(err) = result.termination else {
+            panic!("expected a failed termination, got {:?}", result.termination);
+        };
         // The error message should include the underlying error.
-        let formatted = format!("{err}");
+        let formatted = err.to_string();
         assert!(
             formatted.contains("boom"),
             "abort error should carry the underlying error; got: {formatted:?}"
@@ -380,7 +460,7 @@ mod tests {
                 Ok::<(), EncodeError>(())
             }
         });
-        assert!(result.is_err());
+        assert!(!result.is_completed());
         assert_eq!(
             attempted.len(),
             2,

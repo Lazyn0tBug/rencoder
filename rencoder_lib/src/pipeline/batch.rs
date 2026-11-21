@@ -709,20 +709,17 @@ pub fn transcode_batch(
     // (UI disconnected in the GUI path; rare in the CLI path).
     // We log + return what we have so the caller still gets the
     // partial records.
-    let run_result = manager.run(&tasks, "encoding", &batch_path, |task, _ctx| {
+    let report = manager.run(&tasks, "encoding", &batch_path, |task, _ctx| {
         transcode_single(task, ctx, output)
     });
-    let records: Vec<EncodingRecord> = match run_result {
-        Ok(records) => records,
-        Err((idx, e)) => {
-            tracing::warn!(
-                task_idx = idx,
-                error = %e,
-                "batch aborted; returning partial records"
-            );
-            Vec::new()
-        }
-    };
+    if let crate::pipeline::task::Termination::Cancelled { completed, total } = report.termination {
+        tracing::warn!(
+            task_idx = completed,
+            total,
+            "batch stopped early; keeping the records that finished"
+        );
+    }
+    let records = report.records;
 
     if let Some(cb) = result_callback {
         for record in &records {
@@ -1497,7 +1494,7 @@ Encoders:
             .run(&tasks, "encoding", Path::new("/test"), |_task, _ctx| {
                 Ok(test_succeeded_record(&task, &params))
             })
-            .expect("test batch should succeed");
+            .records;
         assert_eq!(records.len(), 1);
         let record = &records[0];
         assert_eq!(record.outcome, EncodingOutcome::Succeeded);

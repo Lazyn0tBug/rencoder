@@ -24,7 +24,7 @@ use rencoder_lib::{
     encoder::nvenc::{self},
     pipeline::context::BatchContext,
     pipeline::{batch::transcode_batch, cache::cache_from_resolution},
-    types::{EncodeParams, EncodingOutcome, ProcessOutput, Target},
+    types::{EncodeParams, ProcessOutput, Target},
 };
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -233,63 +233,13 @@ fn encode_cmd(args: args::EncodeArgs, force_detect: bool) -> Result<()> {
     // | .jsonl | .csv.
     let output_path = match &args.output {
         Some(p) => p.clone(),
-        None => default_data_path()?,
+        None => rencoder_lib::data::store::default_encoding_path()?,
     };
-    write_records(&records, &output_path)?;
+    rencoder_lib::data::store::write_records(&records, &output_path)
+        .with_context(|| format!("failed to write {}", output_path.display()))?;
+    eprintln!("Wrote {} record(s) to {}", records.len(), output_path.display());
     print_encode_summary(&records);
 
-    Ok(())
-}
-
-/// `<app_dir>/data/encoding-<UTC-ISO8601>Z.parquet` -- one file per run,
-/// named by start time. Uses the canonical UTC timestamp formatter from
-/// `rencoder_lib::utils::time` so the format stays in sync with the
-/// library's docs. Honors `$RENENCODER_DATA_DIR` (U18 step 11).
-///
-/// Filesystem errors (directory creation / mode bits) propagate up via
-/// `Result` so the user sees a clean error instead of a panic. When
-/// `resolve_data_dir` returns `None` (app_dir undeterminable and no
-/// env override), falls back to CWD-relative `data/` so legacy hosts
-/// without a determinable binary dir still produce output (tracing_init
-/// has the same fallback for `log/`).
-fn default_data_path() -> anyhow::Result<PathBuf> {
-    use anyhow::Context;
-
-    let dir =
-        rencoder_lib::config::path::resolve_data_dir().unwrap_or_else(|| PathBuf::from("data"));
-    std::fs::create_dir_all(&dir).context("create data dir")?;
-    rencoder_lib::config::fs_perms::set_app_dir_mode(&dir).context("set data dir mode bits")?;
-    Ok(dir.join(format!(
-        "encoding-{}.parquet",
-        rencoder_lib::utils::time::utc_timestamp()
-    )))
-}
-
-/// Write the records to the given path. Extension determines format.
-fn write_records(
-    records: &[rencoder_lib::types::EncodingRecord],
-    path: &std::path::Path,
-) -> Result<()> {
-    use rencoder_lib::data::store;
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create directory {}", parent.display()))?;
-        }
-    }
-    let bytes = match path.extension().and_then(|e| e.to_str()) {
-        Some("parquet") => {
-            store::records_to_parquet(records).with_context(|| "parquet encode failed")?
-        }
-        Some("jsonl") | Some("ndjson") => store::records_to_jsonl(records).into_bytes(),
-        Some("csv") => store::records_to_csv(records).into_bytes(),
-        other => anyhow::bail!(
-            "unsupported output extension {:?}; use .parquet, .jsonl, or .csv",
-            other
-        ),
-    };
-    std::fs::write(path, bytes).with_context(|| format!("failed to write {}", path.display()))?;
-    eprintln!("Wrote {} record(s) to {}", records.len(), path.display());
     Ok(())
 }
 
@@ -374,7 +324,7 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
                     )),
                 }
             })
-            .unwrap_or_default()
+            .records
     };
     let stats = rencoder_lib::analyzer::records::aggregate_records(&records);
 
@@ -454,30 +404,13 @@ fn records_to_jsonl(records: &[rencoder_lib::analyzer::records::AnalysisRecord])
 }
 
 fn print_encode_summary(results: &[rencoder_lib::types::EncodingRecord]) {
-    let total = results.len();
-    let success = results
-        .iter()
-        .filter(|r| matches!(r.outcome, EncodingOutcome::Succeeded))
-        .count();
-    let reduced = results
-        .iter()
-        .filter(|r| matches!(r.outcome, EncodingOutcome::ReducedFps))
-        .count();
-    // No `Skipped` / `PartialSkip` counters: re-encoding is the rule
-    // (design doc §3.3.4), so nothing is skipped any more. The
-    // `SkippedReason` variants stay in the record schema for history
-    // written by older versions.
-    let failed = results
-        .iter()
-        .filter(|r| matches!(r.outcome, EncodingOutcome::Failed))
-        .count();
-
+    // The wording is the lib's (design doc §3.10.3); the CLI lays it
+    // out.
     println!();
     println!("Summary:");
-    println!("  Total:       {total}");
-    println!("  Success:     {success}");
-    println!("  Reduced:     {reduced}");
-    println!("  Failed:      {failed}");
+    for line in rencoder_lib::data::store::summary_lines(results) {
+        println!("  {line}");
+    }
 }
 
 /// Resolve the CLI args to a `Target`. `--file` wins over `--dir`; with
