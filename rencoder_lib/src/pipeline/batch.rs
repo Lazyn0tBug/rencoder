@@ -1560,9 +1560,13 @@ Encoders:
         }];
         let manager = super::TaskManager::new();
         let records: Vec<EncodingRecord> = manager
-            .run(&tasks, "encoding", Path::new("/test"), &CancelToken::new(), |_task, _ctx| {
-                Ok(test_succeeded_record(&task, &params))
-            })
+            .run(
+                &tasks,
+                "encoding",
+                Path::new("/test"),
+                &CancelToken::new(),
+                |_task, _ctx| Ok(test_succeeded_record(&task, &params)),
+            )
             .records;
         assert_eq!(records.len(), 1);
         let record = &records[0];
@@ -1958,8 +1962,14 @@ Encoders:
             Utc::now(),
             Instant::now(),
         );
-        let record = transcode_with_argv(&task, plan, &mut ctx, ProcessOutput::Null, &CancelToken::new())
-            .expect("transcode_with_argv should return Ok(EncodingRecord)");
+        let record = transcode_with_argv(
+            &task,
+            plan,
+            &mut ctx,
+            ProcessOutput::Null,
+            &CancelToken::new(),
+        )
+        .expect("transcode_with_argv should return Ok(EncodingRecord)");
 
         assert_eq!(record.outcome, EncodingOutcome::Failed);
         let err = record.error.expect("error should be set on Failed");

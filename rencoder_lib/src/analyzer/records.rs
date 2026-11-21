@@ -187,11 +187,15 @@ where
 /// `task 3/8: ...` would be misleading. Per-task logging is the
 /// serial path's responsibility.
 #[cfg(feature = "parallel-analyze")]
-pub fn analyze_records_parallel(files: &[PathBuf]) -> Result<Vec<AnalysisRecord>, EncodeError> {
+pub fn analyze_records_parallel(
+    files: &[PathBuf],
+    cancel: &crate::pipeline::cancel::CancelToken,
+) -> Result<Vec<AnalysisRecord>, EncodeError> {
     use rayon::prelude::*;
 
     let records: Vec<AnalysisRecord> = files
         .par_iter()
+        .filter(|_| !cancel.is_cancelled())
         .map(|path| {
             let file_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
             match probe_video_metadata_auto(path) {

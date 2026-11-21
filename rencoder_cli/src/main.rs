@@ -31,11 +31,19 @@ use std::path::{Path, PathBuf};
 use tracing::{info, instrument, warn};
 
 fn main() -> Result<()> {
+    // The cancel token and the signal handler come **first** (design
+    // doc §3.11.2): before the handler is installed, a signal takes
+    // the default action -- the process dies, the records are lost,
+    // the partial output stays. That window must not exist, so the
+    // handler is installed before anything else happens.
+    let cancel = rencoder_lib::pipeline::cancel::CancelToken::new();
+    signal::install_handler(&cancel);
+
     tracing_init::init().context("initialize tracing")?;
     let cli = args::Cli::parse();
     match cli.command {
-        args::Command::Encode(encode_args) => encode_cmd(encode_args, cli.detect),
-        args::Command::Analyze(analyze_args) => analyze_cmd(analyze_args),
+        args::Command::Encode(encode_args) => encode_cmd(encode_args, cli.detect, cancel),
+        args::Command::Analyze(analyze_args) => analyze_cmd(analyze_args, cancel),
         args::Command::Detect(_) => detect_cmd(),
     }
 }
@@ -97,7 +105,11 @@ fn advise_refresh() -> Result<Refresh> {
 /// write per-file records to `<app_dir>/data/encoding-*.parquet`
 /// (U18; honors `$RENENCODER_DATA_DIR`).
 #[instrument(skip_all, fields(files = tracing::field::Empty))]
-fn encode_cmd(args: args::EncodeArgs, force_detect: bool) -> Result<()> {
+fn encode_cmd(
+    args: args::EncodeArgs,
+    force_detect: bool,
+    cancel: rencoder_lib::pipeline::cancel::CancelToken,
+) -> Result<()> {
     let app_config = load_app_config(args.config.as_deref())?;
 
     let enc = app_config.encode.as_ref();
@@ -215,22 +227,15 @@ fn encode_cmd(args: args::EncodeArgs, force_detect: bool) -> Result<()> {
     // execution path kills the in-flight ffmpeg, removes its partial
     // output and stops the batch at the next file boundary -- and the
     // records of the files that finished are written below (design doc
-    // §3.11.2).
-    let cancel = rencoder_lib::pipeline::cancel::CancelToken::new();
-    signal::install_handler(&cancel);
+    // §3.11.2). The handler itself was installed in `main`, before
+    // any of this started.
 
     // The batch context: this command's parameters, the encoder
     // cache and this machine's NVENC capability (an encoder that
     // fails at runtime is not tried again for the rest of the command).
     let mut ctx = BatchContext::new(params, std::sync::Arc::new(cache), resolution.capability());
 
-    let report = transcode_batch(
-        &files,
-        &mut ctx,
-        ProcessOutput::Inherit,
-        &cancel,
-        None,
-    );
+    let report = transcode_batch(&files, &mut ctx, ProcessOutput::Inherit, &cancel, None);
     let records = report.records;
 
     // Default output: timestamped Parquet in <app_dir>/data/ (U18; honors
@@ -242,7 +247,11 @@ fn encode_cmd(args: args::EncodeArgs, force_detect: bool) -> Result<()> {
     };
     rencoder_lib::data::store::write_records(&records, &output_path)
         .with_context(|| format!("failed to write {}", output_path.display()))?;
-    eprintln!("Wrote {} record(s) to {}", records.len(), output_path.display());
+    eprintln!(
+        "Wrote {} record(s) to {}",
+        records.len(),
+        output_path.display()
+    );
     print_encode_summary(&records);
 
     // An interrupted run is not a successful one: the records are on
@@ -261,7 +270,10 @@ fn encode_cmd(args: args::EncodeArgs, force_detect: bool) -> Result<()> {
 /// `rencoder analyze ...` -- probes each file, groups by rounded fps,
 /// prints summary, optionally writes a detailed file.
 #[instrument(skip_all, fields(dir = ?args.dir, file = ?args.file))]
-fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
+fn analyze_cmd(
+    args: args::AnalyzeArgs,
+    cancel: rencoder_lib::pipeline::cancel::CancelToken,
+) -> Result<()> {
     let app_config = load_app_config(args.config.as_deref())?;
     let an = app_config.analyze.as_ref();
 
@@ -292,15 +304,16 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
     let parallel = an.and_then(|a| a.parallel).unwrap_or(false);
     tracing::Span::current().record("parallel", parallel);
 
-    let records = if parallel {
+    let report = if parallel {
         // The parallel analyzer takes `&[PathBuf]` and bypasses the
         // `InputPath` boundary (probe-only, no argv injection risk).
         // Convert at the CLI boundary; the lib's signature stays
         // untouched per the review #109 plan.
         let paths: Vec<std::path::PathBuf> =
             files.iter().map(|ip| ip.as_path().to_path_buf()).collect();
-        rencoder_lib::analyzer::records::analyze_records_parallel(&paths)
-            .with_context(|| "fps analysis failed")?
+        let records = rencoder_lib::analyzer::records::analyze_records_parallel(&paths, &cancel)
+            .with_context(|| "fps analysis failed")?;
+        rencoder_lib::pipeline::task::BatchReport::completed(records)
     } else {
         // U19 step 5: serial analyze routes through TaskManager so the
         // scaffold logs (batch start/end + per-task start/end) are
@@ -317,13 +330,12 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
             })
             .collect();
         let manager = rencoder_lib::pipeline::task::TaskManager::new();
-        manager
-            .run(
-                &tasks,
-                "analyze",
-                target_path(&target),
-                &rencoder_lib::pipeline::cancel::CancelToken::new(),
-                |task, _ctx| {
+        manager.run(
+            &tasks,
+            "analyze",
+            target_path(&target),
+            &cancel,
+            |task, _ctx| {
                 let file_bytes = std::fs::metadata(task.input.as_path())
                     .map(|m| m.len())
                     .unwrap_or(0);
@@ -343,10 +355,20 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
                         file_bytes,
                     )),
                 }
-            })
-            .records
+            },
+        )
     };
-    let stats = rencoder_lib::analyzer::records::aggregate_records(&records);
+    let records = &report.records;
+    let stats = rencoder_lib::analyzer::records::aggregate_records(records);
+
+    // An interrupted analysis says so with its exit code, like the
+    // encode path (design doc §3.11.2).
+    if matches!(
+        report.termination,
+        rencoder_lib::pipeline::task::Termination::Cancelled { .. }
+    ) {
+        std::process::exit(130);
+    }
 
     // One-line summary to stderr regardless of output format.
     eprintln!(
@@ -380,10 +402,10 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
 
     match format {
         AnalyzeFormatArg::Csv => {
-            render(rencoder_lib::analyzer::records::records_to_csv(&records))?;
+            render(rencoder_lib::analyzer::records::records_to_csv(records))?;
         }
         AnalyzeFormatArg::Table => {
-            let df = rencoder_lib::analyzer::records::records_to_dataframe(&records)
+            let df = rencoder_lib::analyzer::records::records_to_dataframe(records)
                 .map_err(|e| anyhow::anyhow!("dataframe build: {e}"))?;
             render(format!("{df}"))?;
         }
@@ -391,7 +413,7 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
             render(stats.summary())?;
         }
         AnalyzeFormatArg::Json => {
-            render(records_to_jsonl(&records))?;
+            render(records_to_jsonl(records))?;
         }
     }
 

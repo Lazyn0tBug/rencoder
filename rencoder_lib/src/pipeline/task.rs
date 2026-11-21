@@ -382,9 +382,13 @@ mod tests {
     fn run_returns_one_result_per_task() {
         let mgr = TaskManager::new();
         let tasks = make_tasks(3);
-        let results = mgr.run(&tasks, "encoding", Path::new("/in"), &CancelToken::new(), |_task, _ctx| {
-            Ok::<usize, EncodeError>(42)
-        });
+        let results = mgr.run(
+            &tasks,
+            "encoding",
+            Path::new("/in"),
+            &CancelToken::new(),
+            |_task, _ctx| Ok::<usize, EncodeError>(42),
+        );
         assert_eq!(results.records.len(), 3);
     }
 
@@ -393,10 +397,16 @@ mod tests {
         let mgr = TaskManager::new();
         let tasks = make_tasks(2);
         let mut seen: Vec<TaskContext> = Vec::new();
-        let _ = mgr.run(&tasks, "probing", Path::new("/in"), &CancelToken::new(), |_task, ctx| {
-            seen.push(ctx.clone());
-            Ok::<(), EncodeError>(())
-        });
+        let _ = mgr.run(
+            &tasks,
+            "probing",
+            Path::new("/in"),
+            &CancelToken::new(),
+            |_task, ctx| {
+                seen.push(ctx.clone());
+                Ok::<(), EncodeError>(())
+            },
+        );
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0].index, 1);
         assert_eq!(seen[0].total, 2);
@@ -420,9 +430,13 @@ mod tests {
         let mgr = TaskManager::new();
         let tasks = make_tasks(1);
         // Should not panic; Guard is a no-op when handle is None.
-        let results = mgr.run(&tasks, "probing", Path::new("/in"), &CancelToken::new(), |_, _| {
-            Ok::<(), EncodeError>(())
-        });
+        let results = mgr.run(
+            &tasks,
+            "probing",
+            Path::new("/in"),
+            &CancelToken::new(),
+            |_, _| Ok::<(), EncodeError>(()),
+        );
         assert_eq!(results.records.len(), 1);
     }
 
@@ -469,14 +483,23 @@ mod tests {
         let cancel = CancelToken::new();
         cancel.cancel();
 
-        let report = mgr.run(&tasks, "encoding", Path::new("/in"), &cancel, |_t, _c| -> Result<usize, EncodeError> {
-            panic!("no task may run after the cancel");
-        });
+        let report = mgr.run(
+            &tasks,
+            "encoding",
+            Path::new("/in"),
+            &cancel,
+            |_t, _c| -> Result<usize, EncodeError> {
+                panic!("no task may run after the cancel");
+            },
+        );
 
         assert!(report.records.is_empty());
         assert!(matches!(
             report.termination,
-            Termination::Cancelled { completed: 0, total: 3 }
+            Termination::Cancelled {
+                completed: 0,
+                total: 3
+            }
         ));
     }
 
@@ -487,16 +510,25 @@ mod tests {
         // test verifies the abort position + the error round-trip.
         let mgr = TaskManager::new();
         let tasks = make_tasks(3);
-        let result = mgr.run(&tasks, "encoding", Path::new("/in"), &CancelToken::new(), |task, _ctx| {
-            if task.input.to_string().ends_with("1.mp4") {
-                Err(EncodeError::Ffmpeg("boom".into()))
-            } else {
-                Ok::<(), EncodeError>(())
-            }
-        });
+        let result = mgr.run(
+            &tasks,
+            "encoding",
+            Path::new("/in"),
+            &CancelToken::new(),
+            |task, _ctx| {
+                if task.input.to_string().ends_with("1.mp4") {
+                    Err(EncodeError::Ffmpeg("boom".into()))
+                } else {
+                    Ok::<(), EncodeError>(())
+                }
+            },
+        );
         // The abort is not a cancel: it carries the reason.
         let Termination::Failed(err) = result.termination else {
-            panic!("expected a failed termination, got {:?}", result.termination);
+            panic!(
+                "expected a failed termination, got {:?}",
+                result.termination
+            );
         };
         // The error message should include the underlying error.
         let formatted = err.to_string();
@@ -514,14 +546,20 @@ mod tests {
         let mgr = TaskManager::new();
         let tasks = make_tasks(3);
         let mut attempted = Vec::new();
-        let result = mgr.run(&tasks, "encoding", Path::new("/in"), &CancelToken::new(), |task, _ctx| {
-            attempted.push(task.input.to_string());
-            if task.input.to_string().ends_with("1.mp4") {
-                Err(EncodeError::Ffmpeg("boom".into()))
-            } else {
-                Ok::<(), EncodeError>(())
-            }
-        });
+        let result = mgr.run(
+            &tasks,
+            "encoding",
+            Path::new("/in"),
+            &CancelToken::new(),
+            |task, _ctx| {
+                attempted.push(task.input.to_string());
+                if task.input.to_string().ends_with("1.mp4") {
+                    Err(EncodeError::Ffmpeg("boom".into()))
+                } else {
+                    Ok::<(), EncodeError>(())
+                }
+            },
+        );
         assert!(!result.is_completed());
         assert_eq!(
             attempted.len(),

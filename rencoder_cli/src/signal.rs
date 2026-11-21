@@ -120,7 +120,10 @@ mod windows {
     }
 
     pub(super) fn register(cancel: CancelToken) {
-        assert!(CANCEL.set(cancel).is_ok(), "signal handler already installed");
+        assert!(
+            CANCEL.set(cancel).is_ok(),
+            "signal handler already installed"
+        );
         // SAFETY: the callback uses the Windows ABI and stays valid for
         // the lifetime of the process; the shared state it reads is
         // initialized right above.

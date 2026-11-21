@@ -397,3 +397,159 @@ fn encode_rejects_missing_target() {
         "expected error mentioning --file and --dir, got: {stderr}"
     );
 }
+
+// ---- interrupt: the records survive it (design doc §3.11.2) ----
+
+/// Spawn the binary with the scratch environment, so the caller can
+/// signal it. The output is discarded: ffmpeg writes a lot of it, and
+/// a pipe nobody reads would fill up and block the child.
+#[cfg(unix)]
+fn spawn(args: &[&str], logs: Option<(&Path, &Path)>) -> std::process::Child {
+    let scratch = scratch_dir();
+    let mut cmd = Command::new(bin());
+    cmd.args(args)
+        .env("RENENCODER_CONFIG", scratch.join("rencoder.toml"))
+        .env("RENENCODER_DATA_DIR", scratch.join("data"))
+        .env("RENENCODER_LOG_DIR", scratch.join("log"))
+        .env(
+            "RENENCODER_NVENC_CACHE",
+            scratch.join("nvenc-capability.json"),
+        );
+    match logs {
+        Some((out, err)) => {
+            cmd.stdout(std::fs::File::create(out).expect("the log file must be creatable"))
+                .stderr(std::fs::File::create(err).expect("the log file must be creatable"));
+        }
+        None => {
+            cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+    }
+    cmd.spawn().expect("the binary must start")
+}
+
+/// Make a video of `seconds` at 1080p.
+///
+/// The resolution matters: the encode has to be slow enough that the
+/// signal lands *during* it, on any machine.
+#[cfg(unix)]
+fn make_video_of_seconds(dir: &Path, name: &str, seconds: u32) -> PathBuf {
+    let path = dir.join(name);
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("color=c=black:s=1920x1080:d={seconds}"),
+            "-r",
+            "30",
+            "-c:v",
+            "libx264",
+            "-t",
+            &seconds.to_string(),
+        ])
+        .arg(&path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("ffmpeg spawn failed");
+    assert!(status.success(), "ffmpeg failed to make {name}");
+    path
+}
+
+/// Wait until `marker` shows up in `file` (or give up).
+#[cfg(unix)]
+fn wait_for(file: &Path, marker: &str, timeout: std::time::Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let text = std::fs::read_to_string(file).unwrap_or_default();
+        if text.contains(marker) {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("{marker} never showed up in {}", file.display());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// An interrupt must not cost the run: the files that were already
+/// encoded stay in the records, and the process says it was
+/// interrupted (130 = 128 + SIGINT).
+///
+/// Before the cancel contract, the signal handler removed the partial
+/// output and exited right there -- the finished files were never
+/// written anywhere.
+#[cfg(unix)]
+#[test]
+fn an_interrupt_keeps_the_records_of_the_files_that_finished() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+    let dir = fixture_dir("interrupt");
+    // The inputs live in their own directory: the config and the
+    // output file would otherwise be collected as inputs too.
+    let inputs = dir.join("in");
+    std::fs::create_dir_all(&inputs).unwrap();
+    // The first file is short (it finishes before the signal lands);
+    // the second is long (the signal lands while it is encoding).
+    make_video_of_seconds(&inputs, "a-short.mp4", 1);
+    make_video_of_seconds(&inputs, "b-long.mp4", 60);
+    // AV1 is slow enough that the encode is still running when the
+    // signal arrives.
+    let config = write_config(&dir, "[encode]\nformat = \"av1\"\ncrf = 40\n");
+    let out = dir.join("records.parquet");
+
+    let out_log = dir.join("stdout.log");
+    let err_log = dir.join("stderr.log");
+    let mut child = spawn(
+        &[
+            "encode",
+            "-d",
+            inputs.to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ],
+        Some((&out_log, &err_log)),
+    );
+
+    // Wait until the second file is really being encoded: the first
+    // one is done by then, and the batch is busy (so the signal has
+    // something to interrupt). A fixed sleep would be a race -- the
+    // signal can land before the CLI even installed its handler, and
+    // then the default disposition kills the process.
+    wait_for(&err_log, "b-long.mp4", std::time::Duration::from_secs(120));
+
+    let status = Command::new("kill")
+        .arg("-INT")
+        .arg(child.id().to_string())
+        .status()
+        .expect("kill must run");
+    assert!(status.success(), "the signal must be delivered");
+
+    let status = child.wait().expect("the child must exit");
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "an interrupted run exits with 130 (128 + SIGINT); got {status:?} signal={:?}",
+        std::os::unix::process::ExitStatusExt::signal(&status),
+    );
+
+    // The records of the finished file are on disk.
+    assert!(
+        out.exists(),
+        "the records must be written before the process exits: {}",
+        out.display()
+    );
+    let records =
+        rencoder_lib::data::store::read_records(&out).expect("the records must be readable");
+    assert!(
+        !records.is_empty(),
+        "the file that finished before the signal must be in the records"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
