@@ -1597,18 +1597,27 @@ fn run_actor(
                 // Review #122: extension still hoisted (unused now — kept for
                 // the hoist comment / future use).
                 let _ext = params.format.default_extension();
+                // The output paths are **planned** for the whole
+                // batch: two inputs can want the same output, and
+                // the colliding ones are renamed (`movie_mp4_1.mkv`)
+                // instead of overwriting each other.
+                let planned = crate::utils::fs::plan_outputs(
+                    &files
+                        .iter()
+                        .map(|file| file.as_path().to_path_buf())
+                        .collect::<Vec<_>>(),
+                    params.format,
+                );
                 let tasks: Vec<TranscodeTask> = files
                     .iter()
-                    .map(|file| {
+                    .zip(planned)
+                    .map(|(file, output)| {
                         // v1.2 follow-up #3: route through
                         // output_path_for for the `_encoded`
                         // collision guard.
                         TranscodeTask {
                             input: file.clone(),
-                            output: Some(crate::utils::fs::output_path_for(
-                                file.as_path(),
-                                params.format,
-                            )),
+                            output: Some(output),
                         }
                     })
                     .collect();

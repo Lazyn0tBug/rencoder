@@ -732,18 +732,26 @@ pub fn transcode_batch(
     // batch this is 1000 saved lookups.
     let params = ctx.params();
     let _ext = params.format.default_extension();
+    // The output paths are **planned** for the whole batch: two
+    // inputs can want the same output, and the colliding ones are
+    // renamed (`movie_mp4_1.mkv`) instead of overwriting each other.
+    let planned = crate::utils::fs::plan_outputs(
+        &files
+            .iter()
+            .map(|input| input.as_path().to_path_buf())
+            .collect::<Vec<_>>(),
+        params.format,
+    );
     let tasks: Vec<TranscodeTask> = files
         .iter()
-        .map(|input| {
+        .zip(planned)
+        .map(|(input, output)| {
             // v1.2 follow-up #3: route through output_path_for
             // for the `_encoded` collision guard (X264/HEVC/AV1 +
             // .mkv input would otherwise overwrite input).
             TranscodeTask {
                 input: input.clone(),
-                output: Some(crate::utils::fs::output_path_for(
-                    input.as_path(),
-                    params.format,
-                )),
+                output: Some(output),
             }
         })
         .collect();
@@ -805,11 +813,17 @@ where
     let _ext = params.format.default_extension();
     let files: Vec<&crate::types::InputPath> = files.into_iter().collect();
     let total = files.len();
+    // The same planning as the encode path: the dry run must show the
+    // names the encode will really use.
+    let planned = crate::utils::fs::plan_outputs(
+        &files
+            .iter()
+            .map(|file| file.as_path().to_path_buf())
+            .collect::<Vec<_>>(),
+        params.format,
+    );
     let mut records = Vec::new();
-    for file in files {
-        // v1.2 follow-up #3: route through output_path_for
-        // for the `_encoded` collision guard.
-        let output_path = crate::utils::fs::output_path_for(file.as_path(), params.format);
+    for (file, output_path) in files.into_iter().zip(planned) {
         let task = TranscodeTask {
             input: file.clone(),
             output: Some(output_path),
