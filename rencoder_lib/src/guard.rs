@@ -252,26 +252,12 @@ impl TargetGuard {
         };
         let _ = write_holder(&mut file, &record);
 
-        // Descendants: this run collects them. The same walk finds the
-        // temp files of dead attempts -- we hold the target, so they
-        // are all leftovers (design doc §3.11.2).
-        let scan = scan_subtree(&target)?;
-        if let Some((dir, holder)) = scan.conflict {
+        // Descendants: this run collects them.
+        if let Some((dir, holder)) = held_descendant(&target)? {
             // Give the target back before refusing.
             let _ = std::fs::remove_file(&marker);
             drop(file);
             return Err(GuardError::Busy { path: dir, holder });
-        }
-        for leftover in scan.temp_files {
-            if let Err(e) = std::fs::remove_file(&leftover) {
-                if e.kind() != io::ErrorKind::NotFound {
-                    tracing::warn!(
-                        error = %e,
-                        path = %leftover.display(),
-                        "could not remove a leftover temp file"
-                    );
-                }
-            }
         }
 
         Ok(TargetGuard {
@@ -316,44 +302,29 @@ impl Drop for TargetGuard {
     }
 }
 
-/// What one walk over the target's tree finds.
-struct SubtreeScan {
-    /// A directory inside the tree that another instance holds.
-    conflict: Option<(PathBuf, Option<Holder>)>,
-    /// The temp files of dead attempts (design doc §3.11.2).
-    temp_files: Vec<PathBuf>,
-}
-
-/// Walk the target's tree once: who holds a directory inside it, and
-/// which temp files are left over.
+/// Is a directory inside `root` held by another instance?
 ///
 /// The root is ours -- we just locked it -- so it is not a conflict.
-fn scan_subtree(root: &Path) -> Result<SubtreeScan, GuardError> {
-    let mut scan = SubtreeScan {
-        conflict: None,
-        temp_files: Vec::new(),
-    };
-    for entry in WalkDir::new(root).follow_links(false).into_iter() {
+fn held_descendant(root: &Path) -> Result<Option<(PathBuf, Option<Holder>)>, GuardError> {
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| entry.file_type().is_dir())
+    {
         let entry = entry.map_err(|e| GuardError::Io {
             path: root.to_path_buf(),
             source: e.into(),
         })?;
-        let path = entry.path();
-        if entry.file_type().is_dir() {
-            // The root is ours -- we just locked it.
-            if path == root {
-                continue;
-            }
-            if scan.conflict.is_none() {
-                if let Occupancy::Held(holder) = occupancy(path)? {
-                    scan.conflict = Some((path.to_path_buf(), holder));
-                }
-            }
-        } else if entry.file_type().is_file() && crate::utils::fs::is_temp_file(path) {
-            scan.temp_files.push(path.to_path_buf());
+        let dir = entry.path();
+        // The root is ours -- we just locked it.
+        if dir == root {
+            continue;
+        }
+        if let Occupancy::Held(holder) = occupancy(dir)? {
+            return Ok(Some((dir.to_path_buf(), holder)));
         }
     }
-    Ok(scan)
+    Ok(None)
 }
 
 /// The directory as the filesystem sees it: symlinks resolved, so two
@@ -480,25 +451,6 @@ mod tests {
 
         probe(&app).expect("nothing holds this tree");
         assert!(TargetGuard::acquire(&app).is_ok());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn taking_the_target_removes_the_leftover_temp_files() {
-        // We hold the target, so every temp file in it belongs to a
-        // dead attempt (design doc §3.11.2).
-        let dir = scratch("leftovers");
-        let app = dir.join("app");
-        let leftover = app.join(".rencoder-tmp.clip.mkv");
-        std::fs::write(&leftover, b"partial").unwrap();
-
-        let _guard = TargetGuard::acquire(&app).expect("the target is free");
-
-        assert!(
-            !leftover.exists(),
-            "the leftover temp file must be gone: {}",
-            leftover.display()
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

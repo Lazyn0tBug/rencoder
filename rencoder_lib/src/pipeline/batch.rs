@@ -304,24 +304,10 @@ where
     // `&mut` this function already owns).
     R: FnOnce(&BatchContext) -> Option<Vec<String>>,
 {
-    // The temp file is **ours**: created exclusively, so a user's
-    // file with the same name is never clobbered (design doc §3.11.2).
-    // ffmpeg writes into it; the product is committed to the final
-    // path only after ffmpeg succeeded.
-    let mut run_result = match create_temp_file(plan.output_path()) {
-        Ok(()) => {
-            // Clone argv for the closure — build_encode_record needs
-            // it too. Per-batch this is one ~20-element Vec<String>
-            // clone; trivial.
-            let argv_for_run = plan.argv().to_vec();
-            run_ffmpeg(argv_for_run)
-        }
-        Err(e) => Err((
-            ErrorCategory::IoError,
-            format!("could not create the temp file: {e}"),
-            String::new(),
-        )),
-    };
+    // Clone argv for the closure — build_encode_record needs it too.
+    // Per-batch this is one ~20-element Vec<String> clone; trivial.
+    let argv_for_run = plan.argv().to_vec();
+    let mut run_result = run_ffmpeg(argv_for_run);
 
     // NVENC fallback. A failed NVENC encode does NOT prove the encoder
     // is unusable -- a full disk, a bad passthrough argument or a
@@ -352,26 +338,14 @@ where
                 });
                 if let Some(fallback_argv) = rebuild_argv(&*ctx) {
                     if !fallback_argv.is_empty() {
-                        // The first attempt's temp file is this
-                        // attempt's own: it goes before the retry
-                        // creates its own (design doc §3.11.2).
-                        remove_temp_file(plan.output_path());
-                        if let Err(e) = create_temp_file(plan.output_path()) {
-                            run_result = Err((
-                                ErrorCategory::IoError,
-                                format!("could not create the temp file: {e}"),
-                                String::new(),
-                            ));
-                        } else {
-                            plan.set_argv(fallback_argv);
-                            run_result = run_ffmpeg(plan.argv().to_vec());
-                            if let Err((_, message, _)) = &run_result {
-                                tracing::warn!(
-                                    encoder = %encoder,
-                                    error = %message,
-                                    "software fallback also failed"
-                                );
-                            }
+                        plan.set_argv(fallback_argv);
+                        run_result = run_ffmpeg(plan.argv().to_vec());
+                        if let Err((_, message, _)) = &run_result {
+                            tracing::warn!(
+                                encoder = %encoder,
+                                error = %message,
+                                "software fallback also failed"
+                            );
                         }
                     }
                 }
@@ -379,67 +353,7 @@ where
         }
     }
 
-    // The commit (design doc §3.11.2): ffmpeg wrote the temp file; the
-    // product becomes the final path only now that it succeeded. A
-    // failed replace keeps the old result and is recorded as this
-    // file's failure.
-    if run_result.is_ok() {
-        if let Err(e) = commit_temp_file(plan.output_path()) {
-            tracing::error!(
-                output = %plan.output_path().display(),
-                error = %e,
-                "could not commit the output"
-            );
-            run_result = Err((
-                ErrorCategory::IoError,
-                format!("could not commit the output: {e}"),
-                String::new(),
-            ));
-        }
-    } else {
-        // A failed attempt leaves nothing behind -- but only its own
-        // temp file, never the old result.
-        remove_temp_file(plan.output_path());
-    }
-
     build_encode_record(task, plan, ctx, run_result, fallback_note)
-}
-
-/// Commit the product: the temp file becomes the output.
-///
-/// The replace is atomic and on the same volume (the temp file is
-/// next to the output). A failure leaves the old result in place.
-fn commit_temp_file(output: &Path) -> std::io::Result<()> {
-    let temp = crate::utils::fs::temp_output_path(output);
-    crate::utils::fs::replace_file(&temp, output)
-}
-
-/// Create this attempt's temp file, exclusively.
-///
-/// Exclusive creation: the file is ours, and a file that is already
-/// there (a user's, or a leftover the guard did not clean) is never
-/// clobbered (design doc §3.11.2).
-fn create_temp_file(output: &Path) -> std::io::Result<()> {
-    let temp = crate::utils::fs::temp_output_path(output);
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp)
-        .map(|_| ())
-}
-
-/// Remove this attempt's temp file (and nothing else).
-fn remove_temp_file(output: &Path) {
-    let temp = crate::utils::fs::temp_output_path(output);
-    if let Err(e) = std::fs::remove_file(&temp) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(
-                error = %e,
-                path = %temp.display(),
-                "could not remove the temp file"
-            );
-        }
-    }
 }
 
 /// What the first (NVENC) attempt left behind, when a software retry
@@ -539,6 +453,45 @@ fn transcode_with_progress(
         |argv| run_ffmpeg_with_progress(&argv, cancel, metadata.duration_secs, on_progress),
         |ctx| rebuild_argv_after_nvenc_failure(task, ctx, &metadata),
     )
+}
+
+/// Remove the output a failed attempt wrote.
+///
+/// Only when ffmpeg actually wrote it **during this attempt** (the
+/// file is newer than the attempt's start): an attempt that failed
+/// before opening the output leaves the previous result alone -- it is
+/// still a complete product.
+///
+/// The mtime comparison is second-granular, so a file written in the
+/// same second as the attempt's start counts as "not touched" -- the
+/// safe direction: a leftover half-written file beats deleting a
+/// complete one.
+fn remove_failed_output(output: &Path, started_at: chrono::DateTime<chrono::Utc>) {
+    let Ok(meta) = std::fs::metadata(output) else {
+        return;
+    };
+    let Ok(modified) = meta.modified() else {
+        return;
+    };
+    let modified_secs = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if modified_secs <= started_at.timestamp() {
+        return;
+    }
+    match std::fs::remove_file(output) {
+        Ok(()) => tracing::warn!(
+            output = %output.display(),
+            "the encode failed; removed the half-written output"
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(
+            output = %output.display(),
+            error = %e,
+            "the encode failed; could not remove the half-written output"
+        ),
+    }
 }
 
 /// Build the final EncodingRecord from ffmpeg's exit result. Shared
@@ -694,6 +647,10 @@ fn build_encode_record(
             if category == ErrorCategory::Cancelled {
                 return Err(EncodeError::UserCancel);
             }
+            // The failed attempt may have left a half-written file at
+            // the output path. It goes: the target directory keeps
+            // complete products only (design doc §3.11.2).
+            remove_failed_output(output_path, started_at_meta);
             // When the NVENC attempt was replaced by a software retry,
             // the record has to carry both failures -- otherwise the
             // record blames the software encoder for a hardware
@@ -947,16 +904,7 @@ fn build_argv(
     // parameters (design doc §3.10.4) so `encoder` does not depend on
     // `pipeline`.
     let encoder = select_encoder(params.format, ctx.cache(), params, ctx.capability())?;
-    // ffmpeg writes to the **temp file**, not to the final path
-    // (design doc §3.11.2): the product is committed to the final path
-    // only after ffmpeg succeeded. A failed attempt leaves the old
-    // result alone.
-    let output = task
-        .output
-        .as_ref()
-        .expect("build_argv called with TranscodeTask.output = None");
-    let temp = crate::utils::fs::temp_output_path(output);
-    Ok(build_ffmpeg_command(task, &temp, params, &encoder, src_fps))
+    Ok(build_ffmpeg_command(task, params, &encoder, src_fps))
 }
 
 /// Build a failed-probe record (used when probe_video_metadata_auto
@@ -2155,6 +2103,45 @@ Encoders:
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn a_failed_attempt_removes_the_output_it_wrote() {
+        // The output is ffmpeg's own writing (newer than the attempt's
+        // start) -> the half-written file goes (design doc §3.11.2).
+        let dir = cleanup_tmp("failed_output");
+        let output = dir.join("out.mkv");
+        std::fs::write(&output, b"half written").unwrap();
+
+        let started_at = chrono::Utc::now() - chrono::Duration::seconds(5);
+        super::remove_failed_output(&output, started_at);
+
+        assert!(
+            !output.exists(),
+            "the half-written output must be gone: {}",
+            output.display()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_attempt_keeps_a_result_it_never_touched() {
+        // ffmpeg failed before opening the output: the previous result
+        // is intact and must survive (design doc §3.11.2).
+        let dir = cleanup_tmp("untouched_output");
+        let output = dir.join("out.mkv");
+        std::fs::write(&output, b"previous result").unwrap();
+        // The attempt started after the file was written.
+        let started_at = chrono::Utc::now() + chrono::Duration::seconds(5);
+
+        super::remove_failed_output(&output, started_at);
+
+        assert!(
+            output.exists(),
+            "the previous result must survive: {}",
+            output.display()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

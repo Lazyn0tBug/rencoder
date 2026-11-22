@@ -117,12 +117,6 @@ fn collect_dir(
 
 /// Is this file one of the app's own (design doc §3.6)?
 fn is_app_owned_file(path: &Path) -> bool {
-    // The temp files of an in-flight attempt (design doc §3.11.2):
-    // they keep the container extension, so the extension filter would
-    // match them -- the prefix is what keeps them out.
-    if crate::utils::fs::is_temp_file(path) {
-        return true;
-    }
     path.file_name().is_some_and(|name| {
         crate::config::paths::APP_OWNED_FILE_NAMES
             .iter()
@@ -193,36 +187,6 @@ mod tests {
             names,
             vec!["movie.mp4".to_string()],
             "only the user's video is an input"
-        );
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn the_temp_files_are_not_collected_as_inputs() {
-        // The temp file keeps the container extension, so the
-        // extension filter would match it -- the prefix is what keeps
-        // it out (design doc §3.11.2).
-        let dir = fixture_dir("temp_files");
-        fs::write(dir.join("movie.mp4"), b"video").unwrap();
-        fs::write(dir.join(".rencoder-tmp.movie.mkv"), b"partial").unwrap();
-
-        let files = collect_files(&crate::types::Target::Dir(dir.clone()), &[], 100)
-            .expect("collection must succeed");
-
-        let names: Vec<String> = files
-            .iter()
-            .map(|f| {
-                f.as_path()
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .collect();
-        assert_eq!(
-            names,
-            vec!["movie.mp4".to_string()],
-            "the temp file of an in-flight attempt is not an input"
         );
         let _ = fs::remove_dir_all(&dir);
     }

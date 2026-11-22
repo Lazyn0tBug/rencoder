@@ -30,12 +30,6 @@ rayon = { version = "1", optional = true }
 polars = { version = "0.53", default-features = false, features = ["csv", "lazy", "fmt", "parquet", "json", "dtype-datetime", "temporal"] }
 crossbeam-channel = "0.5"
 
-# Windows' `rename` refuses an existing target; the same-volume
-# replace (design doc §3.11.2) needs the platform call. Unix uses
-# `rename` and needs nothing.
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
-
 [features]
 # Native FFmpeg probing requires pkg-config + FFmpeg development
 # libraries, so it stays opt-in: portable / default builds use the
