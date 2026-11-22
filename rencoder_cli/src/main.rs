@@ -31,25 +31,36 @@ use std::path::{Path, PathBuf};
 use tracing::{info, instrument, warn};
 
 fn main() -> Result<()> {
-    // The cancel request is a file in the app directory (design doc
-    // §3.11.2): the signal handler writes it, the batch polls for it,
-    // and anyone who can write that file can stop a running batch.
-    let cancel_file = rencoder_lib::config::path::resolve_cancel_file();
-    // A leftover cancel file would cancel this run as well.
-    if let Some(path) = &cancel_file {
-        let _ = std::fs::remove_file(path);
-    }
-    let cancel = match &cancel_file {
-        Some(path) => rencoder_lib::pipeline::cancel::CancelToken::watching(path.clone()),
-        None => rencoder_lib::pipeline::cancel::CancelToken::new(),
+    // The run capability check (design doc §3.10.7), priority 1: the
+    // app directory must be writable. The config, the records and the
+    // cancel request all live there -- a directory that cannot be
+    // written means this run cannot finish either, so say so now
+    // rather than after an hour of encoding.
+    let Some(app_dir) = rencoder_lib::config::path::app_dir() else {
+        anyhow::bail!("cannot determine the app directory");
     };
+    rencoder_lib::config::fs_perms::ensure_dir_writable(&app_dir)
+        .context("the app directory is not writable")?;
 
-    // The cancel token and the signal handler come **first** (design
-    // doc §3.11.2): before the handler is installed, a signal takes
-    // the default action -- the process dies, the records are lost,
-    // the partial output stays. That window must not exist, so the
-    // handler is installed before anything else happens.
-    signal::install_handler(cancel_file.as_deref(), &cancel);
+    // The cancel request is a file (design doc §3.11.2): the signal
+    // handler writes it, the batch polls for it, and anyone who can
+    // write that file can stop a running batch.
+    let cancel_file = rencoder_lib::config::path::resolve_cancel_file()
+        .ok_or_else(|| anyhow::anyhow!("cannot determine the cancel file location"))?;
+    if let Some(parent) = cancel_file.parent() {
+        rencoder_lib::config::fs_perms::ensure_dir_writable(parent)
+            .context("the cancel file's directory is not writable")?;
+    }
+    // A leftover request would cancel this run as well.
+    let _ = std::fs::remove_file(&cancel_file);
+    let cancel = rencoder_lib::pipeline::cancel::CancelToken::watching(cancel_file.clone());
+
+    // The signal handler comes **first** (design doc §3.11.2): before
+    // it is installed, a signal takes the default action -- the
+    // process dies, the records are lost, the partial output stays.
+    // That window must not exist, so the handler is installed before
+    // anything else happens.
+    signal::install_handler(&cancel_file);
 
     tracing_init::init().context("initialize tracing")?;
     let cli = args::Cli::parse();

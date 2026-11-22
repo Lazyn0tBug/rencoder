@@ -54,6 +54,31 @@ pub fn resolve_cancel_file() -> Option<PathBuf> {
     app_dir().map(|d| d.join(CANCEL_FILE_NAME))
 }
 
+/// Prepare the cancel file: prove the directory is writable, and clear
+/// a stale request.
+///
+/// Two things in one, and both are preconditions of the run:
+///
+/// - **the directory must be writable** -- the cancel request lives
+///   there, and so do the records (`<app_dir>/data`). A run that cannot
+///   write there cannot finish either; better to say so now than after
+///   an hour of encoding;
+/// - **no stale request** -- a cancel left over from an earlier run
+///   would cancel this one on sight.
+///
+/// The file's content does not matter (only its existence is the
+/// request), so creating and removing it is enough to check both.
+pub fn prepare_cancel_file(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(path, b"")?;
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
 /// Resolves the config file path.
 ///
 /// Priority:
