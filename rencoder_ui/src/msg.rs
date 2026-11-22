@@ -1129,20 +1129,27 @@ fn collect_input_files(
         return Err(CollectError::Guard(e.to_string()));
     }
     let target = rencoder_lib::types::Target::Dir(dir.clone());
-    rencoder_lib::collect::collect_files(&target, &extensions, max_batch_size).map_err(
-        |e| match e {
-            rencoder_lib::error::EncodeError::BatchTooLarge { count, max } => {
-                CollectError::BatchTooLarge { count, max }
-            }
-            // v1.2 follow-up #5 fix: forward the lib's specific error
-            // rather than collapsing every non-BatchTooLarge into a
-            // generic UnreadableDir. The toast path uses
-            // `Display` (which the lib's thiserror derives) so the
-            // user sees "Probe error: walkdir: ..." vs "I/O error:
-            // ..." distinctly.
-            other => CollectError::UnreadableDir(other),
-        },
+    // The UI collects before the batch exists, so there is no cancel
+    // token to hand over yet (design doc §3.11.2 applies to the
+    // batch's own startup phase).
+    rencoder_lib::collect::collect_files(
+        &target,
+        &extensions,
+        max_batch_size,
+        &rencoder_lib::pipeline::cancel::CancelToken::new(),
     )
+    .map_err(|e| match e {
+        rencoder_lib::error::EncodeError::BatchTooLarge { count, max } => {
+            CollectError::BatchTooLarge { count, max }
+        }
+        // v1.2 follow-up #5 fix: forward the lib's specific error
+        // rather than collapsing every non-BatchTooLarge into a
+        // generic UnreadableDir. The toast path uses
+        // `Display` (which the lib's thiserror derives) so the
+        // user sees "Probe error: walkdir: ..." vs "I/O error:
+        // ..." distinctly.
+        other => CollectError::UnreadableDir(other),
+    })
 }
 
 /// Move the active task to history, applying `mutate` to it first.

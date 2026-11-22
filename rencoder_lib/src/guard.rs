@@ -553,8 +553,13 @@ mod tests {
         let _guard = TargetGuard::acquire(&app).expect("the target is free");
         assert!(marker_path(&app).exists());
 
-        let files = crate::collect::collect_files(&crate::types::Target::Dir(app.clone()), &[], 10)
-            .expect("the collection must work");
+        let files = crate::collect::collect_files(
+            &crate::types::Target::Dir(app.clone()),
+            &[],
+            10,
+            &crate::pipeline::cancel::CancelToken::new(),
+        )
+        .expect("the collection must work");
         assert!(
             files.is_empty(),
             "the marker must not be an input: {files:?}"

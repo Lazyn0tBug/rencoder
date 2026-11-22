@@ -116,9 +116,22 @@ fn prepare(
 fn detect_cmd() -> Result<()> {
     let slot = signal::new_cancel_slot();
     signal::install_handler(&slot);
-    let (_config, paths, _cancel) = prepare(None, None, &slot)?;
-    let resolution = nvenc::resolve_and_store(Some(&paths.capability_record), true)
-        .context("NVENC detection failed")?;
+    let (_config, paths, cancel) = prepare(None, None, &slot)?;
+    // The probe is part of the startup phase: a cancel must not wait
+    // for it (design doc §3.11.2).
+    let resolution =
+        match nvenc::resolve_and_store_with(Some(&paths.capability_record), true, |args| {
+            if cancel.is_cancelled() {
+                return Err(rencoder_lib::error::EncodeError::UserCancel);
+            }
+            rencoder_lib::encoder::nvenc::run_ffmpeg(args)
+        }) {
+            Ok(resolution) => resolution,
+            Err(rencoder_lib::error::EncodeError::UserCancel) => {
+                std::process::exit(130);
+            }
+            Err(e) => return Err(e).context("NVENC detection failed"),
+        };
     print!("{}", nvenc::report(&resolution));
     Ok(())
 }
@@ -203,9 +216,13 @@ fn encode_cmd(
     // per target tree. It is taken right after the target is known --
     // before the config, the collection, the encoding -- so a conflict
     // shows up before this run has done anything.
-    let target_guard = rencoder_lib::guard::TargetGuard::acquire(&op_dir)
-        .map_err(|e| anyhow::anyhow!("{e}"))
-        .context("cannot take the target")?;
+    // Held in an Option: the cancel path releases it explicitly (the
+    // process exits there, and `process::exit` skips the destructors).
+    let mut target_guard = Some(
+        rencoder_lib::guard::TargetGuard::acquire(&op_dir)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("cannot take the target")?,
+    );
     let (app_config, paths, cancel) = prepare(args.config.as_deref(), Some(&op_dir), cancel_slot)?;
 
     let enc = app_config.encode.as_ref();
@@ -226,12 +243,26 @@ fn encode_cmd(
     // would trip on entry #1.
     let max_batch_size = rencoder_lib::config::app::resolve_max_batch_size(enc);
 
-    let files = collect_files(&target, &extensions, max_batch_size).with_context(|| {
-        format!(
-            "failed to collect files from {}",
-            target_path(&target).display()
-        )
-    })?;
+    // The collection is part of the startup phase, so it takes the
+    // cancel token too (design doc §3.11.2): Ctrl-C during a long
+    // walk must not wait for the walk.
+    let files = match collect_files(&target, &extensions, max_batch_size, &cancel) {
+        Ok(files) => files,
+        Err(rencoder_lib::error::EncodeError::UserCancel) => {
+            // The run never started: release the target and leave
+            // with the cancel exit code (130).
+            drop(target_guard.take());
+            std::process::exit(130);
+        }
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "failed to collect files from {}",
+                    target_path(&target).display()
+                )
+            });
+        }
+    };
 
     if files.is_empty() {
         warn!("no files matched; nothing to do");
@@ -286,8 +317,22 @@ fn encode_cmd(
     // (design doc §3.10.5). Resolving it costs a file read when the
     // stored record is fresh.
     let mut resolution =
-        match nvenc::resolve_and_store(Some(&paths.capability_record), force_detect) {
+        match nvenc::resolve_and_store_with(Some(&paths.capability_record), force_detect, |args| {
+            // The probe is part of the startup phase: a cancel must
+            // not wait for it (design doc §3.11.2). The runner is the
+            // seam every ffmpeg call goes through, so this is the one
+            // place to check.
+            if cancel.is_cancelled() {
+                return Err(rencoder_lib::error::EncodeError::UserCancel);
+            }
+            rencoder_lib::encoder::nvenc::run_ffmpeg(args)
+        }) {
             Ok(resolution) => resolution,
+            Err(rencoder_lib::error::EncodeError::UserCancel) => {
+                // Cancelled before the batch started.
+                drop(target_guard.take());
+                std::process::exit(130);
+            }
             Err(e) => {
                 // ffmpeg does not run. The check still reports what it
                 // found -- the report is information, not a gate --
@@ -365,7 +410,7 @@ fn encode_cmd(
     // The target is released before the exit: `process::exit` skips
     // the destructors, and the user's directory must not keep a
     // leftover marker (design doc §3.11.1.1).
-    drop(target_guard);
+    drop(target_guard.take());
 
     // An interrupted run is not a successful one: the records are on
     // disk, but the exit code says the batch did not finish (130 =
@@ -411,12 +456,22 @@ fn analyze_cmd(args: args::AnalyzeArgs, cancel_slot: &signal::CancelSlot) -> Res
     let max_batch_size =
         rencoder_lib::config::app::resolve_max_batch_size(app_config.encode.as_ref());
 
-    let files = collect_files(&target, &extensions, max_batch_size).with_context(|| {
-        format!(
-            "failed to collect files from {}",
-            target_path(&target).display()
-        )
-    })?;
+    // The collection takes the cancel token (design doc §3.11.2).
+    let files = match collect_files(&target, &extensions, max_batch_size, &cancel) {
+        Ok(files) => files,
+        Err(rencoder_lib::error::EncodeError::UserCancel) => {
+            // Cancelled before the analysis started.
+            std::process::exit(130);
+        }
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "failed to collect files from {}",
+                    target_path(&target).display()
+                )
+            });
+        }
+    };
 
     // The check: one call, the whole result (design doc §3.10.7). An
     // analyze run needs no encoder, so nobody resolved the machine's
