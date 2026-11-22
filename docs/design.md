@@ -2364,6 +2364,8 @@ UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `int
 | `guard.rs` | `TargetGuard` struct | 目标目录的占用：标记文件 + 内核文件锁——同一目标同一时刻只有一个实例(§3.11.1.1) |
 | `guard.rs` | `GuardError` / `Occupancy` / `Holder` | 占用探测的三个答案：有人占着(良性拒绝) / 文件系统不支持锁(拒绝这一趟) / 谁在占(§3.11.1.1) |
 | `guard.rs` | `common_ancestor()` | 批的范围 = 它所有输入所在目录的公共祖先(§3.11.1.1) |
+| `utils/fs.rs` | `temp_output_path()` / `is_temp_file()` | 临时文件的路径与前缀 `.rencoder-tmp.`——同目录、保留容器扩展名、采集器按前缀排除(§3.11.2) |
+| `utils/fs.rs` | `replace_file()` | 同卷替换的平台层——Unix `rename`、Windows `MoveFileEx`(REPLACE_EXISTING)；替换失败保留旧结果(§3.11.2) |
 | `capability.rs` | `Capabilities` struct | 检查的**整体**结果：检查项 + 机器能力；报告文件是它的落盘形态(§3.10.7) |
 | `job.rs` | `Command::SetWorkingDir { dir }` | GUI 换工作目录 → 重新检查(复用机器事实)+ 报告落到新目录(§3.10.7) |
 | `job.rs` | `Event::CapabilityChecked { report }` | `Event` 新增 variant：报告写好了，路径在这儿——前端读文件(§3.10.7) |
@@ -4437,6 +4439,7 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 97 | **路径写进配置**（§3.6）：`[paths]` 段覆盖各路径，优先级 = 入口显式值（env / CLI）> 文件显式值 > 内建默认值；配置文件自身的位置仍由 `--config` / `$RENENCODER_CONFIG` 决定 | ✅ |
 | 98 | **路径一处决定**（§3.6）：lib 的 `config::paths::Paths` 一次解析出全部路径，前端不再各自现算；操作目录里的应用文件（`cancel`、`capabilities.json`）按名字跳过，不被当成输入 | ✅ |
 | 99 | **单例守卫**（§3.11.1.1）：范围是一棵目录树（自己 ✅ ✅、祖先 ✅ ✅、后代 ✅ ✅）；互斥交给内核文件锁 ✅ ✅（进程死了内核放锁 ✅ ✅、取得占用是原子的 ✅ ✅、不需要 pid 判活 ✅ ✅）；标记只记 pid 与开始时刻 ✅ ✅，用完就删 ✅ ✅（先删名字后放锁 ✅ ✅）；冲突整趟拒绝 ✅ ✅，文件系统不支持锁则报错拒绝这一趟 ✅ ✅；GUI 空闲不占 ✅ ✅（只在会写产物的批次期间持有 ✅ ✅） | ✅ |
+| 100 | **临时文件 + 提交**（§3.11.2）：ffmpeg 只写同目录、独占创建的 `.rencoder-tmp.` 临时文件 ✅ ✅，成功退出后才**提交**到目标路径 ✅ ✅（同卷替换 ✅ ✅，平台层在 `utils::fs::replace_file` ✅ ✅）；替换失败保留旧结果 ✅ ✅ 并记进该文件的结果 ✅ ✅；取消 ✅ ✅、执行失败 ✅ ✅、NVENC 重试 ✅ ✅ 只清理本次尝试的临时文件 ✅ ✅；采集器按前缀排除临时文件 ✅ ✅；守卫持有目标时目录里的临时文件全是遗留物 ✅ ✅，一并清掉 ✅ ✅ | ✅ |
 
 ---
 

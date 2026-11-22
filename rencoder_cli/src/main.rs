@@ -203,7 +203,7 @@ fn encode_cmd(
     // per target tree. It is taken right after the target is known --
     // before the config, the collection, the encoding -- so a conflict
     // shows up before this run has done anything.
-    let _guard = rencoder_lib::guard::TargetGuard::acquire(&op_dir)
+    let target_guard = rencoder_lib::guard::TargetGuard::acquire(&op_dir)
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("cannot take the target")?;
     let (app_config, paths, cancel) = prepare(args.config.as_deref(), Some(&op_dir), cancel_slot)?;
@@ -361,6 +361,11 @@ fn encode_cmd(
         output_path.display()
     );
     print_encode_summary(&records);
+
+    // The target is released before the exit: `process::exit` skips
+    // the destructors, and the user's directory must not keep a
+    // leftover marker (design doc §3.11.1.1).
+    drop(target_guard);
 
     // An interrupted run is not a successful one: the records are on
     // disk, but the exit code says the batch did not finish (130 =

@@ -203,6 +203,72 @@ fn transcode_batch_end_to_end_produces_output_files() {
 }
 
 #[test]
+fn transcode_batch_commits_the_output_and_leaves_no_temp_file() {
+    // The temp-file scheme (design doc §3.11.2): ffmpeg writes to
+    // `.rencoder-tmp.<name>`, and the product is committed to the
+    // final path only after ffmpeg succeeded. Nothing temp is left
+    // behind.
+    if skip_if_no_ffmpeg() {
+        return;
+    }
+    let dir = fixture_dir("transcode_commit");
+    let input = make_video(&dir, "in.mp4", 30, 1);
+    let files = vec![rencoder_lib::types::InputPath::new(&input).unwrap()];
+
+    let cache = EncoderCache {
+        encoders_output: "V..... libsvtav1            libsvtav1 SVT-AV1\n".to_string(),
+    };
+    let params = EncodeParams {
+        format: VideoFormat::Av1,
+        is_crf: true,
+        bitrate_or_crf: 28,
+        target: Target::Dir(dir.clone()),
+        extensions: vec!["mp4".into()],
+        extra_args: vec![],
+        max_fps: rencoder_lib::types::MaxFpsConfig::default(),
+        ..Default::default()
+    };
+    let mut ctx = rencoder_lib::pipeline::context::BatchContext::new(
+        params,
+        std::sync::Arc::new(cache),
+        rencoder_lib::encoder::nvenc::Capability::default(),
+    );
+
+    let report = transcode_batch(
+        &files,
+        &mut ctx,
+        ProcessOutput::Null,
+        &rencoder_lib::pipeline::cancel::CancelToken::new(),
+        None,
+    );
+
+    let record = &report.records[0];
+    assert!(
+        matches!(
+            record.outcome,
+            rencoder_lib::types::EncodingOutcome::Succeeded
+                | rencoder_lib::types::EncodingOutcome::ReducedFps
+        ),
+        "the encode must succeed: {:?}",
+        record.outcome
+    );
+    let output = dir.join("in.mkv");
+    assert!(output.exists(), "the product must be committed");
+
+    // No temp file is left behind.
+    let leftovers: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".rencoder-tmp."))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "no temp file may survive the batch: {leftovers:?}"
+    );
+}
+
+#[test]
 fn transcode_batch_reencodes_when_output_exists() {
     if skip_if_no_ffmpeg() {
         return;
