@@ -116,7 +116,10 @@ mod windows {
         if let Some(cancel) = CANCEL.get() {
             request_cancel(cancel, name);
         }
-        FALSE
+        // TRUE = "handled". Returning FALSE would let the default
+        // action run -- the process is killed, the records are lost,
+        // the partial output stays (design doc §3.11.2).
+        TRUE
     }
 
     pub(super) fn register(cancel: CancelToken) {
