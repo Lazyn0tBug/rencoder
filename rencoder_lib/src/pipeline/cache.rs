@@ -17,6 +17,7 @@
 //! processes. This module owns the "build a cache from a resolved
 //! capability" part.
 
+use crate::capability::MachineFacts;
 use crate::encoder::nvenc;
 use crate::error::EncodeError;
 use crate::types::EncoderCache;
@@ -32,20 +33,20 @@ pub fn cache_from_resolution(resolution: &nvenc::Resolution) -> EncoderCache {
 }
 
 /// What the background cache init produces: the cache (or the error
-/// that prevented building it) plus the NVENC capability summary the
-/// UI shows next to the NVENC switch.
+/// that prevented building it) plus the machine facts the run shares.
 #[derive(Debug)]
 pub struct CacheInit {
     pub cache: Result<EncoderCache, EncodeError>,
-    /// `None` when the resolve failed.
+    /// The facts this resolution produced: can ffmpeg run, and what
+    /// can NVENC do (design doc §3.10.7).
     ///
-    /// The one capability the whole chain shares: the encoder
-    /// selection reads it, the runtime fallback updates it, the UI
-    /// shows it (design doc §3.10.5).
-    pub capability: Option<nvenc::Capability>,
+    /// The one capability the whole chain shares: the capability
+    /// check adopts it, the encoder selection reads it, the runtime
+    /// fallback updates it, the UI shows it (design doc §3.10.5).
+    pub facts: MachineFacts,
 }
 
-/// The cache plus the capability summary, from one resolution.
+/// The cache plus the machine facts, from one resolution.
 ///
 /// The **only** place a resolution becomes what the frontends see
 /// (design doc §3.10.3: the wording and the mapping live in the lib,
@@ -53,7 +54,7 @@ pub struct CacheInit {
 pub fn cache_init_from_resolution(resolution: &nvenc::Resolution) -> CacheInit {
     CacheInit {
         cache: Ok(cache_from_resolution(resolution)),
-        capability: Some(resolution.capability()),
+        facts: MachineFacts::from_resolution(resolution),
     }
 }
 
@@ -85,7 +86,7 @@ where
                 Ok(resolution) => cache_init_from_resolution(&resolution),
                 Err(e) => CacheInit {
                     cache: Err(e),
-                    capability: None,
+                    facts: MachineFacts::ffmpeg_broken(),
                 },
             };
             // Block on the send until the consumer picks up. With
@@ -206,7 +207,7 @@ Encoders:
 
         assert!(result.cache.is_ok(), "the fake runner always answers");
         assert!(
-            result.capability.is_some(),
+            result.facts.nvenc.is_some(),
             "the capability summary must ride along"
         );
         assert!(

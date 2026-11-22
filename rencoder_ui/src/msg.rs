@@ -212,6 +212,10 @@ pub struct AppState {
     /// arrives — the lib resolves it at startup and on every
     /// `Command::Detect`.
     pub nvenc_capability: Option<rencoder_lib::encoder::nvenc::Capability>,
+    /// The run capability report for the current working directory,
+    /// read from the file the lib wrote (design doc §3.10.7).
+    /// `None` until the first check lands.
+    pub capability_report: Option<rencoder_lib::capability::Capabilities>,
 }
 
 /// Cap on the toasts queue. Older toasts are popped when the
@@ -519,7 +523,12 @@ pub fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>) {
                 }
             }
             state.last_error = None;
-            state.input_dir = Some(path);
+            state.input_dir = Some(path.clone());
+            // The working directory moved: the operation directory
+            // follows it and the capability check runs again (design
+            // doc §3.10.7). The lib checks and writes the report; the
+            // UI reads it (the `Event::CapabilityChecked` arm).
+            let _ = cmd_tx.try_send(Command::SetWorkingDir { dir: path });
         }
         Msg::UserEditedConfigField { kind, value } => {
             // v1.2 review #133 part 2d: real-time save on every
@@ -902,6 +911,12 @@ fn apply_event(state: &mut AppState, evt: Event) {
             // startup or after a `Command::Detect`). The Setup page
             // renders it next to the NVENC switch.
             state.nvenc_capability = Some(capability);
+        }
+        Event::CapabilityChecked { report } => {
+            // The lib checked and wrote the report (design doc
+            // §3.10.7). The frontends **read the file** -- nobody
+            // recomputes the check.
+            state.capability_report = rencoder_lib::capability::read_report(&report);
         }
         Event::ConfigSaved { .. } => {
             // review-delta F1 (was empty): wire the lib's save
@@ -1390,6 +1405,40 @@ mod tests {
     }
 
     #[test]
+    fn the_capability_report_is_read_from_the_file() {
+        // The frontends read the file (design doc §3.10.7): the lib
+        // checked and wrote it, the UI shows what the file says --
+        // nobody recomputes the check here.
+        use crossbeam_channel::unbounded;
+        let (tx, _rx) = unbounded::<Command>();
+        let mut state = fresh_state();
+        let dir =
+            std::env::temp_dir().join(format!("rencoder_ui_capability_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let report = dir.join("capabilities.json");
+        std::fs::write(
+            &report,
+            r#"{"checks":[{"name":"operation directory","status":"ok"}]}"#,
+        )
+        .unwrap();
+
+        reduce(
+            &mut state,
+            Msg::Lib(Event::CapabilityChecked {
+                report: report.clone(),
+            }),
+            &tx,
+        );
+
+        let read = state
+            .capability_report
+            .expect("the report must be read from the file");
+        assert_eq!(read.checks.len(), 1);
+        assert_eq!(read.checks[0].name, "operation directory");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn editing_the_nv_field_updates_the_config_draft() {
         use crossbeam_channel::unbounded;
         let (tx, _rx) = unbounded::<Command>();
@@ -1416,6 +1465,25 @@ mod tests {
         let p = PathBuf::from("/some/dir");
         reduce(&mut state, Msg::UserSelectedDir(p.clone()), &tx);
         assert_eq!(state.input_dir, Some(p));
+    }
+
+    #[test]
+    fn user_selected_dir_tells_the_lib_to_recheck() {
+        // The working directory moved: the lib re-checks and writes
+        // the report into the new operation directory (design doc
+        // §3.10.7). The UI reads the file when the check lands.
+        use crossbeam_channel::unbounded;
+        let (tx, rx) = unbounded::<Command>();
+        let mut state = fresh_state();
+        let p = PathBuf::from("/some/dir");
+        reduce(&mut state, Msg::UserSelectedDir(p.clone()), &tx);
+        match rx
+            .try_recv()
+            .expect("a command should have been dispatched")
+        {
+            Command::SetWorkingDir { dir } => assert_eq!(dir, p),
+            _ => panic!("expected Command::SetWorkingDir"),
+        }
     }
 
     #[test]

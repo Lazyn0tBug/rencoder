@@ -756,6 +756,15 @@ fn TaskPage(
     let active = state.read().tasks.active.clone();
     let history = state.read().task_history.clone();
     let progress = state.read().progress.clone();
+    // The capability report for the current working directory (design
+    // doc §3.10.7): the lib checked and wrote the file, the UI reads
+    // it — nobody recomputes the check.
+    let capability_lines = state
+        .read()
+        .capability_report
+        .as_ref()
+        .map(|report| report.lines())
+        .unwrap_or_default();
 
     // Pick the source of records to show in the file list. Active task
     // wins (its dry-run records during Analyzing, its records during
@@ -831,6 +840,18 @@ fn TaskPage(
             // -> file list -> progress -> bottom button bar.
 
             DirPicker { state: state, cmd_tx: cmd_tx }
+
+            // The capability report — one line per check, written by
+            // the lib into the operation directory (design doc
+            // §3.10.7). It answers "can this directory be worked in".
+            if !capability_lines.is_empty() {
+                div { class: "capability-report",
+                    span { class: "section-label", "CAPABILITY" }
+                    for line in capability_lines.iter() {
+                        div { class: "capability-line", "{line}" }
+                    }
+                }
+            }
 
             // Count summary — only when at least one phase has run
             // a dry-run (to_encode/to_failed > 0 means the dry-run is

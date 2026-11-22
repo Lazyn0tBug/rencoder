@@ -82,7 +82,7 @@ pub const BUILD_ABSENT_SUMMARY: &str = "this ffmpeg build has no NVENC encoders"
 /// The GUI's actor keeps the authoritative copy: each batch worker
 /// gets a snapshot, and downgrades the worker finds are reported back
 /// so the next batch inherits them.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CapabilityVerdicts {
     /// Encoder name → usable?
     map: HashMap<String, bool>,
@@ -151,7 +151,7 @@ impl CapabilityVerdicts {
 /// It is the one answer the whole chain shares: the encoder selection
 /// reads it, the runtime fallback updates it, and the actor keeps the
 /// authoritative copy (design doc §3.10.5).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Capability {
     support: Vec<NvencSupport>,
     probed_at: Option<DateTime<Utc>>,

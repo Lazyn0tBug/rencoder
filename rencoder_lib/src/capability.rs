@@ -23,13 +23,64 @@
 //! The GUI can switch its working directory. A different target
 //! means different answers (is it writable? do the paths alias?), so
 //! the check runs again on every switch.
+//!
+//! # One check, shared
+//!
+//! The result is **one whole**, not "the answer to one item". The
+//! machine's facts (can ffmpeg run? can NVENC run?) are gathered
+//! **once** -- by the NVENC resolution -- and handed to the check
+//! ([`MachineFacts`]). The check adopts them; it does not probe the
+//! machine a second time. What the check does itself is the part
+//! that changes with the directory: the filesystem.
 
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::config::paths::Paths;
+use crate::encoder::nvenc;
 use crate::error::EncodeError;
+
+/// This run's machine facts: what the machine can do.
+///
+/// The facts are gathered **once** (design doc §3.10.7): whoever
+/// needed them gathered them and hands them on -- to the check, to
+/// the encoder cache, to the UI. Nobody asks a second time: asking
+/// again is slow, and the second answer can disagree with the first
+/// (the report says "no capability record" while the run encodes with
+/// the GPU).
+#[derive(Clone, Debug, Default)]
+pub struct MachineFacts {
+    /// Can ffmpeg run? `Some` = known, `None` = nobody asked yet.
+    ///
+    /// `None` means "this run did not need it" (an analyze run never
+    /// touches an encoder) -- not "it cannot run".
+    pub ffmpeg: Option<bool>,
+    /// This machine's NVENC capability (`None` = nobody resolved it).
+    pub nvenc: Option<nvenc::Capability>,
+}
+
+impl MachineFacts {
+    /// The facts a resolved NVENC capability implies.
+    ///
+    /// The resolution ran `ffmpeg -encoders`, so ffmpeg works -- the
+    /// two facts come out of the same call.
+    pub fn from_resolution(resolution: &nvenc::Resolution) -> Self {
+        Self {
+            ffmpeg: Some(true),
+            nvenc: Some(resolution.capability()),
+        }
+    }
+
+    /// The facts when ffmpeg does not work: the resolution failed
+    /// because ffmpeg did not run.
+    pub fn ffmpeg_broken() -> Self {
+        Self {
+            ffmpeg: Some(false),
+            nvenc: None,
+        }
+    }
+}
 
 /// How one check came out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,10 +134,19 @@ impl Check {
 }
 
 /// The report: every check and how it came out.
+///
+/// The **whole** result, not "the answer to one item": the checks
+/// and the machine's capability together (design doc §3.10.7). The
+/// report file is this struct on disk -- a frontend reads it, it
+/// does not recompute anything.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Capabilities {
     /// The checks, in the order they ran.
     pub checks: Vec<Check>,
+    /// This machine's NVENC capability -- part of the result, and the
+    /// part the frontends show next to the encoder switch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nvenc: Option<nvenc::Capability>,
 }
 
 impl Capabilities {
@@ -128,7 +188,12 @@ impl Capabilities {
 /// application directory holds the config, the records and the machine
 /// capability record; the operation directory holds the cancel request
 /// and the report.
-pub fn check_run_capabilities(paths: &Paths) -> Capabilities {
+///
+/// `facts` are the machine facts somebody already gathered (design doc
+/// §3.10.7: the facts are gathered once and shared). The check adopts
+/// them; only the filesystem -- the part that changes with the
+/// directory -- is checked here.
+pub fn check_run_capabilities(paths: &Paths, facts: &MachineFacts) -> Capabilities {
     let mut capabilities = Capabilities::default();
 
     // 1. Filesystem: the directories this run writes into.
@@ -139,19 +204,27 @@ pub fn check_run_capabilities(paths: &Paths) -> Capabilities {
         .checks
         .push(writable("operation directory", &paths.op_dir));
 
-    // 2. ffmpeg: without it there is no encoding.
-    capabilities
-        .checks
-        .push(match crate::encoder::nvenc::run_ffmpeg(&["-encoders"]) {
-            Ok(_) => Check::ok("ffmpeg"),
-            Err(e) => Check::failed("ffmpeg", e.to_string()),
-        });
+    // 2. ffmpeg: without it there is no encoding. The fact is known
+    //    when the run resolved the machine's capability; when nobody
+    //    needed it (an analyze run), the check asks now -- this is
+    //    the one place that runs the probe.
+    let ffmpeg = facts.ffmpeg.unwrap_or_else(probe_ffmpeg);
+    capabilities.checks.push(if ffmpeg {
+        Check::ok("ffmpeg")
+    } else {
+        Check::failed("ffmpeg", "ffmpeg is not available")
+    });
 
     // 3. NVENC: advisory only -- a machine without it still encodes,
-    //    in software.
-    capabilities
-        .checks
-        .push(nvenc_capability(&paths.capability_record));
+    //    in software. The capability the run resolved; if nobody
+    //    resolved it, the stored record is the next best thing
+    //    (reading it costs nothing -- probing would).
+    let nvenc = facts
+        .nvenc
+        .clone()
+        .or_else(|| stored_capability(&paths.capability_record));
+    capabilities.checks.push(nvenc_check(nvenc.as_ref()));
+    capabilities.nvenc = nvenc;
 
     // The report goes to a file: every frontend reads this one.
     if let Err(e) = write_report(&capabilities, &paths.capability_report) {
@@ -168,23 +241,33 @@ fn writable(name: &str, dir: &Path) -> Check {
     }
 }
 
-/// Is there a usable NVENC encoder according to the stored record?
-fn nvenc_capability(record_path: &Path) -> Check {
-    match crate::encoder::nvenc::load(record_path) {
-        Some(record) => {
-            let usable: Vec<&str> = record
-                .encoders
-                .iter()
-                .filter(|e| e.usable)
-                .map(|e| e.encoder.as_str())
-                .collect();
-            if usable.is_empty() {
-                Check::advisory("nvenc", "no NVENC encoder is usable here")
-            } else {
+/// Can ffmpeg run? The probe the check runs when nobody asked before.
+fn probe_ffmpeg() -> bool {
+    crate::encoder::nvenc::run_ffmpeg(&["-encoders"]).is_ok()
+}
+
+/// The capability the stored record describes.
+fn stored_capability(record_path: &Path) -> Option<nvenc::Capability> {
+    let record = nvenc::load(record_path)?;
+    Some(nvenc::Capability::from_check(
+        record.encoders.clone(),
+        Some(record.probed_at),
+        false,
+    ))
+}
+
+/// The NVENC line: advisory -- a machine without it still encodes, in
+/// software.
+fn nvenc_check(capability: Option<&nvenc::Capability>) -> Check {
+    match capability {
+        None => Check::advisory("nvenc", "no capability record yet"),
+        Some(capability) => {
+            if capability.any_usable() {
                 Check::ok("nvenc")
+            } else {
+                Check::advisory("nvenc", "no NVENC encoder is usable here")
             }
         }
-        None => Check::advisory("nvenc", "no capability record yet"),
     }
 }
 
@@ -251,6 +334,22 @@ mod tests {
         )
     }
 
+    /// The facts a machine with a working NVENC encoder produces.
+    fn facts_with_nvenc() -> MachineFacts {
+        MachineFacts {
+            ffmpeg: Some(true),
+            nvenc: Some(nvenc::Capability::from_check(
+                vec![crate::types::NvencSupport {
+                    encoder: "h264_nvenc".to_string(),
+                    usable: true,
+                    reason: None,
+                }],
+                None,
+                false,
+            )),
+        }
+    }
+
     #[test]
     fn the_report_is_written_and_read_back() {
         let dir = scratch("report");
@@ -258,7 +357,7 @@ mod tests {
         let op = dir.join("op");
         let paths = paths(&app, &op);
 
-        let capabilities = check_run_capabilities(&paths);
+        let capabilities = check_run_capabilities(&paths, &facts_with_nvenc());
 
         assert!(
             paths.capability_report.exists(),
@@ -266,6 +365,30 @@ mod tests {
         );
         let read = read_report(&paths.capability_report).expect("the report must be readable");
         assert_eq!(read.checks.len(), capabilities.checks.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_report_carries_the_machine_capability() {
+        let dir = scratch("capability_in_report");
+        let app = dir.join("app");
+        let op = dir.join("op");
+        let paths = paths(&app, &op);
+
+        let capabilities = check_run_capabilities(&paths, &facts_with_nvenc());
+
+        // The whole result: the checks *and* the machine's capability.
+        let capability = capabilities
+            .nvenc
+            .as_ref()
+            .expect("the capability must be part of the result");
+        assert!(capability.any_usable());
+        // ... and it survives the round trip through the file.
+        let read = read_report(&paths.capability_report).expect("the report must be readable");
+        assert!(read
+            .nvenc
+            .expect("the capability must be in the file")
+            .any_usable());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -281,7 +404,7 @@ mod tests {
         let op = dir.join("op");
         let paths = paths(&blocked, &op);
 
-        let capabilities = check_run_capabilities(&paths);
+        let capabilities = check_run_capabilities(&paths, &facts_with_nvenc());
 
         assert!(
             !capabilities.all_ok(),
@@ -306,7 +429,12 @@ mod tests {
         let op = dir.join("op");
         let paths = paths(&app, &op);
 
-        let capabilities = check_run_capabilities(&paths);
+        // The machine has no usable NVENC encoder.
+        let facts = MachineFacts {
+            ffmpeg: Some(true),
+            nvenc: Some(nvenc::Capability::default()),
+        };
+        let capabilities = check_run_capabilities(&paths, &facts);
 
         // No NVENC is not a failure -- the run encodes in software.
         let nvenc = capabilities
@@ -319,6 +447,29 @@ mod tests {
             capabilities.all_ok(),
             "advisory items do not make the run impossible"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_facts_are_adopted_not_recomputed() {
+        let dir = scratch("adopted_facts");
+        let app = dir.join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        let op = dir.join("op");
+        let paths = paths(&app, &op);
+
+        // The facts say ffmpeg does not work. The check adopts them:
+        // it does not run ffmpeg to find out a second time (and the
+        // answer it reports is the one the run is going with).
+        let facts = MachineFacts::ffmpeg_broken();
+        let capabilities = check_run_capabilities(&paths, &facts);
+
+        let ffmpeg = capabilities
+            .checks
+            .iter()
+            .find(|c| c.name == "ffmpeg")
+            .expect("the ffmpeg check must be there");
+        assert_eq!(ffmpeg.status, CheckStatus::Failed);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

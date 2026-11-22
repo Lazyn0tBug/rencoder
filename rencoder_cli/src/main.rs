@@ -19,6 +19,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use rencoder_lib::pipeline::cancel::CancelToken;
 use rencoder_lib::{
+    capability::{Capabilities, MachineFacts},
     collect::collect_files,
     config::{paths::Paths, AnalyzeFormatArg, AppConfig},
     data::extract::probe_video_metadata,
@@ -122,13 +123,12 @@ fn detect_cmd() -> Result<()> {
     Ok(())
 }
 
-/// Run the capability check and report it (design doc §3.10.7).
+/// Log the capability report (design doc §3.10.7).
 ///
 /// The report is a file the frontends read; a failed check does
 /// **not** refuse the start -- it is information: the user is told
 /// what cannot be done here and decides.
-fn check_capabilities(paths: &Paths) {
-    let capabilities = rencoder_lib::capability::check_run_capabilities(paths);
+fn report_capabilities(capabilities: &Capabilities) {
     for line in capabilities.lines() {
         info!("capability: {line}");
     }
@@ -269,19 +269,30 @@ fn encode_cmd(
         params.format
     );
 
-    check_capabilities(&paths);
-
-    // NVENC capability: prefer the stored record (probing costs
-    // ~200-500ms per encoder, and the answer barely changes). `--detect`
-    // forces a fresh probe; a record past its review date only gets the
-    // user asked about it.
+    // The machine facts: gathered once (design doc §3.10.7). Prefer
+    // the stored record (probing costs ~200-500ms per encoder, and
+    // the answer barely changes). `--detect` forces a fresh probe; a
+    // record past its review date only gets the user asked about it.
     //
     // The capability is resolved whether or not this run uses NVENC:
     // it is a fact about the machine, and `nv` is this run's choice
     // (design doc §3.10.5). Resolving it costs a file read when the
     // stored record is fresh.
-    let mut resolution = nvenc::resolve_and_store(Some(&paths.capability_record), force_detect)
-        .context("NVENC detection failed")?;
+    let mut resolution =
+        match nvenc::resolve_and_store(Some(&paths.capability_record), force_detect) {
+            Ok(resolution) => resolution,
+            Err(e) => {
+                // ffmpeg does not run. The check still reports what it
+                // found -- the report is information, not a gate --
+                // and then this run fails.
+                let capabilities = rencoder_lib::capability::check_run_capabilities(
+                    &paths,
+                    &MachineFacts::ffmpeg_broken(),
+                );
+                report_capabilities(&capabilities);
+                return Err(e).context("NVENC detection failed");
+            }
+        };
 
     // The staleness advisory. The review cycle belongs to the lib: the
     // resolve already pushed the review date when the record was due,
@@ -301,6 +312,14 @@ fn encode_cmd(
             }
         }
     }
+
+    // The check: one call, the whole result (design doc §3.10.7). The
+    // facts come from the resolution above -- the check adopts them
+    // instead of probing the machine a second time, and the report
+    // says what this run is actually going to do.
+    let facts = MachineFacts::from_resolution(&resolution);
+    let capabilities = rencoder_lib::capability::check_run_capabilities(&paths, &facts);
+    report_capabilities(&capabilities);
 
     // `resolve_and_store` already persisted a freshly probed record.
     let cache = cache_from_resolution(&resolution);
@@ -380,7 +399,13 @@ fn analyze_cmd(args: args::AnalyzeArgs, cancel_slot: &signal::CancelSlot) -> Res
         )
     })?;
 
-    check_capabilities(&paths);
+    // The check: one call, the whole result (design doc §3.10.7). An
+    // analyze run needs no encoder, so nobody resolved the machine's
+    // NVENC capability -- the check reads the stored record (no probe)
+    // and asks ffmpeg once.
+    let capabilities =
+        rencoder_lib::capability::check_run_capabilities(&paths, &MachineFacts::default());
+    report_capabilities(&capabilities);
 
     info!("analyzing {} file(s)", files.len());
 

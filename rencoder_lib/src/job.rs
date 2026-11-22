@@ -122,6 +122,14 @@ pub enum Command {
     /// * `force = true` -- always probe (the "重新检测" button).
     /// * `force = false` -- reuse the stored record when it is fresh.
     Detect { force: bool },
+    /// The GUI's working directory changed.
+    ///
+    /// The operation directory moves with it (design doc §3.6): the
+    /// run-level paths follow. The capability check runs again -- the
+    /// directory changed, the machine did not (design doc §3.10.7), so
+    /// the machine's facts are reused and only the filesystem is
+    /// checked anew. The report lands in the new operation directory.
+    SetWorkingDir { dir: PathBuf },
     /// Start a parallel analyze batch (U22 / Tier 3 #9).
     ///
     /// The lib actor probes each file (c-probe if enabled, ffprobe
@@ -234,6 +242,13 @@ pub enum Event {
     /// or the startup resolve). The UI shows it next to the NVENC
     /// switch: which hardware encoders run here, and why not.
     NvencCapability(crate::encoder::nvenc::Capability),
+
+    /// The run capability report is written; here is its path.
+    ///
+    /// The frontends **read the file** (design doc §3.10.7): one
+    /// check, one result, several readers -- nobody recomputes it.
+    /// The event only says "it is ready"; the content is the file's.
+    CapabilityChecked { report: PathBuf },
 
     // ---- Analyze topic (U22 / Tier 3 #9) ----
     // See docs/design.md §3.4 "分析进度上报" for the full protocol
@@ -883,6 +898,12 @@ type CacheSlot = Result<Arc<EncoderCache>, Arc<EncodeError>>;
 /// batch must see that error.
 type CacheCell = Arc<Mutex<Option<CacheSlot>>>;
 
+/// The machine facts, gathered once and shared (design doc §3.10.7).
+///
+/// One writer (the cache init thread), one reader (the actor, when a
+/// working directory change asks for a re-check).
+type FactsCell = Arc<Mutex<Option<crate::capability::MachineFacts>>>;
+
 /// Replace the encoder cache with a freshly resolved capability.
 ///
 /// Only the `detect` path calls this: the capability is a fact about
@@ -1323,6 +1344,10 @@ fn run_actor(
 ) {
     // The injected dependencies, unpacked for the arms below.
     let config_path = env.config_path.clone();
+    // The paths: the app-level ones never move, the run-level ones
+    // follow the working directory (design doc §3.6). The actor owns
+    // the current value -- `Command::SetWorkingDir` moves it.
+    let mut paths = env.paths.clone();
     let records_dir = env.paths.records_dir.clone();
     let nvenc_cache_path = env.paths.capability_record.clone();
     let file_encoder = Arc::clone(&env.file_encoder);
@@ -1353,8 +1378,14 @@ fn run_actor(
     // two writers (the init thread and the refresh thread), so a
     // read/write split would buy nothing.
     let cache_cell: CacheCell = Arc::new(Mutex::new(None));
+    // The machine facts, gathered once by the cache init (design doc
+    // §3.10.7). The actor adopts them: a re-check after a working
+    // directory change reuses them instead of probing the machine
+    // again.
+    let facts_cell: FactsCell = Arc::new(Mutex::new(None));
     // The background init thread fills the slot.
     let cache_cell_for_thread = Arc::clone(&cache_cell);
+    let facts_cell_for_thread = Arc::clone(&facts_cell);
     let evt_tx_for_init = evt_tx.clone();
     let dropped_for_init = DropCounter::default();
     std::thread::spawn(move || {
@@ -1367,7 +1398,7 @@ fn run_actor(
                 cache: Err(EncodeError::Probe(
                     "encoder cache init channel closed".into(),
                 )),
-                capability: None,
+                facts: crate::capability::MachineFacts::ffmpeg_broken(),
             });
         // Peek at the result so we can emit an error event with the
         // correct category before moving into the OnceLock.
@@ -1381,7 +1412,7 @@ fn run_actor(
         // The review cycle is the lib's: the resolution already pushed
         // the review date when the record was due, so the UI's
         // advisory is shown once and the next start is quiet.
-        if let Some(capability) = init.capability {
+        if let Some(capability) = init.facts.nvenc.clone() {
             send_evt_lossy(
                 &evt_tx_for_init,
                 Event::NvencCapability(capability),
@@ -1391,6 +1422,11 @@ fn run_actor(
         {
             let mut guard = cache_cell_for_thread.lock();
             *guard = Some(init.cache.map(Arc::new).map_err(Arc::new));
+        }
+        // The facts are the chain's to share from here on.
+        {
+            let mut guard = facts_cell_for_thread.lock();
+            *guard = Some(init.facts.clone());
         }
         if let Some((category, message)) = err_event {
             send_evt_lossy(
@@ -1487,9 +1523,8 @@ fn run_actor(
                 // acts on (design doc §3.6). The GUI's working
                 // directory can change between batches, so the
                 // run-level paths follow it.
-                let batch_paths = env
-                    .paths
-                    .with_op_dir(&crate::pipeline::batch::batch_target_path_for_files(&files));
+                let batch_paths =
+                    paths.with_op_dir(&crate::pipeline::batch::batch_target_path_for_files(&files));
                 // A leftover request would cancel this batch as well.
                 let _ = std::fs::remove_file(&batch_paths.cancel_file);
                 cancel_token = CancelToken::watching(batch_paths.cancel_file.clone());
@@ -1708,6 +1743,10 @@ fn run_actor(
                 // the cache knows about -- so the cache follows the
                 // capability (not the other way round).
                 let cache_cell_for_detect = Arc::clone(&cache_cell);
+                let facts_cell_for_detect = Arc::clone(&facts_cell);
+                // The paths as they are now: the report the re-check
+                // writes belongs to the current operation directory.
+                let paths_for_detect = paths.clone();
                 std::thread::Builder::new()
                     .name("renencoder-detect".into())
                     .spawn(move || {
@@ -1718,6 +1757,23 @@ fn run_actor(
                         ) {
                             Ok(resolution) => {
                                 replace_encoder_cache(&cache_cell_for_detect, &resolution);
+                                // The machine's facts changed: the
+                                // chain shares the new ones, and the
+                                // report says what this run will do.
+                                let facts =
+                                    crate::capability::MachineFacts::from_resolution(&resolution);
+                                *facts_cell_for_detect.lock() = Some(facts.clone());
+                                crate::capability::check_run_capabilities(
+                                    &paths_for_detect,
+                                    &facts,
+                                );
+                                send_evt_lossy(
+                                    &evt_tx_detect,
+                                    Event::CapabilityChecked {
+                                        report: paths_for_detect.capability_report.clone(),
+                                    },
+                                    &dropped_detect,
+                                );
                                 send_evt_lossy(
                                     &evt_tx_detect,
                                     Event::NvencCapability(resolution.capability()),
@@ -1737,6 +1793,27 @@ fn run_actor(
                         }
                     })
                     .expect("spawn detect thread");
+            }
+
+            Command::SetWorkingDir { dir } => {
+                // The operation directory follows the working
+                // directory (design doc §3.6): the run-level paths
+                // move with it.
+                paths = paths.with_op_dir(&dir);
+                // Re-check (design doc §3.10.7): the directory
+                // changed, the machine did not -- so the machine's
+                // facts are reused and only the filesystem is checked
+                // anew. The report lands in the new operation
+                // directory.
+                let facts = facts_cell.lock().as_ref().cloned().unwrap_or_default();
+                crate::capability::check_run_capabilities(&paths, &facts);
+                send_evt_lossy(
+                    &evt_tx,
+                    Event::CapabilityChecked {
+                        report: paths.capability_report.clone(),
+                    },
+                    &dropped_counter,
+                );
             }
 
             Command::Analyze { files } => {
@@ -1994,7 +2071,12 @@ mod mock_tests {
                 cache: Ok(EncoderCache {
                     encoders_output: String::new(),
                 }),
-                capability,
+                // The facts the resolution would have produced: the
+                // fake runner answers, so ffmpeg works.
+                facts: crate::capability::MachineFacts {
+                    ffmpeg: Some(true),
+                    nvenc: capability,
+                },
             })
             .expect("send the pre-populated cache");
 
@@ -2003,7 +2085,15 @@ mod mock_tests {
         let records_dir = data_dir
             .clone()
             .unwrap_or_else(|| PathBuf::from("/nonexistent/rencoder-records"));
-        let app_dir = data_dir.clone().unwrap_or_else(|| PathBuf::from("."));
+        // The app directory: a temp dir, never the working directory
+        // -- the actor writes there (the capability report, the saved
+        // config), and a test must not leave files in the source
+        // tree.
+        let app_dir = data_dir.clone().unwrap_or_else(|| {
+            let dir = unique_tmp("app_dir");
+            std::fs::create_dir_all(&dir).ok();
+            dir
+        });
         let config_path = app_dir.join("saved-config.toml");
         let mut paths = Paths::resolve(
             config_path.clone(),
@@ -2562,6 +2652,46 @@ mod mock_tests {
                 .any(|e| matches!(e, Event::NvencCapability(_))),
             "expected a NvencCapability event, got {events:?}"
         );
+    }
+
+    #[test]
+    fn a_working_directory_change_rechecks_and_writes_the_report() {
+        // The GUI's working directory moved: the operation directory
+        // follows it (design doc §3.6), the capability check runs
+        // again (design doc §3.10.7), and the report lands in the new
+        // operation directory.
+        let app = unique_tmp("working_dir_app");
+        let working = unique_tmp("working_dir_op");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::create_dir_all(&working).unwrap();
+        let (cmd_tx, evt_rx) = run_test_controller(make_succeeding_mock().0, Some(app.clone()));
+        cmd_tx
+            .send(Command::SetWorkingDir {
+                dir: working.clone(),
+            })
+            .unwrap();
+        drop(cmd_tx);
+
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
+        let report = events
+            .iter()
+            .find_map(|e| match e {
+                Event::CapabilityChecked { report } => Some(report.clone()),
+                _ => None,
+            })
+            .expect("the check must announce its report");
+        assert_eq!(
+            report,
+            working.join("capabilities.json"),
+            "the report belongs to the new operation directory"
+        );
+        assert!(
+            report.exists(),
+            "the report must be written: {}",
+            report.display()
+        );
+        let _ = std::fs::remove_dir_all(&app);
+        let _ = std::fs::remove_dir_all(&working);
     }
 
     #[test]
