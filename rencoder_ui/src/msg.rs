@@ -35,7 +35,6 @@ use chrono::{DateTime, Local, Utc};
 use crossbeam_channel::Sender;
 
 use rencoder_lib::job::{Command, EncodingRecord, Event};
-use rencoder_lib::types::EncodingOutcome;
 
 /// Cap on the stderr log ring buffer. Per §3.8.6 + §8 item 30.
 const LOG_RING_CAP: usize = 1000;
@@ -852,10 +851,9 @@ fn apply_event(state: &mut AppState, evt: Event) {
                 state.tasks.active = None;
                 return;
             }
-            let to_encode = records
-                .iter()
-                .filter(|r| matches!(r.outcome, EncodingOutcome::Succeeded))
-                .count();
+            // The counts and the wording are the lib's (design doc
+            // §3.10.3) -- the UI lays them out, it does not count.
+            let counts = rencoder_lib::data::store::OutcomeCounts::of(&records);
             if state.tasks.active.is_none() {
                 return;
             }
@@ -870,12 +868,12 @@ fn apply_event(state: &mut AppState, evt: Event) {
             // produces one record); if a file vanished mid-dry-run
             // and records.len() < total_files, subtracting gives a
             // stale 'skip' count.
-            let to_failed = total_files.saturating_sub(to_encode);
+            let plan = counts.plan(total_files);
             {
                 let t = state.tasks.active.as_mut().unwrap();
                 t.dry_run_records = records;
-                t.to_encode = to_encode;
-                t.to_failed = to_failed;
+                t.to_encode = plan.to_encode;
+                t.to_failed = plan.to_failed;
             }
             // v1.2 follow-up #2: dry-run summary toast. The
             // Analyze stats (`Found N to encode, M to skip` /
@@ -883,23 +881,15 @@ fn apply_event(state: &mut AppState, evt: Event) {
             // list area is empty during Analyzing/AwaitingConfirm
             // (§3.8.7.6 + the file list render in app.rs). Toast
             // replaces the previous body-level summary line.
-            if to_encode == 0 {
-                push_toast(
-                    state,
-                    format!("0 encodable files ({to_failed} failed); pick a different dir"),
-                    ToastKind::Warning,
-                );
+            if plan.is_empty() {
+                push_toast(state, plan.line(), ToastKind::Warning);
                 finalize(state, |t| {
                     t.cancelled = false;
                     // t.finished stays false — plan never ran.
                 });
                 return;
             }
-            push_toast(
-                state,
-                format!("Found {to_encode} to encode ({to_failed} failed)"),
-                ToastKind::Info,
-            );
+            push_toast(state, plan.line(), ToastKind::Info);
             // AwaitingConfirm: user reviews the toast, then
             // clicks "Encode" (no count suffix — §3.8.7.1
             // decision 2). UserClickedStart's AwaitingConfirm
