@@ -115,14 +115,26 @@ pub fn marker_path(dir: &Path) -> PathBuf {
 pub fn common_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
     use std::path::Component;
 
-    let mut iter = paths
+    // The parents: the batch writes next to its inputs. A relative
+    // name has no parent -- it means the current directory, and
+    // dropping it would make the scope too narrow (the batch writes
+    // there too).
+    let cwd = std::env::current_dir().ok();
+    let parents: Vec<PathBuf> = paths
         .iter()
-        .map(|path| path.parent().unwrap_or(path).to_path_buf())
-        .filter(|path| !path.as_os_str().is_empty());
-    let first = iter.next()?;
+        .map(|path| {
+            path.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .map(Path::to_path_buf)
+                .or_else(|| cwd.clone())
+                .unwrap_or_else(|| path.clone())
+        })
+        .collect();
+
+    let first = parents.first()?;
     let mut shared: Vec<Component> = first.components().collect();
-    for path in iter {
-        let components: Vec<Component> = path.components().collect();
+    for parent in &parents[1..] {
+        let components: Vec<Component> = parent.components().collect();
         let common = shared
             .iter()
             .zip(components.iter())
@@ -139,19 +151,25 @@ pub fn common_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
 
 /// Is `dir` held by another instance?
 ///
-/// The lock answers it: locking it succeeds when nobody holds it. A
-/// marker we cannot open is treated as *held* -- refusing is safe,
-/// racing is not.
+/// The lock answers it: a **shared** lock can only be taken when
+/// nobody holds the exclusive one ✓. The file is opened **read-only**
+/// ✓: reading is enough to ask ✓, and a marker owned by another user
+/// must not look "held" just because we cannot open it for writing
+/// ✓ (that would block the directory for everyone, forever ✓).
 pub fn occupancy(dir: &Path) -> Result<Occupancy, GuardError> {
     let path = marker_path(dir);
-    let file = match OpenOptions::new().read(true).write(true).open(&path) {
+    let file = match OpenOptions::new().read(true).open(&path) {
         Ok(file) => file,
+        // No marker: nobody holds this directory.
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Occupancy::Free),
+        // We cannot even read it: we cannot tell, and refusing is
+        // safer than racing.
         Err(_) => return Ok(Occupancy::Held(None)),
     };
-    match file.try_lock() {
+    match file.try_lock_shared() {
         Ok(()) => {
-            // We got the lock: nobody holds it. Give it back.
+            // We got the lock: nobody holds it exclusively. Give it
+            // back.
             let _ = file.unlock();
             Ok(Occupancy::Free)
         }
@@ -218,16 +236,7 @@ impl TargetGuard {
 
         // The target itself: the atomic part.
         let marker = marker_path(&target);
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&marker)
-            .map_err(|source| GuardError::Io {
-                path: marker.clone(),
-                source,
-            })?;
+        let mut file = open_marker(&marker)?;
         match file.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
@@ -299,6 +308,40 @@ impl TargetGuard {
 impl Drop for TargetGuard {
     fn drop(&mut self) {
         self.release_inner();
+    }
+}
+
+/// Open the marker file, creating it when it is not there.
+///
+/// Write access is preferred (the record goes in there), but it is not
+/// required: a marker left behind by **another user** cannot be
+/// written, and it must not block this directory forever -- we take it
+/// over (the lock is the state ✓, the record is only for the message
+/// ✓).
+fn open_marker(marker: &Path) -> Result<File, GuardError> {
+    match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(marker)
+    {
+        Ok(file) => Ok(file),
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            // Another user's marker: read it and lock it. The record
+            // stays theirs (we cannot write it) -- it is best-effort.
+            OpenOptions::new()
+                .read(true)
+                .open(marker)
+                .map_err(|source| GuardError::Io {
+                    path: marker.to_path_buf(),
+                    source,
+                })
+        }
+        Err(source) => Err(GuardError::Io {
+            path: marker.to_path_buf(),
+            source,
+        }),
     }
 }
 
@@ -451,6 +494,51 @@ mod tests {
 
         probe(&app).expect("nothing holds this tree");
         assert!(TargetGuard::acquire(&app).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_marker_we_cannot_write_does_not_block_the_directory() {
+        // Another user's marker: readable, not writable. It must not
+        // look "held" -- that would block the directory for everyone,
+        // forever (design doc §3.11.1.1).
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("read_only_marker");
+        let app = dir.join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        let marker = marker_path(&app);
+        std::fs::write(&marker, b"{\"pid\": 1}").unwrap();
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        // The probe asks with a read-only handle: nobody holds it.
+        assert_eq!(
+            occupancy(&app).expect("the probe must work"),
+            Occupancy::Free,
+            "a marker we cannot write must not read as held"
+        );
+
+        // And we can take the target over: the lock is the state, the
+        // record is best-effort.
+        let guard = TargetGuard::acquire(&app).expect("the target must be takeable");
+        drop(guard);
+        // Released: the marker is gone (we may unlink it -- the
+        // directory is ours).
+        assert!(!marker.exists(), "the marker must be removed on release");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_scope_covers_a_relative_path() {
+        // A relative name means the current directory: dropping it
+        // would make the scope too narrow (the batch writes there too).
+        let dir = scratch("relative_scope");
+        let scope = common_ancestor(&[PathBuf::from("clip.mp4")]).expect("a scope");
+        assert_eq!(
+            scope,
+            std::env::current_dir().expect("the current dir"),
+            "a relative name means the current directory"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
