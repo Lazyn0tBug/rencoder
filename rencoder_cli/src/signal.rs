@@ -26,7 +26,6 @@
 
 use std::path::{Path, PathBuf};
 
-
 /// Install the interrupt handler.
 ///
 /// The handler sets `cancel`; the batch notices it (design doc

@@ -6,6 +6,7 @@
 //! See `docs/smart_code.md` for the full design.
 
 pub mod analyzer;
+pub mod capability;
 pub mod collect;
 pub mod config;
 pub mod data;

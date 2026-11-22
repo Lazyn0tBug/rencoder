@@ -53,7 +53,6 @@ fn apply_mode<P: AsRef<Path>>(path: P, mode_bits: u32) -> io::Result<()> {
     Ok(())
 }
 
-
 /// Check that a file can be created in `dir`, leaving nothing behind.
 ///
 /// The **filesystem** part of the run capability check (design doc

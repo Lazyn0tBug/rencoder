@@ -31,26 +31,12 @@ use std::path::{Path, PathBuf};
 use tracing::{info, instrument, warn};
 
 fn main() -> Result<()> {
-    // The run capability check (design doc §3.10.7), priority 1: the
-    // app directory must be writable. The config, the records and the
-    // cancel request all live there -- a directory that cannot be
-    // written means this run cannot finish either, so say so now
-    // rather than after an hour of encoding.
-    let Some(app_dir) = rencoder_lib::config::path::app_dir() else {
-        anyhow::bail!("cannot determine the app directory");
-    };
-    rencoder_lib::config::fs_perms::ensure_dir_writable(&app_dir)
-        .context("the app directory is not writable")?;
-
     // The cancel request is a file (design doc §3.11.2): the signal
     // handler writes it, the batch polls for it, and anyone who can
     // write that file can stop a running batch.
-    let cancel_file = rencoder_lib::config::path::resolve_cancel_file()
-        .ok_or_else(|| anyhow::anyhow!("cannot determine the cancel file location"))?;
-    if let Some(parent) = cancel_file.parent() {
-        rencoder_lib::config::fs_perms::ensure_dir_writable(parent)
-            .context("the cancel file's directory is not writable")?;
-    }
+    let app_dir = rencoder_lib::config::path::app_dir().unwrap_or_else(|| PathBuf::from("."));
+    let cancel_file =
+        rencoder_lib::config::path::resolve_cancel_file().unwrap_or_else(|| app_dir.join("cancel"));
     // A leftover request would cancel this run as well.
     let _ = std::fs::remove_file(&cancel_file);
     let cancel = rencoder_lib::pipeline::cancel::CancelToken::watching(cancel_file.clone());
@@ -61,6 +47,9 @@ fn main() -> Result<()> {
     // That window must not exist, so the handler is installed before
     // anything else happens.
     signal::install_handler(&cancel_file);
+
+    // The capability check needs the target (design doc §3.10.7), which
+    // the command knows, not `main`.
 
     tracing_init::init().context("initialize tracing")?;
     let cli = args::Cli::parse();
@@ -83,6 +72,37 @@ fn detect_cmd() -> Result<()> {
         nvenc::resolve_and_store(cache_path.as_deref(), true).context("NVENC detection failed")?;
     print!("{}", nvenc::report(&resolution));
     Ok(())
+}
+
+/// Run the capability check and report it (design doc §3.10.7).
+///
+/// The report is a file the frontends read; a failed check does
+/// **not** refuse the start -- it is information: the user is told
+/// what cannot be done here and decides.
+fn check_capabilities(target: &Target) {
+    let app_dir = rencoder_lib::config::path::app_dir().unwrap_or_else(|| PathBuf::from("."));
+    let cancel_file =
+        rencoder_lib::config::path::resolve_cancel_file().unwrap_or_else(|| app_dir.join("cancel"));
+    let target_dir = match target {
+        Target::File(file) => file.parent().map(Path::to_path_buf),
+        Target::Dir(dir) => Some(dir.clone()),
+    };
+    let capabilities = rencoder_lib::capability::check_run_capabilities(
+        &app_dir,
+        target_dir.as_deref(),
+        &cancel_file,
+        &rencoder_lib::capability::default_report_path(&app_dir),
+    );
+    for line in capabilities.lines() {
+        info!("capability: {line}");
+    }
+    for failure in capabilities.failures() {
+        warn!(
+            check = failure.name,
+            detail = failure.detail.as_deref().unwrap_or_default(),
+            "this run cannot do that part"
+        );
+    }
 }
 
 /// What the user answered when advised that the stored capability is
@@ -211,6 +231,8 @@ fn encode_cmd(
         params.format
     );
 
+    check_capabilities(&target);
+
     // NVENC capability: prefer the stored record (probing costs
     // ~200-500ms per encoder, and the answer barely changes). `--detect`
     // forces a fresh probe; a record past its review date only gets the
@@ -321,6 +343,8 @@ fn analyze_cmd(
             target_path(&target).display()
         )
     })?;
+
+    check_capabilities(&target);
 
     info!("analyzing {} file(s)", files.len());
 
