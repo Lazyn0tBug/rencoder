@@ -474,21 +474,15 @@ pub fn write_records(records: &[EncodingRecord], path: &Path) -> Result<(), Enco
     Ok(())
 }
 
-/// The default path for a batch's records: `<data_dir>/encoding-<ts>.parquet`.
+/// The default path for a batch's records: `<records_dir>/encoding-<ts>.parquet`.
 ///
 /// One place decides the name -- so the CLI and the actor write files
 /// the history reader recognises (design doc §3.11.4).
-pub fn default_encoding_path() -> Result<std::path::PathBuf, EncodeError> {
-    let dir =
-        crate::config::path::resolve_data_dir().unwrap_or_else(|| std::path::PathBuf::from("data"));
-    default_encoding_path_in(&dir)
-}
-
-/// The default path for a batch's records, in `dir`.
 ///
-/// The caller says *where* -- the app's data directory in production,
-/// a temporary one in a test. The name is the lib's, so every writer
-/// produces a file the history reader recognises (design doc §3.11.4).
+/// The caller says *where*: the app's records directory in production
+/// (design doc §3.6), a temporary one in a test. The name is the
+/// lib's, so every writer produces a file the history reader
+/// recognises.
 pub fn default_encoding_path_in(dir: &Path) -> Result<std::path::PathBuf, EncodeError> {
     std::fs::create_dir_all(dir)?;
     crate::config::fs_perms::set_app_dir_mode(dir)?;

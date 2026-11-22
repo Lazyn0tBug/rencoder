@@ -310,11 +310,16 @@ fn actor_cancel_aborts_the_batch_and_removes_the_partial_output() {
     // The real actor, but with the app directory redirected: the
     // capability record, the config and the history must not land in
     // the developer's app directory (design doc §3.10.4).
+    let paths = rencoder_lib::config::paths::Paths::resolve(
+        dir.join("rencoder.toml"),
+        dir.clone(),
+        dir.clone(),
+        &rencoder_lib::config::app::AppConfig::default(),
+    );
     let env = rencoder_lib::job::ActorEnv {
         app_config: std::sync::Arc::new(rencoder_lib::config::app::AppConfig::default()),
         config_path: dir.join("rencoder.toml"),
-        data_dir: Some(dir.clone()),
-        nvenc_cache_path: Some(dir.join("nvenc-capability.json")),
+        paths,
         file_encoder: std::sync::Arc::new(rencoder_lib::pipeline::batch::FfmpegFileEncoder),
         detect_runner: std::sync::Arc::new(rencoder_lib::encoder::nvenc::run_ffmpeg),
     };

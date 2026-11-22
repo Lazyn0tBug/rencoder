@@ -71,6 +71,12 @@ fn collect_dir(
         // symlink to a file would slip past `follow_links(false)`. With
         // follow_links(false) walkdir reports symlinks with is_file()=false,
         // is_symlink()=true -- exactly what we want.
+        // The app's own files in the operation directory (the cancel
+        // request, the capability report -- design doc §3.6) are this
+        // run's state, not the user's videos.
+        if is_app_owned_file(path) {
+            continue;
+        }
         if entry.file_type().is_file() && matches_extension(path, extensions) {
             // Review fix #109 (type-level boundary): the runtime
             // dash-prefix check that used to live here is gone. Each
@@ -109,6 +115,15 @@ fn collect_dir(
     Ok(results)
 }
 
+/// Is this file one of the app's own (design doc §3.6)?
+fn is_app_owned_file(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| {
+        crate::config::paths::APP_OWNED_FILE_NAMES
+            .iter()
+            .any(|owned| name == std::ffi::OsStr::new(owned))
+    })
+}
+
 fn matches_extension(path: &Path, extensions: &[String]) -> bool {
     if extensions.is_empty() {
         return true;
@@ -142,6 +157,38 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// The app's own files in the operation directory are not inputs
+    /// (design doc §3.6): they are this run's state, not the user's
+    /// videos.
+    #[test]
+    fn the_apps_own_files_are_not_collected_as_inputs() {
+        let dir = fixture_dir("app_owned");
+        fs::write(dir.join("movie.mp4"), b"video").unwrap();
+        fs::write(dir.join("cancel"), b"").unwrap();
+        fs::write(dir.join("capabilities.json"), b"{}").unwrap();
+
+        // No extension filter: everything in the directory is a candidate.
+        let files = collect_files(&crate::types::Target::Dir(dir.clone()), &[], 100)
+            .expect("collection must succeed");
+
+        let names: Vec<String> = files
+            .iter()
+            .map(|f| {
+                f.as_path()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["movie.mp4".to_string()],
+            "only the user's video is an input"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn touch(dir: &Path, name: &str) -> PathBuf {

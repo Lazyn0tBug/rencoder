@@ -28,6 +28,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::paths::Paths;
 use crate::error::EncodeError;
 
 /// How one check came out.
@@ -123,33 +124,20 @@ impl Capabilities {
 /// fundamental first, because a later check writes into what an earlier
 /// one just validated.
 ///
-/// - `app_dir` -- where the config, the records and the capability
-///   record live;
-/// - `target_dir` -- the directory the run writes into (the GUI's
-///   working directory; `None` when the run has no target yet);
-/// - `cancel_file` -- the cancel request's file (its directory has to
-///   be writable too -- the request is how a run gets stopped);
-/// - `report_path` -- where the report is written.
-pub fn check_run_capabilities(
-    app_dir: &Path,
-    target_dir: Option<&Path>,
-    cancel_file: &Path,
-    report_path: &Path,
-) -> Capabilities {
+/// `paths` decides where everything lives (design doc §3.6): the
+/// application directory holds the config, the records and the machine
+/// capability record; the operation directory holds the cancel request
+/// and the report.
+pub fn check_run_capabilities(paths: &Paths) -> Capabilities {
     let mut capabilities = Capabilities::default();
 
     // 1. Filesystem: the directories this run writes into.
-    capabilities.checks.push(writable("app directory", app_dir));
-    if let Some(target) = target_dir {
-        capabilities
-            .checks
-            .push(writable("target directory", target));
-    }
-    if let Some(parent) = cancel_file.parent() {
-        capabilities
-            .checks
-            .push(writable("cancel request directory", parent));
-    }
+    capabilities
+        .checks
+        .push(writable("app directory", &paths.app_dir));
+    capabilities
+        .checks
+        .push(writable("operation directory", &paths.op_dir));
 
     // 2. ffmpeg: without it there is no encoding.
     capabilities
@@ -161,11 +149,13 @@ pub fn check_run_capabilities(
 
     // 3. NVENC: advisory only -- a machine without it still encodes,
     //    in software.
-    capabilities.checks.push(nvenc_capability(app_dir));
+    capabilities
+        .checks
+        .push(nvenc_capability(&paths.capability_record));
 
     // The report goes to a file: every frontend reads this one.
-    if let Err(e) = write_report(&capabilities, report_path) {
-        tracing::warn!(error = %e, path = %report_path.display(), "could not write the capability report");
+    if let Err(e) = write_report(&capabilities, &paths.capability_report) {
+        tracing::warn!(error = %e, path = %paths.capability_report.display(), "could not write the capability report");
     }
     capabilities
 }
@@ -179,9 +169,8 @@ fn writable(name: &str, dir: &Path) -> Check {
 }
 
 /// Is there a usable NVENC encoder according to the stored record?
-fn nvenc_capability(app_dir: &Path) -> Check {
-    let path = app_dir.join(crate::encoder::nvenc::CAPABILITY_FILE_NAME);
-    match crate::encoder::nvenc::load(&path) {
+fn nvenc_capability(record_path: &Path) -> Check {
+    match crate::encoder::nvenc::load(record_path) {
         Some(record) => {
             let usable: Vec<&str> = record
                 .encoders
@@ -211,11 +200,6 @@ fn write_report(capabilities: &Capabilities, path: &Path) -> std::io::Result<()>
     std::fs::write(path, json)
 }
 
-/// The report's default location: next to the capability record.
-pub fn default_report_path(app_dir: &Path) -> std::path::PathBuf {
-    app_dir.join("capabilities.json")
-}
-
 /// The report the last run left behind (`None` when there is none).
 pub fn read_report(path: &Path) -> Option<Capabilities> {
     let raw = std::fs::read_to_string(path).ok()?;
@@ -240,6 +224,7 @@ impl From<&Capabilities> for EncodeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::app::AppConfig;
     use std::path::PathBuf;
 
     fn scratch(label: &str) -> PathBuf {
@@ -255,17 +240,31 @@ mod tests {
         dir
     }
 
+    /// The paths of a run: the application directory holds the app's
+    /// own files, the operation directory holds this run's state.
+    fn paths(app: &std::path::Path, op: &std::path::Path) -> Paths {
+        Paths::resolve(
+            app.join("rencoder.toml"),
+            app.to_path_buf(),
+            op.to_path_buf(),
+            &AppConfig::default(),
+        )
+    }
+
     #[test]
     fn the_report_is_written_and_read_back() {
         let dir = scratch("report");
         let app = dir.join("app");
-        let report = default_report_path(&app);
-        let cancel = app.join("cancel");
+        let op = dir.join("op");
+        let paths = paths(&app, &op);
 
-        let capabilities = check_run_capabilities(&app, None, &cancel, &report);
+        let capabilities = check_run_capabilities(&paths);
 
-        assert!(report.exists(), "the report must be a file");
-        let read = read_report(&report).expect("the report must be readable");
+        assert!(
+            paths.capability_report.exists(),
+            "the report must be a file"
+        );
+        let read = read_report(&paths.capability_report).expect("the report must be readable");
         assert_eq!(read.checks.len(), capabilities.checks.len());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -275,15 +274,14 @@ mod tests {
         let dir = scratch("unwritable");
         let app = dir.join("app");
         std::fs::create_dir_all(&app).unwrap();
-        let report = default_report_path(&app);
-        let cancel = app.join("cancel");
-
         // A file where the directory should be: the check cannot write
         // there.
         let blocked = app.join("blocked");
         std::fs::write(&blocked, b"not a directory").unwrap();
+        let op = dir.join("op");
+        let paths = paths(&blocked, &op);
 
-        let capabilities = check_run_capabilities(&blocked, None, &cancel, &report);
+        let capabilities = check_run_capabilities(&paths);
 
         assert!(
             !capabilities.all_ok(),
@@ -296,7 +294,7 @@ mod tests {
         );
         // ... and the report was still written (the run is not
         // refused; the user is told).
-        assert!(report.exists());
+        assert!(paths.capability_report.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -305,10 +303,10 @@ mod tests {
         let dir = scratch("no_nvenc");
         let app = dir.join("app");
         std::fs::create_dir_all(&app).unwrap();
-        let report = default_report_path(&app);
-        let cancel = app.join("cancel");
+        let op = dir.join("op");
+        let paths = paths(&app, &op);
 
-        let capabilities = check_run_capabilities(&app, None, &cancel, &report);
+        let capabilities = check_run_capabilities(&paths);
 
         // No NVENC is not a failure -- the run encodes in software.
         let nvenc = capabilities

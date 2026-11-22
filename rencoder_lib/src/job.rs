@@ -31,7 +31,7 @@ use chrono::{DateTime, Utc};
 
 use crate::analyzer::records::{analyze_records_with_probe_and_progress_parallel, AnalyzeProgress};
 use crate::config::app::AppConfig;
-use crate::config::path::resolve_config;
+use crate::config::paths::{self, Paths};
 use crate::data::extract::probe_video_metadata_auto;
 use crate::encoder::nvenc::{Capability, CapabilityVerdicts};
 use crate::error::EncodeError;
@@ -89,7 +89,7 @@ pub enum Command {
     Cancel,
     /// Read history records from `<app_dir>/data/encoding-*.parquet`.
     /// Controller resolves the data dir internally via
-    /// `config::path::resolve_data_dir()` (§8 item 39); the payload
+    /// the app's records directory (design doc §3.6); the payload
     /// is the filter.
     LoadHistory {
         /// `None` = all records; `Some(N)` = most recent N.
@@ -514,7 +514,7 @@ mod tests {
 ///   for `Command::StartBatch` instead of using defaults. Cheap to
 ///   clone (`Arc<AppConfig>`).
 /// - `config_path`: the path the AppConfig was loaded from
-///   (`resolve_config()` result; UI uses this to save back).
+///   (`config::paths::config_file()` result; UI uses this to save back).
 pub struct ControllerHandle {
     pub(crate) cmd_tx: Sender<Command>,
     pub(crate) evt_rx: Receiver<Event>,
@@ -686,10 +686,10 @@ pub struct ActorEnv {
     pub app_config: Arc<AppConfig>,
     /// Where `Command::SaveConfig` writes.
     pub config_path: PathBuf,
-    /// Where `Command::LoadHistory` reads from.
-    pub data_dir: Option<PathBuf>,
-    /// Where the NVENC capability record lives.
-    pub nvenc_cache_path: Option<PathBuf>,
+    /// Where every file lives (design doc §3.6). The GUI rebases the
+    /// operation directory when the user switches working directories
+    /// (§3.10.7).
+    pub paths: Paths,
     /// How to encode one file (the test seam -- design doc §3.10.4).
     pub file_encoder: Arc<dyn FileEncoder>,
     /// The ffmpeg runner the NVENC probe uses (the test seam).
@@ -698,11 +698,15 @@ pub struct ActorEnv {
 
 /// The production environment: real ffmpeg, the app's own paths.
 fn production_env(app_config: Arc<AppConfig>, config_path: PathBuf) -> ActorEnv {
+    let app_dir = paths::app_dir().unwrap_or_else(|| PathBuf::from("."));
+    // The operation directory is the working directory the user picked;
+    // the actor rebases it per batch (the working directory can change
+    // between batches -- design doc §3.10.7).
+    let resolved = Paths::resolve(config_path.clone(), app_dir.clone(), app_dir, &app_config);
     ActorEnv {
         app_config,
         config_path,
-        data_dir: crate::config::path::resolve_data_dir(),
-        nvenc_cache_path: crate::config::path::resolve_nvenc_cache(),
+        paths: resolved,
         file_encoder: Arc::new(FfmpegFileEncoder),
         detect_runner: Arc::new(crate::encoder::nvenc::run_ffmpeg),
     }
@@ -728,7 +732,7 @@ fn production_env(app_config: Arc<AppConfig>, config_path: PathBuf) -> ActorEnv 
 /// # Internal init
 ///
 /// Once at startup, the actor:
-/// 1. Resolves config via [`resolve_config`] (handles
+/// 1. Resolves config via [`paths::config_file`] (handles
 ///    `$RENENCODER_CONFIG`).
 /// 2. Loads [`AppConfig`] (auto-creates default if missing —
 ///    same behavior as CLI).
@@ -780,7 +784,7 @@ pub fn start_controller() -> ControllerHandle {
     // about the machine, and `nv` is this run's choice (design doc
     // §3.10.5). So the resolution happens either way.
     let cache_rx = crate::pipeline::cache::init_encoder_cache_async_with_capability_at(
-        env.nvenc_cache_path.clone(),
+        Some(env.paths.capability_record.clone()),
         crate::encoder::nvenc::run_ffmpeg,
     );
 
@@ -816,7 +820,7 @@ pub fn start_controller_with(env: ActorEnv) -> ControllerHandle {
     // §3.10.4).
     let detect_runner_for_cache = Arc::clone(&env.detect_runner);
     let cache_rx = crate::pipeline::cache::init_encoder_cache_async_with_capability_at(
-        env.nvenc_cache_path.clone(),
+        Some(env.paths.capability_record.clone()),
         move |args| detect_runner_for_cache(args),
     );
 
@@ -843,7 +847,7 @@ pub fn start_controller_with(env: ActorEnv) -> ControllerHandle {
 /// location). Emit `Event::Error` on failure and return None so the
 /// caller falls back to defaults.
 fn load_and_share_config(evt_tx: &Sender<Event>) -> Option<(Arc<AppConfig>, PathBuf)> {
-    let config_path = resolve_config()?;
+    let config_path = paths::config_file(None)?;
     let app_config = match AppConfig::load(&config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -1013,9 +1017,9 @@ fn spawn_task_batch<P, F>(
     tasks: Vec<TranscodeTask>,
     label: &'static str,
     batch_path: PathBuf,
-    // Where the finished batch's records are written (the app's data
-    // directory; `None` = no history).
-    data_dir: Option<PathBuf>,
+    // Where the finished batch's records are written (the app's records
+    // directory).
+    records_dir: Option<PathBuf>,
     // The batch's cancel token: `Command::Cancel` sets it, the
     // worker polls it (design doc §3.11.2).
     cancel_token: CancelToken,
@@ -1068,7 +1072,7 @@ fn spawn_task_batch<P, F>(
             // has something to read (§3.11.4). The mechanics are the
             // lib's; the decision to persist is the frontend's -- and
             // the GUI has no other place to do it.
-            persist_batch_records(&report.records, data_dir.as_deref());
+            persist_batch_records(&report.records, records_dir.as_deref());
             match report.termination {
                 crate::pipeline::task::Termination::Completed => send_evt_lossy(
                     &evt_tx,
@@ -1105,11 +1109,11 @@ fn spawn_task_batch<P, F>(
 /// The mechanics are the lib's (`data::store`); the failure is not
 /// fatal -- a batch that could not be written to disk still finished,
 /// and the UI still shows its records.
-fn persist_batch_records(records: &[EncodingRecord], data_dir: Option<&std::path::Path>) {
+fn persist_batch_records(records: &[EncodingRecord], records_dir: Option<&std::path::Path>) {
     if records.is_empty() {
         return;
     }
-    let Some(dir) = data_dir else {
+    let Some(dir) = records_dir else {
         return;
     };
     let path = match crate::data::store::default_encoding_path_in(dir) {
@@ -1319,8 +1323,8 @@ fn run_actor(
 ) {
     // The injected dependencies, unpacked for the arms below.
     let config_path = env.config_path.clone();
-    let data_dir = env.data_dir.clone();
-    let nvenc_cache_path = env.nvenc_cache_path.clone();
+    let records_dir = env.paths.records_dir.clone();
+    let nvenc_cache_path = env.paths.capability_record.clone();
     let file_encoder = Arc::clone(&env.file_encoder);
     let detect_runner = Arc::clone(&env.detect_runner);
     // Review #111: dropped-event counter for diagnostics. Each sender
@@ -1479,7 +1483,16 @@ fn run_actor(
                 // partial_output::Guard registration.
                 let id = next_batch_id;
                 next_batch_id += 1;
-                cancel_token = CancelToken::new();
+                // The operation directory: the directory this batch
+                // acts on (design doc §3.6). The GUI's working
+                // directory can change between batches, so the
+                // run-level paths follow it.
+                let batch_paths = env
+                    .paths
+                    .with_op_dir(&crate::pipeline::batch::batch_target_path_for_files(&files));
+                // A leftover request would cancel this batch as well.
+                let _ = std::fs::remove_file(&batch_paths.cancel_file);
+                cancel_token = CancelToken::watching(batch_paths.cancel_file.clone());
 
                 send_evt_lossy(
                     &evt_tx,
@@ -1560,7 +1573,7 @@ fn run_actor(
                     tasks,
                     "encoding",
                     batch_path,
-                    data_dir.clone(),
+                    Some(records_dir.clone()),
                     cancel_for_worker.clone(),
                     make_processor,
                     BatchUpdates::new(),
@@ -1641,7 +1654,7 @@ fn run_actor(
             }
 
             Command::LoadHistory { limit, after } => {
-                let records = load_history(data_dir.clone(), limit, after);
+                let records = load_history(Some(records_dir.clone()), limit, after);
                 send_evt_lossy(&evt_tx, Event::HistoryLoaded { records }, &dropped_counter);
             }
 
@@ -1699,7 +1712,7 @@ fn run_actor(
                     .name("renencoder-detect".into())
                     .spawn(move || {
                         match crate::encoder::nvenc::resolve_and_store_with(
-                            cache_path.as_deref(),
+                            Some(cache_path.as_path()),
                             force,
                             move |args| detect_runner(args),
                         ) {
@@ -1792,7 +1805,7 @@ fn run_actor(
 /// Read history records from the given data directory (empty if
 /// `None`), apply `limit` + `after`, return newest-first.
 ///
-/// Production caller passes `Some(resolve_data_dir()?)`; tests pass a
+/// Production caller passes the app's records directory; tests pass a
 /// temp dir. Taking the dir as a parameter (rather than reading the
 /// env var inside) keeps tests parallel-safe — env vars are process-
 /// global and would race between threads.
@@ -1985,17 +1998,26 @@ mod mock_tests {
             })
             .expect("send the pre-populated cache");
 
-        let config_path = data_dir
+        // The temp dir plays the records directory: the writer and
+        // the history reader must agree on it (design doc §3.6).
+        let records_dir = data_dir
             .clone()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("saved-config.toml");
-        let nvenc_cache_path = data_dir.clone().map(|d| d.join("nvenc-capability.json"));
+            .unwrap_or_else(|| PathBuf::from("/nonexistent/rencoder-records"));
+        let app_dir = data_dir.clone().unwrap_or_else(|| PathBuf::from("."));
+        let config_path = app_dir.join("saved-config.toml");
+        let mut paths = Paths::resolve(
+            config_path.clone(),
+            app_dir.clone(),
+            app_dir,
+            &AppConfig::default(),
+        );
+        paths.records_dir = records_dir.clone();
+        paths.capability_record = records_dir.join("nvenc-capability.json");
 
         let env = ActorEnv {
             app_config: Arc::new(AppConfig::default()),
             config_path,
-            data_dir,
-            nvenc_cache_path,
+            paths,
             file_encoder: Arc::new(MockFileEncoder { f: mock_fn }),
             // The NVENC probe never runs in a test: the fake runner
             // answers "no encoders", so nothing is probed.

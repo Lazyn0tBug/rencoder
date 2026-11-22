@@ -52,7 +52,8 @@ Rencoder 是一个独立的第三方应用，不是发布到 crates.io 的通用
 - **发布形态**：target 平台一份自包含目录，包含 binary + 配置 + 运行时资源（log /
   data 占位）。用户解压即用，不依赖系统路径、XDG 约定或 CWD。
 - **运行时约束**：binary 自己 resolve 出父目录（`current_exe().parent()`）作为
-  `app_dir`。所有持久化状态（config / log / data）从 `app_dir` 派生。CWD 只承载
+  应用目录。**应用级**状态（config / log / data / 机器能力记录）从应用目录派生；
+  **运行级**状态（取消请求、运行能力检查报告）落在**操作目录**（§3.6）。CWD 只承载
   用户输入的视频文件，与应用状态无关。
 - **Source 仍是 workspace**：`rencoder_lib` 完成核心工作（业务逻辑、配置加载、
   ffmpeg 命令构造），`rencoder_cli`（及未来的 `rencoder_ui`，见 §3.8）
@@ -1644,7 +1645,7 @@ log "task N/M (source) interrupted" 而不是光秃秃的 path。同步把 `epri
     `[package.metadata.dist] dist = true`（U21: `publish = false`，
     cargo-dist 0.32 默认跳过 `publish = false` 的 package）。
 
-**配置文件路径解析顺序**（`config_path::resolve`）：
+**配置文件路径解析顺序**（`config::paths::config_file`）：
 1. `$RENENCODER_CONFIG`（最高优先级）—— 显式覆盖，read-only fs / 调试用
 2. `<app_dir>/rencoder.toml`（默认）—— `current_exe().parent().join("rencoder.toml")`
 
@@ -1909,20 +1910,70 @@ rencoder-cli-<triple>/
 └── data/                      # 占位，首次运行写入时自动创建
 ```
 
+**文件放在哪里：一条原则** ✅ ✅
+
+每个文件都放在**离它被访问、离它起作用最近的地方** ✅ ✅。这条原则落到两个目录 ✅ ✅：
+
+| 目录 ✅ | 是什么 ✅ | 装什么 ✅ |
+|---|---|---|
+| **应用目录** ✅ ✅ | 应用自己所在的目录（binary 的父目录，文档里写作 `<app_dir>` ✅ ✅）✅ ✅ | 配置 ✅、日志 ✅、机器能力记录 ✅、工作记录 ✅ |
+| **操作目录** ✅ ✅ | **本次操作作用的目录** ✅ ✅ | 取消请求 ✅、运行能力检查报告 ✅ |
+
+**应用目录**装的是"应用自己的东西" ✅ ✅ —— 配置与日志是应用的偏好与痕迹 ✅ ✅，换一批
+文件跑也不换地方 ✅ ✅；机器能力记录是**这台机器**的结论 ✅ ✅（探测一次几百毫秒 ✅ ✅，
+要跨进程复用 ✅ ✅）；工作记录是**跨会话**的历史 ✅ ✅（历史面板一次看全 ✅ ✅）。
+
+**操作目录**装的是"这一趟的东西" ✅ ✅ —— 取消请求与检查报告描述的正是"这一趟、这个目录
+能不能干" ✅ ✅，放在操作目录里，它旁边就是它描述的那个目录 ✅ ✅。
+
+**操作目录怎么定** ✅ ✅：
+
+| 前端 ✅ | 操作目录 ✅ |
+|---|---|
+| CLI ✅ ✅ | 目标所在目录 ✅ ✅ —— `-d DIR` → `DIR` ✅；`-f FILE` → `FILE` 的父目录 ✅ ✅ |
+| GUI ✅ ✅ | 用户选定的工作目录 ✅ ✅ |
+
+没有目标的操作（`rencoder detect` ✅）没有操作目录 ✅ ✅ —— 它唯一的产物（机器能力记录 ✅）
+是应用级的 ✅ ✅，留在应用目录 ✅ ✅。
+
 **运行时视图**（用户解压 + 首次运行后）：
 
 ```
-<user-chosen-install-dir>/     # = app_dir = current_exe().parent()
+<user-chosen-install-dir>/     # = 应用目录 = current_exe().parent()
 ├── rencoder                   # 用户调用的入口
 ├── rencoder.toml              # 用户编辑的偏好（auto-create 后存在）
-├── nvenc-capability.json      # NVENC 能力检测结果（`rencoder detect` 写入）
+├── nvenc-capability.json      # 机器能力记录（`rencoder detect` 写入）
 ├── log/                       # 日志：rencoder.YYYY-MM-DD.NN.log
 └── data/                      # 工作记录：encoding-<ISO8601>Z.parquet
+
+<操作目录>/                    # 本次操作作用的目录
+├── cancel                     # 取消请求（存在即取消）
+└── capabilities.json          # 运行能力检查报告（这一趟的结论）
 ```
 
-小工具的定位：应用目录就是"应用当前目录"，所有状态都跟应用放在一起——配置与
-NVENC 检测结果同级，只有日志分 `log/` 子目录（日志是唯一会不断增长、需要跟
-状态文件分开存放的东西）。
+**路径写进配置，不写死在代码里** ✅ ✅。配置文件自己在哪里仍然是入口显式值 ✅ ✅
+（`--config` ✅ > `$RENENCODER_CONFIG` ✅ > `<应用目录>/rencoder.toml` ✅ ✅）—— 配置
+不能配置自己的位置 ✅ ✅。其余路径写在 `[paths]` 段 ✅ ✅：
+
+```toml
+[paths]
+# 相对「应用目录」
+log_dir = "log"
+records_dir = "data"
+capability_record = "nvenc-capability.json"
+# 相对「操作目录」
+cancel_file = "cancel"
+capability_report = "capabilities.json"
+```
+
+优先级 ✅ ✅：入口显式值（env ✅ / CLI ✅）> 文件显式值（`[paths]` ✅）> 内建默认值 ✅ ✅。
+
+**一处决定** ✅ ✅：路径不再散落在各处现算 ✅ ✅ —— lib 有一个 `Paths` ✅ ✅
+（`rencoder_lib::config::paths` ✅ ✅），一次解析出全部路径 ✅ ✅，前端拿着它用 ✅ ✅。
+
+**操作目录里的应用文件不会被当成输入** ✅ ✅：应用写进操作目录的文件在采集时按名字跳过
+✅ ✅（`cancel` ✅、`capabilities.json` ✅ —— 名字由 lib 的 `Paths` 给出 ✅ ✅，各处不硬编码
+✅ ✅）。
 
 **scripts/dist.sh 职责**：
 
@@ -2303,6 +2354,10 @@ UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `int
 | `pipeline/context.rs` | `FilePlan` | 一个文件的现场(探测结果/argv/输出路径/两个时间基准)——取代 `EncodePrepareResult::Ready` |
 | `pipeline/batch.rs` | `FileEncoder` | "编一个文件"这一步的单方法 trait(测试缝)——生产走真 ffmpeg,测试替身只替换这一步,事件由共享代码发 |
 | `job.rs` | `ActorEnv` | actor 的注入依赖(配置/路径/编码器/探测 runner)——`start_controller_with` 让测试驱动同一个 actor |
+| `config/paths.rs` | `Paths` struct | 一次解析出这次运行用到的全部路径(应用目录 + 操作目录)——各处不再各自现算(§3.6) |
+| `config/paths.rs` | `config_file()` / `app_dir()` | 配置文件与应用目录的解析——入口显式值 > 内建默认值(§3.6) |
+| `config/paths.rs` | `APP_OWNED_FILE_NAMES` | 应用自己写进操作目录的文件名——输入采集器按名字跳过它们(§3.6) |
+| `types.rs` | `Target::operation_dir()` | 目标所在目录 = 这一趟的操作目录(§3.6) |
 | `encoder/nvenc.rs` | `resolve_with` / `resolve_and_store_with` | NVENC 探测的 runner 缝——注入 ffmpeg 调用，测试不必真跑探测；后者把"探测 + 落盘"一起换掉 |
 | `job.rs` | `Event::DryRunFinished { records }` | Dry-run 结果:planned outcomes,**没有**实际 ffmpeg 输出 |
 | `analyzer/records.rs` | `analyze_records_with_probe_and_progress_parallel<F, P>` | U22 / Tier 3 #9：并行 + 进度 closure-injection。`F` 是 probe 闭包（同 `analyze_records_with_probe_parallel`），`P: Fn(AnalyzeProgress) + Send + Sync` 在每个 worker 完成时调一次。`AnalyzeProgress { done, total, failed, last }` 4 字段 |
@@ -2339,7 +2394,7 @@ UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `int
 | `job.rs` | `start_controller() -> ControllerHandle` | 编排：后台线程 + mpsc + `run_ffmpeg_with_progress`；与 CLI 路径**共享** `encode_prepare` / `build_encode_record`（不 fork），但**不**走 `transcode_batch`（那是 CLI 专用的批入口）；job.rs 是 thin glue，把现有 pieces 装成 actor |
 
 **Controller 启动时加载配置**（U21 增量，§3.10.5）：
-- `config::path::resolve_config()` 拿路径（`$RENENCODER_CONFIG` > `<app_dir>/rencoder.toml`）
+- `config::paths::config_file()` 拿路径（`$RENENCODER_CONFIG` > `<app_dir>/rencoder.toml`）
 - `AppConfig::load(&path)` 读 TOML（缺失时自动创建默认文件，与 CLI 一致）→ **每进程一次** ✓
 - 能力解析一次（`detect` 优先：复用 `<app_dir>/nvenc-capability.json`，没有就探测并落盘）✓
   → `EncoderCache` ✓（**不绑 `nv`** ✓）
@@ -3766,7 +3821,7 @@ AppConfig ──EncodeConfig──→ EncodeParams::from_app_config ──→ En
 | 同一份判定 | lib | 能力是否过期（`review_due`） |
 | 能力解析 + 存盘 | lib | `nvenc::resolve_and_store*`：唯一会写能力记录的地方 |
 | 解析结果 → 能力摘要 | lib | `Resolution::capability()`：唯一把解析变成"前端显示什么"的地方 |
-| 记录放在哪、要不要强制重探 | 前端 | CLI 的 `resolve_nvenc_cache()`；GUI 的 `ActorEnv.nvenc_cache_path` |
+| 记录放在哪、要不要强制重探 | 前端 | CLI 的 `Paths::capability_record`；GUI 的 `ActorEnv.paths` |
 | 记录怎么落盘 | lib | `data::store::write_records`（格式分派）与 `default_encoding_path`（默认路径） |
 | 摘要的计数与措辞 | lib | `data::store::summary_lines`；前端各自排版 |
 | 什么时候落盘 | 前端 | CLI 在编码命令结束时；actor 在批次终态时 |
@@ -3840,9 +3895,9 @@ NVENC 能力），就要给八个函数各加一个参数。因为上下文是�
   记录写进开发者的真实 app 目录）。
 - **换缝就要换路径**：路径也是缝的一部分。`path` 与 `runner` 一起注入——
   只换 runner 而让 lib 自己去解析路径，测试就会把记录写进开发者的真实 app
-  目录（`resolve_nvenc_cache()` = `<current_exe 的父目录>/…`，而测试二进制的
+  目录（`Paths::capability_record` = `<current_exe 的父目录>/…`，而测试二进制的
   父目录是 `target/debug/deps/`）。lib 不再自己解析记录路径：路径由调用方给
-  （CLI 给 `resolve_nvenc_cache()`，GUI 给 `ActorEnv.nvenc_cache_path`），lib
+  （CLI 给 `Paths::capability_record`，GUI 给 `ActorEnv.paths`），lib
   里的能力解析入口一律是 `..._at(path, ...)`。前端自己的测试（CLI 集成测试
   spawn 的是真二进制）用 `$RENENCODER_*` 环境变量把子进程指向临时目录。
 - 编码器缓存**不需要缝**：`run_actor` 本来就收一条 `cache_rx`，而 `CacheInit`
@@ -3863,7 +3918,7 @@ NVENC 能力），就要给八个函数各加一个参数。因为上下文是�
    也是合法的。
 3. **注入的依赖集中写明**：`ActorEnv` 里放"从哪来"的东西（配置、历史数据
    目录、NVENC 记录路径、编码器、探测 runner），不藏在函数体深处
-   （`resolve_data_dir()` 这种 env 读取不该藏在 actor 里——它让测试没法并行）。
+   （`Paths` 这种 env 读取不该藏在 actor 里——它让测试没法并行）。
    `ActorEnv` 构造后不变；运行期会变的东西（闸门、批 id、判定、cancel token）
    留在 actor 的局部变量里。
    生产环境由 `start_controller()` 造；测试环境由 `start_controller_with(env)` 造
@@ -3983,12 +4038,12 @@ Capability {
 
 | 优先级 | 检查 | 内容 | 不成立时 |
 |---|---|---|---|
-| 1 | **文件系统** ✅ ✅ | app 目录**可写** ✅ ✅ —— 配置 ✅、记录 ✅、取消请求 ✅ 都在那儿 ✅ ✅ | 报出来 ✅ ✅ —— 写不了记录，这一趟也留不下东西 ✅ ✅ ✅ |
+| 1 | **文件系统** ✅ ✅ | 应用目录**可写** ✅ ✅（配置 ✅、日志 ✅、工作记录 ✅ 都在那儿 ✅ ✅）+ 操作目录**可写** ✅ ✅（取消请求 ✅、检查报告 ✅ 都在那儿 ✅ ✅）✅ ✅ | 报出来 ✅ ✅ —— 写不了产物，这一趟也留不下东西 ✅ ✅ ✅ |
 | 2 | ffmpeg ✅ ✅ | 可执行 ✅、编码器列表拿得到 ✅ ✅ | 报出来 ✅ ✅ —— 没有 ffmpeg 编不了 ✅ ✅ ✅ |
 | 3 | NVENC ✅ ✅ | 两级判定（§3.10.5 ✅ ✅）✅ ✅ | **不算失败** ✅ ✅ —— 只是"这次用软件编码 ✅ ✅"✅ ✅ ✅ |
 
 **顺序不是随便排的** ✅ ✅：文件系统在第一位 ✅ ✅，因为它最基础 ✅ ✅ —— 后面每一项
-都要往那儿写东西 ✅ ✅ ✅（记录 ✅、取消请求 ✅ ✅ ✅）；ffmpeg 在第二位 ✅ ✅，因为没
+都要往那儿写东西 ✅ ✅ ✅（工作记录 ✅、取消请求 ✅ ✅ ✅）；ffmpeg 在第二位 ✅ ✅，因为没
 有它这一趟根本编不了 ✅ ✅ ✅；NVENC 垫底 ✅ ✅ —— 它最贵 ✅ ✅（探针 ✅ ✅），而且
 **不成立也不失败** ✅ ✅ ✅（只是退回软件编码 ✅ ✅ ✅）。
 
@@ -3998,22 +4053,24 @@ Capability {
 
 **结果写进文件 ✅ ✅**（和取消请求同一个方向 ✅ ✅）：前端**读文件** ✅ ✅，不各自再算
 一遍 ✅ ✅ —— 多个前端 ✅ ✅、多个进程 ✅ ✅（将来的 Tauri UI ✅ ✅）看到的是同一份
-✅ ✅ ✅。
+✅ ✅ ✅。报告落在**操作目录** ✅ ✅（§3.6 ✅ ✅）—— 它描述的就是这个目录能不能干 ✅ ✅。
 
 **检查没过不拒绝启动 ✅ ✅**：那是**信息** ✅ ✅，不是闸门 ✅ ✅ ✅ —— 桌面应用因为
-app 目录不可写就打不开 ✅ ✅，那是敌意 ✅ ✅ ✅。用户看到"这里写不了 ✅ ✅"✅ ✅，自己
+目录不可写就打不开 ✅ ✅，那是敌意 ✅ ✅ ✅。用户看到"这里写不了 ✅ ✅"✅ ✅，自己
 决定 ✅ ✅ ✅。
 
 **GUI 的工作目录会换 ✅ ✅** —— 每换一次目录，检查的输入就变了 ✅ ✅ ✅（目标目录 ✅ ✅、
-路径别名 ✅ ✅、能不能写 ✅ ✅），所以**每次切换都重新检查 ✅ ✅** ✅ ✅。
+路径别名 ✅ ✅、能不能写 ✅ ✅），所以**每次切换都重新检查 ✅ ✅** ✅ ✅，报告也落到新的操作目录里 ✅ ✅。
 
 **取消请求的可写性属于文件系统检查 ✅ ✅，不是它自己的一件事** ✅ ✅：取消文件就在
-app 目录里 ✅ ✅，那里写不了 ✅ ✅ → 记录也写不进去 ✅ ✅ → 这一趟本来就完了 ✅ ✅。
+操作目录里 ✅ ✅，那里写不了 ✅ ✅ → 产物也写不进去 ✅ ✅ → 这一趟本来就完了 ✅ ✅。
 所以它是**运行的前置条件** ✅ ✅，在开工前查一次 ✅ ✅ —— 不是等到信号来了才发现写
 不进去 ✅ ✅ ✅。
 
 **请求通道的生命周期 ✅ ✅**：批启动时删掉遗留的取消请求 ✅ ✅ —— 否则上一次的中断
-会取消这一趟 ✅ ✅。
+会取消这一趟 ✅ ✅。取消请求在**操作目录**里 ✅ ✅（§3.6 ✅ ✅），所以清理也在那里做
+✅ ✅：CLI 开工前删一次 ✅ ✅，GUI 每批开工前删一次 ✅ ✅（工作目录会换 ✅ ✅，换过之后
+旧目录里那份就不再相关 ✅ ✅）。
 
 ### 3.11 任务模型与执行契约
 
@@ -4063,7 +4120,7 @@ app 目录里 ✅ ✅，那里写不了 ✅ ✅ → 记录也写不进去 ✅ �
   所以安装点不能在"要开始编码了"的地方，只能在进程入口。
 - **启动期也要能被取消**：能力探测、文件采集这些阶段要么检查取消令牌，要么有明确的
   时间上限——不能让 Ctrl-C 在那里干等着。
-- **取消走状态文件，信号只是它的前端**。取消请求就是 `<app_dir>/cancel` 这个文件的
+- **取消走状态文件，信号只是它的前端**。取消请求就是**操作目录**里 `cancel` 这个文件的
   **存在与否**（`$RENENCODER_CANCEL_FILE` 可覆盖 ✅）。批在轮询里看它 —— 于是：
   - **时限 = 一个轮询间隔**（≤ 100ms ✅ ✅），**与平台无关** ✅ ✅：靠 OS 信号接收的
     话，保证取决于平台（Unix 三个信号 ✅ / Windows 五个控制台事件 ✅ ✅，各有各的坑
@@ -4246,7 +4303,7 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 36 | `ErrorCategory` 加 `#[non_exhaustive]`（U21，对齐 `Command` / `Event`）；`Event::Error` 故意只带 `(category, message)` 不带 stderr_tail | ✅ |
 | 37 | `ErrorContext` 加 `#[non_exhaustive]`（U21，对齐 `ErrorCategory`）；外部 crate 不可构造,字段读取仍可 | ✅ |
 | 38 | §3.8.7 定义 `TaskInfo` / `TaskQueue` / `TaskId` / `ProgressInfo` / `LogLine` UI state struct,让 reducer 可独立 unit-test | ✅ |
-| 39 | `Command::LoadHistory` 不带 path 字段；controller 用 `config::path::resolve_data_dir()` 自解析（honors `$RENENCODER_DATA_DIR`,v1.1 启用） | ✅ |
+| 39 | `Command::LoadHistory` 不带 path 字段；controller 用 `config::paths::Paths` 解析（honors `$RENENCODER_DATA_DIR`,v1.1 启用） | ✅ |
 | 40 | Partial-output 检测(U21)：output duration < source - 1s → partial → 删 + 重转；probe 失败视作 partial；删除失败 → `Skipped(PartialOutput)`——**2026-11-15 起移除**（输出已存在就照常转码，半成品被直接覆盖，检测没有意义，§3.3.4） | ⚠️ 已作废 |
 | 41 | CLI encode summary 增加 `PartialSkip` 独立分类(`PartialOutput` 不计入 `Skipped` 也不计入 `Failed`)——**2026-11-15 起 summary 不再输出 `Skipped` / `PartialSkip` 两行**（§3.3.4、§3.4）；`SkippedReason` 的变体留在记录 schema 里（历史数据），但不再产生 | ⚠️ 已作废 |
 | 42 | Per-frame Progress 事件接线：`transcode_single_with_progress` + controller 把 `FfmpegProgress` 包成 `Event::Progress`；CancelToken 真正能 kill 当前 ffmpeg 子进程 | ✅ |
@@ -4297,7 +4354,7 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 87 | NVENC 夹具及真实 GPU 发布验收（§3.10.6） | future |
 | 88 | **能力判定分两级**（§3.10.5）：一级=构建带不带 NVENC，二级=机器能不能跑；记录存的是测试结果，一级失败是它的原因；每个候选都有一项，记录形状不随机器变化（磁盘格式升到 v2，旧记录作废重探） | ✅ |
 | 89 | **复审周期由 lib 掌管**（§2）：记录到期时解析把它推后 30 天并落盘，前端只负责显示提示；两个前端（及以后的前端）不必各自记着延期这件事 | ✅ |
-| 90 | **取消走状态文件**（§3.11.2）：取消请求 = `<app_dir>/cancel` 是否存在；批在轮询里看它，时限 = 一个轮询间隔且与平台无关；信号只是它的前端；谁能取消一个正在跑的批 = 写那个文件 | ✅ |
+| 90 | **取消走状态文件**（§3.11.2）：取消请求 = **操作目录**里 `cancel` 是否存在；批在轮询里看它，时限 = 一个轮询间隔且与平台无关；信号只是它的前端；谁能取消一个正在跑的批 = 写那个文件 | ✅ |
 | 91 | **运行能力检查**（§3.10.7）：一个检查集的聚合入口 ✅ ✅，按优先级依次跑 ✅ ✅ ✅，结果写进文件 ✅ ✅（前端读文件 ✅ ✅，不各自再算 ✅ ✅）；**检查没过不拒绝启动** ✅ ✅ ✅ —— 是信息不是闸门 ✅ ✅ ✅；GUI 换工作目录就重新检查 ✅ ✅ ✅。取消请求的可写性属于其中的文件系统检查 ✅ ✅，不是独立的一件事 ✅ ✅ | future |
 | 90 | **能力是一个对象**（§3.10.5）：检查的结论与运行时的修正合成一个 `Capability`，整条链共享（选型读、回退写、actor 持权威副本）；`EncoderCache` 只剩 ffmpeg 的编码器列表；自己探一次的独立入口删除 | ✅ |
 | 91 | **记录落盘归 lib**（§3.11.4）：格式分派与默认路径进 `data::store`；actor 在批次终态时落盘——**GUI 的历史面板不再永远是空的** | future |
@@ -4305,6 +4362,9 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 93 | **`BatchReport` 落地**（§3.11.4）：执行层组装唯一的报告，CLI 直接消费，actor 据此发终态事件——"这一批结束了"只有一种理解 | ✅ |
 | 94 | **中断要留下记录**（§3.11.2）：信号入口只置位取消令牌，批在文件边界停下，已完成的文件照样落盘，进程以 130 退出；半成品只由 lib 删，`PartialOutputHandle` 随之退休 | ✅ |
 | 95 | **报告覆盖所有批**（§3.11.4）：编码、预演、分析都返回 `BatchReport` | ✅ |
+| 96 | **文件位置原则**（§3.6）：每个文件放在离它被访问、离它起作用最近的地方 —— 应用级（config / log / data / 机器能力记录）在应用目录，运行级（取消请求、运行能力检查报告）在操作目录（CLI = 目标所在目录，GUI = 选定的工作目录） | future |
+| 97 | **路径写进配置**（§3.6）：`[paths]` 段覆盖各路径，优先级 = 入口显式值（env / CLI）> 文件显式值 > 内建默认值；配置文件自身的位置仍由 `--config` / `$RENENCODER_CONFIG` 决定 | future |
+| 98 | **路径一处决定**（§3.6）：lib 的 `config::paths::Paths` 一次解析出全部路径，前端不再各自现算；操作目录里的应用文件（`cancel`、`capabilities.json`）按名字跳过，不被当成输入 | future |
 
 ---
 

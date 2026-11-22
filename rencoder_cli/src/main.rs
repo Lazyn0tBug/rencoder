@@ -17,9 +17,10 @@ mod tracing_init;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use rencoder_lib::pipeline::cancel::CancelToken;
 use rencoder_lib::{
     collect::collect_files,
-    config::{AnalyzeFormatArg, AppConfig},
+    config::{paths::Paths, AnalyzeFormatArg, AppConfig},
     data::extract::probe_video_metadata,
     encoder::nvenc::{self},
     pipeline::context::BatchContext,
@@ -31,33 +32,78 @@ use std::path::{Path, PathBuf};
 use tracing::{info, instrument, warn};
 
 fn main() -> Result<()> {
-    // The cancel request is a file (design doc §3.11.2): the signal
-    // handler writes it, the batch polls for it, and anyone who can
-    // write that file can stop a running batch.
-    let app_dir = rencoder_lib::config::path::app_dir().unwrap_or_else(|| PathBuf::from("."));
-    let cancel_file =
-        rencoder_lib::config::path::resolve_cancel_file().unwrap_or_else(|| app_dir.join("cancel"));
-    // A leftover request would cancel this run as well.
-    let _ = std::fs::remove_file(&cancel_file);
-    let cancel = rencoder_lib::pipeline::cancel::CancelToken::watching(cancel_file.clone());
+    let cli = args::Cli::parse();
 
     // The signal handler comes **first** (design doc §3.11.2): before
-    // it is installed, a signal takes the default action -- the
-    // process dies, the records are lost, the partial output stays.
+    // the handler is installed, a signal takes the default action --
+    // the process dies, the records are lost, the partial output stays.
     // That window must not exist, so the handler is installed before
-    // anything else happens.
-    signal::install_handler(&cancel_file);
+    // anything else happens. The cancel request's path is filled in
+    // once the paths resolve (§3.6).
+    let cancel_slot = signal::new_cancel_slot();
+    signal::install_handler(&cancel_slot);
 
-    // The capability check needs the target (design doc §3.10.7), which
-    // the command knows, not `main`.
-
-    tracing_init::init().context("initialize tracing")?;
-    let cli = args::Cli::parse();
     match cli.command {
-        args::Command::Encode(encode_args) => encode_cmd(encode_args, cli.detect, cancel),
-        args::Command::Analyze(analyze_args) => analyze_cmd(analyze_args, cancel),
+        args::Command::Encode(encode_args) => encode_cmd(encode_args, cli.detect, &cancel_slot),
+        args::Command::Analyze(analyze_args) => analyze_cmd(analyze_args, &cancel_slot),
         args::Command::Detect(_) => detect_cmd(),
     }
+}
+
+/// Everything a run needs before it starts: the config, the paths
+/// (design doc §3.6), and the cancel channel (design doc §3.11.2).
+///
+/// The order matters (design doc §3.11.2): the signal handler goes in
+/// **before any work whose interruption would lose state** -- the
+/// capability probe, the file collection, the encoding. A signal
+/// before that takes the default action: the process dies. Nothing is
+/// lost, because nothing has been produced yet (the config write is
+/// atomic).
+///
+/// The cancel request is a file: the handler writes it, the batch
+/// polls for it, and anyone who can write that file can stop a running
+/// batch.
+fn prepare(
+    config_override: Option<&Path>,
+    op_dir: Option<&Path>,
+    cancel_slot: &signal::CancelSlot,
+) -> Result<(AppConfig, Paths, CancelToken)> {
+    let app_dir = rencoder_lib::config::paths::app_dir().unwrap_or_else(|| PathBuf::from("."));
+    let config_path =
+        rencoder_lib::config::paths::config_file(config_override).ok_or_else(|| {
+            anyhow::anyhow!(
+                "could not determine config location: no --config, $RENENCODER_CONFIG \
+             is unset, and binary directory is unavailable. Pass --config explicitly."
+            )
+        })?;
+    // The config is created on first run; the notice is logged after
+    // tracing is up (below), because the log directory comes from the
+    // config itself (design doc §3.6).
+    let config_existed = config_path.exists();
+    let app_config = AppConfig::load(&config_path)
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+    // No operation directory means the run acts on no directory of
+    // its own (`rencoder detect`): its state stays with the app.
+    let op_dir = op_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| app_dir.clone());
+    let paths = Paths::resolve(config_path, app_dir, op_dir, &app_config);
+
+    tracing_init::init(&paths.log_dir).context("initialize tracing")?;
+    if !config_existed {
+        info!(
+            config_path = %paths.config_file.display(),
+            "{}",
+            rencoder_lib::config::app::CREATED_CONFIG_NOTICE
+        );
+    }
+
+    // A leftover request would cancel this run as well.
+    let _ = std::fs::remove_file(&paths.cancel_file);
+    // Point the handler at the file the batch watches.
+    signal::set_cancel_path(cancel_slot, &paths.cancel_file);
+    let cancel = CancelToken::watching(paths.cancel_file.clone());
+    Ok((app_config, paths, cancel))
 }
 
 /// `rencoder detect` -- probe this machine's NVENC capability, store the
@@ -67,9 +113,11 @@ fn main() -> Result<()> {
 /// actually run" becomes something the user can ask, instead of
 /// something they only learn from a fallback warning.
 fn detect_cmd() -> Result<()> {
-    let cache_path = rencoder_lib::config::path::resolve_nvenc_cache();
-    let resolution =
-        nvenc::resolve_and_store(cache_path.as_deref(), true).context("NVENC detection failed")?;
+    let slot = signal::new_cancel_slot();
+    signal::install_handler(&slot);
+    let (_config, paths, _cancel) = prepare(None, None, &slot)?;
+    let resolution = nvenc::resolve_and_store(Some(&paths.capability_record), true)
+        .context("NVENC detection failed")?;
     print!("{}", nvenc::report(&resolution));
     Ok(())
 }
@@ -79,20 +127,8 @@ fn detect_cmd() -> Result<()> {
 /// The report is a file the frontends read; a failed check does
 /// **not** refuse the start -- it is information: the user is told
 /// what cannot be done here and decides.
-fn check_capabilities(target: &Target) {
-    let app_dir = rencoder_lib::config::path::app_dir().unwrap_or_else(|| PathBuf::from("."));
-    let cancel_file =
-        rencoder_lib::config::path::resolve_cancel_file().unwrap_or_else(|| app_dir.join("cancel"));
-    let target_dir = match target {
-        Target::File(file) => file.parent().map(Path::to_path_buf),
-        Target::Dir(dir) => Some(dir.clone()),
-    };
-    let capabilities = rencoder_lib::capability::check_run_capabilities(
-        &app_dir,
-        target_dir.as_deref(),
-        &cancel_file,
-        &rencoder_lib::capability::default_report_path(&app_dir),
-    );
+fn check_capabilities(paths: &Paths) {
+    let capabilities = rencoder_lib::capability::check_run_capabilities(paths);
     for line in capabilities.lines() {
         info!("capability: {line}");
     }
@@ -151,12 +187,8 @@ fn advise_refresh() -> Result<Refresh> {
 fn encode_cmd(
     args: args::EncodeArgs,
     force_detect: bool,
-    cancel: rencoder_lib::pipeline::cancel::CancelToken,
+    cancel_slot: &signal::CancelSlot,
 ) -> Result<()> {
-    let app_config = load_app_config(args.config.as_deref())?;
-
-    let enc = app_config.encode.as_ref();
-
     let target = if let Some(file) = &args.file {
         Target::File(file.clone())
     } else if let Some(dir) = &args.dir {
@@ -164,6 +196,12 @@ fn encode_cmd(
     } else {
         anyhow::bail!("either --file or --dir must be provided (or use --interactive)");
     };
+
+    // The operation directory: where this run acts (design doc §3.6).
+    let op_dir = target.operation_dir();
+    let (app_config, paths, cancel) = prepare(args.config.as_deref(), Some(&op_dir), cancel_slot)?;
+
+    let enc = app_config.encode.as_ref();
 
     // One mapping from the config to the per-run params:
     // `EncodeParams::from_app_config` is the single entry point (design
@@ -231,7 +269,7 @@ fn encode_cmd(
         params.format
     );
 
-    check_capabilities(&target);
+    check_capabilities(&paths);
 
     // NVENC capability: prefer the stored record (probing costs
     // ~200-500ms per encoder, and the answer barely changes). `--detect`
@@ -242,8 +280,7 @@ fn encode_cmd(
     // it is a fact about the machine, and `nv` is this run's choice
     // (design doc §3.10.5). Resolving it costs a file read when the
     // stored record is fresh.
-    let cache_path = rencoder_lib::config::path::resolve_nvenc_cache();
-    let mut resolution = nvenc::resolve_and_store(cache_path.as_deref(), force_detect)
+    let mut resolution = nvenc::resolve_and_store(Some(&paths.capability_record), force_detect)
         .context("NVENC detection failed")?;
 
     // The staleness advisory. The review cycle belongs to the lib: the
@@ -254,7 +291,7 @@ fn encode_cmd(
     if resolution.review_due && !force_detect {
         match advise_refresh()? {
             Refresh::Yes => {
-                resolution = nvenc::resolve_and_store(cache_path.as_deref(), true)
+                resolution = nvenc::resolve_and_store(Some(&paths.capability_record), true)
                     .context("NVENC detection failed")?;
             }
             Refresh::No | Refresh::Skip => {
@@ -288,7 +325,7 @@ fn encode_cmd(
     // | .jsonl | .csv.
     let output_path = match &args.output {
         Some(p) => p.clone(),
-        None => rencoder_lib::data::store::default_encoding_path()?,
+        None => rencoder_lib::data::store::default_encoding_path_in(&paths.records_dir)?,
     };
     rencoder_lib::data::store::write_records(&records, &output_path)
         .with_context(|| format!("failed to write {}", output_path.display()))?;
@@ -315,15 +352,14 @@ fn encode_cmd(
 /// `rencoder analyze ...` -- probes each file, groups by rounded fps,
 /// prints summary, optionally writes a detailed file.
 #[instrument(skip_all, fields(dir = ?args.dir, file = ?args.file))]
-fn analyze_cmd(
-    args: args::AnalyzeArgs,
-    cancel: rencoder_lib::pipeline::cancel::CancelToken,
-) -> Result<()> {
-    let app_config = load_app_config(args.config.as_deref())?;
-    let an = app_config.analyze.as_ref();
-
+fn analyze_cmd(args: args::AnalyzeArgs, cancel_slot: &signal::CancelSlot) -> Result<()> {
     let target =
         target_from_analyze_args(&args).with_context(|| "failed to determine target directory")?;
+
+    // The operation directory: where this run acts (design doc §3.6).
+    let op_dir = target.operation_dir();
+    let (app_config, paths, cancel) = prepare(args.config.as_deref(), Some(&op_dir), cancel_slot)?;
+    let an = app_config.analyze.as_ref();
 
     let extensions = an.and_then(|a| a.extensions.clone()).unwrap_or_default();
 
@@ -344,7 +380,7 @@ fn analyze_cmd(
         )
     })?;
 
-    check_capabilities(&target);
+    check_capabilities(&paths);
 
     info!("analyzing {} file(s)", files.len());
 
@@ -523,29 +559,6 @@ fn target_path(target: &Target) -> &Path {
     }
 }
 
-/// Load `AppConfig` from `--config` if given, otherwise resolve via
-/// `path::resolve_config()` (U18 step 5):
-///   1. `$RENENCODER_CONFIG` if set
-///   2. `<app_dir>/rencoder.toml` (binary's parent dir)
-///
-/// Missing file at the resolved path is NOT an error — `AppConfig::load`
-/// auto-creates a default config with mode bits 0o644 (Unix).
-/// Schema validation rejects malformed TOML.
-fn load_app_config(path: Option<&Path>) -> Result<AppConfig> {
-    let resolved = if let Some(p) = path {
-        p.to_path_buf()
-    } else {
-        rencoder_lib::config::path::resolve_config().ok_or_else(|| {
-            anyhow::anyhow!(
-                "could not determine config location: no --config, $RENENCODER_CONFIG \
-                 is unset, and binary directory is unavailable. Pass --config explicitly."
-            )
-        })?
-    };
-    AppConfig::load(&resolved)
-        .with_context(|| format!("failed to load config from {}", resolved.display()))
-}
-
 // ---------------------------------------------------------------------------
 // AppConfig -> Config conversion lives in `rencoder_lib::config`
 // (`Config::from_encode_config`) so the inherent impl stays in the same crate
@@ -618,7 +631,7 @@ mod tests {
         let path = dir.join("rencoder.toml");
         assert!(!path.exists(), "precondition: file must not exist");
 
-        let cfg = load_app_config(Some(&path)).expect("auto-create load");
+        let cfg = AppConfig::load(&path).expect("auto-create load");
         assert!(path.exists(), "auto-create must write the file");
 
         // The auto-generated content has explicit values (bitrate=5000
@@ -640,7 +653,7 @@ mod tests {
         let path = dir.join("rencoder.toml");
         std::fs::write(&path, "[encode]\nformat = \"hevc\"\nmax_fps = 30\n").unwrap();
 
-        let cfg = load_app_config(Some(&path)).expect("load existing");
+        let cfg = AppConfig::load(&path).expect("load existing");
         let enc = cfg.encode.as_ref().expect("encode section");
         assert_eq!(enc.format, Some(FormatArg::Hevc));
         assert_eq!(enc.max_fps, Some(30));

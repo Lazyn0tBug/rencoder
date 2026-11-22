@@ -1,6 +1,6 @@
 //! Public data structures shared across the library.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ===== Target format =====
 
@@ -327,6 +327,25 @@ impl EncodeParams {
 pub enum Target {
     File(PathBuf),
     Dir(PathBuf),
+}
+
+impl Target {
+    /// The directory this target acts on -- the **operation directory**
+    /// (design doc §3.6).
+    ///
+    /// A directory target acts on itself; a file target acts on the
+    /// directory that holds it. This run's state files (the cancel
+    /// request, the capability check report) land here.
+    pub fn operation_dir(&self) -> PathBuf {
+        match self {
+            Target::File(f) => f
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from(".")),
+            Target::Dir(d) => d.clone(),
+        }
+    }
 }
 
 impl Default for Target {

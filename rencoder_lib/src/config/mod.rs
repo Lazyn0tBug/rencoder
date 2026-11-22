@@ -15,11 +15,12 @@
 
 pub mod app;
 pub mod fs_perms;
-pub mod path;
+pub mod paths;
 
 // Re-exports for ergonomics: callers can write `rencoder_lib::config::AppConfig`
 // instead of `rencoder_lib::config::app::AppConfig`.
 pub use app::{
     AnalyzeConfig, AnalyzeFormatArg, AppConfig, EncodeConfig, EncodersConfig, FfmpegArgsConfig,
-    FormatArg,
+    FormatArg, PathsConfig,
 };
+pub use paths::Paths;
