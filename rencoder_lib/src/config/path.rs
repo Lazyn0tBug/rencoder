@@ -23,6 +23,9 @@ use std::path::{Path, PathBuf};
 /// File name of the user-facing config inside `app_dir`.
 const CONFIG_FILE_NAME: &str = "rencoder.toml";
 
+/// File name of the cancel request (its existence means "cancel").
+const CANCEL_FILE_NAME: &str = "cancel";
+
 /// Returns the directory containing the running binary (the "app_dir").
 ///
 /// `std::env::current_exe()` is the canonical source. Returns `None` if the
@@ -33,6 +36,22 @@ pub fn app_dir() -> Option<PathBuf> {
     env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf))
+}
+
+/// Resolves the cancel file's path.
+///
+/// The cancel request is the *existence* of this file (design doc
+/// §3.11.2). It lives in the app directory next to the config, the
+/// logs and the capability record; `$RENENCODER_CANCEL_FILE` overrides
+/// it (the same override the other app-dir paths have, so a test can
+/// point it at a scratch directory).
+pub fn resolve_cancel_file() -> Option<PathBuf> {
+    if let Some(raw) = env::var_os("RENENCODER_CANCEL_FILE") {
+        if !raw.is_empty() {
+            return Some(PathBuf::from(raw));
+        }
+    }
+    app_dir().map(|d| d.join(CANCEL_FILE_NAME))
 }
 
 /// Resolves the config file path.

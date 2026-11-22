@@ -31,13 +31,25 @@ use std::path::{Path, PathBuf};
 use tracing::{info, instrument, warn};
 
 fn main() -> Result<()> {
+    // The cancel request is a file in the app directory (design doc
+    // §3.11.2): the signal handler writes it, the batch polls for it,
+    // and anyone who can write that file can stop a running batch.
+    let cancel_file = rencoder_lib::config::path::resolve_cancel_file();
+    // A leftover cancel file would cancel this run as well.
+    if let Some(path) = &cancel_file {
+        let _ = std::fs::remove_file(path);
+    }
+    let cancel = match &cancel_file {
+        Some(path) => rencoder_lib::pipeline::cancel::CancelToken::watching(path.clone()),
+        None => rencoder_lib::pipeline::cancel::CancelToken::new(),
+    };
+
     // The cancel token and the signal handler come **first** (design
     // doc §3.11.2): before the handler is installed, a signal takes
     // the default action -- the process dies, the records are lost,
     // the partial output stays. That window must not exist, so the
     // handler is installed before anything else happens.
-    let cancel = rencoder_lib::pipeline::cancel::CancelToken::new();
-    signal::install_handler(&cancel);
+    signal::install_handler(cancel_file.as_deref(), &cancel);
 
     tracing_init::init().context("initialize tracing")?;
     let cli = args::Cli::parse();
