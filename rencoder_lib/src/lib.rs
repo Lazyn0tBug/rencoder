@@ -12,6 +12,7 @@ pub mod config;
 pub mod data;
 pub mod encoder;
 pub mod error;
+pub mod guard;
 pub mod job;
 pub mod pipeline;
 pub mod test_support;

@@ -609,6 +609,12 @@ pub fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>) {
                             );
                             return;
                         }
+                        Err(CollectError::TargetBusy(message)) => {
+                            // Another instance works on this
+                            // directory (design doc §3.11.1.1).
+                            push_toast(state, message, ToastKind::Error);
+                            return;
+                        }
                     };
                     if files.is_empty() {
                         let dir = state.tasks.active.as_ref().unwrap().dir.display();
@@ -1082,6 +1088,10 @@ enum CollectError {
     /// extensions or split the directory — surfaced as a toast
     /// with the count + max so they know by how much they overshot.
     BatchTooLarge { count: usize, max: u32 },
+    /// Another instance holds this directory (or an ancestor of it) —
+    /// design doc §3.11.1.1. Reading a directory that is being
+    /// written gives unreliable numbers, so the run is refused.
+    TargetBusy(String),
 }
 
 /// Collect input files from `state.input_dir`, filtered by the
@@ -1112,6 +1122,12 @@ fn collect_input_files(
     // StartBatch will actually process, AND the batch cap is enforced
     // uniformly at the same site as the lib.
     let max_batch_size = rencoder_lib::config::app::resolve_max_batch_size(config.encode.as_ref());
+    // The single-instance guard's cheap probe (design doc §3.11.1.1):
+    // another instance working on this directory (or an ancestor of
+    // it) means the numbers we are about to read are unreliable.
+    if let Err(e) = rencoder_lib::guard::probe(dir) {
+        return Err(CollectError::TargetBusy(e.to_string()));
+    }
     let target = rencoder_lib::types::Target::Dir(dir.clone());
     rencoder_lib::collect::collect_files(&target, &extensions, max_batch_size).map_err(
         |e| match e {
@@ -1206,6 +1222,13 @@ fn dispatch_dry_run_for_new_task(
                 ),
                 ToastKind::Error,
             );
+            return;
+        }
+        Err(CollectError::TargetBusy(message)) => {
+            // Another instance works on this directory (design doc
+            // §3.11.1.1): reading it now would give unreliable
+            // numbers.
+            push_toast(state, message, ToastKind::Error);
             return;
         }
     };

@@ -49,7 +49,11 @@ pub const CANCEL_FILE_NAME: &str = "cancel";
 /// 应用自己写进操作目录的文件名——输入采集器按名字跳过它们。
 ///
 /// 它们是这一趟的状态，不是用户的视频：被当成输入去转码就是错的。
-pub const APP_OWNED_FILE_NAMES: [&str; 2] = [CANCEL_FILE_NAME, "capabilities.json"];
+pub const APP_OWNED_FILE_NAMES: [&str; 3] = [
+    CANCEL_FILE_NAME,
+    "capabilities.json",
+    crate::guard::OWNER_FILE_NAME,
+];
 
 /// 一次运行用到的全部路径。
 ///

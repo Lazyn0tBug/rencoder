@@ -199,6 +199,13 @@ fn encode_cmd(
 
     // The operation directory: where this run acts (design doc §3.6).
     let op_dir = target.operation_dir();
+    // The single-instance guard (design doc §3.11.1.1): one instance
+    // per target tree. It is taken right after the target is known --
+    // before the config, the collection, the encoding -- so a conflict
+    // shows up before this run has done anything.
+    let _guard = rencoder_lib::guard::TargetGuard::acquire(&op_dir)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("cannot take the target")?;
     let (app_config, paths, cancel) = prepare(args.config.as_deref(), Some(&op_dir), cancel_slot)?;
 
     let enc = app_config.encode.as_ref();
@@ -377,6 +384,13 @@ fn analyze_cmd(args: args::AnalyzeArgs, cancel_slot: &signal::CancelSlot) -> Res
 
     // The operation directory: where this run acts (design doc §3.6).
     let op_dir = target.operation_dir();
+    // The single-instance guard's cheap probe (design doc §3.11.1.1):
+    // an analyze run writes nothing, so it does not hold the target --
+    // but reading a directory another instance is writing gives
+    // unreliable numbers, so it refuses instead.
+    rencoder_lib::guard::probe(&op_dir)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("cannot analyze this directory")?;
     let (app_config, paths, cancel) = prepare(args.config.as_deref(), Some(&op_dir), cancel_slot)?;
     let an = app_config.analyze.as_ref();
 

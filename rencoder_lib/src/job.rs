@@ -1069,6 +1069,33 @@ fn spawn_task_batch<P, F>(
                 done_tx,
                 updates: Some(rx),
             };
+            // The single-instance guard (design doc §3.11.1.1): the
+            // batch holds its target for as long as it runs. The take
+            // happens **here**, in the worker: the descendant scan is a
+            // tree walk, and the actor must not block on it.
+            let scope = crate::guard::common_ancestor(
+                &tasks
+                    .iter()
+                    .map(|task| task.input.as_path().to_path_buf())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or_else(|| batch_path.clone());
+            let _target_guard = match crate::guard::TargetGuard::acquire(&scope) {
+                Ok(guard) => guard,
+                Err(e) => {
+                    // The batch cannot start: another instance holds
+                    // this target (or a directory inside it).
+                    send_evt_lossy(
+                        &evt_tx,
+                        Event::Error {
+                            category: ErrorCategory::ConfigError,
+                            message: e.to_string(),
+                        },
+                        &dropped_counter,
+                    );
+                    return;
+                }
+            };
             let mut processor = match make_processor(tx) {
                 Ok(processor) => processor,
                 Err((category, message)) => {
@@ -1525,6 +1552,29 @@ fn run_actor(
                 // run-level paths follow it.
                 let batch_paths =
                     paths.with_op_dir(&crate::pipeline::batch::batch_target_path_for_files(&files));
+                // The single-instance guard's cheap probe (design doc
+                // §3.11.1.1): the ancestors and the target itself. A
+                // conflict is a **benign rejection** -- the running
+                // batch is untouched, and this one never starts.
+                // (The full take -- including the descendant scan --
+                // happens in the worker, off the actor thread.)
+                let batch_scope = crate::guard::common_ancestor(
+                    &files
+                        .iter()
+                        .map(|file| file.as_path().to_path_buf())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap_or_else(|| batch_paths.op_dir.clone());
+                if let Err(e) = crate::guard::probe(&batch_scope) {
+                    send_evt_lossy(
+                        &evt_tx,
+                        Event::CommandRejected {
+                            reason: e.to_string(),
+                        },
+                        &dropped_counter,
+                    );
+                    continue;
+                }
                 // A leftover request would cancel this batch as well.
                 let _ = std::fs::remove_file(&batch_paths.cancel_file);
                 cancel_token = CancelToken::watching(batch_paths.cancel_file.clone());
@@ -1996,6 +2046,19 @@ mod mock_tests {
         crate::types::InputPath::new(std::path::Path::new(p)).expect("test fixture")
     }
 
+    /// A real directory with `count` fake video files in it.
+    ///
+    /// The actor touches the filesystem: the single-instance guard
+    /// takes the batch's target directory (design doc §3.11.1.1), so
+    /// the batch's files must live in a directory that exists.
+    fn batch_files(label: &str, count: usize) -> Vec<crate::types::InputPath> {
+        let dir = unique_tmp(label);
+        std::fs::create_dir_all(&dir).expect("the batch dir must exist");
+        (0..count)
+            .map(|i| input(&dir.join(format!("f{i}.mp4")).to_string_lossy()))
+            .collect()
+    }
+
     /// Run a mock actor with a mock encoder.
     ///
     /// `mock_fn` is called once per file and returns the EncodingRecord
@@ -2260,10 +2323,86 @@ mod mock_tests {
     }
 
     #[test]
+    fn a_busy_target_is_a_benign_rejection() {
+        // Another instance holds the target (design doc §3.11.1.1):
+        // the command is **rejected**, not an error -- the running
+        // batch is untouched, and this one never starts.
+        let files = batch_files("busy_target", 1);
+        let target = files[0]
+            .as_path()
+            .parent()
+            .expect("the file has a parent")
+            .to_path_buf();
+        // Take the target the way another instance would.
+        let _held = crate::guard::TargetGuard::acquire(&target).expect("the target is free");
+
+        let (cmd_tx, evt_rx) = run_test_controller(make_succeeding_mock().0, None);
+        cmd_tx
+            .send(Command::StartBatch {
+                params: EncodeParams::default(),
+                files,
+            })
+            .unwrap();
+        drop(cmd_tx);
+
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::CommandRejected { .. })),
+            "the busy target must be a rejection, got {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Error { .. })),
+            "a rejected command is not a fatal error: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_busy_descendant_stops_the_batch() {
+        // A directory **inside** the batch's scope is held by another
+        // instance (design doc §3.11.1.1): the batch cannot start --
+        // it would collect that directory's files and write the same
+        // outputs.
+        let root = unique_tmp("busy_descendant");
+        let held_dir = root.join("held");
+        let other_dir = root.join("other");
+        std::fs::create_dir_all(&held_dir).unwrap();
+        std::fs::create_dir_all(&other_dir).unwrap();
+        // Another instance holds one of the two directories.
+        let _held = crate::guard::TargetGuard::acquire(&held_dir).expect("the target is free");
+        // This batch works on both -- its scope is their common parent.
+        let files = vec![
+            input(&held_dir.join("a.mp4").to_string_lossy()),
+            input(&other_dir.join("b.mp4").to_string_lossy()),
+        ];
+
+        let (cmd_tx, evt_rx) = run_test_controller(make_succeeding_mock().0, None);
+        cmd_tx
+            .send(Command::StartBatch {
+                params: EncodeParams::default(),
+                files,
+            })
+            .unwrap();
+        drop(cmd_tx);
+
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
+        assert!(
+            events.iter().any(|e| matches!(e, Event::Error { .. })),
+            "the batch must not start: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::BatchCompleted { .. })),
+            "no batch may run on a busy scope: {events:?}"
+        );
+    }
+
+    #[test]
     fn start_batch_emits_expected_event_sequence() {
         let (cmd_tx, evt_rx) = run_test_controller(make_succeeding_mock().0, None);
-        let files: Vec<crate::types::InputPath> =
-            (0..3).map(|i| input(&format!("/in/{i}.mp4"))).collect();
+        let files = batch_files("event_sequence", 3);
         cmd_tx
             .send(Command::StartBatch {
                 params: EncodeParams::default(),
@@ -2324,8 +2463,7 @@ mod mock_tests {
     #[test]
     fn start_batch_emits_progress_events_during_encode() {
         let (cmd_tx, evt_rx) = run_test_controller(make_progress_mock(), None);
-        let files: Vec<crate::types::InputPath> =
-            (0..2).map(|i| input(&format!("/p/{i}.mp4"))).collect();
+        let files = batch_files("progress", 2);
         cmd_tx
             .send(Command::StartBatch {
                 params: EncodeParams::default(),
@@ -2363,7 +2501,7 @@ mod mock_tests {
             },
             None,
         );
-        let files: Vec<crate::types::InputPath> = vec![input("/a.mp4")];
+        let files = batch_files("second_batch", 1);
         cmd_tx
             .send(Command::StartBatch {
                 params: EncodeParams::default(),
@@ -2409,8 +2547,7 @@ mod mock_tests {
             },
             None,
         );
-        let files: Vec<crate::types::InputPath> =
-            (0..20).map(|i| input(&format!("/x/{i}.mp4"))).collect();
+        let files: Vec<crate::types::InputPath> = batch_files("cancel_running", 20);
         cmd_tx
             .send(Command::StartBatch {
                 params: EncodeParams::default(),
@@ -2460,8 +2597,7 @@ mod mock_tests {
             },
             None,
         );
-        let files: Vec<crate::types::InputPath> =
-            (0..5).map(|i| input(&format!("/c/{i}.mp4"))).collect();
+        let files: Vec<crate::types::InputPath> = batch_files("cancel_mid", 5);
         cmd_tx
             .send(Command::StartBatch {
                 params: EncodeParams::default(),
@@ -2569,7 +2705,7 @@ mod mock_tests {
         cmd_tx
             .send(Command::StartBatch {
                 params: EncodeParams::default(),
-                files: vec![input("/in/a.mp4")],
+                files: batch_files("history", 1),
             })
             .unwrap();
         drop(cmd_tx);
@@ -2936,7 +3072,7 @@ mod mock_tests {
             },
             None,
         );
-        let files = vec![input("/err.mp4")];
+        let files = batch_files("encode_error", 1);
         cmd_tx
             .send(Command::StartBatch {
                 params: EncodeParams::default(),
