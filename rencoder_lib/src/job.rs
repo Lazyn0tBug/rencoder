@@ -31,15 +31,15 @@ use chrono::{DateTime, Utc};
 
 use crate::analyzer::records::{analyze_records_with_probe_and_progress_parallel, AnalyzeProgress};
 use crate::config::app::AppConfig;
-use crate::config::path::resolve_config;
+use crate::config::paths::{self, Paths};
 use crate::data::extract::probe_video_metadata_auto;
-use crate::encoder::nvenc::CapabilityVerdicts;
+use crate::encoder::nvenc::{Capability, CapabilityVerdicts};
 use crate::error::EncodeError;
 use crate::pipeline::batch::{FfmpegFileEncoder, FfmpegProgress, FileEncoder};
 use crate::pipeline::cancel::CancelToken;
 use crate::pipeline::context::BatchContext;
 use crate::pipeline::task::TaskManager;
-use crate::types::{EncodeParams, EncoderCache, ErrorCategory, TranscodeTask};
+use crate::types::{EncodeParams, EncodeTask, EncoderCache, ErrorCategory};
 
 // Re-export for UI consumers — `Event::FileCompleted` and
 // `Event::BatchCompleted` carry `EncodingRecord`, so consumers
@@ -52,6 +52,35 @@ pub use crate::types::EncodingRecord;
 /// §3.8.3 — `id: u64` is enough for any realistic session length.
 pub type BatchId = u64;
 
+/// Identifier for one command request.
+///
+/// The **submitter** allocates it (monotonic per session) and the lib
+/// echoes it on acceptance and on rejection (design doc §3.11.3):
+/// "which of my requests was this?" must have one answer, and the
+/// answer cannot be "the last one" -- two commands can be in flight.
+pub type RequestId = u64;
+
+/// A command plus the id of the request that carries it.
+///
+/// The channel carries `Request`, not `Command`: every command gets an
+/// id, so the lib can answer "accepted" / "rejected" about a
+/// *specific* request, and the UI can put its own state back the way
+/// it was when a request is refused (design doc §3.11.3).
+#[derive(Debug)]
+pub struct Request {
+    /// The submitter's id for this request.
+    pub id: RequestId,
+    /// What the request asks for.
+    pub command: Command,
+}
+
+impl Request {
+    /// A request with the given id.
+    pub fn new(id: RequestId, command: Command) -> Self {
+        Self { id, command }
+    }
+}
+
 // =====================================================================
 // Command (UI → lib) — §3.8.3
 // =====================================================================
@@ -59,6 +88,7 @@ pub type BatchId = u64;
 /// Messages from the UI to the lib actor. Both enums are
 /// `#[non_exhaustive]` so future variants don't break exhaustive
 /// matches in consumer code (see design.md §8 items 33, 36).
+#[derive(Debug)]
 #[non_exhaustive]
 pub enum Command {
     /// Start a new encode batch. The lib actor will run the same
@@ -79,17 +109,23 @@ pub enum Command {
         params: EncodeParams,
         files: Vec<crate::types::InputPath>,
     },
-    /// Abort the current batch (including any in-flight single file).
-    /// Equivalent to SIGINT but triggered by the UI button. The
+    /// Abort the batch `batch_id` (including any in-flight single
+    /// file). Equivalent to SIGINT but triggered by the UI button. The
     /// `CancelToken` shared with the SIGINT handler means both paths
     /// cancel the same way.
     ///
+    /// **The batch id is not optional** (design doc §3.11.3): a cancel
+    /// that names a batch which is not the active one is rejected. A
+    /// stale cancel -- the user cancelled, then started a new batch
+    /// before the old cancel was processed -- must not stop the new
+    /// batch.
+    ///
     /// Per §3.8.3 item 31: no "skip current file only" variant.
     /// User either lets the file finish or aborts the whole batch.
-    Cancel,
+    Cancel { batch_id: BatchId },
     /// Read history records from `<app_dir>/data/encoding-*.parquet`.
     /// Controller resolves the data dir internally via
-    /// `config::path::resolve_data_dir()` (§8 item 39); the payload
+    /// the app's records directory (design doc §3.6); the payload
     /// is the filter.
     LoadHistory {
         /// `None` = all records; `Some(N)` = most recent N.
@@ -112,7 +148,16 @@ pub enum Command {
     /// failure. A change to `[encode].nv` also refreshes the encoder
     /// cache, so the switch takes effect for the next batch instead
     /// of the next application start.
-    SaveConfig { config: Box<AppConfig> },
+    ///
+    /// `revision` is the submitter's revision of the edit this save
+    /// carries. The lib treats it as an opaque number and hands it
+    /// back in the receipt: the UI needs it to know **which** of its
+    /// edits are on disk now (design doc §3.10.5 -- the receipt
+    /// clears only the edits it saved, later edits stay).
+    SaveConfig {
+        config: Box<AppConfig>,
+        revision: u64,
+    },
     /// Detect this machine's NVENC capability and report it back.
     ///
     /// Same logic as the CLI's `rencoder detect`: the result is stored
@@ -122,6 +167,14 @@ pub enum Command {
     /// * `force = true` -- always probe (the "重新检测" button).
     /// * `force = false` -- reuse the stored record when it is fresh.
     Detect { force: bool },
+    /// The GUI's working directory changed.
+    ///
+    /// The operation directory moves with it (design doc §3.6): the
+    /// run-level paths follow. The capability check runs again -- the
+    /// directory changed, the machine did not (design doc §3.10.7), so
+    /// the machine's facts are reused and only the filesystem is
+    /// checked anew. The report lands in the new operation directory.
+    SetWorkingDir { dir: PathBuf },
     /// Start a parallel analyze batch (U22 / Tier 3 #9).
     ///
     /// The lib actor probes each file (c-probe if enabled, ffprobe
@@ -164,6 +217,34 @@ pub enum Command {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Event {
+    // ---- Request topic (the answer to a command) ----
+    /// The lib accepted a request (design doc §3.11.3).
+    ///
+    /// `request_id` is the id the submitter gave the request;
+    /// `batch_id` is the batch the request starts (`None` for the
+    /// commands that start no batch: history, config, detect).
+    ///
+    /// The UI enters its `Starting` phase on this event -- not when
+    /// it enqueued the command. Enqueuing only says "the command is
+    /// on its way"; acceptance says "the lib took it".
+    CommandAccepted {
+        request_id: RequestId,
+        batch_id: Option<BatchId>,
+    },
+    /// A command was rejected; nothing fatal happened.
+    ///
+    /// The busy gate answers this way when a batch is already running:
+    /// the command is dropped and the running batch continues. It used
+    /// to answer with [`Event::Error`], which is fatal-only -- the UI
+    /// read that as "the batch failed" and finalized it.
+    ///
+    /// `request_id` says **which** request was refused, so the UI can
+    /// put its own state back the way it was (design doc §3.11.3).
+    CommandRejected {
+        request_id: RequestId,
+        reason: String,
+    },
+
     // ---- Lifecycle topic (low frequency) ----
     /// A batch has started. `id` is unique within the controller's
     /// lifetime. `total_files` is the count after collection.
@@ -172,6 +253,7 @@ pub enum Event {
     /// path; the output path is computed by the lib and surfaced via
     /// `FileCompleted`.
     FileStarted {
+        batch_id: BatchId,
         index: usize,
         total: usize,
         source: crate::types::InputPath,
@@ -179,28 +261,57 @@ pub enum Event {
     /// A single file finished encoding. The full record (including
     /// outcome, dimensions, sizes) is included for UI display.
     FileCompleted {
+        batch_id: BatchId,
         index: usize,
         record: EncodingRecord,
     },
     /// All files in the batch finished. The records vec mirrors
     /// what `transcode_batch` would have written to Parquet.
-    BatchCompleted { records: Vec<EncodingRecord> },
+    BatchCompleted {
+        batch_id: BatchId,
+        records: Vec<EncodingRecord>,
+    },
     /// Dry-run finished — `records` contains the planned outcomes
     /// (Succeeded for the files that would be encoded, Failed for the
     /// ones the prepare step could not handle) WITHOUT invoking
     /// ffmpeg. UI uses this to show the user what WOULD happen before
     /// commit.
-    DryRunFinished { records: Vec<EncodingRecord> },
+    DryRunFinished {
+        batch_id: BatchId,
+        /// The capability generation the dry run froze (design doc
+        /// §3.10.5): the plan is only valid for the generation it
+        /// was planned under, so the UI compares it with the current
+        /// one before reusing the plan.
+        generation: u64,
+        records: Vec<EncodingRecord>,
+    },
     /// The batch was cancelled (by `Command::Cancel` or SIGINT).
     /// `completed` is how many files finished before the cancel
-    /// landed. Per §3.8.3 item 31: no partial-output cleanup is
-    /// needed beyond the existing `PartialOutputHandle` mechanism.
-    BatchCancelled { completed: usize, total: usize },
+    /// landed. The partial output of the cancelled file was removed by
+    /// the lib's execution path (design doc §3.11.2).
+    BatchCancelled {
+        batch_id: BatchId,
+        completed: usize,
+        total: usize,
+    },
+    /// The batch could not run: the single-instance guard refused the
+    /// target, the encoder cache was unusable, ...
+    ///
+    /// A **batch-scoped** failure: it finalizes *this* batch and
+    /// nothing else. The UI matches the batch id -- a failure of an
+    /// old batch must not finalize the batch the user is watching
+    /// now (design doc §3.11.3).
+    BatchFailed {
+        batch_id: BatchId,
+        category: ErrorCategory,
+        message: String,
+    },
 
     // ---- Progress topic (~2 events/sec per active file) ----
     /// Per-file progress snapshot from `run_ffmpeg_with_progress`.
     /// UI reducer updates its `progress` map by `file_index`.
     Progress {
+        batch_id: BatchId,
         file_index: usize,
         frame: u64,
         fps: f64,
@@ -217,7 +328,11 @@ pub enum Event {
     /// Single stderr line from ffmpeg. The lib passes lines through
     /// unfiltered (§3.8.6 log filtering); the UI reducer caps the
     /// ring buffer at 1000 entries (§8 item 30).
-    LogLine { file_index: usize, line: String },
+    LogLine {
+        batch_id: BatchId,
+        file_index: usize,
+        line: String,
+    },
 
     // ---- State topic ----
     /// Result of a `Command::LoadHistory`. `records` is the filtered
@@ -228,12 +343,23 @@ pub enum Event {
     /// Result of a `Command::SaveConfig` — the config was written
     /// to disk. The path is included so the UI can show feedback
     /// like "saved to /path/to/rencoder.toml".
-    ConfigSaved { path: PathBuf },
+    ///
+    /// `revision` is the revision the save carried (design doc
+    /// §3.10.5): the UI clears the edits at or below it, and keeps
+    /// the ones the user made while the save was in flight.
+    ConfigSaved { path: PathBuf, revision: u64 },
 
     /// The NVENC capability of this machine (after a `Command::Detect`
     /// or the startup resolve). The UI shows it next to the NVENC
     /// switch: which hardware encoders run here, and why not.
-    NvencCapability(crate::types::NvencCapability),
+    NvencCapability(crate::encoder::nvenc::Capability),
+
+    /// The run capability report is written; here is its path.
+    ///
+    /// The frontends **read the file** (design doc §3.10.7): one
+    /// check, one result, several readers -- nobody recomputes it.
+    /// The event only says "it is ready"; the content is the file's.
+    CapabilityChecked { report: PathBuf },
 
     // ---- Analyze topic (U22 / Tier 3 #9) ----
     // See docs/design.md §3.4 "分析进度上报" for the full protocol
@@ -257,7 +383,7 @@ pub enum Event {
     //   (`par_iter().collect()` preserves it).
     /// `Command::Analyze` accepted; analysis about to start.
     /// `total` is the count of files (== `Command::Analyze.files.len()`).
-    AnalyzeStarted { total: usize },
+    AnalyzeStarted { batch_id: BatchId, total: usize },
     /// Emitted once per file completion (rayon workers may fire
     /// non-deterministically). `done` is the cumulative count of
     /// files probed (including failures); `total` is constant; the
@@ -266,6 +392,7 @@ pub enum Event {
     /// `last` is `Some(file)` for the file that just completed —
     /// operator reads it as "just completed" indicator.
     AnalyzeProgress {
+        batch_id: BatchId,
         done: usize,
         total: usize,
         failed: usize,
@@ -275,25 +402,29 @@ pub enum Event {
     /// r.fps.is_none()).count()` (invariants — UI can cross-check).
     /// `records` is in input order (rayon `par_iter().collect()`).
     AnalyzeFinished {
+        batch_id: BatchId,
         records: Vec<crate::analyzer::records::AnalysisRecord>,
         failed_count: usize,
     },
 
-    // ---- Rejection topic (benign) ----
-    /// A command was rejected; nothing fatal happened.
-    ///
-    /// The busy gate answers this way when a batch is already running:
-    /// the command is dropped and the running batch continues. It used
-    /// to answer with [`Event::Error`], which is fatal-only -- the UI
-    /// read that as "the batch failed" and finalized it.
-    CommandRejected { reason: String },
-
     // ---- Error topic (fatal only) ----
-    /// Fatal-only error. Per §3.8.3 item 26 + §8 item 36:
-    /// per-file failures travel through `EncodingRecord.error` /
-    /// `FileCompleted`, NOT through this variant. This variant is
-    /// for batch-level failures (probe failed at startup, encoder
-    /// cache corrupt, disk full mid-batch, etc.).
+    /// A **non-batch** operation failed (config save, NVENC
+    /// detection, ...). The request id says which operation it was.
+    ///
+    /// It finalizes nothing: a failed config save must not finalize
+    /// the batch the user is watching (design doc §3.11.3).
+    OperationFailed {
+        request_id: RequestId,
+        category: ErrorCategory,
+        message: String,
+    },
+    /// Fatal-only error, with **no scope**: the actor itself could
+    /// not do its job (the encoder cache never came up). No batch is
+    /// running when this fires, so there is nothing to finalize.
+    ///
+    /// Per-file failures travel through `EncodingRecord.error` /
+    /// `FileCompleted` (design doc §3.11.3); a batch-level failure
+    /// travels through `BatchFailed`, scoped to its batch.
     ///
     /// Payload is intentionally lean (no `ffmpeg_stderr_tail`) —
     /// see design.md §3.8.3 doc comment on `Event::Error`. UI
@@ -340,61 +471,176 @@ mod tests {
     }
 
     #[test]
-    fn command_construction_is_constructible() {
-        // Sanity: the variants the design promises are reachable.
-        let _ = Command::StartBatch {
-            params: EncodeParams::default(),
-            files: vec![crate::types::InputPath::new(std::path::Path::new("/a.mp4")).unwrap()],
-        };
-        let _ = Command::Cancel;
-        let _ = Command::LoadHistory {
-            limit: Some(10),
-            after: None,
-        };
+    fn every_command_variant_is_constructible() {
+        // The protocol's shape, pinned.
+        //
+        // The match is **exhaustive on purpose**: a new variant
+        // breaks the build until it is constructed here -- so nobody
+        // adds a command without its shape being looked at.
+        let commands = vec![
+            Command::StartBatch {
+                params: EncodeParams::default(),
+                files: vec![crate::types::InputPath::new(std::path::Path::new("/a.mp4")).unwrap()],
+            },
+            Command::DryRun {
+                params: EncodeParams::default(),
+                files: vec![crate::types::InputPath::new(std::path::Path::new("/a.mp4")).unwrap()],
+            },
+            Command::Cancel { batch_id: 1 },
+            Command::LoadHistory {
+                limit: Some(10),
+                after: None,
+            },
+            Command::SaveConfig {
+                config: Box::new(AppConfig::default()),
+                revision: 1,
+            },
+            Command::Detect { force: true },
+            Command::SetWorkingDir {
+                dir: std::path::PathBuf::from("/tmp"),
+            },
+            Command::Analyze {
+                files: vec![crate::types::InputPath::new(std::path::Path::new("/a.mp4")).unwrap()],
+            },
+        ];
+        for command in commands {
+            match command {
+                Command::StartBatch { .. }
+                | Command::DryRun { .. }
+                | Command::Cancel { .. }
+                | Command::LoadHistory { .. }
+                | Command::SaveConfig { .. }
+                | Command::Detect { .. }
+                | Command::SetWorkingDir { .. }
+                | Command::Analyze { .. } => {}
+            }
+        }
     }
 
     #[test]
-    fn event_construction_is_constructible() {
+    fn every_event_variant_is_constructible() {
+        // The protocol's shape, pinned -- exhaustive on purpose, see
+        // [`every_command_variant_is_constructible`].
         let rec = sample_record();
-        let _ = Event::BatchStarted {
-            id: 1,
-            total_files: 5,
-        };
-        let _ = Event::FileStarted {
-            index: 0,
-            total: 5,
-            source: crate::types::InputPath::new(std::path::Path::new("/a.mp4")).unwrap(),
-        };
-        let _ = Event::FileCompleted {
-            index: 0,
-            record: rec,
-        };
-        let _ = Event::BatchCompleted {
-            records: vec![sample_record()],
-        };
-        let _ = Event::BatchCancelled {
-            completed: 2,
-            total: 5,
-        };
-        let _ = Event::Progress {
-            file_index: 0,
-            frame: 100,
-            fps: 30.0,
-            speed: 1.5,
-            time_secs: 5.0,
-            eta_secs: Some(40.0),
-        };
-        let _ = Event::LogLine {
-            file_index: 0,
-            line: "frame= 100".into(),
-        };
-        let _ = Event::HistoryLoaded {
-            records: vec![sample_record()],
-        };
-        let _ = Event::Error {
-            category: ErrorCategory::FfmpegSpawnFailed,
-            message: "ffmpeg not found".into(),
-        };
+        let source = crate::types::InputPath::new(std::path::Path::new("/a.mp4")).unwrap();
+        let events = vec![
+            Event::CommandAccepted {
+                request_id: 1,
+                batch_id: Some(1),
+            },
+            Event::CommandRejected {
+                request_id: 1,
+                reason: "another batch is already running".into(),
+            },
+            Event::BatchStarted {
+                id: 1,
+                total_files: 5,
+            },
+            Event::FileStarted {
+                batch_id: 1,
+                index: 0,
+                total: 5,
+                source: source.clone(),
+            },
+            Event::FileCompleted {
+                batch_id: 1,
+                index: 0,
+                record: rec.clone(),
+            },
+            Event::BatchCompleted {
+                batch_id: 1,
+                records: vec![rec.clone()],
+            },
+            Event::DryRunFinished {
+                batch_id: 1,
+                generation: 1,
+                records: vec![rec.clone()],
+            },
+            Event::BatchCancelled {
+                batch_id: 1,
+                completed: 2,
+                total: 5,
+            },
+            Event::BatchFailed {
+                batch_id: 1,
+                category: ErrorCategory::ConfigError,
+                message: "the target is held".into(),
+            },
+            Event::Progress {
+                batch_id: 1,
+                file_index: 0,
+                frame: 100,
+                fps: 30.0,
+                speed: 1.5,
+                time_secs: 5.0,
+                eta_secs: Some(40.0),
+            },
+            Event::LogLine {
+                batch_id: 1,
+                file_index: 0,
+                line: "frame= 100".into(),
+            },
+            Event::HistoryLoaded {
+                records: vec![rec.clone()],
+            },
+            Event::ConfigSaved {
+                path: std::path::PathBuf::from("/tmp/rencoder.toml"),
+                revision: 1,
+            },
+            Event::NvencCapability(Capability::default()),
+            Event::CapabilityChecked {
+                report: std::path::PathBuf::from("/tmp/capabilities.json"),
+            },
+            Event::AnalyzeStarted {
+                batch_id: 1,
+                total: 3,
+            },
+            Event::AnalyzeProgress {
+                batch_id: 1,
+                done: 1,
+                total: 3,
+                failed: 0,
+                last: None,
+            },
+            Event::AnalyzeFinished {
+                batch_id: 1,
+                records: vec![],
+                failed_count: 0,
+            },
+            Event::OperationFailed {
+                request_id: 1,
+                category: ErrorCategory::ConfigError,
+                message: "save failed".into(),
+            },
+            Event::Error {
+                category: ErrorCategory::FfmpegSpawnFailed,
+                message: "ffmpeg not found".into(),
+            },
+        ];
+        for event in events {
+            match event {
+                Event::CommandAccepted { .. }
+                | Event::CommandRejected { .. }
+                | Event::BatchStarted { .. }
+                | Event::FileStarted { .. }
+                | Event::FileCompleted { .. }
+                | Event::BatchCompleted { .. }
+                | Event::DryRunFinished { .. }
+                | Event::BatchCancelled { .. }
+                | Event::BatchFailed { .. }
+                | Event::Progress { .. }
+                | Event::LogLine { .. }
+                | Event::HistoryLoaded { .. }
+                | Event::ConfigSaved { .. }
+                | Event::NvencCapability(_)
+                | Event::CapabilityChecked { .. }
+                | Event::AnalyzeStarted { .. }
+                | Event::AnalyzeProgress { .. }
+                | Event::AnalyzeFinished { .. }
+                | Event::OperationFailed { .. }
+                | Event::Error { .. } => {}
+            }
+        }
     }
 
     // ---- send_evt_lossy / bounded channel policy (review #111) ----
@@ -402,6 +648,7 @@ mod tests {
     /// Helper: build a synthetic Event::Progress for tests.
     fn progress_event(i: usize) -> Event {
         Event::Progress {
+            batch_id: 1,
             file_index: i,
             frame: i as u64 * 100,
             fps: 30.0,
@@ -430,6 +677,7 @@ mod tests {
     fn is_droppable_classification_covers_progress_and_analyze_progress() {
         assert!(is_droppable_event(&progress_event(0)));
         assert!(is_droppable_event(&Event::AnalyzeProgress {
+            batch_id: 1,
             done: 1,
             total: 10,
             failed: 0,
@@ -441,6 +689,7 @@ mod tests {
             total_files: 10,
         }));
         assert!(!is_droppable_event(&Event::BatchCompleted {
+            batch_id: 1,
             records: vec![],
         }));
         assert!(!is_droppable_event(&Event::Error {
@@ -473,24 +722,17 @@ mod tests {
         // structural path uses `send` (blocking) and that the
         // Disconnected branch handles it.
         drop(rx);
-        send_evt_lossy(&tx, Event::BatchCompleted { records: vec![] }, &counter);
+        send_evt_lossy(
+            &tx,
+            Event::BatchCompleted {
+                batch_id: 1,
+                records: vec![],
+            },
+            &counter,
+        );
         // Droppable counter must NOT have ticked (structural events
         // never increment).
         assert_eq!(counter.0.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn send_cmd_lossy_drops_on_full() {
-        // cmd_tx capacity is 16 by convention; verify the helper
-        // drops on Full and accepts under-cap.
-        let (tx, _rx) = crossbeam_channel::bounded::<Command>(2);
-        send_cmd_lossy(&tx, Command::Cancel);
-        send_cmd_lossy(&tx, Command::Cancel);
-        // Third send should drop (capacity 2).
-        send_cmd_lossy(&tx, Command::Cancel);
-        // Receiver was held, so no Disconnected path exercised here.
-        // (The full assertion is just that the function returned
-        // without panicking on the third send.)
     }
 }
 
@@ -514,9 +756,9 @@ mod tests {
 ///   for `Command::StartBatch` instead of using defaults. Cheap to
 ///   clone (`Arc<AppConfig>`).
 /// - `config_path`: the path the AppConfig was loaded from
-///   (`resolve_config()` result; UI uses this to save back).
+///   (`config::paths::config_file()` result; UI uses this to save back).
 pub struct ControllerHandle {
-    pub(crate) cmd_tx: Sender<Command>,
+    pub(crate) cmd_tx: Sender<Request>,
     pub(crate) evt_rx: Receiver<Event>,
     pub(crate) config: Arc<AppConfig>,
     pub(crate) config_path: PathBuf,
@@ -603,23 +845,10 @@ fn send_evt_lossy(tx: &Sender<Event>, event: Event, dropped: &DropCounter) {
     }
 }
 
-/// Send a `Command` to the lib actor without blocking the caller.
-/// UI commands are human-paced; if the channel is full the command
-/// is dropped (review #111). The lib already handles duplicate
-/// `StartBatch` via the busy-gate.
-fn send_cmd_lossy(tx: &Sender<Command>, cmd: Command) {
-    if let Err(crossbeam_channel::TrySendError::Full(cmd)) = tx.try_send(cmd) {
-        tracing::warn!(
-            cmd_variant = ?std::mem::discriminant(&cmd),
-            "cmd_tx full; dropping command"
-        );
-    }
-}
-
 impl ControllerHandle {
-    /// Get a cloneable sender for sending commands. The UI typically
+    /// Get a cloneable sender for sending requests. The UI typically
     /// clones this once per component that needs to dispatch.
-    pub fn command_sender(&self) -> Sender<Command> {
+    pub fn command_sender(&self) -> Sender<Request> {
         self.cmd_tx.clone()
     }
 
@@ -643,22 +872,27 @@ impl ControllerHandle {
     /// After this is called the handle is in a partial state; the UI
     /// typically destructures (`let ControllerHandle { evt_rx, .. } = handle`)
     /// rather than calling this method.
-    pub fn into_split(self) -> (Sender<Command>, Receiver<Event>) {
+    pub fn into_split(self) -> (Sender<Request>, Receiver<Event>) {
         (self.cmd_tx, self.evt_rx)
     }
 
-    /// Non-blocking command send (review #111). `cmd_tx` is
-    /// bounded (capacity 16); if the channel is full the command
-    /// is dropped with a log warn. The lib already handles
-    /// duplicate / late `StartBatch` via the busy-gate, so a
-    /// dropped command is a UI ergonomics issue, not a correctness
-    /// one.
+    /// Non-blocking request send (review #111). `cmd_tx` is
+    /// bounded (capacity 16); if the channel is full the send fails
+    /// and the caller reports it -- the UI keeps its state and shows
+    /// the error (design doc §3.11.3: "发送失败显示错误并保留原状态").
     ///
-    /// Use this from UI send sites that must not block the GUI
-    /// thread. For internal / test usage the standard
-    /// `Sender<Command>::send` is fine.
-    pub fn try_send_command(&self, cmd: Command) {
-        send_cmd_lossy(&self.cmd_tx, cmd);
+    /// The request is **not** returned on failure: it is large (the
+    /// command carries the whole parameter set), and the caller has
+    /// nothing to do with it beyond the error message.
+    pub fn try_send_request(&self, request: Request) -> Result<(), String> {
+        self.cmd_tx.try_send(request).map_err(|e| match e {
+            crossbeam_channel::TrySendError::Full(_) => {
+                "the lib is busy (the command queue is full)".to_string()
+            }
+            crossbeam_channel::TrySendError::Disconnected(_) => {
+                "the lib is gone (the command channel is closed)".to_string()
+            }
+        })
     }
 }
 
@@ -686,10 +920,10 @@ pub struct ActorEnv {
     pub app_config: Arc<AppConfig>,
     /// Where `Command::SaveConfig` writes.
     pub config_path: PathBuf,
-    /// Where `Command::LoadHistory` reads from.
-    pub data_dir: Option<PathBuf>,
-    /// Where the NVENC capability record lives.
-    pub nvenc_cache_path: Option<PathBuf>,
+    /// Where every file lives (design doc §3.6). The GUI rebases the
+    /// operation directory when the user switches working directories
+    /// (§3.10.7).
+    pub paths: Paths,
     /// How to encode one file (the test seam -- design doc §3.10.4).
     pub file_encoder: Arc<dyn FileEncoder>,
     /// The ffmpeg runner the NVENC probe uses (the test seam).
@@ -698,11 +932,15 @@ pub struct ActorEnv {
 
 /// The production environment: real ffmpeg, the app's own paths.
 fn production_env(app_config: Arc<AppConfig>, config_path: PathBuf) -> ActorEnv {
+    let app_dir = paths::app_dir().unwrap_or_else(|| PathBuf::from("."));
+    // The operation directory is the working directory the user picked;
+    // the actor rebases it per batch (the working directory can change
+    // between batches -- design doc §3.10.7).
+    let resolved = Paths::resolve(config_path.clone(), app_dir.clone(), app_dir, &app_config);
     ActorEnv {
         app_config,
         config_path,
-        data_dir: crate::config::path::resolve_data_dir(),
-        nvenc_cache_path: crate::config::path::resolve_nvenc_cache(),
+        paths: resolved,
         file_encoder: Arc::new(FfmpegFileEncoder),
         detect_runner: Arc::new(crate::encoder::nvenc::run_ffmpeg),
     }
@@ -728,7 +966,7 @@ fn production_env(app_config: Arc<AppConfig>, config_path: PathBuf) -> ActorEnv 
 /// # Internal init
 ///
 /// Once at startup, the actor:
-/// 1. Resolves config via [`resolve_config`] (handles
+/// 1. Resolves config via [`paths::config_file`] (handles
 ///    `$RENENCODER_CONFIG`).
 /// 2. Loads [`AppConfig`] (auto-creates default if missing —
 ///    same behavior as CLI).
@@ -746,7 +984,7 @@ pub fn start_controller() -> ControllerHandle {
     // headroom at 20 events/sec for 10 concurrent files). Send
     // policy: progress-class events drop on full; structural events
     // block. See `send_evt_lossy` / `send_cmd_lossy` below.
-    let (cmd_tx, cmd_rx) = bounded::<Command>(CMD_TX_CAPACITY);
+    let (cmd_tx, cmd_rx) = bounded::<Request>(CMD_TX_CAPACITY);
     let (evt_tx, evt_rx) = bounded::<Event>(EVT_TX_CAPACITY);
 
     // Load AppConfig once here so the same Arc is shared with both:
@@ -779,7 +1017,10 @@ pub fn start_controller() -> ControllerHandle {
     // The capability does NOT depend on the `nv` switch: it is a fact
     // about the machine, and `nv` is this run's choice (design doc
     // §3.10.5). So the resolution happens either way.
-    let cache_rx = crate::pipeline::cache::init_encoder_cache_async_with_capability();
+    let cache_rx = crate::pipeline::cache::init_encoder_cache_async_with_capability_at(
+        Some(env.paths.capability_record.clone()),
+        crate::encoder::nvenc::run_ffmpeg,
+    );
 
     std::thread::Builder::new()
         .name("renencoder-controller".into())
@@ -803,16 +1044,19 @@ pub fn start_controller() -> ControllerHandle {
 /// protocol therefore has exactly one implementation (design doc
 /// §3.10.4).
 pub fn start_controller_with(env: ActorEnv) -> ControllerHandle {
-    let (cmd_tx, cmd_rx) = bounded::<Command>(CMD_TX_CAPACITY);
+    let (cmd_tx, cmd_rx) = bounded::<Request>(CMD_TX_CAPACITY);
     let (evt_tx, evt_rx) = bounded::<Event>(EVT_TX_CAPACITY);
 
     // The cache init goes through the injected runner, so a test never
-    // spawns ffmpeg (the fake runner answers every invocation).
+    // spawns ffmpeg (the fake runner answers every invocation). The
+    // record path travels with it: a test must not write the
+    // capability record into the real app directory (design doc
+    // §3.10.4).
     let detect_runner_for_cache = Arc::clone(&env.detect_runner);
-    let cache_rx =
-        crate::pipeline::cache::init_encoder_cache_async_with_capability_runner(move |args| {
-            detect_runner_for_cache(args)
-        });
+    let cache_rx = crate::pipeline::cache::init_encoder_cache_async_with_capability_at(
+        Some(env.paths.capability_record.clone()),
+        move |args| detect_runner_for_cache(args),
+    );
 
     let app_config = Arc::clone(&env.app_config);
     let config_path = env.config_path.clone();
@@ -837,7 +1081,7 @@ pub fn start_controller_with(env: ActorEnv) -> ControllerHandle {
 /// location). Emit `Event::Error` on failure and return None so the
 /// caller falls back to defaults.
 fn load_and_share_config(evt_tx: &Sender<Event>) -> Option<(Arc<AppConfig>, PathBuf)> {
-    let config_path = resolve_config()?;
+    let config_path = paths::config_file(None)?;
     let app_config = match AppConfig::load(&config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -866,43 +1110,116 @@ fn load_and_share_config(evt_tx: &Sender<Event>) -> Option<(Arc<AppConfig>, Path
 /// `EncoderCache` nor `EncodeError` has to be `Clone`.
 type CacheSlot = Result<Arc<EncoderCache>, Arc<EncodeError>>;
 
-/// The encoder cache cell: a replaceable handle.
+/// What one probe published: the encoder cache and the capability.
 ///
-/// `None` means "the cache has not landed yet" (the init thread is
-/// still running); `Some(Err(..))` means the init failed and every
-/// batch must see that error.
-type CacheCell = Arc<Mutex<Option<CacheSlot>>>;
+/// The two travel together: they are **one probe's answer**, and the
+/// actor publishes them together (design doc §3.10.6 step 5). A batch
+/// that waits for the cache therefore waits for the published
+/// capability too -- it cannot start with an unpublished one (which
+/// would say "this machine cannot do hardware encoding" about a
+/// machine that can).
+#[derive(Clone)]
+struct PublishedState {
+    /// The encoder cache (the ffmpeg build's encoder list).
+    cache: CacheSlot,
+    /// The capability, as published: it carries the generation.
+    capability: Capability,
+}
 
-/// Replace the encoder cache with a freshly resolved capability.
+/// The published state cell: a replaceable handle.
 ///
-/// Only the `detect` path calls this: the capability is a fact about
-/// the machine, so it changes only when the machine (or the ffmpeg
-/// build) changes -- not when the user flips the `nv` switch. That
-/// switch is a run choice and travels in the run's parameters, so
-/// flipping it never touches the cache.
+/// `None` means "the first probe has not landed yet"; `Some` holds
+/// the published state -- the cache (which may be the init's error)
+/// and the capability that goes with it.
+type PublishedCell = Arc<Mutex<Option<PublishedState>>>;
+
+/// The machine facts, gathered once and shared (design doc §3.10.7).
+///
+/// Put the actor's authoritative capability into the published state.
+///
+/// The runtime corrections land in the actor's copy (the merge is
+/// generation-scoped, see [`apply_verdict_updates`]), and the next
+/// batch must inherit them -- so the published state carries the
+/// actor's copy, not the probe's original.
+///
+/// The lock is held only for the swap -- no IO inside (§3.10.1
+/// rule 2).
+fn update_published_capability(cell: &PublishedCell, capability: &Capability) {
+    let mut guard = cell.lock();
+    if let Some(state) = guard.as_mut() {
+        state.capability = capability.clone();
+    }
+}
+
+/// Publish a probe's answer: the encoder cache and the capability.
+///
+/// Only the **actor** calls this -- the actor is the publisher (design
+/// doc §3.10.6 step 5), so the published state has one writer and the
+/// batches read one consistent answer.
+///
+/// The capability is a fact about the machine, so it changes only when
+/// the machine (or the ffmpeg build) changes -- not when the user
+/// flips the `nv` switch. That switch is a run choice and travels in
+/// the run's parameters, so flipping it never touches the cache.
 ///
 /// The lock is held only for the pointer swap -- no IO inside
 /// (§3.10.1 rule 2).
-fn replace_encoder_cache(cache_cell: &CacheCell, resolution: &crate::encoder::nvenc::Resolution) {
-    let cache = crate::pipeline::cache::cache_from_resolution(resolution);
-    let mut guard = cache_cell.lock();
-    *guard = Some(Ok(Arc::new(cache)));
+fn publish_state(cell: &PublishedCell, cache: CacheSlot, capability: Capability) {
+    let mut guard = cell.lock();
+    *guard = Some(PublishedState { cache, capability });
 }
 
-/// Summarize a capability resolution for the UI.
-fn nvenc_capability_of(
-    resolution: &crate::encoder::nvenc::Resolution,
-) -> crate::types::NvencCapability {
-    crate::types::NvencCapability {
-        support: resolution.support.clone(),
-        probed_at: Some(resolution.record.probed_at),
-        review_due: resolution.review_due,
-    }
+/// What a probe hands back to the actor.
+///
+/// The probe runs off the actor thread (it spawns ffmpeg), and the
+/// **actor** publishes its result (design doc §3.10.6 step 5): the
+/// actor owns the probe request sequence and the published
+/// generation, so an older probe's result can never overwrite a newer
+/// snapshot -- or a newer record on disk.
+struct ProbeResult {
+    /// The probe request's sequence number (the actor's counter).
+    seq: u64,
+    /// The request that asked for the probe (`None` for the startup
+    /// resolution -- nobody asked for it).
+    request_id: Option<RequestId>,
+    /// What the probe produced.
+    outcome: ProbeOutcome,
+}
+
+/// What a probe produced.
+struct ProbeOutcome {
+    /// The encoder cache the init built. `None` for a re-probe: the
+    /// resolution carries the encoder list instead.
+    ///
+    /// The **actor** puts it in the cache cell, so "the cache is
+    /// there" means "the capability is published" too -- a batch that
+    /// waited for the cache cannot start with an unpublished
+    /// capability.
+    cache: Option<Result<crate::types::EncoderCache, EncodeError>>,
+    /// The machine facts the probe established (including the
+    /// capability it found).
+    facts: crate::capability::MachineFacts,
+    /// The resolution behind a re-probe: it carries the encoder list
+    /// (a new cache) and the record to store.
+    resolution: Option<crate::encoder::nvenc::Resolution>,
+    /// The failure, when the probe failed.
+    failure: Option<(ErrorCategory, String)>,
 }
 
 // =====================================================================
 // Batch workers — the actor never runs a batch itself (§3.10.1.1)
 // =====================================================================
+
+/// A runtime correction the worker found, with the generation it was
+/// found under.
+///
+/// The generation is what makes the report scoped: a batch that ran
+/// under an older publication reports its corrections against **that**
+/// publication, and the actor merges only the reports of the
+/// generation it currently holds (design doc §3.10.6 step 5). A late
+/// report from an old batch therefore cannot disable an encoder the
+/// new generation found usable.
+type VerdictUpdate = (u64, String, bool);
 
 /// "This batch is done" signal, sent by a worker to the actor.
 ///
@@ -913,8 +1230,8 @@ fn nvenc_capability_of(
 /// that failed at runtime). The actor merges them into its authoritative
 /// copy, so the next batch inherits them.
 struct BatchDone {
-    /// Encoder name → usable?
-    updates: Vec<(String, bool)>,
+    /// The runtime corrections, each with its generation.
+    updates: Vec<VerdictUpdate>,
 }
 
 /// Drain the pending "batch done" signals.
@@ -924,7 +1241,7 @@ struct BatchDone {
 /// gate: a worker can report "done" while the actor is handling a
 /// command, and a batch that has finished must not be mistaken for a
 /// running one.
-fn drain_batch_done(done_rx: &Receiver<BatchDone>) -> (bool, Vec<(String, bool)>) {
+fn drain_batch_done(done_rx: &Receiver<BatchDone>) -> (bool, Vec<VerdictUpdate>) {
     let mut finished = false;
     let mut updates = Vec::new();
     while let Ok(BatchDone { updates: u }) = done_rx.try_recv() {
@@ -943,7 +1260,7 @@ fn drain_batch_done(done_rx: &Receiver<BatchDone>) -> (bool, Vec<(String, bool)>
 struct DoneGuard {
     done_tx: Sender<BatchDone>,
     /// Verdict updates the worker reported (drained on drop).
-    updates: Option<Receiver<(String, bool)>>,
+    updates: Option<Receiver<VerdictUpdate>>,
 }
 
 impl Drop for DoneGuard {
@@ -965,20 +1282,34 @@ impl Drop for DoneGuard {
 ///
 /// The body owns the batch's event sender, so every event of the batch
 /// comes from one sender: the channel's FIFO order is the order the UI
-/// sees.
+/// sees. It returns the batch's **terminal event** (`None` when the
+/// batch produced none).
+///
+/// The terminal event is published **after** the run slot is released
+/// (design doc §3.11.3): the moment the UI sees the confirmation, the
+/// lib can already take the next batch. Publishing it first would
+/// make the UI's "restart" lose the race against the actor's busy
+/// gate.
 fn spawn_batch_job<F>(
     body: F,
     done_tx: Sender<BatchDone>,
-    updates: Option<Receiver<(String, bool)>>,
+    updates: Option<Receiver<VerdictUpdate>>,
+    evt_tx: Sender<Event>,
+    dropped_counter: DropCounter,
 ) where
-    F: FnOnce() + Send + 'static,
+    F: FnOnce() -> Option<Event> + Send + 'static,
 {
     std::thread::Builder::new()
         .name("rencoder-batch".into())
         .spawn(move || {
             // Dropped when the body returns — or unwinds.
-            let _done = DoneGuard { done_tx, updates };
-            body();
+            let done = DoneGuard { done_tx, updates };
+            let terminal = body();
+            // The slot goes first, the confirmation second.
+            drop(done);
+            if let Some(event) = terminal {
+                send_evt_lossy(&evt_tx, event, &dropped_counter);
+            }
         })
         .expect("spawn batch worker");
 }
@@ -990,8 +1321,8 @@ fn spawn_batch_job<F>(
 /// (which writes into its verdict snapshot), the receiver is drained
 /// when the batch ends and handed to the actor with the done signal.
 struct BatchUpdates {
-    tx: Sender<(String, bool)>,
-    rx: Receiver<(String, bool)>,
+    tx: Sender<VerdictUpdate>,
+    rx: Receiver<VerdictUpdate>,
 }
 
 impl BatchUpdates {
@@ -1015,9 +1346,16 @@ impl BatchUpdates {
 /// the worker, so the whole batch reads as one ordered stream.
 #[allow(clippy::too_many_arguments)]
 fn spawn_task_batch<P, F>(
-    tasks: Vec<TranscodeTask>,
+    batch_id: BatchId,
+    tasks: Vec<EncodeTask>,
     label: &'static str,
     batch_path: PathBuf,
+    // Where the finished batch's records are written (the app's records
+    // directory).
+    records_dir: Option<PathBuf>,
+    // The batch's cancel token: `Command::Cancel` sets it, the
+    // worker polls it (design doc §3.11.2).
+    cancel_token: CancelToken,
     make_processor: F,
     updates: BatchUpdates,
     evt_tx: Sender<Event>,
@@ -1025,59 +1363,135 @@ fn spawn_task_batch<P, F>(
     done_tx: Sender<BatchDone>,
 ) where
     P: FnMut(
-            &TranscodeTask,
+            &EncodeTask,
             &crate::pipeline::task::TaskContext,
         ) -> Result<EncodingRecord, EncodeError>
         + Send
         + 'static,
-    F: FnOnce(Sender<(String, bool)>) -> Result<P, (ErrorCategory, String)> + Send + 'static,
+    F: FnOnce(Sender<VerdictUpdate>) -> Result<P, (ErrorCategory, String)> + Send + 'static,
 {
     let BatchUpdates { tx, rx } = updates;
     std::thread::Builder::new()
-        .name("rencoder-batch".into())
+        .name("renencoder-batch".into())
         .spawn(move || {
             // Dropped when the body returns — or unwinds. The guard
             // reports "done" (and hands the verdict updates to the
             // actor) even if the batch panicked.
-            let _done = DoneGuard {
+            let done = DoneGuard {
                 done_tx,
                 updates: Some(rx),
             };
-            let mut processor = match make_processor(tx) {
-                Ok(processor) => processor,
-                Err((category, message)) => {
-                    // The batch could not start (no encoder cache).
-                    // The error event is terminal for the UI.
-                    send_evt_lossy(
-                        &evt_tx,
-                        Event::Error { category, message },
-                        &dropped_counter,
-                    );
-                    return;
-                }
-            };
-            let total = tasks.len();
-            // `TaskManager::new(None)`: the actor path has no signal
-            // handler — the cancel branch of `run_ffmpeg_with_progress`
-            // deletes the partial output itself.
-            let run_result = TaskManager::new(None).run(&tasks, label, &batch_path, &mut processor);
-            match run_result {
-                Ok(records) => {
-                    send_evt_lossy(&evt_tx, Event::BatchCompleted { records }, &dropped_counter)
-                }
-                // The processor asked to abort (cancel). `idx` is the
-                // 0-based index of the task the batch stopped at.
-                Err((idx, _)) => send_evt_lossy(
-                    &evt_tx,
-                    Event::BatchCancelled {
-                        completed: idx,
-                        total,
+            let terminal = (|| -> Option<Event> {
+                // The single-instance guard (design doc §3.11.1.1): the
+                // batch holds its target for as long as it runs. The take
+                // happens **here**, in the worker: the descendant scan is a
+                // tree walk, and the actor must not block on it.
+                let scope = crate::guard::common_ancestor(
+                    &tasks
+                        .iter()
+                        .map(|task| task.input.as_path().to_path_buf())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap_or_else(|| batch_path.clone());
+                let _target_guard = match crate::guard::TargetGuard::acquire(&scope) {
+                    Ok(guard) => guard,
+                    Err(e) => {
+                        // The batch cannot start: another instance holds
+                        // this target (or a directory inside it). The
+                        // failure belongs to **this batch** (design doc
+                        // §3.11.3) -- it must not finalize another one.
+                        return Some(Event::BatchFailed {
+                            batch_id,
+                            category: ErrorCategory::ConfigError,
+                            message: e.to_string(),
+                        });
+                    }
+                };
+                let mut processor = match make_processor(tx) {
+                    Ok(processor) => processor,
+                    Err((category, message)) => {
+                        // The batch could not start (no encoder cache).
+                        return Some(Event::BatchFailed {
+                            batch_id,
+                            category,
+                            message,
+                        });
+                    }
+                };
+                // `TaskManager::new(None)`: the actor path has no signal
+                // handler — the cancel branch of `run_ffmpeg_with_progress`
+                // deletes the partial output itself.
+                // One report, one meaning of "this batch is over"
+                // (design doc §3.11.4).
+                let report = TaskManager::new().run(
+                    &tasks,
+                    label,
+                    &batch_path,
+                    &cancel_token,
+                    &mut processor,
+                );
+                // The batch is done: persist its records, so the history
+                // has something to read (§3.11.4). The mechanics are the
+                // lib's; the decision to persist is the frontend's -- and
+                // the GUI has no other place to do it.
+                persist_batch_records(&report.records, records_dir.as_deref());
+                Some(match report.termination {
+                    crate::pipeline::task::Termination::Completed => Event::BatchCompleted {
+                        batch_id,
+                        records: report.records,
                     },
-                    &dropped_counter,
-                ),
+                    // The processor asked to abort (cancel). `completed`
+                    // is the 0-based index of the task the batch stopped
+                    // at.
+                    crate::pipeline::task::Termination::Cancelled { completed, total } => {
+                        Event::BatchCancelled {
+                            batch_id,
+                            completed,
+                            total,
+                        }
+                    }
+                    crate::pipeline::task::Termination::Failed(error) => Event::BatchFailed {
+                        batch_id,
+                        category: ErrorCategory::ConfigError,
+                        message: error,
+                    },
+                })
+            })();
+            // The run slot goes first, the confirmation second
+            // (design doc §3.11.3): the UI may start the next batch
+            // the moment it sees the terminal event.
+            drop(done);
+            if let Some(event) = terminal {
+                send_evt_lossy(&evt_tx, event, &dropped_counter);
             }
         })
         .expect("spawn batch worker");
+}
+
+/// Write a finished batch's records to the default history file.
+///
+/// The mechanics are the lib's (`data::store`); the failure is not
+/// fatal -- a batch that could not be written to disk still finished,
+/// and the UI still shows its records.
+fn persist_batch_records(records: &[EncodingRecord], records_dir: Option<&std::path::Path>) {
+    if records.is_empty() {
+        return;
+    }
+    let Some(dir) = records_dir else {
+        return;
+    };
+    let path = match crate::data::store::default_encoding_path_in(dir) {
+        Ok(path) => path,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not resolve the history path");
+            return;
+        }
+    };
+    if let Err(e) = crate::data::store::write_records(records, &path) {
+        tracing::warn!(error = %e, path = %path.display(), "could not write the batch records");
+    } else {
+        tracing::info!(path = %path.display(), records = records.len(), "wrote the batch records");
+    }
 }
 
 /// Build the per-file processor for an encode batch.
@@ -1090,21 +1504,22 @@ fn spawn_task_batch<P, F>(
 /// the actor never waits for the cache init (§3.10.1.1 rule 5).
 fn make_encode_processor(
     mut batch_ctx: BatchContext,
+    batch_id: BatchId,
     cancel: CancelToken,
     evt_tx: Sender<Event>,
     dropped_counter: DropCounter,
-    update_tx: Sender<(String, bool)>,
+    update_tx: Sender<VerdictUpdate>,
     encoder: Arc<dyn FileEncoder>,
 ) -> impl FnMut(
-    &TranscodeTask,
+    &EncodeTask,
     &crate::pipeline::task::TaskContext,
 ) -> Result<EncodingRecord, EncodeError>
        + Send
        + 'static {
     // What the actor already knows: the verdicts this batch started
     // with. The comparison tells us what the encode changed.
-    let mut reported = batch_ctx.verdicts().clone();
-    move |task: &TranscodeTask, ctx: &crate::pipeline::task::TaskContext| {
+    let mut reported = batch_ctx.capability().verdicts().clone();
+    move |task: &EncodeTask, ctx: &crate::pipeline::task::TaskContext| {
         // FileStarted uses 0-indexed (matches the v1 UI contract).
         // TaskManager passes 1-indexed in `ctx.index`; convert.
         let idx = ctx.index - 1;
@@ -1112,6 +1527,7 @@ fn make_encode_processor(
         send_evt_lossy(
             &evt_tx,
             Event::FileStarted {
+                batch_id,
                 index: idx,
                 total: ctx.total,
                 source: task.input.clone(),
@@ -1136,6 +1552,7 @@ fn make_encode_processor(
             send_evt_lossy(
                 &evt_tx_progress,
                 Event::Progress {
+                    batch_id,
                     file_index: idx,
                     frame: p.frame,
                     fps: p.fps,
@@ -1152,11 +1569,15 @@ fn make_encode_processor(
         // Report the verdicts this file changed (rare: only when an
         // NVENC encode failed and the encoder turned out to be
         // unusable). The actor merges them into its authoritative copy
-        // so the next batch inherits them.
-        for change in batch_ctx.verdicts().changes_since(&reported) {
-            let _ = update_tx.send(change);
+        // so the next batch inherits them -- but only the ones that
+        // belong to the generation the actor still holds (design doc
+        // §3.10.6 step 5): this batch ran under the generation it
+        // froze, and a newer publication has already superseded it.
+        let generation = batch_ctx.capability().generation();
+        for (encoder, usable) in batch_ctx.capability().verdicts().changes_since(&reported) {
+            let _ = update_tx.send((generation, encoder, usable));
         }
-        reported.clone_from(batch_ctx.verdicts());
+        reported.clone_from(batch_ctx.capability().verdicts());
 
         match res {
             Ok(record) => {
@@ -1171,6 +1592,7 @@ fn make_encode_processor(
                 send_evt_lossy(
                     &evt_tx,
                     Event::FileCompleted {
+                        batch_id,
                         index: idx,
                         record: record.clone(),
                     },
@@ -1182,14 +1604,20 @@ fn make_encode_processor(
                 Ok(record)
             }
             Err(e) => {
-                send_evt_lossy(
-                    &evt_tx,
-                    Event::Error {
-                        category: e.category(),
-                        message: format!("encode error: {e}"),
-                    },
-                    &dropped_counter,
-                );
+                // A cancel is not a per-file failure: the batch is
+                // stopping, and the report says so (design doc
+                // §3.11.2). The Ok arm above catches the cancels that
+                // come back as a record; this one catches the ones
+                // that come back as an error.
+                if matches!(e, EncodeError::UserCancel) {
+                    return Err(e);
+                }
+                // A per-file failure is **not** a fatal event (design
+                // doc §3.11.3): it travels in the record's
+                // `error` field. A fatal event here would finalize
+                // the whole batch while the other files are still
+                // running.
+                //
                 // Map a per-file failure to Ok(Failed record) so
                 // TaskManager doesn't abort the batch on the first
                 // failure — matches v1 inline behavior.
@@ -1221,13 +1649,13 @@ const CACHE_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 ///
 /// A batch uses ONE snapshot: a batch is a unit, the encoder must not
 /// change under it.
-fn take_cache(cell: &CacheCell, timeout: std::time::Duration) -> Option<CacheSlot> {
+fn take_published(cell: &PublishedCell, timeout: std::time::Duration) -> Option<PublishedState> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         // The lock is held only for the pointer clone — no IO inside
         // (§3.10.1 rule 2).
-        if let Some(slot) = { cell.lock().clone() } {
-            return Some(slot);
+        if let Some(state) = { cell.lock().clone() } {
+            return Some(state);
         }
         if std::time::Instant::now() >= deadline {
             return None;
@@ -1237,8 +1665,34 @@ fn take_cache(cell: &CacheCell, timeout: std::time::Duration) -> Option<CacheSlo
 }
 
 /// Fold the verdicts a worker reported into the actor's copy.
-fn apply_verdict_updates(verdicts: &mut CapabilityVerdicts, updates: Vec<(String, bool)>) {
-    for (encoder, usable) in updates {
+///
+/// **Only the current generation's reports are folded in.** A batch
+/// that ran under an older publication reported against that
+/// publication: its conclusion ("this NVENC encoder is broken") is
+/// about a machine state the current generation has already replaced
+/// (design doc §3.10.6 step 5). Folding it in would carry a stale
+/// hardware failure into the next batch forever.
+///
+/// The known cost: after a re-probe publishes a new generation, the
+/// old generation's runtime corrections are not inherited -- the next
+/// batch may try an encoder that just fell back, and fall back again
+/// (harmless: the product is still correct, one file is encoded
+/// twice).
+fn apply_verdict_updates(
+    verdicts: &mut CapabilityVerdicts,
+    generation: u64,
+    updates: Vec<VerdictUpdate>,
+) {
+    for (reported_generation, encoder, usable) in updates {
+        if reported_generation != generation {
+            tracing::debug!(
+                encoder = %encoder,
+                reported_generation,
+                generation,
+                "dropping a verdict from an older generation"
+            );
+            continue;
+        }
         verdicts.set(&encoder, usable);
     }
 }
@@ -1253,7 +1707,7 @@ fn cache_from_slot(slot: CacheSlot) -> Result<Arc<EncoderCache>, (ErrorCategory,
 }
 
 fn run_actor(
-    cmd_rx: Receiver<Command>,
+    cmd_rx: Receiver<Request>,
     evt_tx: Sender<Event>,
     env: ActorEnv,
     // Review #126: cache init runs on a background thread; this
@@ -1265,8 +1719,12 @@ fn run_actor(
 ) {
     // The injected dependencies, unpacked for the arms below.
     let config_path = env.config_path.clone();
-    let data_dir = env.data_dir.clone();
-    let nvenc_cache_path = env.nvenc_cache_path.clone();
+    // The paths: the app-level ones never move, the run-level ones
+    // follow the working directory (design doc §3.6). The actor owns
+    // the current value -- `Command::SetWorkingDir` moves it.
+    let mut paths = env.paths.clone();
+    let records_dir = env.paths.records_dir.clone();
+    let nvenc_cache_path = env.paths.capability_record.clone();
     let file_encoder = Arc::clone(&env.file_encoder);
     let detect_runner = Arc::clone(&env.detect_runner);
     // Review #111: dropped-event counter for diagnostics. Each sender
@@ -1294,49 +1752,61 @@ fn run_actor(
     // reader (the actor thread, which takes a snapshot per batch) and
     // two writers (the init thread and the refresh thread), so a
     // read/write split would buy nothing.
-    let cache_cell: CacheCell = Arc::new(Mutex::new(None));
-    // The background init thread fills the slot.
-    let cache_cell_for_thread = Arc::clone(&cache_cell);
-    let evt_tx_for_init = evt_tx.clone();
-    let dropped_for_init = DropCounter::default();
+    let published_cell: PublishedCell = Arc::new(Mutex::new(None));
+    // The machine facts, gathered once by the cache init (design doc
+    // §3.10.7). The actor adopts them: a re-check after a working
+    // directory change reuses them instead of probing the machine
+    // again.
+    //
+    // A plain local, not a cell: the actor is the only reader *and*
+    // the only writer (the probes hand their result to the actor,
+    // which publishes it) -- one owner, so no lock (§3.10.1 rule 1).
+    let mut machine_facts: Option<crate::capability::MachineFacts> = None;
+    // The probe channel: the probe threads hand their result back
+    // here, and the actor publishes it (design doc §3.10.6 step 5).
+    let (probe_tx, probe_rx) = unbounded::<ProbeResult>();
+    // The probe request counter. Every probe takes the next number:
+    // the startup one and every re-probe.
+    let mut probe_seq: u64 = 0;
+    // The newest published probe request. A result older than this
+    // is dropped -- it cannot overwrite a newer snapshot.
+    let mut published_probe_seq: u64 = 0;
+    // The generation the next published capability carries.
+    let mut next_generation: u64 = 1;
+    // The background init thread hands its result to the actor.
+    let probe_tx_for_init = probe_tx.clone();
     std::thread::spawn(move || {
         // The receiver delivers exactly one `Result`. Use
         // `unwrap_or_else` to surface a channel-disconnect as
-        // a sentinel error so the OnceLock always gets set.
+        // a sentinel error so the actor always gets an answer.
         let init = cache_rx
             .recv()
             .unwrap_or_else(|_| crate::pipeline::cache::CacheInit {
                 cache: Err(EncodeError::Probe(
                     "encoder cache init channel closed".into(),
                 )),
-                capability: None,
+                facts: crate::capability::MachineFacts::ffmpeg_broken(),
+                resolution: None,
             });
-        // Peek at the result so we can emit an error event with the
-        // correct category before moving into the OnceLock.
-        let err_event = match &init.cache {
+        // The cache init failed -> the failure rides with the result,
+        // and the actor reports it (one publisher, one event).
+        let failure = match &init.cache {
             Err(e) => Some((e.category(), format!("encoder cache init failed: {e}"))),
             Ok(_) => None,
         };
-        // The NVENC capability as resolved at startup -- the UI shows
-        // it without the user having to ask for it.
-        if let Some(capability) = init.capability {
-            send_evt_lossy(
-                &evt_tx_for_init,
-                Event::NvencCapability(capability),
-                &dropped_for_init,
-            );
-        }
-        {
-            let mut guard = cache_cell_for_thread.lock();
-            *guard = Some(init.cache.map(Arc::new).map_err(Arc::new));
-        }
-        if let Some((category, message)) = err_event {
-            send_evt_lossy(
-                &evt_tx_for_init,
-                Event::Error { category, message },
-                &dropped_for_init,
-            );
-        }
+        let _ = probe_tx_for_init.send(ProbeResult {
+            seq: 0,
+            request_id: None,
+            outcome: ProbeOutcome {
+                cache: Some(init.cache),
+                facts: init.facts,
+                // The resolution rides along: the actor stores the
+                // record (the publisher arranges the persistence --
+                // design doc §3.10.6 step 5).
+                resolution: init.resolution,
+                failure,
+            },
+        });
     });
     // `app_config` is still held (referenced by `config_path`
     // for the SaveConfig handler). Don't drop yet.
@@ -1348,6 +1818,11 @@ fn run_actor(
     // itself runs on a worker thread (§3.10.1.1), so the actor is the
     // only reader and the only writer.
     let mut batch_running = false;
+    // The batch the UI may cancel (design doc §3.11.3): `Cancel`
+    // names a batch, and only the active one may be cancelled. A
+    // stale cancel -- the user cancelled and started a new batch
+    // before the cancel was processed -- must not stop the new one.
+    let mut active_batch_id: Option<BatchId> = None;
     // Per-batch cancel token. Reset between batches. Shared with the
     // worker: the actor sets it on `Command::Cancel`, the worker polls
     // it (between files, and inside the ffmpeg progress loop).
@@ -1355,31 +1830,189 @@ fn run_actor(
     // "This batch is done" signals. The worker sends one when it
     // finishes; the actor reopens the busy gate when it reads one.
     let (done_tx, done_rx) = bounded::<BatchDone>(1);
-    // The authoritative NVENC verdicts: which encoders this session
-    // already found to be unusable. Each batch worker gets a snapshot
-    // and reports its changes back (the done signal carries them).
-    let mut verdicts = CapabilityVerdicts::default();
+    // The authoritative capability: this machine's NVENC capability as
+    // the session knows it. Each batch worker gets a snapshot and
+    // reports its changes back (the done signal carries them).
+    let mut capability = Capability::default();
 
     loop {
         // Wait for the next command OR for a worker to report "done".
         // The done branch re-opens the gate and goes back to waiting.
-        let cmd = select! {
-            recv(cmd_rx) -> cmd => cmd,
+        let request = select! {
+            recv(cmd_rx) -> req => req,
             recv(done_rx) -> done => {
                 if let Ok(BatchDone { updates }) = done {
-                    apply_verdict_updates(&mut verdicts, updates);
+                    let generation = capability.generation();
+                    apply_verdict_updates(capability.verdicts_mut(), generation, updates);
+                    // The next batch inherits the corrections.
+                    update_published_capability(&published_cell, &capability);
                     batch_running = false;
+                    active_batch_id = None;
+                }
+                continue;
+            }
+            recv(probe_rx) -> probed => {
+                // A probe came back. The actor publishes it (design
+                // doc §3.10.6 step 5): it owns the probe request
+                // sequence and the published generation.
+                if let Ok(probed) = probed {
+                    // Only the newest probe result is published: an
+                    // older one must not overwrite a newer snapshot
+                    // -- or a newer record on disk.
+                    if probed.seq >= published_probe_seq {
+                        published_probe_seq = probed.seq;
+                        let ProbeResult {
+                            request_id,
+                            outcome,
+                            ..
+                        } = probed;
+                        // The encoder cache, from the resolution when
+                        // there is one, else from the init. `None` when
+                        // the probe failed without producing a cache
+                        // (a failed re-probe: the old cache is still
+                        // the right one -- the build did not change).
+                        let cache: Option<CacheSlot> = match outcome.resolution.as_ref() {
+                            Some(resolution) => Some(Ok(Arc::new(
+                                crate::pipeline::cache::cache_from_resolution(resolution),
+                            ))),
+                            None => outcome
+                                .cache
+                                .map(|cache| cache.map(Arc::new).map_err(Arc::new)),
+                        };
+                        // The record on disk. The **publisher** writes
+                        // it: the probe threads do not, so an older
+                        // probe's result cannot overwrite a newer
+                        // record (design doc §3.10.6 step 5).
+                        if let Some(resolution) = &outcome.resolution {
+                            crate::encoder::nvenc::store_resolution(
+                                Some(nvenc_cache_path.as_path()),
+                                resolution,
+                                chrono::Utc::now(),
+                            );
+                        }
+                        match outcome.failure {
+                            Some((category, message)) => {
+                                // A failed detection **keeps the current
+                                // snapshot** (design doc §3.10.6 step
+                                // 5): the machine did not change, only
+                                // the probe failed. Publishing an empty
+                                // capability here would silently turn
+                                // NVENC off for the next batch.
+                                //
+                                // The cache error still lands when
+                                // nothing has been published yet (the
+                                // startup probe failed): a batch must
+                                // see the failure at once, not wait for
+                                // the timeout.
+                                {
+                                    let mut guard = published_cell.lock();
+                                    if guard.is_none() {
+                                        if let Some(cache) = cache {
+                                            *guard = Some(PublishedState {
+                                                cache,
+                                                capability: Capability::default(),
+                                            });
+                                        }
+                                    }
+                                }
+                                // The startup failure is the actor's
+                                // own (no scope); a re-probe's failure
+                                // belongs to the request that asked
+                                // for it.
+                                match request_id {
+                                    Some(request_id) => send_evt_lossy(
+                                        &evt_tx,
+                                        Event::OperationFailed {
+                                            request_id,
+                                            category,
+                                            message,
+                                        },
+                                        &dropped_counter,
+                                    ),
+                                    None => send_evt_lossy(
+                                        &evt_tx,
+                                        Event::Error { category, message },
+                                        &dropped_counter,
+                                    ),
+                                }
+                            }
+                            None => {
+                                // Publish: this snapshot gets the
+                                // next generation.
+                                let published = outcome
+                                    .facts
+                                    .nvenc
+                                    .clone()
+                                    .unwrap_or_default()
+                                    .with_generation(next_generation);
+                                next_generation += 1;
+                                // The machine facts carry the
+                                // published capability (the report
+                                // reads it).
+                                let mut facts = outcome.facts.clone();
+                                facts.nvenc = Some(published.clone());
+                                if outcome.resolution.is_some() {
+                                    // The run capability report for
+                                    // the current operation directory.
+                                    crate::capability::check_run_capabilities(&paths, &facts);
+                                    send_evt_lossy(
+                                        &evt_tx,
+                                        Event::CapabilityChecked {
+                                            report: paths.capability_report.clone(),
+                                        },
+                                        &dropped_counter,
+                                    );
+                                }
+                                machine_facts = Some(facts);
+                                capability = published.clone();
+                                // The published state: the encoder
+                                // cache and the capability, together.
+                                // The actor is the only writer -- a
+                                // batch that waits for the cache
+                                // therefore waits for the published
+                                // capability too.
+                                publish_state(
+                                    &published_cell,
+                                    cache.unwrap_or_else(|| {
+                                        Err(Arc::new(EncodeError::Probe(
+                                            "the probe produced no encoder cache".into(),
+                                        )))
+                                    }),
+                                    published.clone(),
+                                );
+                                // The UI hears about the capability
+                                // from here -- one publisher, one
+                                // event.
+                                //
+                                // **After** the state is published:
+                                // the event then means "the new
+                                // capability is in force", which is
+                                // what a caller waits for.
+                                send_evt_lossy(
+                                    &evt_tx,
+                                    Event::NvencCapability(published),
+                                    &dropped_counter,
+                                );
+                            }
+                        }
+                    }
                 }
                 continue;
             }
         };
-        let Ok(cmd) = cmd else {
+        let Ok(request) = request else {
             // The UI dropped the command sender: nobody left to
             // serve. Leave the loop. A worker that is still running
             // finishes on its own — its events go nowhere, but nothing
             // here waits for them.
             break;
         };
+        // Every answer carries the request's id (design doc §3.11.3):
+        // "which of my requests was this?" has one answer.
+        let Request {
+            id: request_id,
+            command,
+        } = request;
 
         // The busy gate covers StartBatch / DryRun / Analyze (§3.4:
         // one batch in flight at a time). It is checked in one place
@@ -1389,13 +2022,17 @@ fn run_actor(
         // actor was handling a command, and a batch that has finished
         // must not be mistaken for a running one.
         if matches!(
-            &cmd,
+            &command,
             Command::StartBatch { .. } | Command::DryRun { .. } | Command::Analyze { .. }
         ) {
             let (finished, updates) = drain_batch_done(&done_rx);
-            apply_verdict_updates(&mut verdicts, updates);
+            let generation = capability.generation();
+            apply_verdict_updates(capability.verdicts_mut(), generation, updates);
+            // The next batch inherits the corrections.
+            update_published_capability(&published_cell, &capability);
             if finished {
                 batch_running = false;
+                active_batch_id = None;
             }
             if batch_running {
                 // Benign rejection: the command is dropped, the running
@@ -1404,6 +2041,7 @@ fn run_actor(
                 send_evt_lossy(
                     &evt_tx,
                     Event::CommandRejected {
+                        request_id,
                         reason: "another batch is already running".into(),
                     },
                     &dropped_counter,
@@ -1412,17 +2050,60 @@ fn run_actor(
             }
         }
 
-        match cmd {
+        match command {
             Command::StartBatch { params, files } => {
                 // Review #120: delegate per-file iteration to
                 // TaskManager::run. The processor closure owns the UI
-                // protocol (FileStarted / FileCompleted / Progress /
-                // Error); TaskManager owns batch/task scaffold logs +
+                // protocol (FileStarted / FileCompleted / Progress);
+                // TaskManager owns batch/task scaffold logs +
                 // partial_output::Guard registration.
                 let id = next_batch_id;
                 next_batch_id += 1;
-                cancel_token = CancelToken::new();
+                // The operation directory: the directory this batch
+                // acts on (design doc §3.6). The GUI's working
+                // directory can change between batches, so the
+                // run-level paths follow it.
+                let batch_paths =
+                    paths.with_op_dir(&crate::pipeline::batch::batch_target_path_for_files(&files));
+                // The single-instance guard's cheap probe (design doc
+                // §3.11.1.1): the ancestors and the target itself. A
+                // conflict is a **benign rejection** -- the running
+                // batch is untouched, and this one never starts.
+                // (The full take -- including the descendant scan --
+                // happens in the worker, off the actor thread.)
+                let batch_scope = crate::guard::common_ancestor(
+                    &files
+                        .iter()
+                        .map(|file| file.as_path().to_path_buf())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap_or_else(|| batch_paths.op_dir.clone());
+                if let Err(e) = crate::guard::probe(&batch_scope) {
+                    send_evt_lossy(
+                        &evt_tx,
+                        Event::CommandRejected {
+                            request_id,
+                            reason: e.to_string(),
+                        },
+                        &dropped_counter,
+                    );
+                    continue;
+                }
+                // A leftover request would cancel this batch as well.
+                let _ = std::fs::remove_file(&batch_paths.cancel_file);
+                cancel_token = CancelToken::watching(batch_paths.cancel_file.clone());
 
+                // The batch is admitted: the request gets its answer
+                // and the batch its id (design doc §3.11.3). The UI
+                // moves from `Starting` to `Encoding` on this event.
+                send_evt_lossy(
+                    &evt_tx,
+                    Event::CommandAccepted {
+                        request_id,
+                        batch_id: Some(id),
+                    },
+                    &dropped_counter,
+                );
                 send_evt_lossy(
                     &evt_tx,
                     Event::BatchStarted {
@@ -1431,6 +2112,8 @@ fn run_actor(
                     },
                     &dropped_counter,
                 );
+                // The batch the UI may cancel (design doc §3.11.3).
+                active_batch_id = Some(id);
 
                 // One cache snapshot per batch (a batch is a unit —
                 // the encoder must not change under it). The cache is
@@ -1441,48 +2124,47 @@ fn run_actor(
                 // Review #122: extension still hoisted (unused now — kept for
                 // the hoist comment / future use).
                 let _ext = params.format.default_extension();
-                let tasks: Vec<TranscodeTask> = files
-                    .iter()
-                    .map(|file| {
-                        // v1.2 follow-up #3: route through
-                        // output_path_for for the `_encoded`
-                        // collision guard.
-                        TranscodeTask {
-                            input: file.clone(),
-                            output: Some(crate::utils::fs::output_path_for(
-                                file.as_path(),
-                                params.format,
-                            )),
-                        }
-                    })
-                    .collect();
+                // The tasks come from the shared construction entry
+                // (design doc §3.11.1): the same names the encode
+                // path and the dry run use.
+                let tasks = crate::pipeline::batch::encode_tasks(&files, params.format);
 
                 let batch_path = crate::pipeline::batch::batch_target_path_for_files(&files);
 
-                let cache_cell_for_worker = Arc::clone(&cache_cell);
+                let published_cell_for_worker = Arc::clone(&published_cell);
                 let params_for_worker = params.clone();
                 let cancel_for_worker = cancel_token.clone();
                 let evt_tx_for_worker = evt_tx.clone();
                 let dropped_for_worker = DropCounter::default();
-                // The worker gets a snapshot of the authoritative
-                // verdicts; whatever it changes is reported back
-                // through the update channel.
-                let verdicts_for_worker = verdicts.clone();
                 let file_encoder_for_worker = Arc::clone(&file_encoder);
-                let make_processor = move |update_tx: Sender<(String, bool)>| {
+                // The processor and the worker each hold a handle on
+                // the same token (the `move` closure would otherwise
+                // take it).
+                let cancel_for_processor = cancel_for_worker.clone();
+                let make_processor = move |update_tx: Sender<VerdictUpdate>| {
                     // The context is built here, in the worker: the
                     // cache may still be initializing, and waiting for
                     // it must not block the actor (§3.10.1.1 rule 5).
-                    let slot = take_cache(&cache_cell_for_worker, CACHE_WAIT_TIMEOUT).ok_or((
-                        ErrorCategory::ConfigError,
-                        "encoder cache init timed out".into(),
-                    ))?;
-                    let cache = cache_from_slot(slot)?;
+                    // The published state: the cache and the
+                    // capability of one publication (design doc
+                    // §3.10.6 step 5). The batch freezes this
+                    // generation -- a re-probe during the batch does
+                    // not change what this batch encodes with.
+                    let published = take_published(&published_cell_for_worker, CACHE_WAIT_TIMEOUT)
+                        .ok_or((
+                            ErrorCategory::ConfigError,
+                            "encoder cache init timed out".into(),
+                        ))?;
+                    let cache = cache_from_slot(published.cache)?;
+                    // The capability of **this** publication: the
+                    // batch freezes the generation it was admitted
+                    // with (design doc §3.10.6 step 5).
                     let batch_ctx =
-                        BatchContext::new(params_for_worker, cache, verdicts_for_worker);
+                        BatchContext::new(params_for_worker, cache, published.capability);
                     Ok(make_encode_processor(
                         batch_ctx,
-                        cancel_for_worker,
+                        id,
+                        cancel_for_processor,
                         evt_tx_for_worker,
                         dropped_for_worker,
                         update_tx,
@@ -1495,9 +2177,12 @@ fn run_actor(
                 // in-flight ffmpeg.
                 batch_running = true;
                 spawn_task_batch(
+                    id,
                     tasks,
                     "encoding",
                     batch_path,
+                    Some(records_dir.clone()),
+                    cancel_for_worker.clone(),
                     make_processor,
                     BatchUpdates::new(),
                     evt_tx.clone(),
@@ -1511,58 +2196,98 @@ fn run_actor(
                 // StartBatch, but no ffmpeg invocation. The busy gate
                 // (checked above) applies so a real batch can't sneak
                 // in during dry-run.
-                let cache_cell_for_worker = Arc::clone(&cache_cell);
-                let evt_tx_for_worker = evt_tx.clone();
-                let dropped_for_worker = DropCounter::default();
-                // A dry run never encodes, so it cannot change a
-                // verdict -- it only reads them.
-                let verdicts_for_worker = verdicts.clone();
+                let published_cell_for_worker = Arc::clone(&published_cell);
+                // A dry run never encodes, so it cannot change the
+                // capability -- it only reads it. It reads the
+                // published one, like every other batch.
+                let cancel_for_worker = cancel_token.clone();
+                // The dry run is a batch too: it gets a batch id, so
+                // its events can be matched (design doc §3.11.3).
+                let id = next_batch_id;
+                next_batch_id += 1;
+                send_evt_lossy(
+                    &evt_tx,
+                    Event::CommandAccepted {
+                        request_id,
+                        batch_id: Some(id),
+                    },
+                    &dropped_counter,
+                );
+                active_batch_id = Some(id);
                 batch_running = true;
                 spawn_batch_job(
                     move || {
                         // The cache is resolved here, in the worker: the
                         // one-time init may still be running, and
                         // waiting for it must not block the actor.
-                        let slot = take_cache(&cache_cell_for_worker, CACHE_WAIT_TIMEOUT);
-                        let cache = match slot {
-                            Some(slot) => match cache_from_slot(slot) {
-                                Ok(cache) => cache,
-                                Err((category, message)) => {
-                                    send_evt_lossy(
-                                        &evt_tx_for_worker,
-                                        Event::Error { category, message },
-                                        &dropped_for_worker,
-                                    );
-                                    return;
-                                }
-                            },
-                            None => {
-                                send_evt_lossy(
-                                    &evt_tx_for_worker,
-                                    Event::Error {
-                                        category: ErrorCategory::ConfigError,
-                                        message: "encoder cache init timed out".into(),
-                                    },
-                                    &dropped_for_worker,
-                                );
-                                return;
+                        let Some(published) =
+                            take_published(&published_cell_for_worker, CACHE_WAIT_TIMEOUT)
+                        else {
+                            return Some(Event::BatchFailed {
+                                batch_id: id,
+                                category: ErrorCategory::ConfigError,
+                                message: "encoder cache init timed out".into(),
+                            });
+                        };
+                        let cache = match cache_from_slot(published.cache) {
+                            Ok(cache) => cache,
+                            Err((category, message)) => {
+                                return Some(Event::BatchFailed {
+                                    batch_id: id,
+                                    category,
+                                    message,
+                                });
                             }
                         };
-                        let batch_ctx = BatchContext::new(params, cache, verdicts_for_worker);
-                        let records =
-                            crate::pipeline::batch::dry_run_batch(&batch_ctx, files.iter());
-                        send_evt_lossy(
-                            &evt_tx_for_worker,
-                            Event::DryRunFinished { records },
-                            &dropped_for_worker,
+                        // The capability of this publication: the
+                        // dry run freezes the generation too.
+                        // The generation this dry run froze: the
+                        // plan is only valid for it (design doc
+                        // §3.10.5).
+                        let generation = published.capability.generation();
+                        let batch_ctx = BatchContext::new(params, cache, published.capability);
+                        let report = crate::pipeline::batch::dry_run_batch(
+                            &batch_ctx,
+                            files.iter(),
+                            &cancel_for_worker,
                         );
+                        Some(Event::DryRunFinished {
+                            batch_id: id,
+                            generation,
+                            records: report.records,
+                        })
                     },
                     done_tx.clone(),
                     None,
+                    evt_tx.clone(),
+                    DropCounter::default(),
                 );
             }
 
-            Command::Cancel => {
+            Command::Cancel { batch_id } => {
+                // Only the active batch may be cancelled (design doc
+                // §3.11.3): a cancel that names another batch -- a
+                // stale one, or a batch that already ended -- is
+                // refused. It must not stop whatever runs now.
+                if active_batch_id != Some(batch_id) {
+                    send_evt_lossy(
+                        &evt_tx,
+                        Event::CommandRejected {
+                            request_id,
+                            reason: format!("no active batch {batch_id} to cancel"),
+                        },
+                        &dropped_counter,
+                    );
+                    continue;
+                }
+                send_evt_lossy(
+                    &evt_tx,
+                    Event::CommandAccepted {
+                        request_id,
+                        batch_id: Some(batch_id),
+                    },
+                    &dropped_counter,
+                );
                 // Marks the per-batch token. The worker polls it: the
                 // in-flight ffmpeg is killed (and its partial output
                 // removed), and the batch stops at the next file
@@ -1571,11 +2296,27 @@ fn run_actor(
             }
 
             Command::LoadHistory { limit, after } => {
-                let records = load_history(data_dir.clone(), limit, after);
+                send_evt_lossy(
+                    &evt_tx,
+                    Event::CommandAccepted {
+                        request_id,
+                        batch_id: None,
+                    },
+                    &dropped_counter,
+                );
+                let records = load_history(Some(records_dir.clone()), limit, after);
                 send_evt_lossy(&evt_tx, Event::HistoryLoaded { records }, &dropped_counter);
             }
 
-            Command::SaveConfig { config } => {
+            Command::SaveConfig { config, revision } => {
+                send_evt_lossy(
+                    &evt_tx,
+                    Event::CommandAccepted {
+                        request_id,
+                        batch_id: None,
+                    },
+                    &dropped_counter,
+                );
                 // The payload is the UI's edited draft. Persisting our
                 // own copy would silently drop the edit: the file
                 // would be rewritten with the original values while
@@ -1586,14 +2327,18 @@ fn run_actor(
                             &evt_tx,
                             Event::ConfigSaved {
                                 path: config_path.clone(),
+                                revision,
                             },
                             &dropped_counter,
                         );
                     }
                     Err(e) => {
+                        // A failed save is a **non-batch** failure: it
+                        // finalizes nothing (design doc §3.11.3).
                         send_evt_lossy(
                             &evt_tx,
-                            Event::Error {
+                            Event::OperationFailed {
+                                request_id,
                                 category: ErrorCategory::ConfigError,
                                 message: format!("save failed: {e}"),
                             },
@@ -1609,6 +2354,14 @@ fn run_actor(
             }
 
             Command::Detect { force } => {
+                send_evt_lossy(
+                    &evt_tx,
+                    Event::CommandAccepted {
+                        request_id,
+                        batch_id: None,
+                    },
+                    &dropped_counter,
+                );
                 // Same path as the CLI's `rencoder detect`: resolve
                 // through the on-disk record, store a fresh probe, and
                 // report what this machine can actually run.
@@ -1617,43 +2370,80 @@ fn run_actor(
                 // so it runs on its own thread: doing it here would
                 // stall every other command -- `Command::Cancel`
                 // included -- for the duration.
-                let evt_tx_detect = evt_tx.clone();
-                let dropped_detect = DropCounter::default();
                 let cache_path = nvenc_cache_path.clone();
                 let detect_runner = Arc::clone(&detect_runner);
-                // A fresh probe may find different encoders usable than
-                // the cache knows about -- so the cache follows the
-                // capability (not the other way round).
-                let cache_cell_for_detect = Arc::clone(&cache_cell);
+                // The probe request takes the next sequence number:
+                // the actor publishes the result only if it is the
+                // newest one (design doc §3.10.6 step 5).
+                probe_seq += 1;
+                let seq = probe_seq;
+                let probe_tx = probe_tx.clone();
                 std::thread::Builder::new()
                     .name("renencoder-detect".into())
                     .spawn(move || {
-                        match crate::encoder::nvenc::resolve_and_store_with(
-                            cache_path.as_deref(),
+                        // The probe only -- the **store** and the
+                        // publication are the actor's, so an older
+                        // result cannot overwrite a newer record.
+                        let outcome = match crate::encoder::nvenc::resolve_with_clock(
+                            Some(cache_path.as_path()),
                             force,
                             move |args| detect_runner(args),
+                            chrono::Utc::now(),
                         ) {
-                            Ok(resolution) => {
-                                replace_encoder_cache(&cache_cell_for_detect, &resolution);
-                                send_evt_lossy(
-                                    &evt_tx_detect,
-                                    Event::NvencCapability(nvenc_capability_of(&resolution)),
-                                    &dropped_detect,
-                                );
-                            }
-                            Err(e) => {
-                                send_evt_lossy(
-                                    &evt_tx_detect,
-                                    Event::Error {
-                                        category: ErrorCategory::ProbeFailed,
-                                        message: format!("NVENC detection failed: {e}"),
-                                    },
-                                    &dropped_detect,
-                                );
-                            }
-                        }
+                            Ok(resolution) => ProbeOutcome {
+                                cache: None,
+                                facts: crate::capability::MachineFacts::from_resolution(
+                                    &resolution,
+                                ),
+                                resolution: Some(resolution),
+                                failure: None,
+                            },
+                            Err(e) => ProbeOutcome {
+                                cache: None,
+                                facts: crate::capability::MachineFacts::default(),
+                                resolution: None,
+                                failure: Some((
+                                    ErrorCategory::ProbeFailed,
+                                    format!("NVENC detection failed: {e}"),
+                                )),
+                            },
+                        };
+                        let _ = probe_tx.send(ProbeResult {
+                            seq,
+                            request_id: Some(request_id),
+                            outcome,
+                        });
                     })
                     .expect("spawn detect thread");
+            }
+
+            Command::SetWorkingDir { dir } => {
+                send_evt_lossy(
+                    &evt_tx,
+                    Event::CommandAccepted {
+                        request_id,
+                        batch_id: None,
+                    },
+                    &dropped_counter,
+                );
+                // The operation directory follows the working
+                // directory (design doc §3.6): the run-level paths
+                // move with it.
+                paths = paths.with_op_dir(&dir);
+                // Re-check (design doc §3.10.7): the directory
+                // changed, the machine did not -- so the machine's
+                // facts are reused and only the filesystem is checked
+                // anew. The report lands in the new operation
+                // directory.
+                let facts = machine_facts.clone().unwrap_or_default();
+                crate::capability::check_run_capabilities(&paths, &facts);
+                send_evt_lossy(
+                    &evt_tx,
+                    Event::CapabilityChecked {
+                        report: paths.capability_report.clone(),
+                    },
+                    &dropped_counter,
+                );
             }
 
             Command::Analyze { files } => {
@@ -1665,7 +2455,27 @@ fn run_actor(
                 // par_iter runs to completion and AnalyzeFinished fires
                 // cleanly.
                 let total = files.len();
-                send_evt_lossy(&evt_tx, Event::AnalyzeStarted { total }, &dropped_counter);
+                // The analyze run is a batch too: it gets a batch id
+                // (design doc §3.11.3).
+                let id = next_batch_id;
+                next_batch_id += 1;
+                send_evt_lossy(
+                    &evt_tx,
+                    Event::CommandAccepted {
+                        request_id,
+                        batch_id: Some(id),
+                    },
+                    &dropped_counter,
+                );
+                send_evt_lossy(
+                    &evt_tx,
+                    Event::AnalyzeStarted {
+                        batch_id: id,
+                        total,
+                    },
+                    &dropped_counter,
+                );
+                active_batch_id = Some(id);
 
                 let evt_tx_for_worker = evt_tx.clone();
                 let dropped_for_worker = DropCounter::default();
@@ -1680,6 +2490,7 @@ fn run_actor(
                             send_evt_lossy(
                                 &evt_tx_for_worker,
                                 Event::AnalyzeProgress {
+                                    batch_id: id,
                                     done: p.done,
                                     total: p.total,
                                     failed: p.failed,
@@ -1702,17 +2513,16 @@ fn run_actor(
                         // the final records to keep the contract testable.
                         let failed_count = records.iter().filter(|r| r.fps.is_none()).count();
 
-                        send_evt_lossy(
-                            &evt_tx_for_worker,
-                            Event::AnalyzeFinished {
-                                records,
-                                failed_count,
-                            },
-                            &dropped_for_worker,
-                        );
+                        Some(Event::AnalyzeFinished {
+                            batch_id: id,
+                            records,
+                            failed_count,
+                        })
                     },
                     done_tx.clone(),
                     None,
+                    evt_tx.clone(),
+                    DropCounter::default(),
                 );
             }
         }
@@ -1722,7 +2532,7 @@ fn run_actor(
 /// Read history records from the given data directory (empty if
 /// `None`), apply `limit` + `after`, return newest-first.
 ///
-/// Production caller passes `Some(resolve_data_dir()?)`; tests pass a
+/// Production caller passes the app's records directory; tests pass a
 /// temp dir. Taking the dir as a parameter (rather than reading the
 /// env var inside) keeps tests parallel-safe — env vars are process-
 /// global and would race between threads.
@@ -1779,7 +2589,7 @@ mod controller_tests {
 
     #[test]
     fn handle_into_split_returns_both_halves() {
-        let (cmd_tx, _) = unbounded::<Command>();
+        let (cmd_tx, _) = unbounded::<Request>();
         let (_, evt_rx) = unbounded::<Event>();
         let handle = ControllerHandle {
             cmd_tx,
@@ -1836,6 +2646,19 @@ mod mock_tests {
         crate::types::InputPath::new(std::path::Path::new(p)).expect("test fixture")
     }
 
+    /// A real directory with `count` fake video files in it.
+    ///
+    /// The actor touches the filesystem: the single-instance guard
+    /// takes the batch's target directory (design doc §3.11.1.1), so
+    /// the batch's files must live in a directory that exists.
+    fn batch_files(label: &str, count: usize) -> Vec<crate::types::InputPath> {
+        let dir = unique_tmp(label);
+        std::fs::create_dir_all(&dir).expect("the batch dir must exist");
+        (0..count)
+            .map(|i| input(&dir.join(format!("f{i}.mp4")).to_string_lossy()))
+            .collect()
+    }
+
     /// Run a mock actor with a mock encoder.
     ///
     /// `mock_fn` is called once per file and returns the EncodingRecord
@@ -1860,11 +2683,11 @@ mod mock_tests {
     fn run_test_controller<F>(
         mock_fn: F,
         data_dir: Option<PathBuf>,
-    ) -> (Sender<Command>, Receiver<Event>)
+    ) -> (Sender<Request>, Receiver<Event>)
     where
         F: Fn(
-                &TranscodeTask,
-                &BatchContext,
+                &EncodeTask,
+                &mut BatchContext,
                 &CancelToken,
                 &mut dyn FnMut(FfmpegProgress),
             ) -> Result<EncodingRecord, EncodeError>
@@ -1872,7 +2695,67 @@ mod mock_tests {
             + Sync
             + 'static,
     {
-        let (cmd_tx, cmd_rx) = unbounded::<Command>();
+        run_test_controller_with_capability(mock_fn, data_dir, None)
+    }
+
+    /// [`run_test_controller`] with the NVENC capability the cache
+    /// init hands to the UI.
+    ///
+    /// The production actor resolves the capability at startup and
+    /// reports it in an `Event::NvencCapability`; the test harness
+    /// pre-populates the cache channel instead, so a test that cares
+    /// about that event (or about the review-date deferral it
+    /// triggers) passes the capability in here.
+    fn run_test_controller_with_capability<F>(
+        mock_fn: F,
+        data_dir: Option<PathBuf>,
+        capability: Option<Capability>,
+    ) -> (Sender<Request>, Receiver<Event>)
+    where
+        F: Fn(
+                &EncodeTask,
+                &mut BatchContext,
+                &CancelToken,
+                &mut dyn FnMut(FfmpegProgress),
+            ) -> Result<EncodingRecord, EncodeError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        run_test_controller_with_runner(
+            mock_fn,
+            data_dir,
+            capability,
+            Arc::new(|_args| Ok(String::new())),
+        )
+    }
+
+    /// [`run_test_controller_with_capability`] with an injected NVENC
+    /// probe runner.
+    ///
+    /// The runner is the seam the probe goes through, so a test can
+    /// make a probe block, or answer differently each time -- the
+    /// probe's *order* matters (design doc §3.10.6 step 5: an older
+    /// probe's result must not overwrite a newer one).
+    #[allow(clippy::too_many_arguments)]
+    fn run_test_controller_with_runner<F>(
+        mock_fn: F,
+        data_dir: Option<PathBuf>,
+        capability: Option<Capability>,
+        detect_runner: crate::job::DetectRunner,
+    ) -> (Sender<Request>, Receiver<Event>)
+    where
+        F: Fn(
+                &EncodeTask,
+                &mut BatchContext,
+                &CancelToken,
+                &mut dyn FnMut(FfmpegProgress),
+            ) -> Result<EncodingRecord, EncodeError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let (cmd_tx, cmd_rx) = unbounded::<Request>();
         let (evt_tx, evt_rx) = unbounded::<Event>();
 
         // The cache is fed through the same channel the production
@@ -1883,27 +2766,49 @@ mod mock_tests {
             .send(crate::pipeline::cache::CacheInit {
                 cache: Ok(EncoderCache {
                     encoders_output: String::new(),
-                    nvenc: Vec::new(),
                 }),
-                capability: None,
+                resolution: None,
+                // The facts the resolution would have produced: the
+                // fake runner answers, so ffmpeg works.
+                facts: crate::capability::MachineFacts {
+                    ffmpeg: Some(true),
+                    nvenc: capability,
+                },
             })
             .expect("send the pre-populated cache");
 
-        let config_path = data_dir
+        // The temp dir plays the records directory: the writer and
+        // the history reader must agree on it (design doc §3.6).
+        let records_dir = data_dir
             .clone()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("saved-config.toml");
-        let nvenc_cache_path = data_dir.clone().map(|d| d.join("nvenc-capability.json"));
+            .unwrap_or_else(|| PathBuf::from("/nonexistent/rencoder-records"));
+        // The app directory: a temp dir, never the working directory
+        // -- the actor writes there (the capability report, the saved
+        // config), and a test must not leave files in the source
+        // tree.
+        let app_dir = data_dir.clone().unwrap_or_else(|| {
+            let dir = unique_tmp("app_dir");
+            std::fs::create_dir_all(&dir).ok();
+            dir
+        });
+        let config_path = app_dir.join("saved-config.toml");
+        let mut paths = Paths::resolve(
+            config_path.clone(),
+            app_dir.clone(),
+            app_dir,
+            &AppConfig::default(),
+        );
+        paths.records_dir = records_dir.clone();
+        paths.capability_record = records_dir.join("nvenc-capability.json");
 
         let env = ActorEnv {
             app_config: Arc::new(AppConfig::default()),
             config_path,
-            data_dir,
-            nvenc_cache_path,
+            paths,
             file_encoder: Arc::new(MockFileEncoder { f: mock_fn }),
-            // The NVENC probe never runs in a test: the fake runner
-            // answers "no encoders", so nothing is probed.
-            detect_runner: Arc::new(|_args| Ok(String::new())),
+            // The NVENC probe never runs against real ffmpeg: the
+            // fake runner answers it.
+            detect_runner,
         };
 
         std::thread::spawn(move || {
@@ -1921,8 +2826,8 @@ mod mock_tests {
     impl<F> FileEncoder for MockFileEncoder<F>
     where
         F: Fn(
-                &TranscodeTask,
-                &BatchContext,
+                &EncodeTask,
+                &mut BatchContext,
                 &CancelToken,
                 &mut dyn FnMut(FfmpegProgress),
             ) -> Result<EncodingRecord, EncodeError>
@@ -1932,7 +2837,7 @@ mod mock_tests {
     {
         fn encode(
             &self,
-            task: &TranscodeTask,
+            task: &EncodeTask,
             ctx: &mut BatchContext,
             cancel: &CancelToken,
             on_progress: &mut dyn FnMut(FfmpegProgress),
@@ -1976,8 +2881,8 @@ mod mock_tests {
     /// and counts calls. No progress events emitted.
     fn make_succeeding_mock() -> (
         impl Fn(
-                &TranscodeTask,
-                &BatchContext,
+                &EncodeTask,
+                &mut BatchContext,
                 &CancelToken,
                 &mut dyn FnMut(FfmpegProgress),
             ) -> Result<EncodingRecord, EncodeError>
@@ -1988,8 +2893,8 @@ mod mock_tests {
     ) {
         let count = Arc::new(AtomicUsize::new(0));
         let count_clone = count.clone();
-        let f = move |task: &TranscodeTask,
-                      _: &BatchContext,
+        let f = move |task: &EncodeTask,
+                      _: &mut BatchContext,
                       _: &CancelToken,
                       _: &mut dyn FnMut(FfmpegProgress)|
               -> Result<EncodingRecord, EncodeError> {
@@ -2002,8 +2907,8 @@ mod mock_tests {
     /// Mock encoder that emits 2 progress blocks per file then
     /// returns Succeeded. Used to verify Event::Progress flow.
     fn make_progress_mock() -> impl Fn(
-        &TranscodeTask,
-        &BatchContext,
+        &EncodeTask,
+        &mut BatchContext,
         &CancelToken,
         &mut dyn FnMut(FfmpegProgress),
     ) -> Result<EncodingRecord, EncodeError>
@@ -2011,8 +2916,8 @@ mod mock_tests {
            + Sync
            + 'static {
         fn f(
-            task: &TranscodeTask,
-            _: &BatchContext,
+            task: &EncodeTask,
+            _: &mut BatchContext,
             _: &CancelToken,
             on_progress: &mut dyn FnMut(FfmpegProgress),
         ) -> Result<EncodingRecord, EncodeError> {
@@ -2035,75 +2940,242 @@ mod mock_tests {
         f
     }
 
-    /// Drain events until `evt_rx` returns Err (sender dropped) or
-    /// the deadline expires. Tests use a generous deadline because
-    /// the mock actor runs synchronously on a thread; events should
-    /// be available almost immediately after the command is sent.
+    /// The events of a batch, without the actor's own publications.
+    ///
+    /// The capability publication is the actor's business -- it lands
+    /// when the first probe finishes. The batch's event sequence is
+    /// what these tests are about, so the publications are filtered
+    /// out and the sequence is asserted on its own.
+    fn batch_events(events: Vec<Event>) -> Vec<Event> {
+        events
+            .into_iter()
+            .filter(|e| {
+                !matches!(
+                    e,
+                    Event::NvencCapability(_) | Event::CapabilityChecked { .. }
+                )
+            })
+            .collect()
+    }
+
+    /// Drain events until the batch's **terminal event**, the sender
+    /// drops, or the deadline expires.
+    ///
+    /// The terminal event is the natural end of a batch's event
+    /// stream: after it, the batch is over and none of its events
+    /// arrive any more. Waiting for a wall-clock window instead
+    /// makes the test depend on how loaded the machine is -- the
+    /// batch's start waits for the published capability, so a fixed
+    /// two-second window is a coin flip on a busy machine (the
+    /// window is a safety net, not the thing being waited for).
     fn collect_events(rx: &Receiver<Event>, timeout: std::time::Duration) -> Vec<Event> {
         let mut events = Vec::new();
         let deadline = std::time::Instant::now() + timeout;
         while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
             match rx.recv_timeout(remaining) {
-                Ok(evt) => events.push(evt),
+                Ok(evt) => {
+                    let terminal = is_terminal_event(&evt);
+                    events.push(evt);
+                    if terminal {
+                        break;
+                    }
+                }
                 Err(_) => break,
             }
         }
         events
     }
 
+    /// Is this event the end of a batch?
+    fn is_terminal_event(event: &Event) -> bool {
+        matches!(
+            event,
+            Event::BatchCompleted { .. }
+                | Event::BatchCancelled { .. }
+                | Event::BatchFailed { .. }
+                | Event::DryRunFinished { .. }
+                | Event::AnalyzeFinished { .. }
+        )
+    }
+
+    #[test]
+    fn a_busy_target_is_a_benign_rejection() {
+        // Another instance holds the target (design doc §3.11.1.1):
+        // the command is **rejected**, not an error -- the running
+        // batch is untouched, and this one never starts.
+        let files = batch_files("busy_target", 1);
+        let target = files[0]
+            .as_path()
+            .parent()
+            .expect("the file has a parent")
+            .to_path_buf();
+        // Take the target the way another instance would.
+        let _held = crate::guard::TargetGuard::acquire(&target).expect("the target is free");
+
+        let (cmd_tx, evt_rx) = run_test_controller(make_succeeding_mock().0, None);
+        cmd_tx
+            .send(Request::new(
+                1,
+                Command::StartBatch {
+                    params: EncodeParams::default(),
+                    files,
+                },
+            ))
+            .unwrap();
+        // The command channel stays open: closing it tells the actor
+        // "nobody left to serve", and it exits. The actor is the
+        // publisher (design doc §3.10.6 step 5), so an actor that
+        // exited would never publish the startup capability and the
+        // batch would wait for a state that never arrives.
+
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::CommandRejected { .. })),
+            "the busy target must be a rejection, got {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Error { .. })),
+            "a rejected command is not a fatal error: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_busy_descendant_stops_the_batch() {
+        // A directory **inside** the batch's scope is held by another
+        // instance (design doc §3.11.1.1): the batch cannot start --
+        // it would collect that directory's files and write the same
+        // outputs.
+        let root = unique_tmp("busy_descendant");
+        let held_dir = root.join("held");
+        let other_dir = root.join("other");
+        std::fs::create_dir_all(&held_dir).unwrap();
+        std::fs::create_dir_all(&other_dir).unwrap();
+        // Another instance holds one of the two directories.
+        let _held = crate::guard::TargetGuard::acquire(&held_dir).expect("the target is free");
+        // This batch works on both -- its scope is their common parent.
+        let files = vec![
+            input(&held_dir.join("a.mp4").to_string_lossy()),
+            input(&other_dir.join("b.mp4").to_string_lossy()),
+        ];
+
+        let (cmd_tx, evt_rx) = run_test_controller(make_succeeding_mock().0, None);
+        cmd_tx
+            .send(Request::new(
+                1,
+                Command::StartBatch {
+                    params: EncodeParams::default(),
+                    files,
+                },
+            ))
+            .unwrap();
+        // The command channel stays open: closing it tells the actor
+        // "nobody left to serve", and it exits. The actor is the
+        // publisher (design doc §3.10.6 step 5), so an actor that
+        // exited would never publish the startup capability and the
+        // batch would wait for a state that never arrives.
+
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::BatchFailed { .. })),
+            "the batch must not start: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::BatchCompleted { .. })),
+            "no batch may run on a busy scope: {events:?}"
+        );
+    }
+
     #[test]
     fn start_batch_emits_expected_event_sequence() {
         let (cmd_tx, evt_rx) = run_test_controller(make_succeeding_mock().0, None);
-        let files: Vec<crate::types::InputPath> =
-            (0..3).map(|i| input(&format!("/in/{i}.mp4"))).collect();
+        let files = batch_files("event_sequence", 3);
         cmd_tx
-            .send(Command::StartBatch {
-                params: EncodeParams::default(),
-                files: files.clone(),
-            })
+            .send(Request::new(
+                1,
+                Command::StartBatch {
+                    params: EncodeParams::default(),
+                    files: files.clone(),
+                },
+            ))
             .unwrap();
-        drop(cmd_tx);
+        // The command channel stays open: closing it tells the actor
+        // "nobody left to serve", and it exits. The actor is the
+        // publisher (design doc §3.10.6 step 5), so an actor that
+        // exited would never publish the startup capability and the
+        // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
+        let events = batch_events(collect_events(&evt_rx, std::time::Duration::from_secs(10)));
         // Expected sequence: per-file events interleave (each
         // process_one_file emits FileStarted then FileCompleted
         // before moving to the next file).
+        //   CommandAccepted
         //   BatchStarted
         //   FileStarted(0) FileCompleted(0)
         //   FileStarted(1) FileCompleted(1)
         //   FileStarted(2) FileCompleted(2)
         //   BatchCompleted
-        assert_eq!(events.len(), 1 + 3 * 2 + 1);
+        assert_eq!(events.len(), 2 + 3 * 2 + 1);
 
+        // The request is answered before the batch starts (design
+        // doc §3.11.3): the answer carries the batch id.
+        let batch_id = match &events[0] {
+            Event::CommandAccepted {
+                request_id,
+                batch_id: Some(id),
+            } => {
+                assert_eq!(*request_id, 1, "the answer carries the request id");
+                *id
+            }
+            other => panic!("expected CommandAccepted first, got {other:?}"),
+        };
         assert!(matches!(
-            events[0],
+            events[1],
             Event::BatchStarted { total_files: 3, .. }
         ));
 
         // Verify per-file pairs in order.
         for i in 0..3 {
-            let started = &events[1 + i * 2];
-            let completed = &events[1 + i * 2 + 1];
+            let started = &events[2 + i * 2];
+            let completed = &events[2 + i * 2 + 1];
             match (started, completed) {
                 (
                     Event::FileStarted {
+                        batch_id: sb,
                         index: si,
                         total: st,
                         source: ss,
                     },
-                    Event::FileCompleted { index: ci, .. },
+                    Event::FileCompleted {
+                        batch_id: cb,
+                        index: ci,
+                        ..
+                    },
                 ) => {
                     assert_eq!(*si, i);
                     assert_eq!(*ci, i);
                     assert_eq!(*st, 3);
                     assert_eq!(ss, &files[i]);
+                    // Every event of the batch carries its id (design
+                    // doc §3.11.3).
+                    assert_eq!(*sb, batch_id);
+                    assert_eq!(*cb, batch_id);
                 }
                 _ => panic!("events {started:?} {completed:?} not a started/completed pair"),
             }
         }
 
         match events.last().unwrap() {
-            Event::BatchCompleted { records } => {
+            Event::BatchCompleted {
+                batch_id: id,
+                records,
+            } => {
+                assert_eq!(*id, batch_id);
                 assert_eq!(records.len(), 3);
                 for (i, r) in records.iter().enumerate() {
                     assert_eq!(r.source_path, files[i].to_string());
@@ -2116,19 +3188,26 @@ mod mock_tests {
     #[test]
     fn start_batch_emits_progress_events_during_encode() {
         let (cmd_tx, evt_rx) = run_test_controller(make_progress_mock(), None);
-        let files: Vec<crate::types::InputPath> =
-            (0..2).map(|i| input(&format!("/p/{i}.mp4"))).collect();
+        let files = batch_files("progress", 2);
         cmd_tx
-            .send(Command::StartBatch {
-                params: EncodeParams::default(),
-                files,
-            })
+            .send(Request::new(
+                1,
+                Command::StartBatch {
+                    params: EncodeParams::default(),
+                    files,
+                },
+            ))
             .unwrap();
-        drop(cmd_tx);
+        // The command channel stays open: closing it tells the actor
+        // "nobody left to serve", and it exits. The actor is the
+        // publisher (design doc §3.10.6 step 5), so an actor that
+        // exited would never publish the startup capability and the
+        // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
-        // Expected: BatchStarted + (FileStarted + Progress×2 + FileCompleted) × 2 + BatchCompleted
-        assert_eq!(events.len(), 1 + (1 + 2 + 1) * 2 + 1);
+        let events = batch_events(collect_events(&evt_rx, std::time::Duration::from_secs(10)));
+        // Expected: CommandAccepted + BatchStarted
+        //   + (FileStarted + Progress×2 + FileCompleted) × 2 + BatchCompleted
+        assert_eq!(events.len(), 2 + (1 + 2 + 1) * 2 + 1);
         let progress_count = events
             .iter()
             .filter(|e| matches!(e, Event::Progress { .. }))
@@ -2155,25 +3234,31 @@ mod mock_tests {
             },
             None,
         );
-        let files: Vec<crate::types::InputPath> = vec![input("/a.mp4")];
+        let files = batch_files("second_batch", 1);
         cmd_tx
-            .send(Command::StartBatch {
-                params: EncodeParams::default(),
-                files: files.clone(),
-            })
+            .send(Request::new(
+                1,
+                Command::StartBatch {
+                    params: EncodeParams::default(),
+                    files: files.clone(),
+                },
+            ))
             .unwrap();
         cmd_tx
-            .send(Command::StartBatch {
-                params: EncodeParams::default(),
-                files,
-            })
+            .send(Request::new(
+                2,
+                Command::StartBatch {
+                    params: EncodeParams::default(),
+                    files,
+                },
+            ))
             .unwrap();
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
         assert!(
             events.iter().any(|e| matches!(
                 e,
-                Event::CommandRejected { reason } if reason.contains("another batch")
+                Event::CommandRejected { reason, .. } if reason.contains("another batch")
             )),
             "the second batch must be rejected, got: {events:?}"
         );
@@ -2201,30 +3286,41 @@ mod mock_tests {
             },
             None,
         );
-        let files: Vec<crate::types::InputPath> =
-            (0..20).map(|i| input(&format!("/x/{i}.mp4"))).collect();
+        let files: Vec<crate::types::InputPath> = batch_files("cancel_running", 20);
         cmd_tx
-            .send(Command::StartBatch {
-                params: EncodeParams::default(),
-                files,
-            })
+            .send(Request::new(
+                1,
+                Command::StartBatch {
+                    params: EncodeParams::default(),
+                    files,
+                },
+            ))
             .unwrap();
 
-        // Wait until the worker really started the batch.
-        loop {
-            match evt_rx.recv_timeout(std::time::Duration::from_secs(2)) {
-                Ok(Event::FileStarted { .. }) => break,
+        // Wait until the worker really started the batch -- and
+        // learn the batch id (the cancel names it, design doc
+        // §3.11.3).
+        let batch_id = loop {
+            match evt_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(Event::BatchStarted { id, .. }) => break id,
                 Ok(_) => continue,
-                Err(e) => panic!("no FileStarted event: {e}"),
+                Err(e) => panic!("no BatchStarted event: {e}"),
             }
-        }
+        };
 
-        cmd_tx.send(Command::Cancel).unwrap();
+        cmd_tx
+            .send(Request::new(2, Command::Cancel { batch_id }))
+            .unwrap();
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
         let last = events.last().expect("expected a terminal event");
         match last {
-            Event::BatchCancelled { completed, total } => {
+            Event::BatchCancelled {
+                batch_id: id,
+                completed,
+                total,
+            } => {
+                assert_eq!(*id, batch_id);
                 assert_eq!(*total, 20);
                 assert!(
                     *completed < 20,
@@ -2252,29 +3348,141 @@ mod mock_tests {
             },
             None,
         );
-        let files: Vec<crate::types::InputPath> =
-            (0..5).map(|i| input(&format!("/c/{i}.mp4"))).collect();
+        let files: Vec<crate::types::InputPath> = batch_files("cancel_mid", 5);
         cmd_tx
-            .send(Command::StartBatch {
-                params: EncodeParams::default(),
-                files,
-            })
+            .send(Request::new(
+                1,
+                Command::StartBatch {
+                    params: EncodeParams::default(),
+                    files,
+                },
+            ))
             .unwrap();
-        drop(cmd_tx);
+        // The command channel stays open: closing it tells the actor
+        // "nobody left to serve", and it exits. The actor is the
+        // publisher (design doc §3.10.6 step 5), so an actor that
+        // exited would never publish the startup capability and the
+        // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
         // First file completes (FileStarted + FileCompleted) before
         // cancel propagates; then BatchCancelled with completed = 1.
         // (Mock cancels on file 1 itself, but the file's FileCompleted
         // already emitted before the cancel was observed.)
         let last = events.last().unwrap();
         match last {
-            Event::BatchCancelled { completed, total } => {
+            Event::BatchCancelled {
+                completed, total, ..
+            } => {
                 assert_eq!(*completed, 1);
                 assert_eq!(*total, 5);
             }
             _ => panic!("expected BatchCancelled, got {last:?}"),
         }
+    }
+
+    #[test]
+    fn a_cancel_that_names_another_batch_is_refused() {
+        // Design doc §3.11.3: only the active batch may be cancelled.
+        // A stale cancel (the user cancelled, then a new batch
+        // started) must not stop the batch that is running now.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let (cmd_tx, evt_rx) = run_test_controller(
+            move |task, _, _, _| {
+                calls_clone.fetch_add(1, AtomicOrdering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                Ok(fake_record(&task.input))
+            },
+            None,
+        );
+        let files: Vec<crate::types::InputPath> = batch_files("stale_cancel", 6);
+        cmd_tx
+            .send(Request::new(
+                1,
+                Command::StartBatch {
+                    params: EncodeParams::default(),
+                    files,
+                },
+            ))
+            .unwrap();
+
+        // Wait for the batch to announce its id.
+        let batch_id = loop {
+            match evt_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(Event::BatchStarted { id, .. }) => break id,
+                Ok(_) => continue,
+                Err(e) => panic!("no BatchStarted event: {e}"),
+            }
+        };
+
+        // A cancel for a different batch: refused.
+        cmd_tx
+            .send(Request::new(
+                2,
+                Command::Cancel {
+                    batch_id: batch_id + 100,
+                },
+            ))
+            .unwrap();
+
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::CommandRejected { request_id: 2, .. })),
+            "a cancel for another batch must be refused: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::BatchCancelled { .. })),
+            "the running batch must not be cancelled: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_rejected_request_names_the_request() {
+        // The busy gate's refusal says *which* request was refused
+        // (design doc §3.11.3): the UI restores the state of that
+        // request, not of "the last one".
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let (cmd_tx, evt_rx) = run_test_controller(
+            move |task, _, _, _| {
+                calls_clone.fetch_add(1, AtomicOrdering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                Ok(fake_record(&task.input))
+            },
+            None,
+        );
+        let files = batch_files("reject_names", 1);
+        cmd_tx
+            .send(Request::new(
+                1,
+                Command::StartBatch {
+                    params: EncodeParams::default(),
+                    files: files.clone(),
+                },
+            ))
+            .unwrap();
+        cmd_tx
+            .send(Request::new(
+                77,
+                Command::StartBatch {
+                    params: EncodeParams::default(),
+                    files,
+                },
+            ))
+            .unwrap();
+
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::CommandRejected { request_id: 77, .. })),
+            "the refusal must name the refused request: {events:?}"
+        );
     }
 
     #[test]
@@ -2285,16 +3493,25 @@ mod mock_tests {
         let (cmd_tx, evt_rx) =
             run_test_controller(|task, _, _, _| Ok(fake_record(&task.input)), None);
         cmd_tx
-            .send(Command::LoadHistory {
-                limit: None,
-                after: None,
-            })
+            .send(Request::new(
+                1,
+                Command::LoadHistory {
+                    limit: None,
+                    after: None,
+                },
+            ))
             .unwrap();
-        drop(cmd_tx);
+        // The command channel stays open: closing it tells the actor
+        // "nobody left to serve", and it exits. The actor is the
+        // publisher (design doc §3.10.6 step 5), so an actor that
+        // exited would never publish the startup capability and the
+        // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
-        assert_eq!(events.len(), 1);
-        match &events[0] {
+        let events = batch_events(collect_events(&evt_rx, std::time::Duration::from_secs(10)));
+        // The request is answered first (design doc §3.11.3), then
+        // the result.
+        assert_eq!(events.len(), 2);
+        match &events[1] {
             Event::HistoryLoaded { records } => assert!(records.is_empty()),
             _ => panic!("expected HistoryLoaded"),
         }
@@ -2327,16 +3544,23 @@ mod mock_tests {
             Some(tmp.clone()),
         );
         cmd_tx
-            .send(Command::LoadHistory {
-                limit: None,
-                after: None,
-            })
+            .send(Request::new(
+                1,
+                Command::LoadHistory {
+                    limit: None,
+                    after: None,
+                },
+            ))
             .unwrap();
-        drop(cmd_tx);
+        // The command channel stays open: closing it tells the actor
+        // "nobody left to serve", and it exits. The actor is the
+        // publisher (design doc §3.10.6 step 5), so an actor that
+        // exited would never publish the startup capability and the
+        // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
-        assert_eq!(events.len(), 1);
-        match &events[0] {
+        let events = batch_events(collect_events(&evt_rx, std::time::Duration::from_secs(10)));
+        assert_eq!(events.len(), 2);
+        match &events[1] {
             Event::HistoryLoaded { records: loaded } => {
                 assert_eq!(loaded.len(), 3);
                 // Newest-first ordering.
@@ -2347,6 +3571,54 @@ mod mock_tests {
         }
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_finished_batch_writes_its_records_to_the_history_file() {
+        // The GUI's history reads `<data_dir>/encoding-*.parquet`; if
+        // nobody writes it, the history stays empty forever (design
+        // doc §3.11.4).
+        let dir = unique_tmp("batch_records");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (cmd_tx, evt_rx) = run_test_controller(make_succeeding_mock().0, Some(dir.clone()));
+        cmd_tx
+            .send(Request::new(
+                1,
+                Command::StartBatch {
+                    params: EncodeParams::default(),
+                    files: batch_files("history", 1),
+                },
+            ))
+            .unwrap();
+        // The command channel stays open: closing it tells the actor
+        // "nobody left to serve", and it exits. The actor is the
+        // publisher (design doc §3.10.6 step 5), so an actor that
+        // exited would never publish the startup capability and the
+        // batch would wait for a state that never arrives.
+
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::BatchCompleted { .. })),
+            "expected a BatchCompleted event, got {events:?}"
+        );
+
+        // The records are on disk, under the name the history reader
+        // recognises.
+        let written: Vec<_> = std::fs::read_dir(&dir)
+            .expect("the data dir must be readable")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("encoding-") && name.ends_with(".parquet"))
+            .collect();
+        assert_eq!(
+            written.len(),
+            1,
+            "the batch's records must be written: {written:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(feature = "parallel-analyze")]
@@ -2367,18 +3639,26 @@ mod mock_tests {
             ..Default::default()
         };
         cmd_tx
-            .send(Command::SaveConfig {
-                config: Box::new(edited),
-            })
+            .send(Request::new(
+                1,
+                Command::SaveConfig {
+                    config: Box::new(edited),
+                    revision: 7,
+                },
+            ))
             .unwrap();
-        drop(cmd_tx);
+        // The command channel stays open: closing it tells the actor
+        // "nobody left to serve", and it exits. The actor is the
+        // publisher (design doc §3.10.6 step 5), so an actor that
+        // exited would never publish the startup capability and the
+        // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, Event::ConfigSaved { .. })),
-            "expected a ConfigSaved event, got {events:?}"
+                .any(|e| matches!(e, Event::ConfigSaved { revision: 7, .. })),
+            "the receipt must carry the revision it saved, got {events:?}"
         );
 
         let written = std::fs::read_to_string(dir.join("saved-config.toml")).unwrap();
@@ -2393,16 +3673,69 @@ mod mock_tests {
         // The actor's Command::Detect arm: the capability comes back
         // as an event so the UI can render it.
         let (cmd_tx, evt_rx) = run_test_controller(make_succeeding_mock().0, None);
-        cmd_tx.send(Command::Detect { force: true }).unwrap();
-        drop(cmd_tx);
+        cmd_tx
+            .send(Request::new(1, Command::Detect { force: true }))
+            .unwrap();
+        // The command channel stays open: closing it tells the actor
+        // "nobody left to serve", and it exits. The actor is the
+        // publisher (design doc §3.10.6 step 5), so an actor that
+        // exited would never publish the startup capability and the
+        // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
         assert!(
             events
                 .iter()
                 .any(|e| matches!(e, Event::NvencCapability(_))),
             "expected a NvencCapability event, got {events:?}"
         );
+    }
+
+    #[test]
+    fn a_working_directory_change_rechecks_and_writes_the_report() {
+        // The GUI's working directory moved: the operation directory
+        // follows it (design doc §3.6), the capability check runs
+        // again (design doc §3.10.7), and the report lands in the new
+        // operation directory.
+        let app = unique_tmp("working_dir_app");
+        let working = unique_tmp("working_dir_op");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::create_dir_all(&working).unwrap();
+        let (cmd_tx, evt_rx) = run_test_controller(make_succeeding_mock().0, Some(app.clone()));
+        cmd_tx
+            .send(Request::new(
+                1,
+                Command::SetWorkingDir {
+                    dir: working.clone(),
+                },
+            ))
+            .unwrap();
+        // The command channel stays open: closing it tells the actor
+        // "nobody left to serve", and it exits. The actor is the
+        // publisher (design doc §3.10.6 step 5), so an actor that
+        // exited would never publish the startup capability and the
+        // batch would wait for a state that never arrives.
+
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        let report = events
+            .iter()
+            .find_map(|e| match e {
+                Event::CapabilityChecked { report } => Some(report.clone()),
+                _ => None,
+            })
+            .expect("the check must announce its report");
+        assert_eq!(
+            report,
+            working.join("capabilities.json"),
+            "the report belongs to the new operation directory"
+        );
+        assert!(
+            report.exists(),
+            "the report must be written: {}",
+            report.display()
+        );
+        let _ = std::fs::remove_dir_all(&app);
+        let _ = std::fs::remove_dir_all(&working);
     }
 
     #[test]
@@ -2429,22 +3762,35 @@ mod mock_tests {
 
         let (cmd_tx, evt_rx) = run_test_controller(make_succeeding_mock().0, None);
         cmd_tx
-            .send(Command::Analyze {
-                files: files.clone(),
-            })
+            .send(Request::new(
+                1,
+                Command::Analyze {
+                    files: files.clone(),
+                },
+            ))
             .unwrap();
-        drop(cmd_tx);
+        // The command channel stays open: closing it tells the actor
+        // "nobody left to serve", and it exits. The actor is the
+        // publisher (design doc §3.10.6 step 5), so an actor that
+        // exited would never publish the startup capability and the
+        // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
-        // Expected: 1 AnalyzeStarted + 3 AnalyzeProgress + 1 AnalyzeFinished.
-        assert_eq!(events.len(), 5, "expected 5 events, got: {events:?}");
-        // First event: AnalyzeStarted with total = 3.
+        let events = batch_events(collect_events(&evt_rx, std::time::Duration::from_secs(10)));
+        // Expected: 1 CommandAccepted + 1 AnalyzeStarted
+        //            + 3 AnalyzeProgress + 1 AnalyzeFinished.
+        assert_eq!(events.len(), 6, "expected 6 events, got: {events:?}");
+        // First event: the request is answered (design doc §3.11.3).
         match &events[0] {
-            Event::AnalyzeStarted { total } => assert_eq!(*total, 3),
-            _ => panic!("expected AnalyzeStarted first, got: {:?}", events[0]),
+            Event::CommandAccepted { batch_id, .. } => assert!(batch_id.is_some()),
+            _ => panic!("expected CommandAccepted first, got: {:?}", events[0]),
+        }
+        // Second event: AnalyzeStarted with total = 3.
+        match &events[1] {
+            Event::AnalyzeStarted { total, .. } => assert_eq!(*total, 3),
+            _ => panic!("expected AnalyzeStarted, got: {:?}", events[1]),
         }
         // Middle 3 events: AnalyzeProgress, all with total = 3.
-        for evt in &events[1..4] {
+        for evt in &events[2..5] {
             match evt {
                 Event::AnalyzeProgress { total, last, .. } => {
                     assert_eq!(*total, 3);
@@ -2459,6 +3805,7 @@ mod mock_tests {
             Event::AnalyzeFinished {
                 records,
                 failed_count,
+                ..
             } => {
                 assert_eq!(*failed_count, 3);
                 assert_eq!(records.len(), 3);
@@ -2497,13 +3844,20 @@ mod mock_tests {
             })
             .collect();
         cmd_tx
-            .send(Command::Analyze {
-                files: files.clone(),
-            })
+            .send(Request::new(
+                1,
+                Command::Analyze {
+                    files: files.clone(),
+                },
+            ))
             .unwrap();
-        drop(cmd_tx);
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
-        assert!(matches!(events[0], Event::AnalyzeStarted { .. }));
+        // The command channel stays open: closing it tells the actor
+        // "nobody left to serve", and it exits. The actor is the
+        // publisher (design doc §3.10.6 step 5), so an actor that
+        // exited would never publish the startup capability and the
+        // batch would wait for a state that never arrives.
+        let events = batch_events(collect_events(&evt_rx, std::time::Duration::from_secs(10)));
+        assert!(matches!(events[1], Event::AnalyzeStarted { .. }));
         assert!(matches!(
             events.last().unwrap(),
             Event::AnalyzeFinished { .. }
@@ -2524,23 +3878,30 @@ mod mock_tests {
         // "emits_finished_only" was a lie since the body asserted
         // 2 events.
         let (cmd_tx, evt_rx) = run_test_controller(make_succeeding_mock().0, None);
-        cmd_tx.send(Command::Analyze { files: Vec::new() }).unwrap();
-        drop(cmd_tx);
+        cmd_tx
+            .send(Request::new(1, Command::Analyze { files: Vec::new() }))
+            .unwrap();
+        // The command channel stays open: closing it tells the actor
+        // "nobody left to serve", and it exits. The actor is the
+        // publisher (design doc §3.10.6 step 5), so an actor that
+        // exited would never publish the startup capability and the
+        // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
+        let events = batch_events(collect_events(&evt_rx, std::time::Duration::from_secs(10)));
         assert_eq!(
             events.len(),
-            2,
-            "expected Started + Finished, got: {events:?}"
+            3,
+            "expected Accepted + Started + Finished, got: {events:?}"
         );
-        match &events[0] {
-            Event::AnalyzeStarted { total } => assert_eq!(*total, 0),
+        match &events[1] {
+            Event::AnalyzeStarted { total, .. } => assert_eq!(*total, 0),
             _ => panic!("expected AnalyzeStarted"),
         }
-        match &events[1] {
+        match &events[2] {
             Event::AnalyzeFinished {
                 records,
                 failed_count,
+                ..
             } => {
                 assert!(records.is_empty());
                 assert_eq!(*failed_count, 0);
@@ -2570,15 +3931,22 @@ mod mock_tests {
             Some(tmp.clone()),
         );
         cmd_tx
-            .send(Command::LoadHistory {
-                limit: Some(3),
-                after: None,
-            })
+            .send(Request::new(
+                1,
+                Command::LoadHistory {
+                    limit: Some(3),
+                    after: None,
+                },
+            ))
             .unwrap();
-        drop(cmd_tx);
+        // The command channel stays open: closing it tells the actor
+        // "nobody left to serve", and it exits. The actor is the
+        // publisher (design doc §3.10.6 step 5), so an actor that
+        // exited would never publish the startup capability and the
+        // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
-        match &events[0] {
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        match &events[1] {
             Event::HistoryLoaded { records: loaded } => {
                 assert_eq!(loaded.len(), 3);
                 // Newest-first: highest started_at first.
@@ -2614,15 +3982,22 @@ mod mock_tests {
         );
         let cutoff = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000 + 200, 0).unwrap();
         cmd_tx
-            .send(Command::LoadHistory {
-                limit: None,
-                after: Some(cutoff),
-            })
+            .send(Request::new(
+                1,
+                Command::LoadHistory {
+                    limit: None,
+                    after: Some(cutoff),
+                },
+            ))
             .unwrap();
-        drop(cmd_tx);
+        // The command channel stays open: closing it tells the actor
+        // "nobody left to serve", and it exits. The actor is the
+        // publisher (design doc §3.10.6 step 5), so an actor that
+        // exited would never publish the startup capability and the
+        // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
-        match &events[0] {
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        match &events[1] {
             Event::HistoryLoaded { records: loaded } => {
                 // started_at values: 0, 100, 200, 300, 400 (seconds offset).
                 // after = 200 → keep records with started_at >= 200.
@@ -2638,7 +4013,11 @@ mod mock_tests {
     }
 
     #[test]
-    fn encode_error_propagates_as_event_error() {
+    fn a_per_file_failure_travels_in_the_record_not_in_a_fatal_event() {
+        // Design doc §3.11.3: a file failure belongs to the file. It
+        // travels in the record's `error` field -- a fatal event
+        // would finalize the whole batch while the other files are
+        // still running.
         let (cmd_tx, evt_rx) = run_test_controller(
             |_, _, _, _| {
                 Err(crate::error::EncodeError::Ffmpeg(
@@ -2647,38 +4026,43 @@ mod mock_tests {
             },
             None,
         );
-        let files = vec![input("/err.mp4")];
+        let files = batch_files("encode_error", 1);
         cmd_tx
-            .send(Command::StartBatch {
-                params: EncodeParams::default(),
-                files,
-            })
+            .send(Request::new(
+                1,
+                Command::StartBatch {
+                    params: EncodeParams::default(),
+                    files,
+                },
+            ))
             .unwrap();
-        drop(cmd_tx);
+        // The command channel stays open: closing it tells the actor
+        // "nobody left to serve", and it exits. The actor is the
+        // publisher (design doc §3.10.6 step 5), so an actor that
+        // exited would never publish the startup capability and the
+        // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
-        // Expect: BatchStarted, Error(FfmpegSpawnFailed per mapping
-        // table), BatchCompleted(empty).
-        let error_events: Vec<_> = events
-            .iter()
-            .filter(|e| matches!(e, Event::Error { .. }))
-            .collect();
-        assert_eq!(error_events.len(), 1);
-        match error_events[0] {
-            Event::Error { category, .. } => {
-                assert!(matches!(category, ErrorCategory::FfmpegSpawnFailed));
-            }
-            _ => unreachable!(),
-        }
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Error { .. })),
+            "a file failure is not a fatal event: {events:?}"
+        );
         // Review #120: failed records ARE included in the final
-        // BatchCompleted list (the per-file failure is now mapped to
-        // Ok(Failed record) inside the processor closure, not to
-        // an aborted batch).
-        assert!(matches!(
-            events.last().unwrap(),
-            Event::BatchCompleted { records } if records.len() == 1
-                && matches!(records[0].outcome, EncodingOutcome::Failed)
-        ));
+        // BatchCompleted list (the per-file failure is mapped to
+        // Ok(Failed record) inside the processor closure, not to an
+        // aborted batch).
+        match events.last().unwrap() {
+            Event::BatchCompleted { records, .. } => {
+                assert_eq!(records.len(), 1);
+                assert!(matches!(records[0].outcome, EncodingOutcome::Failed));
+                assert!(records[0].error.is_some(), "the record carries the error");
+                assert!(matches!(
+                    records[0].error.as_ref().unwrap().category,
+                    ErrorCategory::FfmpegSpawnFailed
+                ));
+            }
+            other => panic!("expected BatchCompleted, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2738,16 +4122,11 @@ mod mock_tests {
         );
 
         let (cmd_tx, evt_rx) = run_test_controller(
-            move |task: &TranscodeTask,
-                  _ctx: &BatchContext,
+            move |task: &EncodeTask,
+                  _ctx: &mut BatchContext,
                   cancel: &CancelToken,
                   on_progress: &mut dyn FnMut(FfmpegProgress)| {
-                let output = task
-                    .output
-                    .as_ref()
-                    .expect("test: task has output")
-                    .to_string_lossy()
-                    .into_owned();
+                let output = task.output.to_string_lossy().into_owned();
                 let argv = vec![
                     "sh".to_string(),
                     "-c".to_string(),
@@ -2811,14 +4190,21 @@ mod mock_tests {
 
         let files: Vec<crate::types::InputPath> = vec![input(input_path.to_str().unwrap())];
         cmd_tx
-            .send(Command::StartBatch {
-                params: EncodeParams::default(),
-                files,
-            })
+            .send(Request::new(
+                1,
+                Command::StartBatch {
+                    params: EncodeParams::default(),
+                    files,
+                },
+            ))
             .unwrap();
-        drop(cmd_tx);
+        // The command channel stays open: closing it tells the actor
+        // "nobody left to serve", and it exits. The actor is the
+        // publisher (design doc §3.10.6 step 5), so an actor that
+        // exited would never publish the startup capability and the
+        // batch would wait for a state that never arrives.
 
-        let _events = collect_events(&evt_rx, std::time::Duration::from_secs(5));
+        let _events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
 
         assert!(
             !partial_check_b.exists(),
@@ -2826,6 +4212,451 @@ mod mock_tests {
             partial_check_b.display()
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn the_batch_gets_the_published_capability() {
+        // The point of the generation work (design doc §3.10.6
+        // step 5): the GUI's batches must see the machine's NVENC
+        // capability. The actor publishes it; the batch freezes that
+        // publication.
+        //
+        // Before this, the actor's authoritative copy was never
+        // assigned -- the batches ran with an empty capability, so
+        // `any_usable()` was false and the selection always fell
+        // back to software encoding.
+        let capability = Capability::from_support(vec![crate::types::NvencSupport {
+            encoder: "h264_nvenc".into(),
+            usable: true,
+            reason: None,
+        }]);
+        let saw_usable = Arc::new(AtomicUsize::new(0));
+        let saw_usable_clone = saw_usable.clone();
+        let (cmd_tx, evt_rx) = run_test_controller_with_capability(
+            move |task: &EncodeTask,
+                  ctx: &mut BatchContext,
+                  _: &CancelToken,
+                  _: &mut dyn FnMut(FfmpegProgress)| {
+                if ctx.capability().any_usable() {
+                    saw_usable_clone.fetch_add(1, AtomicOrdering::SeqCst);
+                }
+                Ok(fake_record(&task.input))
+            },
+            None,
+            Some(capability),
+        );
+        let files = batch_files("published_capability", 1);
+        cmd_tx
+            .send(Request::new(
+                1,
+                Command::StartBatch {
+                    params: EncodeParams::default(),
+                    files,
+                },
+            ))
+            .unwrap();
+
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::BatchCompleted { .. })),
+            "the batch must run: {events:?}"
+        );
+        assert_eq!(
+            saw_usable.load(AtomicOrdering::SeqCst),
+            1,
+            "the batch must see the machine's capability"
+        );
+    }
+
+    #[test]
+    fn a_failed_re_probe_keeps_the_current_capability() {
+        // Design doc §3.10.6 step 5: a failed detection keeps the
+        // current snapshot. Publishing an empty capability instead
+        // would silently turn NVENC off for the next batch -- the
+        // machine is fine, only the probe failed.
+        let capability = Capability::from_support(vec![crate::types::NvencSupport {
+            encoder: "h264_nvenc".into(),
+            usable: true,
+            reason: None,
+        }]);
+        let saw_usable = Arc::new(AtomicUsize::new(0));
+        let saw_usable_clone = saw_usable.clone();
+        let (cmd_tx, evt_rx) = run_test_controller_with_runner(
+            move |task: &EncodeTask,
+                  ctx: &mut BatchContext,
+                  _: &CancelToken,
+                  _: &mut dyn FnMut(FfmpegProgress)| {
+                if ctx.capability().any_usable() {
+                    saw_usable_clone.fetch_add(1, AtomicOrdering::SeqCst);
+                }
+                Ok(fake_record(&task.input))
+            },
+            None,
+            Some(capability),
+            // The probe fails.
+            Arc::new(|_args: &[&str]| Err(EncodeError::Probe("probe failed".into()))),
+        );
+
+        // The forced re-probe: it fails.
+        cmd_tx
+            .send(Request::new(1, Command::Detect { force: true }))
+            .unwrap();
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::OperationFailed { .. })),
+            "the failed probe must be reported: {events:?}"
+        );
+
+        // The next batch still sees the machine's capability.
+        cmd_tx
+            .send(Request::new(
+                2,
+                Command::StartBatch {
+                    params: EncodeParams::default(),
+                    files: batch_files("failed_probe", 1),
+                },
+            ))
+            .unwrap();
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::BatchCompleted { .. })),
+            "the batch must run: {events:?}"
+        );
+        assert_eq!(
+            saw_usable.load(AtomicOrdering::SeqCst),
+            1,
+            "the failed probe must not have wiped the capability"
+        );
+    }
+
+    #[test]
+    fn a_re_probe_publishes_a_new_generation() {
+        // A forced re-probe publishes a new capability -- a new
+        // generation -- and the next batch freezes that one (design
+        // doc §3.10.6 step 5).
+        let generations = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let generations_clone = Arc::clone(&generations);
+        let (cmd_tx, evt_rx) = run_test_controller_with_capability(
+            move |task: &EncodeTask,
+                  ctx: &mut BatchContext,
+                  _: &CancelToken,
+                  _: &mut dyn FnMut(FfmpegProgress)| {
+                generations_clone.lock().push(ctx.capability().generation());
+                Ok(fake_record(&task.input))
+            },
+            None,
+            None,
+        );
+
+        // The first batch: the startup publication.
+        cmd_tx
+            .send(Request::new(
+                1,
+                Command::StartBatch {
+                    params: EncodeParams::default(),
+                    files: batch_files("generation_first", 1),
+                },
+            ))
+            .unwrap();
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::BatchCompleted { .. })),
+            "the first batch must run: {events:?}"
+        );
+
+        // The forced re-probe.
+        cmd_tx
+            .send(Request::new(2, Command::Detect { force: true }))
+            .unwrap();
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::NvencCapability(_))),
+            "the re-probe must publish a capability: {events:?}"
+        );
+
+        // The second batch: the new generation.
+        cmd_tx
+            .send(Request::new(
+                3,
+                Command::StartBatch {
+                    params: EncodeParams::default(),
+                    files: batch_files("generation_second", 1),
+                },
+            ))
+            .unwrap();
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::BatchCompleted { .. })),
+            "the second batch must run: {events:?}"
+        );
+
+        let seen = generations.lock().clone();
+        assert_eq!(seen.len(), 2, "two batches: {seen:?}");
+        assert_eq!(seen[0], 1, "the first batch froze the startup generation");
+        assert!(
+            seen[1] > seen[0],
+            "the re-probe must publish a newer generation: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn an_older_probe_result_does_not_overwrite_a_newer_one() {
+        // Design doc §3.10.6 step 5: the probe requests carry a
+        // sequence number, and only the newest result is published.
+        // An older probe that finishes late must not overwrite the
+        // newer snapshot (or the newer record on disk).
+        //
+        // The first probe blocks in the runner; the second one runs
+        // through and publishes; then the first one is let go -- and
+        // its result must be dropped.
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release_for_runner = Arc::clone(&release);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_runner = Arc::clone(&calls);
+        let runner: crate::job::DetectRunner = Arc::new(move |_args: &[&str]| {
+            if calls_for_runner.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                // The first probe waits until the test lets it through.
+                while !release_for_runner.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+            Ok(String::new())
+        });
+        let (cmd_tx, evt_rx) = run_test_controller_with_runner(
+            |task: &EncodeTask,
+             _: &mut BatchContext,
+             _: &CancelToken,
+             _: &mut dyn FnMut(FfmpegProgress)| Ok(fake_record(&task.input)),
+            None,
+            None,
+            runner,
+        );
+
+        // The first probe: it blocks.
+        cmd_tx
+            .send(Request::new(1, Command::Detect { force: true }))
+            .unwrap();
+        // The second probe: it runs through.
+        cmd_tx
+            .send(Request::new(2, Command::Detect { force: true }))
+            .unwrap();
+
+        // Wait for the second probe's publication (the second
+        // `NvencCapability` event: the startup one is the first).
+        let mut published = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while published.len() < 2 {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .expect("timed out waiting for the publications");
+            match evt_rx.recv_timeout(remaining) {
+                Ok(Event::NvencCapability(capability)) => published.push(capability.generation()),
+                Ok(_) => continue,
+                Err(e) => panic!("no capability event: {e}"),
+            }
+        }
+        // Let the first probe finish.
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // Give the dropped result time to arrive (and be dropped).
+        let extra = collect_events(&evt_rx, std::time::Duration::from_millis(500));
+        let extra_publications = extra
+            .iter()
+            .filter(|e| matches!(e, Event::NvencCapability(_)))
+            .count();
+        assert_eq!(
+            extra_publications, 0,
+            "the older probe's result must not publish: {extra:?}"
+        );
+        assert_eq!(
+            published,
+            vec![1, 2],
+            "exactly two publications: the startup one and the newer probe"
+        );
+    }
+
+    #[test]
+    fn a_verdict_from_an_older_generation_does_not_land() {
+        // Design doc §3.10.6 step 5: only the current generation's
+        // runtime corrections are merged. A batch that ran under an
+        // older publication reported against that publication -- its
+        // conclusion is about a machine state the current generation
+        // has already replaced.
+        let mut verdicts = CapabilityVerdicts::default();
+
+        // A report from generation 1, while generation 2 is current.
+        apply_verdict_updates(&mut verdicts, 2, vec![(1, "h264_nvenc".to_string(), false)]);
+        assert!(
+            !verdicts.is_disabled("h264_nvenc"),
+            "a stale report must not disable the encoder"
+        );
+
+        // A report from the current generation lands.
+        apply_verdict_updates(&mut verdicts, 2, vec![(2, "h264_nvenc".to_string(), false)]);
+        assert!(
+            verdicts.is_disabled("h264_nvenc"),
+            "the current generation's report must land"
+        );
+    }
+
+    #[test]
+    fn a_late_verdict_from_an_old_batch_does_not_disable_the_new_generation() {
+        // The scenario: a batch runs under generation 1 and finds an
+        // NVENC encoder unusable; while it is still running, a forced
+        // re-probe publishes generation 2; the batch's late report
+        // must not disable the encoder for the next batch (design doc
+        // §3.10.6 step 5).
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release_for_mock = Arc::clone(&release);
+        let recorded = Arc::new(Mutex::new(Vec::<bool>::new()));
+        let recorded_for_mock = Arc::clone(&recorded);
+        let (cmd_tx, evt_rx) = run_test_controller(
+            move |task: &EncodeTask,
+                  ctx: &mut BatchContext,
+                  _: &CancelToken,
+                  _: &mut dyn FnMut(FfmpegProgress)| {
+                // The batch blocks here until the re-probe has
+                // published the new generation.
+                while !release_for_mock.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                // What this batch was admitted with.
+                recorded_for_mock
+                    .lock()
+                    .push(ctx.capability().verdicts().is_disabled("h264_nvenc"));
+                // The runtime correction: the encoder turned out to
+                // be unusable.
+                ctx.capability_mut().verdicts_mut().set("h264_nvenc", false);
+                Ok(fake_record(&task.input))
+            },
+            None,
+        );
+
+        // The first batch: it blocks inside the encoder.
+        cmd_tx
+            .send(Request::new(
+                1,
+                Command::StartBatch {
+                    params: EncodeParams::default(),
+                    files: batch_files("late_verdict", 1),
+                },
+            ))
+            .unwrap();
+        // Wait until the batch is really inside the encoder.
+        loop {
+            match evt_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(Event::FileStarted { .. }) => break,
+                Ok(_) => continue,
+                Err(e) => panic!("the batch must start: {e}"),
+            }
+        }
+
+        // The forced re-probe: it publishes a new generation while the
+        // first batch is still running.
+        cmd_tx
+            .send(Request::new(2, Command::Detect { force: true }))
+            .unwrap();
+        loop {
+            match evt_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(Event::NvencCapability(capability)) => {
+                    if capability.generation() > 1 {
+                        break;
+                    }
+                }
+                Ok(_) => continue,
+                Err(e) => panic!("no capability event: {e}"),
+            }
+        }
+
+        // Let the first batch finish: its verdict report is late now.
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+        loop {
+            match evt_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(Event::BatchCompleted { .. }) => break,
+                Ok(_) => continue,
+                Err(e) => panic!("the first batch must finish: {e}"),
+            }
+        }
+
+        // The second batch: it must not inherit the old conclusion.
+        cmd_tx
+            .send(Request::new(
+                3,
+                Command::StartBatch {
+                    params: EncodeParams::default(),
+                    files: batch_files("late_verdict_second", 1),
+                },
+            ))
+            .unwrap();
+        loop {
+            match evt_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(Event::BatchCompleted { .. }) => break,
+                Ok(_) => continue,
+                Err(e) => panic!("the second batch must finish: {e}"),
+            }
+        }
+
+        let seen = recorded.lock().clone();
+        assert_eq!(seen.len(), 2, "two batches: {seen:?}");
+        assert!(
+            !seen[1],
+            "the new generation must not inherit the old batch's verdict: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn the_capability_reaches_the_ui_at_startup() {
+        // The GUI's half of the review cycle: the capability (with the
+        // advisory flag) reaches the UI without the user asking for it.
+        //
+        // Pushing the review date is the lib's job -- the resolve
+        // does it, so there is no state machine in the frontend
+        // (`nvenc::tests::an_expired_record_is_re_stored_with_a_pushed_review_date`
+        // covers that half).
+        let dir = unique_tmp("capability_event");
+        std::fs::create_dir_all(&dir).expect("the temp dir must be created");
+
+        let capability = Capability::from_check(
+            Vec::new(),
+            Some(chrono::Utc::now() - chrono::Duration::days(40)),
+            true,
+        );
+
+        let (_cmd_tx, evt_rx) = run_test_controller_with_capability(
+            make_succeeding_mock().0,
+            Some(dir.clone()),
+            Some(capability),
+        );
+
+        let mut reported = None;
+        for _ in 0..50 {
+            match evt_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(Event::NvencCapability(capability)) => {
+                    reported = Some(capability);
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        let capability = reported.expect("the capability must reach the UI");
+        assert!(
+            capability.review_due(),
+            "the UI needs the advisory flag to show the advisory"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

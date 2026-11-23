@@ -38,6 +38,15 @@ use serde::{Deserialize, Serialize};
 use super::fs_perms;
 use crate::types::VideoFormat;
 
+/// The notice the app logs when it creates the default config file.
+///
+/// The CLI loads the config *before* tracing is up (the log directory
+/// comes from the config -- design doc §3.6), so it re-emits this
+/// notice once the subscriber exists. The GUI initializes tracing
+/// first, so the notice reaches the log pane directly.
+pub const CREATED_CONFIG_NOTICE: &str =
+    "rencoder: created default config (no config found; edit to customize)";
+
 /// Canonical auto-generated config content. Used when the resolved
 /// config path doesn't exist on first run. This is a starter template
 /// (not the literal `Default::default()` output) — it includes inline
@@ -128,6 +137,32 @@ pub struct AppConfig {
     pub encode: Option<EncodeConfig>,
     #[serde(default)]
     pub analyze: Option<AnalyzeConfig>,
+    /// Where each file lives (design doc §3.6). Relative paths resolve
+    /// against their base directory: application-level paths against the
+    /// application directory, run-level paths against the operation
+    /// directory.
+    #[serde(default)]
+    pub paths: Option<PathsConfig>,
+}
+
+/// The `[paths]` section: where the app's files live.
+///
+/// Each entry may be absolute (used as is) or relative (resolved
+/// against its base directory). Precedence: explicit entry (env / CLI)
+/// > this file > built-in default (design doc §3.6).
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PathsConfig {
+    /// Log directory -- relative to the application directory.
+    pub log_dir: Option<PathBuf>,
+    /// Work-record directory -- relative to the application directory.
+    pub records_dir: Option<PathBuf>,
+    /// Machine capability record -- relative to the application directory.
+    pub capability_record: Option<PathBuf>,
+    /// Cancel request file -- relative to the operation directory.
+    pub cancel_file: Option<PathBuf>,
+    /// Run capability check report -- relative to the operation directory.
+    pub capability_report: Option<PathBuf>,
 }
 
 /// Default CRF value (libsvtav1 medium quality). Sentinel `0` switches
@@ -352,7 +387,7 @@ impl AppConfig {
             // User can silence via RUST_LOG.
             tracing::info!(
                 config_path = %path.display(),
-                "rencoder: created default config (no config found; edit to customize)"
+                "{CREATED_CONFIG_NOTICE}"
             );
             // Re-parse the constant as a self-consistency check: catches
             // drift between DEFAULT_CONFIG_TOML and the schema. If the
@@ -787,6 +822,7 @@ mod tests {
                     ffmpeg_args: FfmpegArgsConfig::default(),
                 }),
                 analyze: None,
+                paths: None,
             };
             let err = cfg.validate().unwrap_err();
             assert!(
@@ -816,6 +852,7 @@ mod tests {
                     ffmpeg_args: FfmpegArgsConfig::default(),
                 }),
                 analyze: None,
+                paths: None,
             };
             cfg.validate()
                 .unwrap_or_else(|e| panic!("max_fps={good} should validate, got {e:?}"));
@@ -840,6 +877,7 @@ mod tests {
                 ffmpeg_args: FfmpegArgsConfig::default(),
             }),
             analyze: None,
+            paths: None,
         };
         let err = cfg.validate().unwrap_err();
         assert!(
@@ -866,6 +904,7 @@ mod tests {
                 ffmpeg_args: FfmpegArgsConfig::default(),
             }),
             analyze: None,
+            paths: None,
         };
         cfg.validate().expect("bitrate=5000 should validate");
     }
@@ -878,6 +917,7 @@ mod tests {
         let cfg = AppConfig {
             encode: None,
             analyze: Some(AnalyzeConfig::default()),
+            paths: None,
         };
         cfg.validate().expect("analyze-only config should validate");
     }

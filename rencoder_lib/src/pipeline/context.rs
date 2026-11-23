@@ -29,36 +29,35 @@ use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 
-use crate::encoder::nvenc::CapabilityVerdicts;
+use crate::encoder::nvenc::Capability;
 use crate::types::{EncodeParams, EncoderCache, VideoMetadata};
 
 /// Everything one batch carries: its parameters, the resolved encoder
-/// cache and this run's NVENC verdicts.
+/// cache and this machine's NVENC capability.
 ///
 /// The effective configuration lives in `params` -- there is no second
 /// config object to keep in sync (design doc §3.10.5).
 ///
-/// The verdicts are the only mutable part: the NVENC fallback writes
-/// them when an encoder turns out to be unusable (design doc §3.10.1.1
-/// — the actor owns the authoritative copy, a worker owns a snapshot).
+/// The capability is the only mutable part: the NVENC fallback writes
+/// into it when an encoder turns out to be unusable (design doc
+/// §3.10.1.1 — the actor owns the authoritative copy, a worker owns a
+/// snapshot). It carries the check's conclusion *and* the run's
+/// corrections, so the whole chain reads one thing (design doc
+/// §3.10.5).
 #[derive(Clone, Debug)]
 pub struct BatchContext {
     params: EncodeParams,
     cache: Arc<EncoderCache>,
-    verdicts: CapabilityVerdicts,
+    capability: Capability,
 }
 
 impl BatchContext {
     /// Build a context for one batch.
-    pub fn new(
-        params: EncodeParams,
-        cache: Arc<EncoderCache>,
-        verdicts: CapabilityVerdicts,
-    ) -> Self {
+    pub fn new(params: EncodeParams, cache: Arc<EncoderCache>, capability: Capability) -> Self {
         Self {
             params,
             cache,
-            verdicts,
+            capability,
         }
     }
 
@@ -72,17 +71,17 @@ impl BatchContext {
         &self.cache
     }
 
-    /// The run's NVENC verdicts.
-    pub fn verdicts(&self) -> &CapabilityVerdicts {
-        &self.verdicts
+    /// This machine's NVENC capability.
+    pub fn capability(&self) -> &Capability {
+        &self.capability
     }
 
-    /// The run's NVENC verdicts, mutably.
+    /// This machine's NVENC capability, mutably.
     ///
-    /// Only the NVENC fallback path writes them — one place, right
+    /// Only the NVENC fallback path writes into it — one place, right
     /// after an NVENC encode failed.
-    pub fn verdicts_mut(&mut self) -> &mut CapabilityVerdicts {
-        &mut self.verdicts
+    pub fn capability_mut(&mut self) -> &mut Capability {
+        &mut self.capability
     }
 }
 
@@ -168,9 +167,8 @@ mod tests {
             EncodeParams::default(),
             Arc::new(EncoderCache {
                 encoders_output: String::new(),
-                nvenc: Vec::new(),
             }),
-            CapabilityVerdicts::default(),
+            Capability::default(),
         )
     }
 
@@ -184,10 +182,10 @@ mod tests {
             .encoders
             .for_format(ctx.params().format)
             .is_none());
-        assert!(!ctx.verdicts().is_disabled("h264_nvenc"));
+        assert!(!ctx.capability().verdicts().is_disabled("h264_nvenc"));
         // The verdicts are the mutable part.
-        ctx.verdicts_mut().set("h264_nvenc", false);
-        assert!(ctx.verdicts().is_disabled("h264_nvenc"));
+        ctx.capability_mut().verdicts_mut().set("h264_nvenc", false);
+        assert!(ctx.capability().verdicts().is_disabled("h264_nvenc"));
     }
 
     #[test]

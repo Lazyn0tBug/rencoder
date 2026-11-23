@@ -65,3 +65,23 @@ parallel = true
 # Optional: write the analyze output to this path instead of stdout.
 # The CLI `-o` flag overrides this per-run; `-` means stdout (default).
 # output = "video_stats.csv"
+
+[paths]
+# Where each file lives (design doc §3.6). Every entry may be absolute
+# (used as is) or relative (resolved against its base directory):
+# application-level paths against the application directory, run-level
+# paths against the operation directory -- the directory this run acts
+# on (CLI: the target's directory; GUI: the selected working directory).
+#
+# Precedence: environment variable / CLI > this file > built-in default.
+#
+# Log directory -- relative to the application directory.
+# log_dir = "log"
+# Work-record directory -- relative to the application directory.
+# records_dir = "data"
+# Machine capability record -- relative to the application directory.
+# capability_record = "nvenc-capability.json"
+# Cancel request file -- relative to the operation directory.
+# cancel_file = "cancel"
+# Run capability check report -- relative to the operation directory.
+# capability_report = "capabilities.json"

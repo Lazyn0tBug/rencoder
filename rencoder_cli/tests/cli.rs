@@ -27,9 +27,36 @@ fn ffmpeg_available() -> bool {
         .unwrap_or(false)
 }
 
+/// A per-process scratch directory for the spawned binary.
+///
+/// The binary keeps its config, its history, its logs and its NVENC
+/// capability record in its app directory. In a test that must not be
+/// the build directory: the child gets env vars pointing at a scratch
+/// directory instead -- they exist for exactly this ("explicit
+/// override for debugging / CI").
+fn scratch_dir() -> PathBuf {
+    use std::sync::OnceLock;
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("rencoder_cli_env_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the scratch dir must be created");
+        dir
+    })
+    .clone()
+}
+
 fn run(args: &[&str]) -> std::process::Output {
+    let scratch = scratch_dir();
     Command::new(bin())
         .args(args)
+        .env("RENENCODER_CONFIG", scratch.join("rencoder.toml"))
+        .env("RENENCODER_DATA_DIR", scratch.join("data"))
+        .env("RENENCODER_LOG_DIR", scratch.join("log"))
+        .env(
+            "RENENCODER_NVENC_CACHE",
+            scratch.join("nvenc-capability.json"),
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -369,4 +396,224 @@ fn encode_rejects_missing_target() {
         stderr.contains("--file") && stderr.contains("--dir"),
         "expected error mentioning --file and --dir, got: {stderr}"
     );
+}
+
+// ---- interrupt: the records survive it (design doc §3.11.2) ----
+
+/// Spawn the binary with the scratch environment, so the caller can
+/// signal it. The output is discarded: ffmpeg writes a lot of it, and
+/// a pipe nobody reads would fill up and block the child.
+fn spawn(args: &[&str], logs: Option<(&Path, &Path)>) -> std::process::Child {
+    let scratch = scratch_dir();
+    let mut cmd = Command::new(bin());
+    cmd.args(args)
+        .env("RENENCODER_CONFIG", scratch.join("rencoder.toml"))
+        .env("RENENCODER_DATA_DIR", scratch.join("data"))
+        .env("RENENCODER_LOG_DIR", scratch.join("log"))
+        .env(
+            "RENENCODER_NVENC_CACHE",
+            scratch.join("nvenc-capability.json"),
+        )
+        // The cancel request is a file in the app directory (design
+        // doc §3.11.2); point it at the scratch so the test never
+        // writes into the build directory.
+        .env("RENENCODER_CANCEL_FILE", scratch.join("cancel"));
+    match logs {
+        Some((out, err)) => {
+            cmd.stdout(std::fs::File::create(out).expect("the log file must be creatable"))
+                .stderr(std::fs::File::create(err).expect("the log file must be creatable"));
+        }
+        None => {
+            cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+    }
+    cmd.spawn().expect("the binary must start")
+}
+
+/// Make a video of `seconds` at 1080p.
+///
+/// The resolution matters: the encode has to be slow enough that the
+/// request lands *during* it, on any machine.
+fn make_video_of_seconds(dir: &Path, name: &str, seconds: u32) -> PathBuf {
+    let path = dir.join(name);
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("color=c=black:s=1920x1080:d={seconds}"),
+            "-r",
+            "30",
+            "-c:v",
+            "libx264",
+            "-t",
+            &seconds.to_string(),
+        ])
+        .arg(&path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("ffmpeg spawn failed");
+    assert!(status.success(), "ffmpeg failed to make {name}");
+    path
+}
+
+/// Wait until `marker` shows up in `file` (or give up).
+fn wait_for(file: &Path, marker: &str, timeout: std::time::Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let text = std::fs::read_to_string(file).unwrap_or_default();
+        if text.contains(marker) {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("{marker} never showed up in {}", file.display());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// An interrupt must not cost the run: the files that were already
+/// encoded stay in the records, and the process says it was
+/// interrupted (130 = 128 + SIGINT).
+///
+/// Before the cancel contract, the signal handler removed the partial
+/// output and exited right there -- the finished files were never
+/// written anywhere.
+/// The fixture for the interrupt tests: two inputs (the first one
+/// finishes before the request lands, the second one is still being
+/// encoded when it does), a config and the output path.
+struct InterruptFixture {
+    dir: PathBuf,
+    inputs: PathBuf,
+    config: PathBuf,
+    out: PathBuf,
+    err_log: PathBuf,
+}
+
+fn interrupt_fixture(label: &str) -> InterruptFixture {
+    let dir = fixture_dir(label);
+    // The inputs live in their own directory: the config and the
+    // output file would otherwise be collected as inputs too.
+    let inputs = dir.join("in");
+    std::fs::create_dir_all(&inputs).unwrap();
+    make_video_of_seconds(&inputs, "a-short.mp4", 1);
+    make_video_of_seconds(&inputs, "b-long.mp4", 60);
+    // AV1 is slow enough that the encode is still running when the
+    // request arrives.
+    let config = write_config(&dir, "[encode]\nformat = \"av1\"\ncrf = 40\n");
+    InterruptFixture {
+        out: dir.join("records.parquet"),
+        err_log: dir.join("stderr.log"),
+        inputs,
+        config,
+        dir,
+    }
+}
+
+impl InterruptFixture {
+    /// Spawn the encoder on the fixture.
+    fn spawn(&self) -> std::process::Child {
+        spawn(
+            &[
+                "encode",
+                "-d",
+                self.inputs.to_str().unwrap(),
+                "--config",
+                self.config.to_str().unwrap(),
+                "-o",
+                self.out.to_str().unwrap(),
+            ],
+            Some((&self.dir.join("stdout.log"), &self.err_log)),
+        )
+    }
+
+    /// Wait until the second file is really being encoded: the first
+    /// one is done by then, and the batch is busy -- so the request
+    /// has something to interrupt.
+    ///
+    /// A fixed sleep would be a race: the request can land before the
+    /// batch starts, and then it interrupts nothing (design doc
+    /// §3.11.5).
+    fn wait_until_encoding(&self) {
+        wait_for(
+            &self.err_log,
+            "b-long.mp4",
+            std::time::Duration::from_secs(120),
+        );
+    }
+
+    /// What an interrupted run must look like: a non-zero exit code,
+    /// the records on disk, and the file that finished before the
+    /// request among them.
+    fn assert_interrupted(&self, status: &std::process::ExitStatus) {
+        assert_eq!(
+            status.code(),
+            Some(130),
+            "an interrupted run exits with 130 (128 + SIGINT); got {status:?}"
+        );
+        assert!(
+            self.out.exists(),
+            "the records must be written before the process exits: {}",
+            self.out.display()
+        );
+        let records = rencoder_lib::data::store::read_records(&self.out)
+            .expect("the records must be readable");
+        assert!(
+            !records.is_empty(),
+            "the file that finished before the request must be in the records"
+        );
+    }
+}
+
+/// The cancel request is a file (design doc §3.11.2): the batch polls
+/// for it, so anyone who can write it can stop a running batch -- and
+/// the guarantee is one poll interval, on every platform.
+#[test]
+fn the_cancel_file_stops_the_batch_and_the_records_survive() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+    let fixture = interrupt_fixture("cancel_file");
+    let mut child = fixture.spawn();
+
+    fixture.wait_until_encoding();
+
+    // The request: the file's existence is the request.
+    let cancel_file = scratch_dir().join("cancel");
+    std::fs::write(&cancel_file, b"").expect("the cancel file must be writable");
+
+    let status = child.wait().expect("the child must exit");
+    fixture.assert_interrupted(&status);
+
+    let _ = std::fs::remove_dir_all(&fixture.dir);
+}
+
+/// Ctrl-C takes the same route: the handler writes the cancel file,
+/// the batch polls for it.
+#[cfg(unix)]
+#[test]
+fn an_interrupt_keeps_the_records_of_the_files_that_finished() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+    let fixture = interrupt_fixture("interrupt");
+    let mut child = fixture.spawn();
+
+    fixture.wait_until_encoding();
+
+    let status = Command::new("kill")
+        .arg("-INT")
+        .arg(child.id().to_string())
+        .status()
+        .expect("kill must run");
+    assert!(status.success(), "the signal must be delivered");
+
+    let status = child.wait().expect("the child must exit");
+    fixture.assert_interrupted(&status);
+
+    let _ = std::fs::remove_dir_all(&fixture.dir);
 }

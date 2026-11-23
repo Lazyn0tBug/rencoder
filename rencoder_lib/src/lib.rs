@@ -6,13 +6,16 @@
 //! See `docs/smart_code.md` for the full design.
 
 pub mod analyzer;
+pub mod capability;
 pub mod collect;
 pub mod config;
 pub mod data;
 pub mod encoder;
 pub mod error;
+pub mod guard;
 pub mod job;
 pub mod pipeline;
+pub mod test_support;
 pub mod types;
 pub mod utils;
 

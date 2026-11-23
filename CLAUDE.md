@@ -51,10 +51,10 @@ signature at call"** principle:
 - `#[cfg(...)]` lives only inside the function body that does the
   platform-specific work.
 - Callers see one stable signature; no cfg at the call site.
-- **Current implementation is Unix only** (built and tested on macOS;
-  Linux shares the `#[cfg(unix)]` branch and will be verified when
-  we cross-compile or run on Linux). Non-Unix platforms are not yet
-  implemented — future work.
+- **Current implementation is Unix only** for the GUI (design doc
+  §8 row 35); the library and the CLI build and test on macOS,
+  Linux and Windows. The CI (`.github/workflows/ci.yml`) runs the
+  gate on all three hosts — see `docs/TESTING.md`.
 - Adding a new platform later = edit one file (the definition site).
 
 Concrete: `rencoder_lib::config::fs_perms` exposes
@@ -65,8 +65,7 @@ Exception (CLI only): `rencoder_cli::signal` has a Windows branch --
 Unix uses `signal-hook` (SIGINT/SIGTERM/SIGHUP), Windows uses
 `SetConsoleCtrlHandler` (console events). The divergence stays in that
 one file; `install_handler()` keeps one signature everywhere. The
-Windows path is written but **not compiler-verified here** (this
-machine's toolchain has no Windows std) -- verify it on a Windows host.
+Windows path is compiled and tested by the CI's Windows job.
 
 ## Build
 
@@ -89,10 +88,13 @@ cargo build --features c-probe        # macOS: brew install pkg-config ffmpeg
 ## Test
 
 ```bash
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 cargo fmt --check
 ```
+
+Running the suite on another host: `docs/TESTING.md` (what each host
+needs, what differs per platform, what the CI covers).
 
 ## External tools
 
@@ -107,7 +109,7 @@ cargo fmt --check
 - Library errors: `thiserror`. CLI errors: `anyhow`. `EncodeError` is `#[non_exhaustive]`.
 - `EncoderCache` is passed by `&` -- never cloned.
 - `-r <fps>` is an FFmpeg output option: `build_ffmpeg_command` must place it after `-i`, before the output path.
-- Phase 2 (this commit) covers workspace + base data structures. Subsequent phases per `docs/design.md` §7.
+- The design doc's §8 table tracks what is left; §3.11 is the execution contract.
 
 ## Review checklist
 
@@ -143,6 +145,63 @@ saying a change is done.
 
 - (none open)
 
+## Batch check, batch fix, batch verify
+
+A change that spans several files is one change, not several. The unit of
+integration is the **task**: a coherent piece of work that can be
+implemented, checked and verified on its own.
+
+**Outer loop (the whole job):**
+
+1. **Spread out the whole picture and read it once.** Before planning,
+   read everything the work touches in one pass (the files, the call
+   sites, the tests). Reading piecemeal while editing is what produces a
+   plan built on half the picture.
+2. **Decompose into tasks.** Each task has one intent, one verification,
+   and a file list you can name up front. The task list is the iteration
+   order.
+3. **Run each task's inner loop**, in order. Tasks are independent: one
+   task's loop ends green before the next one starts.
+4. **Integrate.** After the last task, run one more whole check -> fix ->
+   verify over everything. If that surfaces problems too big to fix in
+   place, decompose them into new tasks and run their loops.
+
+**Inner loop (per task):**
+
+1. **Implement the whole task in one pass.** Write all of it before
+   compiling. The compiler tells you what you got wrong; it does not
+   tell you what to write.
+2. **Check, fix, verify -- then repeat.** One check that surfaces every
+   error of this task at once: `cargo check --workspace --all-targets`
+   (not `cargo check -p <crate>`, which hides the errors in the crates
+   you did not name, and not a per-file loop). Then one fix pass that
+   applies every fix in one go. Then the gate (`cargo clippy --workspace
+   --all-targets -- -D warnings`, `cargo test --workspace`,
+   `cargo fmt --check`). Iterate check -> fix -> verify until the task
+   is green.
+
+The discipline: **inside a task, the errors are handled in batches and
+the iteration happens between the batches.** A systematic mistake (a
+renamed field, a changed signature) shows up as N errors at N sites;
+fixing them one at a time costs N compiles, and each compile reveals
+only the next error, never the shape of the change.
+
+**A check narrower than the task hides errors.** The check must cover the
+task's full blast radius (every crate the task touches), otherwise the
+errors outside it surface in the next round -- and a task that ends with
+errors outside it is not green.
+
+**Granularity is a trade-off.** Too coarse and the task stops being one
+unit: the fix pass becomes unrelated edits, and the verification can no
+longer attribute anything to what it proved. Too fine and the compile
+overhead per task dominates, so batching buys nothing, and the
+integration point moves so often that nothing is ever verified as a
+whole. If you cannot name a task's file list, the task is not scoped
+yet: scope it first (step 1 of the methodology below), then batch it.
+
+State the batch before running it: what this task implements, what it
+checks, what it fixes, what proves it.
+
 ## Refactor / rename methodology
 
 When a refactor or rename touches more than one file, the wrong pattern is
@@ -166,8 +225,8 @@ call sites. Use this workflow instead:
      many files.
    - `Edit` only when the file has unique context that sed can't handle.
      Read the file first; verify the path is right.
-   - `cargo check` once at the END of the change set, not after each
-     file. One iteration goal.
+   - One compile at the END of the change set, not after each file (see
+     **Batch check, batch fix, batch verify**). One iteration goal.
 
 4. **Verify before each commit:**
    - `git status --short` — what actually changed?

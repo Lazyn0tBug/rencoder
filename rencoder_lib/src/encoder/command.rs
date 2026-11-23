@@ -11,7 +11,7 @@
 //! corrupt the output.
 
 use crate::config::app::FfmpegArgsConfig;
-use crate::types::{EncodeParams, FpsDecision, TranscodeTask, VideoFormat};
+use crate::types::{EncodeParams, EncodeTask, FpsDecision, VideoFormat};
 
 #[cfg(test)]
 use crate::encoder::ffmpeg_arg::ExtraArg;
@@ -50,7 +50,7 @@ fn is_nvenc(encoder: &str) -> bool {
 /// The `-r` block is the single most error-prone position; tests assert
 /// argv ordering by index, not just presence.
 pub fn build_ffmpeg_command(
-    task: &TranscodeTask,
+    task: &EncodeTask,
     params: &EncodeParams,
     encoder: &str,
     src_fps: Option<f64>,
@@ -151,15 +151,7 @@ pub fn build_ffmpeg_command(
     }
 
     // Output path always last.
-    argv.push(
-        task.output
-            .as_ref()
-            .expect(
-                "encoder::command::build_ffmpeg_command called with TranscodeTask.output = None",
-            )
-            .to_string_lossy()
-            .into_owned(),
-    );
+    argv.push(task.output.to_string_lossy().into_owned());
 
     argv
 }
@@ -170,10 +162,10 @@ mod tests {
     use crate::types::MaxFpsConfig;
     use std::path::PathBuf;
 
-    fn task(input: &str, output: &str) -> TranscodeTask {
-        TranscodeTask {
+    fn task(input: &str, output: &str) -> EncodeTask {
+        EncodeTask {
             input: crate::types::InputPath::new(&PathBuf::from(input)).unwrap(),
-            output: Some(PathBuf::from(output)),
+            output: PathBuf::from(output),
         }
     }
 

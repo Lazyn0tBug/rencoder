@@ -12,7 +12,7 @@
 //! context (function name + entered spans). `#[instrument]` annotations
 //! on `encode_cmd` / `analyze_cmd` propagate the span hierarchy.
 
-use std::path::PathBuf;
+use std::path::Path;
 
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
@@ -24,7 +24,7 @@ use crate::file_sink::FileSink;
 /// `Err` and we swallow it). Filesystem errors (log dir creation /
 /// mode-bit set) propagate via `Result` so the binary exits with a
 /// clean error message instead of panicking.
-pub fn init() -> anyhow::Result<()> {
+pub fn init(log_dir: &Path) -> anyhow::Result<()> {
     use anyhow::Context;
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -35,12 +35,11 @@ pub fn init() -> anyhow::Result<()> {
         .with_span_events(fmt::format::FmtSpan::CLOSE)
         .with_writer(std::io::stderr);
 
-    let dir = log_dir();
-    std::fs::create_dir_all(&dir).context("create log dir")?;
-    rencoder_lib::config::fs_perms::set_app_dir_mode(&dir).context("set log dir mode bits")?;
+    std::fs::create_dir_all(log_dir).context("create log dir")?;
+    rencoder_lib::config::fs_perms::set_app_dir_mode(log_dir).context("set log dir mode bits")?;
 
     let file_sink =
-        FileSink::new(&dir, 10 * 1024 * 1024, 7).context("failed to open log file sink")?;
+        FileSink::new(log_dir, 10 * 1024 * 1024, 7).context("failed to open log file sink")?;
     // File layer is for post-mortem analysis: keep it scannable.
     // - `.compact()` produces Format::Compact, which renders span
     //   fields inline without the Pretty field formatter's ANSI
@@ -68,34 +67,14 @@ pub fn init() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Resolve the log directory via `path::resolve_log_dir()` (U18).
-/// Honors `$RENENCODER_LOG_DIR`; falls back to `<app_dir>/log/`.
-/// If both env and app_dir are unavailable, falls back to CWD-relative
-/// `log/` — same as U17 behavior, so the test environment still works.
-fn log_dir() -> PathBuf {
-    rencoder_lib::config::path::resolve_log_dir().unwrap_or_else(|| PathBuf::from("log"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn init_is_idempotent() {
-        init().expect("first init");
-        init().expect("second init (idempotent)");
-    }
-
-    #[test]
-    fn log_dir_ends_with_log() {
-        // U18: log_dir() resolves to <app_dir>/log when app_dir is known.
-        // Don't pin the absolute path (varies by test runner); just check
-        // the trailing path component.
-        let dir = log_dir();
-        assert!(
-            dir.ends_with("log"),
-            "log dir must end with 'log', got {}",
-            dir.display()
-        );
+        let dir = std::env::temp_dir().join(format!("rencoder_log_init_{}", std::process::id()));
+        init(&dir).expect("first init");
+        init(&dir).expect("second init (idempotent)");
     }
 }

@@ -37,7 +37,7 @@ use dioxus::prelude::*;
 use crossbeam_channel::Sender;
 
 use rencoder_lib::config::app::FormatArg;
-use rencoder_lib::job::{start_controller, Command};
+use rencoder_lib::job::{start_controller, Command, Request};
 
 use crate::msg::{
     reduce, AppState, BatchPhase, ConfigFieldKind, ConfigFieldValue, Msg, Page, TaskId, TaskQueue,
@@ -53,7 +53,7 @@ const CSS: &str = include_str!("../assets/style.css");
 #[component]
 pub fn App() -> Element {
     let state: Signal<AppState, SyncStorage> = use_signal_sync(AppState::default);
-    let mut cmd_tx: Signal<Option<Sender<Command>>, SyncStorage> = use_signal_sync(|| None);
+    let mut cmd_tx: Signal<Option<Sender<Request>>, SyncStorage> = use_signal_sync(|| None);
 
     // One-shot setup: start the controller, wire the channels,
     // spawn the event-drain thread. Runs once per App() mount.
@@ -66,9 +66,9 @@ pub fn App() -> Element {
         // v1.2 review #133: seed the Setup-page editor's
         // in-memory draft from the loaded config so the form
         // shows the user's actual values, not `AppConfig::default()`.
-        // `apply_config_field_edit` (msg.rs) mutates `config_draft`
-        // on every edit; the form dispatches `UserEditedConfigField`
-        // which fires `Command::SaveConfig` for atomic TOML write.
+        // The form dispatches `UserEditedConfigField`, which the
+        // reducer records in the entry layer and fires
+        // `Command::SaveConfig` for (design doc §3.10.5).
         let mut state_thread = state;
         state_thread.with_mut(|s| s.config_draft = (*cfg).clone());
         // v1.2 (review #133 follow-up): seed the log with a
@@ -89,9 +89,15 @@ pub fn App() -> Element {
         // isn't empty on first launch. Limit to 100 most-recent
         // records (per §3.8.7.4 history-page design).
         if let Some(tx) = cmd_tx.read().clone() {
-            let _ = tx.try_send(Command::LoadHistory {
-                limit: Some(100),
-                after: None,
+            // The request id comes from the UI's counter (design doc
+            // §3.11.3): the lib's answer names the request.
+            let request_id = state_thread.with_mut(|s| s.alloc_request_id());
+            let _ = tx.try_send(Request {
+                id: request_id,
+                command: Command::LoadHistory {
+                    limit: Some(100),
+                    after: None,
+                },
             });
         }
         // Per the /code-review medium perf finding: hoist the
@@ -303,7 +309,7 @@ fn ToastCard(toast: Toast, state: Signal<AppState, SyncStorage>) -> Element {
 #[component]
 fn TopBar(
     state: Signal<AppState, SyncStorage>,
-    cmd_tx: Signal<Option<Sender<Command>>, SyncStorage>,
+    cmd_tx: Signal<Option<Sender<Request>>, SyncStorage>,
 ) -> Element {
     let active = state.read().active_page;
     let tx_exit = cmd_tx.read().clone();
@@ -323,18 +329,16 @@ fn TopBar(
                         class: "exit-btn",
                         onclick: move |_| {
                             // v1 Exit semantics (per §3.8.7.4):
-                            // active phase -> Command::Cancel,
-                            // then window().close() (after
-                            // BatchCancelled in v1.1; v1 close
-                            // immediately after dispatch).
+                            // an active batch -> cancel it, then
+                            // window().close() (after BatchCancelled
+                            // in v1.1; v1 closes immediately after
+                            // the dispatch).
                             // None/Done -> close immediately.
-                            let phase = state.read().tasks.active.as_ref().map(|t| t.phase);
-                            match phase {
-                                Some(BatchPhase::Analyzing) | Some(BatchPhase::Encoding) => {
-                                    let _ = tx.send(Command::Cancel);
-                                }
-                                _ => {}
-                            }
+                            //
+                            // The cancel goes through the reducer:
+                            // it names the batch (design doc
+                            // §3.11.3) and carries the request id.
+                            state.with_mut(|s| reduce(s, Msg::UserClickedCancel, &tx));
                             desktop::window().close();
                         },
                         "Exit"
@@ -351,7 +355,7 @@ fn TopBar(
 #[component]
 fn tab_button(
     state: Signal<AppState, SyncStorage>,
-    cmd_tx: Signal<Option<Sender<Command>>, SyncStorage>,
+    cmd_tx: Signal<Option<Sender<Request>>, SyncStorage>,
     page: Page,
     active: Page,
     label: &'static str,
@@ -373,10 +377,11 @@ fn tab_button(
 // SetupPage — pure config editor (review #133 part 3b).
 //
 // No [SETUP] header, no DirPicker, no Start button — those moved
-// to the Task tab. This page is a form that mirrors
-// `state.config_draft`; every input/radio change dispatches
-// `Msg::UserEditedConfigField`, which the reducer applies via
-// `apply_config_field_edit` + fires `Command::SaveConfig` for
+// to the Task tab. This page is a form that mirrors the **effective
+// config** (the file layer `config_draft` plus the entry layer
+// `config_edits`, design doc §3.10.5); every input/radio change
+// dispatches `Msg::UserEditedConfigField`, which the reducer
+// records in the entry layer + fires `Command::SaveConfig` for
 // atomic TOML write. The save status line reads
 // `state.config_save_status` ("Saving…" / "Saved at HH:MM:SS").
 // ============================================================================
@@ -384,12 +389,20 @@ fn tab_button(
 #[component]
 fn SetupPage(
     state: Signal<AppState, SyncStorage>,
-    cmd_tx: Signal<Option<Sender<Command>>, SyncStorage>,
+    cmd_tx: Signal<Option<Sender<Request>>, SyncStorage>,
 ) -> Element {
     // Snapshot the values needed to render the form. The form
     // is fully controlled — every input reads from `draft` and
     // every change dispatches a Msg.
-    let draft = state.read().config_draft.encode.clone().unwrap_or_default();
+    // The effective config: the file layer with the user's unsaved
+    // edits on top (design doc §3.10.5). The form shows what the
+    // run will use.
+    let draft = state
+        .read()
+        .effective_config()
+        .encode
+        .clone()
+        .unwrap_or_default();
     let save_status = state.read().config_save_status.clone();
     let tx_opt = cmd_tx.read().clone();
 
@@ -675,7 +688,7 @@ fn SetupPage(
 #[component]
 fn DirPicker(
     state: Signal<AppState, SyncStorage>,
-    cmd_tx: Signal<Option<Sender<Command>>, SyncStorage>,
+    cmd_tx: Signal<Option<Sender<Request>>, SyncStorage>,
 ) -> Element {
     let input_dir = state.read().input_dir.clone();
     let active_phase = state.read().tasks.active.as_ref().map(|t| t.phase);
@@ -751,11 +764,20 @@ struct BatchSummary {
 #[component]
 fn TaskPage(
     state: Signal<AppState, SyncStorage>,
-    cmd_tx: Signal<Option<Sender<Command>>, SyncStorage>,
+    cmd_tx: Signal<Option<Sender<Request>>, SyncStorage>,
 ) -> Element {
     let active = state.read().tasks.active.clone();
     let history = state.read().task_history.clone();
     let progress = state.read().progress.clone();
+    // The capability report for the current working directory (design
+    // doc §3.10.7): the lib checked and wrote the file, the UI reads
+    // it — nobody recomputes the check.
+    let capability_lines = state
+        .read()
+        .capability_report
+        .as_ref()
+        .map(|report| report.lines())
+        .unwrap_or_default();
 
     // Pick the source of records to show in the file list. Active task
     // wins (its dry-run records during Analyzing, its records during
@@ -779,8 +801,13 @@ fn TaskPage(
         //   events fill this in real time).
         // - Done / Cancelled: render records (final outcomes).
         let list = match task.phase {
-            BatchPhase::Analyzing | BatchPhase::AwaitingConfirm => Vec::new(),
-            BatchPhase::Encoding | BatchPhase::Done | BatchPhase::Cancelled => task.records.clone(),
+            BatchPhase::Analyzing | BatchPhase::AwaitingConfirm | BatchPhase::Starting => {
+                Vec::new()
+            }
+            BatchPhase::Encoding
+            | BatchPhase::Cancelling
+            | BatchPhase::Done
+            | BatchPhase::Cancelled => task.records.clone(),
         };
         (
             list,
@@ -832,6 +859,18 @@ fn TaskPage(
 
             DirPicker { state: state, cmd_tx: cmd_tx }
 
+            // The capability report — one line per check, written by
+            // the lib into the operation directory (design doc
+            // §3.10.7). It answers "can this directory be worked in".
+            if !capability_lines.is_empty() {
+                div { class: "capability-report",
+                    span { class: "section-label", "CAPABILITY" }
+                    for line in capability_lines.iter() {
+                        div { class: "capability-line", "{line}" }
+                    }
+                }
+            }
+
             // Count summary — only when at least one phase has run
             // a dry-run (to_encode/to_failed > 0 means the dry-run is
             // done). When no active task and no history, skip.
@@ -864,7 +903,8 @@ fn TaskPage(
                                 span { class: "path", "{r.source_path}" }
                                 span {
                                     class: match r.outcome {
-                                        rencoder_lib::types::EncodingOutcome::Succeeded => "outcome-encode",
+                                        rencoder_lib::types::EncodingOutcome::Ready
+                                        | rencoder_lib::types::EncodingOutcome::Succeeded => "outcome-encode",
                                         rencoder_lib::types::EncodingOutcome::Failed => "outcome-fail",
                                         _ => "outcome-skip",
                                     },
@@ -922,7 +962,7 @@ fn TaskPage(
 #[component]
 fn TaskPageButton(
     state: Signal<AppState, SyncStorage>,
-    cmd_tx: Signal<Option<Sender<Command>>, SyncStorage>,
+    cmd_tx: Signal<Option<Sender<Request>>, SyncStorage>,
 ) -> Element {
     let active = state.read().tasks.active.clone();
     let history = state.read().task_history.clone();
@@ -1009,6 +1049,16 @@ fn task_button_decision(
         Some(BatchPhase::Encoding) => TaskButtonKind::EnabledSecondary {
             label: "Cancel ✕"
         },
+        // The batch is on its way: the lib has not answered yet, and
+        // the batch id (which a cancel must name -- design doc
+        // §3.11.3) is not known. Nothing to press.
+        Some(BatchPhase::Starting) => TaskButtonKind::Disabled {
+            label: "Starting…"
+        },
+        // The cancel is on its way: the batch is still finishing.
+        Some(BatchPhase::Cancelling) => TaskButtonKind::Disabled {
+            label: "Cancelling…",
+        },
         // Defensive — finalize moves Done tasks to history
         // immediately, so this branch is rarely hit.
         Some(BatchPhase::Done) => TaskButtonKind::Disabled { label: "Done" },
@@ -1044,14 +1094,18 @@ fn BatchStatus(summary: BatchSummary) -> Element {
     let badge = match phase {
         BatchPhase::Analyzing => "[● ANALYZING]",
         BatchPhase::AwaitingConfirm => "[● READY]",
+        BatchPhase::Starting => "[● STARTING]",
         BatchPhase::Encoding => "[● ENCODING]",
+        BatchPhase::Cancelling => "[● CANCELLING]",
         BatchPhase::Done => "[● DONE]",
         BatchPhase::Cancelled => "[● CANCELLED]",
     };
     let badge_class = match phase {
-        BatchPhase::Analyzing | BatchPhase::AwaitingConfirm | BatchPhase::Encoding => {
-            "badge badge-active"
-        }
+        BatchPhase::Analyzing
+        | BatchPhase::AwaitingConfirm
+        | BatchPhase::Starting
+        | BatchPhase::Encoding
+        | BatchPhase::Cancelling => "badge badge-active",
         BatchPhase::Done => "badge badge-done",
         // Cancelled: distinct visual from Done (terminal
         // success) — uses a warning-style class so the user
@@ -1122,7 +1176,7 @@ fn ProgressPanel(state: Signal<AppState, SyncStorage>) -> Element {
 #[component]
 fn HistoryPage(
     state: Signal<AppState, SyncStorage>,
-    cmd_tx: Signal<Option<Sender<Command>>, SyncStorage>,
+    cmd_tx: Signal<Option<Sender<Request>>, SyncStorage>,
 ) -> Element {
     let history = state.read().history.clone();
     let tx_opt = cmd_tx.read().clone();

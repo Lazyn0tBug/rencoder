@@ -9,7 +9,16 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use crate::error::EncodeError;
+use crate::pipeline::cancel::CancelToken;
 use crate::types::{InputPath, Target};
+
+/// How often the collection checks the cancel token.
+///
+/// The check is a file's existence (the cancel request, design doc
+/// §3.11.2) -- cheap, but not free. Every 64 entries keeps the
+/// reaction time around a millisecond on a big tree without paying a
+/// stat per file.
+const CANCEL_CHECK_EVERY: usize = 64;
 
 /// Collect input files for a transcode batch, wrapped in [`InputPath`]
 /// (review #109 type-level boundary — dash-prefixed filenames are
@@ -31,14 +40,18 @@ use crate::types::{InputPath, Target};
 /// bailing. `collect_single_file` (target = a single file) ignores
 /// the cap — passing a single path through the same limit would
 /// break the CLI `encode -f foo.mp4` UX.
+/// `cancel` stops the walk: the startup phase must be cancellable
+/// too (design doc §3.11.2) -- Ctrl-C during a long walk must not
+/// wait for the walk to finish.
 pub fn collect_files(
     target: &Target,
     extensions: &[String],
     max_batch_size: u32,
+    cancel: &CancelToken,
 ) -> Result<Vec<InputPath>, EncodeError> {
     match target {
         Target::File(p) => Ok(collect_single_file(p, extensions)),
-        Target::Dir(root) => collect_dir(root, extensions, max_batch_size),
+        Target::Dir(root) => collect_dir(root, extensions, max_batch_size, cancel),
     }
 }
 
@@ -60,10 +73,21 @@ fn collect_dir(
     root: &Path,
     extensions: &[String],
     max_batch_size: u32,
+    cancel: &CancelToken,
 ) -> Result<Vec<InputPath>, EncodeError> {
     let mut results = Vec::new();
+    let mut since_check = 0usize;
     let walker = walkdir::WalkDir::new(root).follow_links(false);
     for entry in walker {
+        // The cancel check (design doc §3.11.2): the walk is part of
+        // the startup phase, and Ctrl-C must not wait for it.
+        since_check += 1;
+        if since_check >= CANCEL_CHECK_EVERY {
+            since_check = 0;
+            if cancel.is_cancelled() {
+                return Err(EncodeError::UserCancel);
+            }
+        }
         let entry = entry.map_err(|e| EncodeError::Probe(format!("walkdir: {e}")))?;
         let path = entry.path();
         // Use walkdir's reported file_type(), NOT `Path::is_file()`. The
@@ -71,6 +95,12 @@ fn collect_dir(
         // symlink to a file would slip past `follow_links(false)`. With
         // follow_links(false) walkdir reports symlinks with is_file()=false,
         // is_symlink()=true -- exactly what we want.
+        // The app's own files in the operation directory (the cancel
+        // request, the capability report -- design doc §3.6) are this
+        // run's state, not the user's videos.
+        if is_app_owned_file(path) {
+            continue;
+        }
         if entry.file_type().is_file() && matches_extension(path, extensions) {
             // Review fix #109 (type-level boundary): the runtime
             // dash-prefix check that used to live here is gone. Each
@@ -109,6 +139,15 @@ fn collect_dir(
     Ok(results)
 }
 
+/// Is this file one of the app's own (design doc §3.6)?
+fn is_app_owned_file(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| {
+        crate::config::paths::APP_OWNED_FILE_NAMES
+            .iter()
+            .any(|owned| name == std::ffi::OsStr::new(owned))
+    })
+}
+
 fn matches_extension(path: &Path, extensions: &[String]) -> bool {
     if extensions.is_empty() {
         return true;
@@ -124,6 +163,7 @@ fn matches_extension(path: &Path, extensions: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::cancel::CancelToken;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -144,6 +184,69 @@ mod tests {
         dir
     }
 
+    /// The app's own files in the operation directory are not inputs
+    /// (design doc §3.6): they are this run's state, not the user's
+    /// videos.
+    #[test]
+    fn a_cancelled_collection_stops() {
+        // The startup phase must be cancellable too (design doc
+        // §3.11.2): Ctrl-C during a long walk must not wait for it.
+        let dir = fixture_dir("cancelled");
+        for i in 0..200 {
+            touch(&dir, &format!("movie_{i}.mp4"));
+        }
+        let cancel = CancelToken::new();
+        cancel.cancel();
+
+        let result = collect_files(
+            &Target::Dir(dir.clone()),
+            &["mp4".into()],
+            u32::MAX,
+            &cancel,
+        );
+
+        assert!(
+            matches!(result, Err(EncodeError::UserCancel)),
+            "the collection must stop: {:?}",
+            result.err()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_apps_own_files_are_not_collected_as_inputs() {
+        let dir = fixture_dir("app_owned");
+        fs::write(dir.join("movie.mp4"), b"video").unwrap();
+        fs::write(dir.join("cancel"), b"").unwrap();
+        fs::write(dir.join("capabilities.json"), b"{}").unwrap();
+
+        // No extension filter: everything in the directory is a candidate.
+        let files = collect_files(
+            &crate::types::Target::Dir(dir.clone()),
+            &[],
+            100,
+            &CancelToken::new(),
+        )
+        .expect("collection must succeed");
+
+        let names: Vec<String> = files
+            .iter()
+            .map(|f| {
+                f.as_path()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["movie.mp4".to_string()],
+            "only the user's video is an input"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     fn touch(dir: &Path, name: &str) -> PathBuf {
         let p = dir.join(name);
         fs::write(&p, b"x").unwrap();
@@ -156,7 +259,13 @@ mod tests {
     fn file_target_with_matching_extension_is_collected() {
         let dir = fixture_dir("file_match");
         let f = touch(&dir, "movie.mp4");
-        let files = collect_files(&Target::File(f.clone()), &["mp4".into()], u32::MAX).unwrap();
+        let files = collect_files(
+            &Target::File(f.clone()),
+            &["mp4".into()],
+            u32::MAX,
+            &CancelToken::new(),
+        )
+        .unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].as_path(), f);
     }
@@ -165,7 +274,13 @@ mod tests {
     fn file_target_with_non_matching_extension_is_skipped() {
         let dir = fixture_dir("file_miss");
         let f = touch(&dir, "movie.txt");
-        let files = collect_files(&Target::File(f.clone()), &["mp4".into()], u32::MAX).unwrap();
+        let files = collect_files(
+            &Target::File(f.clone()),
+            &["mp4".into()],
+            u32::MAX,
+            &CancelToken::new(),
+        )
+        .unwrap();
         assert!(files.is_empty());
     }
 
@@ -173,7 +288,8 @@ mod tests {
     fn file_target_with_empty_extensions_always_matches() {
         let dir = fixture_dir("file_empty");
         let f = touch(&dir, "anything.xyz");
-        let files = collect_files(&Target::File(f.clone()), &[], u32::MAX).unwrap();
+        let files =
+            collect_files(&Target::File(f.clone()), &[], u32::MAX, &CancelToken::new()).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].as_path(), f);
     }
@@ -188,7 +304,13 @@ mod tests {
         let dir = fixture_dir("dir_dash");
         let good = touch(&dir, "movie.mp4");
         let bad = touch(&dir, "-vf_negate.mp4");
-        let files = collect_files(&Target::Dir(dir), &["mp4".into()], u32::MAX).unwrap();
+        let files = collect_files(
+            &Target::Dir(dir),
+            &["mp4".into()],
+            u32::MAX,
+            &CancelToken::new(),
+        )
+        .unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].as_path(), good);
         assert!(!files.iter().any(|ip| ip.as_path() == bad));
@@ -200,6 +322,7 @@ mod tests {
             &Target::File(PathBuf::from("/nonexistent/never.mp4")),
             &["mp4".into()],
             u32::MAX,
+            &CancelToken::new(),
         )
         .unwrap();
         assert!(files.is_empty());
@@ -209,7 +332,13 @@ mod tests {
     fn file_target_extension_match_is_case_insensitive() {
         let dir = fixture_dir("file_case");
         let f = touch(&dir, "movie.MP4");
-        let files = collect_files(&Target::File(f.clone()), &["mp4".into()], u32::MAX).unwrap();
+        let files = collect_files(
+            &Target::File(f.clone()),
+            &["mp4".into()],
+            u32::MAX,
+            &CancelToken::new(),
+        )
+        .unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].as_path(), f);
     }
@@ -226,6 +355,7 @@ mod tests {
             &Target::Dir(dir.clone()),
             &["mp4".into(), "mkv".into()],
             u32::MAX,
+            &CancelToken::new(),
         )
         .unwrap();
         assert_eq!(files.len(), 2);
@@ -243,14 +373,26 @@ mod tests {
         touch(&dir, "a.mp4");
         touch(&dir, "b.txt");
         touch(&dir, "c.bin");
-        let files = collect_files(&Target::Dir(dir.clone()), &[], u32::MAX).unwrap();
+        let files = collect_files(
+            &Target::Dir(dir.clone()),
+            &[],
+            u32::MAX,
+            &CancelToken::new(),
+        )
+        .unwrap();
         assert_eq!(files.len(), 3);
     }
 
     #[test]
     fn dir_empty_returns_empty() {
         let dir = fixture_dir("dir_empty");
-        let files = collect_files(&Target::Dir(dir.clone()), &["mp4".into()], u32::MAX).unwrap();
+        let files = collect_files(
+            &Target::Dir(dir.clone()),
+            &["mp4".into()],
+            u32::MAX,
+            &CancelToken::new(),
+        )
+        .unwrap();
         assert!(files.is_empty());
     }
 
@@ -261,7 +403,13 @@ mod tests {
         fs::create_dir_all(&sub).unwrap();
         touch(&dir, "a.mp4");
         touch(&sub, "b.mp4");
-        let files = collect_files(&Target::Dir(dir.clone()), &["mp4".into()], u32::MAX).unwrap();
+        let files = collect_files(
+            &Target::Dir(dir.clone()),
+            &["mp4".into()],
+            u32::MAX,
+            &CancelToken::new(),
+        )
+        .unwrap();
         assert_eq!(files.len(), 2);
     }
 
@@ -281,7 +429,13 @@ mod tests {
             let _ = link;
             return;
         }
-        let files = collect_files(&Target::Dir(dir.clone()), &["mp4".into()], u32::MAX).unwrap();
+        let files = collect_files(
+            &Target::Dir(dir.clone()),
+            &["mp4".into()],
+            u32::MAX,
+            &CancelToken::new(),
+        )
+        .unwrap();
         assert_eq!(files.len(), 1);
         assert!(files.iter().any(|ip| ip.as_path() == real));
         assert!(!files.iter().any(|ip| ip.as_path() == link));
@@ -305,7 +459,13 @@ mod tests {
             let _ = link;
             return;
         }
-        let files = collect_files(&Target::Dir(dir.clone()), &["mp4".into()], u32::MAX).unwrap();
+        let files = collect_files(
+            &Target::Dir(dir.clone()),
+            &["mp4".into()],
+            u32::MAX,
+            &CancelToken::new(),
+        )
+        .unwrap();
         // outer.mp4 + inner.mp4; the symlink should NOT cause the walk to
         // revisit outer.mp4 a second time.
         assert_eq!(files.len(), 2);
@@ -317,7 +477,13 @@ mod tests {
         touch(&dir, "a.MP4");
         touch(&dir, "b.mp4");
         touch(&dir, "c.Mp4");
-        let files = collect_files(&Target::Dir(dir.clone()), &["mp4".into()], u32::MAX).unwrap();
+        let files = collect_files(
+            &Target::Dir(dir.clone()),
+            &["mp4".into()],
+            u32::MAX,
+            &CancelToken::new(),
+        )
+        .unwrap();
         assert_eq!(files.len(), 3);
     }
 
@@ -333,8 +499,13 @@ mod tests {
         for i in 0..(max + 5) {
             touch(&dir, &format!("movie_{i}.mp4"));
         }
-        let err = collect_files(&Target::Dir(dir.clone()), &["mp4".into()], max)
-            .expect_err("expected BatchTooLarge");
+        let err = collect_files(
+            &Target::Dir(dir.clone()),
+            &["mp4".into()],
+            max,
+            &CancelToken::new(),
+        )
+        .expect_err("expected BatchTooLarge");
         match err {
             EncodeError::BatchTooLarge { count, max: m } => {
                 assert_eq!(m, max);
@@ -356,7 +527,8 @@ mod tests {
         for i in 0..max {
             touch(&dir, &format!("m_{i}.mp4"));
         }
-        let files = collect_files(&Target::Dir(dir), &["mp4".into()], max).expect("at boundary");
+        let files = collect_files(&Target::Dir(dir), &["mp4".into()], max, &CancelToken::new())
+            .expect("at boundary");
         assert_eq!(files.len() as u32, max);
     }
 
@@ -368,7 +540,7 @@ mod tests {
         for i in 0..(max + 1) {
             touch(&dir, &format!("m_{i}.mp4"));
         }
-        let err = collect_files(&Target::Dir(dir), &["mp4".into()], max)
+        let err = collect_files(&Target::Dir(dir), &["mp4".into()], max, &CancelToken::new())
             .expect_err("expected BatchTooLarge");
         assert!(matches!(err, EncodeError::BatchTooLarge { .. }));
     }
@@ -380,8 +552,13 @@ mod tests {
         // the CLI UX for one-off encodes.)
         let dir = fixture_dir("file_ignore_cap");
         let f = touch(&dir, "movie.mp4");
-        let files = collect_files(&Target::File(f.clone()), &["mp4".into()], 0)
-            .expect("single file bypasses cap");
+        let files = collect_files(
+            &Target::File(f.clone()),
+            &["mp4".into()],
+            0,
+            &CancelToken::new(),
+        )
+        .expect("single file bypasses cap");
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].as_path(), f);
     }

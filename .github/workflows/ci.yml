@@ -1,0 +1,139 @@
+# Test CI for Rencoder.
+#
+# The release workflow (build.yml) only builds and packages on a tag.
+# Without this workflow the test suite ran on one developer's macOS
+# and nowhere else -- so the Linux `#[cfg(unix)]` branch and the
+# Windows signal handler were never compiled, let alone run.
+#
+# Two jobs, deliberately:
+#
+#   * `core` -- the library and the CLI, on all three hosts. This is
+#     the gate: it has no system dependencies beyond a Rust toolchain,
+#     so it cannot go red for an unrelated reason.
+#   * `ui`   -- the whole workspace including the Dioxus desktop GUI,
+#     on the two hosts it supports. The GUI is Unix-only by design
+#     (design doc §8 row 35), so Windows is out; the Linux job needs
+#     the webview stack, which is a heavier dependency than the core
+#     and therefore its own job (a broken webview package must not
+#     take the core gate with it).
+#
+# ffmpeg/ffprobe are installed so the integration tests actually run
+# instead of skipping (they skip when the binaries are missing).
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run per ref; a newer push supersedes an in-flight one.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core:
+    name: core (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+          - os: ubuntu-22.04
+          - os: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install the Rust toolchain
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+
+      - name: Install ffmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+
+      - name: Install ffmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg --no-progress -y
+
+      - name: Cache the cargo registry and the build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: The gate
+        run: |
+          set -euo pipefail
+          cargo fmt --check
+          cargo clippy -p rencoder_lib -p rencoder_cli --all-targets -- -D warnings
+          cargo test -p rencoder_lib -p rencoder_cli
+
+  ui:
+    name: ui (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+          - os: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install the Rust toolchain
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+
+      - name: Install ffmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+
+      - name: Install ffmpeg and the webview stack (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ffmpeg \
+            libwebkit2gtk-4.0-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - name: Cache the cargo registry and the build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-ui-${{ hashFiles('Cargo.lock') }}
+
+      - name: The gate (the whole workspace)
+        run: |
+          set -euo pipefail
+          cargo fmt --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace

@@ -187,11 +187,15 @@ where
 /// `task 3/8: ...` would be misleading. Per-task logging is the
 /// serial path's responsibility.
 #[cfg(feature = "parallel-analyze")]
-pub fn analyze_records_parallel(files: &[PathBuf]) -> Result<Vec<AnalysisRecord>, EncodeError> {
+pub fn analyze_records_parallel(
+    files: &[PathBuf],
+    cancel: &crate::pipeline::cancel::CancelToken,
+) -> Result<Vec<AnalysisRecord>, EncodeError> {
     use rayon::prelude::*;
 
     let records: Vec<AnalysisRecord> = files
         .par_iter()
+        .filter(|_| !cancel.is_cancelled())
         .map(|path| {
             let file_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
             match probe_video_metadata_auto(path) {
@@ -477,6 +481,19 @@ pub fn aggregate_records(records: &[AnalysisRecord]) -> VideoStats {
         total_duration_secs: total_duration,
         failed_paths,
     }
+}
+
+/// The analyze tasks for a batch of inputs.
+///
+/// The analyze path keeps its own execution route (§3.11.1) but the
+/// task construction is shared: the tasks say what they read, and
+/// nothing about writing.
+pub fn analyze_tasks(files: &[crate::types::InputPath]) -> Vec<crate::types::AnalyzeTask> {
+    files
+        .iter()
+        .cloned()
+        .map(|input| crate::types::AnalyzeTask { input })
+        .collect()
 }
 
 #[cfg(test)]

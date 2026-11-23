@@ -4,19 +4,31 @@
 //! only via `reduce(state, msg, cmd_tx)` which also dispatches
 //! Commands back to the lib actor as needed.
 //!
-//! **Workflow state machine** (§3.8.7.1, v1.2 final — review #133):
+//! **Workflow state machine** (§3.8.7.1 + §3.11.3):
 //!
 //! ```text
 //! [None]
-//!   |  (UserClickedStart or UserSelectedDir)
+//!   |  UserClickedStart
 //!   v
 //! [Analyzing] --Event::DryRunFinished--> [AwaitingConfirm]
-//!                                          | (to_encode > 0)
-//!                                          | UserClickedStart
-//!                                          v
-//! [Encoding] --BatchCompleted/Cancelled/Error--> [Done]
-//! [Done]    --UserClickedStart (re-arm)--> [Analyzing]
+//!                                            | (to_encode > 0)
+//!                                            | UserClickedStart
+//!                                            v
+//! [Starting] --CommandAccepted--> [Encoding]
+//!      |                             |  UserClickedCancel
+//!      | CommandRejected             v
+//!      +--> [AwaitingConfirm]    [Cancelling] --BatchCancelled--> [Cancelled]
+//!                                    |
+//!                                    | CommandRejected
+//!                                    v
+//!                                [Encoding]
+//! [Encoding] --BatchCompleted/BatchFailed--> [Done]
 //! ```
+//!
+//! The two new phases are the protocol's answer to "the command is
+//! on its way" (design doc §3.11.3): `Starting` waits for the lib to
+//! admit the batch, `Cancelling` waits for the batch's terminal
+//! event. A rejected request puts the phase back where it was.
 //!
 //! v1.2 user feedback (review #133 follow-up): removed the
 //! auto-encode on positive dry-run count. Encoding is a
@@ -34,40 +46,18 @@ use std::path::PathBuf;
 use chrono::{DateTime, Local, Utc};
 use crossbeam_channel::Sender;
 
-use rencoder_lib::job::{Command, EncodingRecord, Event};
-use rencoder_lib::types::EncodingOutcome;
+use rencoder_lib::job::{BatchId, Command, EncodingRecord, Event, Request, RequestId};
 
 /// Cap on the stderr log ring buffer. Per §3.8.6 + §8 item 30.
 const LOG_RING_CAP: usize = 1000;
 
-/// Lifecycle phase of a task (v1.2 follow-up #2):
-/// 6-state machine with a manual Confirm step between
-/// DryRunFinished and StartBatch, plus an explicit `Cancelled`
-/// terminal state for optimistic cancel.
+/// Lifecycle phase of a task (v1.2 follow-up #2 + §3.11.3).
 ///
-/// ```text
-/// [None]
-///   |  (UserClickedStart or UserSelectedDir)
-///   v
-/// [Analyzing] --Event::DryRunFinished--> [AwaitingConfirm]
-///                                            | (to_encode > 0)
-///                                            | UserClickedStart
-///                                            v
-/// [Encoding] --BatchCompleted--> [Done]
-///           --UserClickedCancel--> [Cancelled]   (optimistic; late
-///             BatchCancelled events filtered out by apply_event)
-///           --Event::Error--> [Done]
-/// [Done/Cancelled] --dir re-pick / new dry-run--> [Analyzing]
-/// ```
-///
-/// Cancel is **optimistic**: `Msg::UserClickedCancel` sets
-/// `phase = Cancelled` immediately. `apply_event` then drops any
-/// late batch events (`BatchStarted` / `FileStarted` / `Progress`
-/// / `FileCompleted` / `BatchCompleted` / `BatchCancelled` /
-/// `Error`) for this batch — see `apply_event` phase guard.
-/// This eliminates the ~1.5s window where the badge flickered
-/// "encoding" after the user clicked cancel (lib cancel latency
-/// breakdown: §3.8.7.6).
+/// The phase says what the UI **knows**, not what it hopes:
+/// `Starting` means "the command is on its way", `Encoding` means
+/// "the lib admitted the batch". The difference is the request id:
+/// the lib's answer names the request it answers, and the phase
+/// follows the answer (design doc §3.11.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchPhase {
     /// `Command::DryRun` dispatched; awaiting `Event::DryRunFinished`.
@@ -78,10 +68,17 @@ pub enum BatchPhase {
     /// count — we don't design for encoding a subset; per
     /// §3.8.7.1 decision 2).
     AwaitingConfirm,
-    /// `Command::StartBatch` dispatched; awaiting `BatchCompleted`
-    /// / `BatchCancelled` / `Event::Error`. Start button shows
+    /// `Command::StartBatch` dispatched; the lib has not answered yet
+    /// (design doc §3.11.3). The button shows "Starting…" and the
+    /// cancel is not available -- the batch id is not known yet.
+    Starting,
+    /// The batch is admitted and running. Start button shows
     /// "Cancel ✕".
     Encoding,
+    /// `Command::Cancel` dispatched; awaiting the batch's terminal
+    /// event (`BatchCancelled`). The batch is still finishing -- the
+    /// UI says so instead of pretending it is over.
+    Cancelling,
     /// Final state after a successful batch lifecycle. Dir picker
     /// re-enabled. Start button **disabled** (re-arm via dir
     /// re-pick — per §3.8.7.1 decision 4).
@@ -109,7 +106,7 @@ pub enum Page {
 #[allow(dead_code)]
 // constructed by the Setup-page form (app.rs) on
 // every <input>/radio change; not constructed by the reducer itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ConfigFieldKind {
     Format,
     Crf,
@@ -162,8 +159,8 @@ pub struct AppState {
     /// Session-completed tasks, newest-first. Inserted on
     /// BatchCompleted / BatchCancelled / Encoding-phase Error.
     /// `task_history` is session UX cache; the primary store is
-    /// Parquet (`encoding-*.parquet`, written by lib on every
-    /// `BatchCompleted`). v1.1 reload via `Command::LoadHistory`
+    /// Parquet (`encoding-*.parquet`, written by the lib when the batch
+    /// completes). v1.1 reload via `Command::LoadHistory`
     /// gives cross-session `state.history` (per-file records).
     pub task_history: Vec<TaskInfo>,
     /// Active page tab (§3.8.7.2). Default `Setup`. Tab clicks
@@ -188,12 +185,25 @@ pub struct AppState {
     /// Last fatal error (any source). UI renders it as the global
     /// status badge.
     pub last_error: Option<String>,
-    /// In-memory mirror of the on-disk `AppConfig` for the Setup
-    /// page's inline-edit form (review #133). Updated by every
-    /// `Msg::UserEditedConfigField` reducer arm and written to
-    /// TOML via `Command::SaveConfig`. Initialized at app start
-    /// from the loaded `AppConfig`.
+    /// The **file layer**: the `AppConfig` as it was loaded or last
+    /// saved successfully (design doc §3.10.5).
+    ///
+    /// The draft's values express this layer -- not "what the user
+    /// touched". The user's unsaved edits live in `config_edits`.
+    /// The draft only takes an edit over when the save that carried
+    /// it succeeded.
     pub config_draft: rencoder_lib::config::app::AppConfig,
+    /// The **entry layer**: the user's unsaved edits, per field, each
+    /// with the revision it carries (design doc §3.10.5).
+    ///
+    /// "The user touched this field" is tracked here, not inferred
+    /// from whether a draft field has a value: the draft expresses
+    /// the file layer, and the entry layer is a different thing.
+    pub config_edits: std::collections::BTreeMap<ConfigFieldKind, ConfigEdit>,
+    /// The revision counter. Every edit bumps it; a save carries
+    /// the counter's value at the time of the save, and the receipt
+    /// hands it back (design doc §3.10.5).
+    pub config_revision: u64,
     /// Display label for the Setup page's save-status indicator
     /// (`"Saved at HH:MM:SS"` / `"Saving…"` / `"Save failed: …"`).
     pub config_save_status: String,
@@ -211,7 +221,52 @@ pub struct AppState {
     /// (`Event::NvencCapability`). `None` until the first report
     /// arrives — the lib resolves it at startup and on every
     /// `Command::Detect`.
-    pub nvenc_capability: Option<rencoder_lib::types::NvencCapability>,
+    pub nvenc_capability: Option<rencoder_lib::encoder::nvenc::Capability>,
+    /// The run capability report for the current working directory,
+    /// read from the file the lib wrote (design doc §3.10.7).
+    /// `None` until the first check lands.
+    pub capability_report: Option<rencoder_lib::capability::Capabilities>,
+    /// The next request id (design doc §3.11.3). Every command the
+    /// UI sends carries one, so the lib's answer ("accepted" /
+    /// "rejected") names the request it answers.
+    next_request_id: u64,
+}
+
+/// One unsaved edit: the value and the revision it carries.
+#[derive(Debug, Clone)]
+pub struct ConfigEdit {
+    /// The value the user set.
+    pub value: ConfigFieldValue,
+    /// The revision this edit carries (the counter's value when the
+    /// user made it).
+    pub revision: u64,
+}
+
+impl AppState {
+    /// The effective config: the file layer with the entry layer on
+    /// top (design doc §3.10.5).
+    ///
+    /// This is what the run uses and what a save writes: the user's
+    /// unsaved edits count, and so does everything the file says
+    /// that the user did not touch.
+    pub fn effective_config(&self) -> rencoder_lib::config::app::AppConfig {
+        let mut config = self.config_draft.clone();
+        for (kind, edit) in &self.config_edits {
+            apply_field_edit(&mut config, *kind, edit.value.clone());
+        }
+        config
+    }
+
+    /// Allocate the next request id.
+    ///
+    /// Monotonic per session. The ids are the UI's half of the
+    /// request protocol: the lib echoes them on acceptance and on
+    /// rejection, and the UI matches them against the request it is
+    /// waiting for.
+    pub fn alloc_request_id(&mut self) -> RequestId {
+        self.next_request_id += 1;
+        self.next_request_id
+    }
 }
 
 /// Cap on the toasts queue. Older toasts are popped when the
@@ -356,8 +411,16 @@ impl TaskQueue {
 pub struct TaskInfo {
     /// UI-side id, allocated by `TaskQueue::next_task_id`.
     pub task_id: TaskId,
-    /// Lib-side batch id mapping. `None` until `Event::BatchStarted`.
-    pub batch_id: Option<u64>,
+    /// Lib-side batch id mapping. `None` until the lib admits the
+    /// batch (`Event::CommandAccepted` / `Event::BatchStarted`).
+    pub batch_id: Option<BatchId>,
+    /// The id of the request the UI is waiting for (design doc
+    /// §3.11.3). `None` when no request is in flight.
+    pub pending_request: Option<RequestId>,
+    /// The phase to go back to when the pending request is refused.
+    /// The refusal restores the state the UI was in before it sent
+    /// the request.
+    pub restore_phase: Option<BatchPhase>,
     /// Lifecycle phase.
     pub phase: BatchPhase,
     /// Input directory captured at Start time.
@@ -389,6 +452,31 @@ pub struct TaskInfo {
     /// Records from the DryRun phase. Kept until the next task
     /// lifecycle starts.
     pub dry_run_records: Vec<EncodingRecord>,
+    /// The capability generation the dry run froze (design doc
+    /// §3.10.5). The plan is only valid for the generation it was
+    /// planned under: a re-probe publishes a new one, and the plan
+    /// made under the old one may pick a different encoder.
+    pub dry_run_generation: Option<u64>,
+    /// The planning parameters the dry run ran under (the effective
+    /// `[encode]` section). A change invalidates the plan.
+    pub dry_run_params: Option<rencoder_lib::config::app::EncodeConfig>,
+    /// The inputs the dry run planned, with the stat it saw. The
+    /// plan depends on the media probe, so an input that changed
+    /// invalidates it.
+    pub dry_run_inputs: Vec<(PathBuf, InputStat)>,
+}
+
+/// What the dry run saw of one input: its size and its mtime.
+///
+/// The mtime is what says "changed": the size alone would miss an
+/// edit that keeps the size (design doc §3.10.5 -- the plan depends
+/// on the media probe, so an input that changed invalidates it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputStat {
+    /// The file's size in bytes.
+    pub size: u64,
+    /// The file's modification time, when the filesystem reports one.
+    pub mtime: Option<std::time::SystemTime>,
 }
 
 #[allow(dead_code)] // fields populated by lib, not all read yet by UI
@@ -452,9 +540,10 @@ pub enum Msg {
     // (review #133 part 3c, follows in the next commit).
     UserSelectedDir(PathBuf),
     /// Setup-page live edit (review #133). The Setup page's
-    /// `<input>` and radio handlers fire this on every change;
-    /// the reducer updates `state.config_draft` AND fires
-    /// `Command::SaveConfig` so each keystroke persists atomically.
+    /// `<input>` and radio handlers fire this on every change; the
+    /// reducer records the edit in the **entry layer**
+    /// (`state.config_edits`) AND fires `Command::SaveConfig` so each
+    /// keystroke persists atomically (design doc §3.10.5).
     #[allow(dead_code)] // constructed by the Setup-page form (app.rs).
     UserEditedConfigField {
         kind: ConfigFieldKind,
@@ -490,22 +579,49 @@ pub enum Msg {
     LibLogLine(String),
 }
 
+/// Send a command to the lib actor, with a fresh request id.
+///
+/// The send never blocks the UI thread. A failed send is the UI's
+/// problem to report: the caller keeps the state it had and shows
+/// the error (design doc §3.11.3 -- "发送失败显示错误并保留原状态").
+///
+/// The request id is the UI's half of the protocol: the lib's
+/// answer ("accepted" / "rejected") names it, so the UI can tell
+/// *which* request was refused.
+fn dispatch(
+    state: &mut AppState,
+    cmd_tx: &Sender<Request>,
+    command: Command,
+) -> Result<RequestId, String> {
+    let id = state.alloc_request_id();
+    match cmd_tx.try_send(Request { id, command }) {
+        Ok(()) => Ok(id),
+        Err(crossbeam_channel::TrySendError::Full(_)) => {
+            Err("the lib is busy (the command queue is full)".to_string())
+        }
+        Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+            Err("the lib is gone (the command channel is closed)".to_string())
+        }
+    }
+}
+
 /// Reduce a message into a state change; emit Commands to the lib
 /// actor as needed.
 ///
 /// **Phase-aware `UserClickedStart`** (§3.8.7.1, review #133):
-///   - `None` / `Done` -> build params, collect files, dispatch
-///     `Command::DryRun`, optimistically transition to `Analyzing`
-///   - `Analyzing` / `Encoding` -> set `last_error = "task in
-///     progress"`, return early (busy-gate; Cancel-during-Analyzing
-///     is review #100, still pending — the button is disabled)
+///
+/// - `None` / `Done` -> build params, collect files, dispatch
+///   `Command::DryRun`, transition to `Analyzing`.
+/// - `Analyzing` / `Encoding` / `Starting` / `Cancelling` -> a toast
+///   ("task in progress"); the button is disabled in these phases.
 ///
 /// **Phase-aware `UserClickedCancel`**:
-///   - `Analyzing` / `Encoding`: set `cancelled = true`, dispatch
-///     `Command::Cancel`. The lib respects cancel_token only
-///     during encoding (Analyze is best-effort).
-///   - `None` / `Done`: ignored
-pub fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>) {
+///
+/// - `Encoding`: dispatch `Command::Cancel { batch_id }` and wait for
+///   the batch's terminal event (phase `Cancelling`).
+/// - `Analyzing`: best-effort cancel of the dry run.
+/// - `None` / `Done`: ignored.
+pub fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Request>) {
     match msg {
         Msg::UserSelectedDir(path) => {
             if let Some(t) = &state.tasks.active {
@@ -519,7 +635,20 @@ pub fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>) {
                 }
             }
             state.last_error = None;
-            state.input_dir = Some(path);
+            state.input_dir = Some(path.clone());
+            // The working directory moved: the operation directory
+            // follows it and the capability check runs again (design
+            // doc §3.10.7). The lib checks and writes the report; the
+            // UI reads it (the `Event::CapabilityChecked` arm).
+            //
+            // A failed send keeps the old state (design doc §3.11.3):
+            // the lib would not know about the new directory, and a
+            // UI that shows a directory the lib has not seen is
+            // lying about what is about to happen.
+            if let Err(e) = dispatch(state, cmd_tx, Command::SetWorkingDir { dir: path }) {
+                state.input_dir = None;
+                push_toast(state, e, ToastKind::Error);
+            }
         }
         Msg::UserEditedConfigField { kind, value } => {
             // v1.2 review #133 part 2d: real-time save on every
@@ -529,19 +658,43 @@ pub fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>) {
             // AppConfig to TOML atomically via `write_atomic`.
             // Each field change is one save — cheap for small
             // TOML, safe on every keystroke.
-            apply_config_field_edit(state, kind, value);
+            // The entry layer: the edit is recorded with a fresh
+            // revision (design doc §3.10.5). The draft -- the file
+            // layer -- does not change here; it takes the edit over
+            // when the save that carried it succeeds.
+            state.config_revision += 1;
+            let revision = state.config_revision;
+            state.config_edits.insert(
+                kind,
+                ConfigEdit {
+                    value: value.clone(),
+                    revision,
+                },
+            );
             state.config_save_status = "Saving…".into();
-            // The draft is the payload: the lib must persist what the
-            // user just edited, not the copy it loaded at startup.
-            let _ = cmd_tx.try_send(Command::SaveConfig {
-                config: Box::new(state.config_draft.clone()),
-            });
+            // The effective config is the payload: the lib must
+            // persist what the user sees, not the copy it loaded at
+            // startup.
+            let effective = Box::new(state.effective_config());
+            if let Err(e) = dispatch(
+                state,
+                cmd_tx,
+                Command::SaveConfig {
+                    config: effective,
+                    revision,
+                },
+            ) {
+                state.config_save_status = format!("Save failed: {e}");
+                push_toast(state, e, ToastKind::Error);
+            }
         }
         Msg::UserClickedDetectNv => {
             // Force a fresh probe. The lib stores the result in
             // `<app_dir>/nvenc-capability.json` and reports it back
             // via `Event::NvencCapability`.
-            let _ = cmd_tx.try_send(Command::Detect { force: true });
+            if let Err(e) = dispatch(state, cmd_tx, Command::Detect { force: true }) {
+                push_toast(state, e, ToastKind::Error);
+            }
         }
         Msg::UserClickedStart => {
             let phase = state.tasks.active.as_ref().map(|t| t.phase);
@@ -600,6 +753,12 @@ pub fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>) {
                             );
                             return;
                         }
+                        Err(CollectError::Guard(message)) => {
+                            // The guard refused this directory
+                            // (design doc §3.11.1.1).
+                            push_toast(state, message, ToastKind::Error);
+                            return;
+                        }
                     };
                     if files.is_empty() {
                         let dir = state.tasks.active.as_ref().unwrap().dir.display();
@@ -610,28 +769,50 @@ pub fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>) {
                         );
                         return;
                     }
+                    // The plan the user reviewed must still be the
+                    // plan that runs (design doc §3.10.5): if the
+                    // file list, the parameters, the capability
+                    // generation or an input moved under it, the
+                    // plan is re-made instead of run.
+                    if let Some(reason) = plan_is_stale(state, &files) {
+                        push_toast(state, format!("re-planning: {reason}"), ToastKind::Info);
+                        dispatch_dry_run(state, cmd_tx, files);
+                        return;
+                    }
                     let params = build_encode_params_from_draft(state);
+                    // The phase before the request: a refusal puts it
+                    // back (design doc §3.11.3).
+                    let before = state.tasks.active.as_ref().map(|t| t.phase);
                     {
                         let t = state.tasks.active.as_mut().unwrap();
-                        t.phase = BatchPhase::Encoding;
-                        // Clear dry_run_records so the file list
-                        // switches from dry-run outcomes
-                        // (Succeeded/Skipped/Failed from probe)
-                        // to encoding outcomes (per-file FileCompleted
-                        // events). Without this, the UI would keep
-                        // showing the dry-run results during
-                        // Encoding — misleading.
-                        t.dry_run_records.clear();
+                        t.phase = BatchPhase::Starting;
+                        t.restore_phase = before;
                         t.records.clear();
                     }
-                    // Review #111: cmd_tx is bounded (capacity 16).
-                    // `try_send` is non-blocking; on Full or
-                    // Disconnected the command is dropped. A dropped
-                    // Cmd is equivalent to a no-op (the user sees
-                    // no BatchStarted response and can retry).
-                    let _ = cmd_tx.try_send(Command::StartBatch { params, files });
+                    // The request is on its way; the phase changes to
+                    // `Encoding` when the lib admits the batch
+                    // (`Event::CommandAccepted`).
+                    match dispatch(state, cmd_tx, Command::StartBatch { params, files }) {
+                        Ok(request_id) => {
+                            if let Some(t) = state.tasks.active.as_mut() {
+                                t.pending_request = Some(request_id);
+                            }
+                        }
+                        Err(e) => {
+                            // The send failed: the state goes back to
+                            // what it was, and the user is told.
+                            if let Some(t) = state.tasks.active.as_mut() {
+                                t.phase = before.unwrap_or(BatchPhase::AwaitingConfirm);
+                                t.restore_phase = None;
+                            }
+                            push_toast(state, e, ToastKind::Error);
+                        }
+                    }
                 }
-                Some(BatchPhase::Analyzing) | Some(BatchPhase::Encoding) => {
+                Some(BatchPhase::Analyzing)
+                | Some(BatchPhase::Encoding)
+                | Some(BatchPhase::Starting)
+                | Some(BatchPhase::Cancelling) => {
                     // Defense-in-depth: the bottom button is
                     // disabled in these phases, so this is
                     // unreachable via the UI. Keep the toast as
@@ -645,34 +826,66 @@ pub fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>) {
             let phase = state.tasks.active.as_ref().map(|t| t.phase);
             match phase {
                 Some(BatchPhase::Encoding) => {
-                    // v1.2 follow-up #2: optimistic cancel.
-                    // Set `phase = Cancelled` immediately so the
-                    // UI (badge / button) reflects the user's
-                    // intent without waiting for lib's late
-                    // `Event::BatchCancelled` (1-2s latency —
-                    // §3.8.7.6). The phase guard in `apply_event`
-                    // will drop the late event. Dispatch the
-                    // command so the lib can kill the in-flight
-                    // ffmpeg + clean up partial output.
-                    if let Some(t) = state.tasks.active.as_mut() {
-                        t.cancelled = true;
-                        t.phase = BatchPhase::Cancelled;
+                    // The cancel names the batch (design doc §3.11.3):
+                    // a cancel that names another batch is refused,
+                    // so a stale cancel cannot stop the batch the
+                    // user is watching.
+                    let Some(batch_id) = state.tasks.active.as_ref().and_then(|t| t.batch_id)
+                    else {
+                        push_toast(state, "the batch has no id yet", ToastKind::Warning);
+                        return;
+                    };
+                    {
+                        let t = state.tasks.active.as_mut().unwrap();
+                        t.phase = BatchPhase::Cancelling;
+                        t.restore_phase = Some(BatchPhase::Encoding);
                     }
-                    let _ = cmd_tx.try_send(Command::Cancel);
+                    // The phase changes to `Cancelled` when the
+                    // batch's terminal event arrives -- not when the
+                    // user clicks (the batch is still finishing).
+                    match dispatch(state, cmd_tx, Command::Cancel { batch_id }) {
+                        Ok(request_id) => {
+                            if let Some(t) = state.tasks.active.as_mut() {
+                                t.pending_request = Some(request_id);
+                            }
+                        }
+                        Err(e) => {
+                            if let Some(t) = state.tasks.active.as_mut() {
+                                t.phase = BatchPhase::Encoding;
+                                t.restore_phase = None;
+                            }
+                            push_toast(state, e, ToastKind::Error);
+                        }
+                    }
+                }
+                Some(BatchPhase::Cancelling) => {
+                    // The cancel is already on its way; the batch's
+                    // terminal event will confirm it.
+                }
+                Some(BatchPhase::Starting) => {
+                    // The batch has not been admitted yet, so it has
+                    // no id to name (design doc §3.11.3). The window
+                    // is short: the answer arrives right after.
+                    push_toast(state, "the batch has not started yet", ToastKind::Warning);
                 }
                 Some(BatchPhase::Analyzing) => {
-                    // v1.2 follow-up #2: best-effort cancel during
-                    // dry-run. lib doesn't poll cancel_token in
-                    // the analyze path (§3.8.7.4 limitations), so
-                    // the cancel signal is logged but the analyze
-                    // runs to completion. We still set
-                    // `cancelled = true` and let the eventual
-                    // `Event::DryRunFinished` handler check the
-                    // flag and discard the result.
+                    // Best-effort cancel during the dry run. The
+                    // dry run is a batch too, so the cancel names it
+                    // (design doc §3.11.3). The lib polls the cancel
+                    // token between files.
+                    let Some(batch_id) = state.tasks.active.as_ref().and_then(|t| t.batch_id)
+                    else {
+                        // The dry run has not been admitted yet: there
+                        // is no batch to cancel.
+                        if let Some(t) = state.tasks.active.as_mut() {
+                            t.cancelled = true;
+                        }
+                        return;
+                    };
                     if let Some(t) = state.tasks.active.as_mut() {
                         t.cancelled = true;
                     }
-                    let _ = cmd_tx.try_send(Command::Cancel);
+                    let _ = dispatch(state, cmd_tx, Command::Cancel { batch_id });
                 }
                 Some(BatchPhase::AwaitingConfirm) => {
                     // P2.7 fix: keep the cancelled plan in history
@@ -705,10 +918,16 @@ pub fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>) {
             }
         }
         Msg::UserClickedLoadHistory => {
-            let _ = cmd_tx.try_send(Command::LoadHistory {
-                limit: Some(100),
-                after: None,
-            });
+            if let Err(e) = dispatch(
+                state,
+                cmd_tx,
+                Command::LoadHistory {
+                    limit: Some(100),
+                    after: None,
+                },
+            ) {
+                push_toast(state, e, ToastKind::Error);
+            }
         }
         Msg::UserClickedTab(page) => {
             state.active_page = page;
@@ -728,59 +947,113 @@ pub fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>) {
     }
 }
 
+/// Is this event about the batch the active task is watching?
+///
+/// Every batch event carries its batch id (design doc §3.11.3). An
+/// event from another batch -- the previous one, still draining --
+/// must not touch the task the user is watching now: its file index
+/// means something else there.
+fn is_active_batch(state: &AppState, batch_id: BatchId) -> bool {
+    let Some(t) = state.tasks.active.as_ref() else {
+        return false;
+    };
+    t.batch_id == Some(batch_id)
+}
+
 fn apply_event(state: &mut AppState, evt: Event) {
-    // v1.2 follow-up #2 — phase guard (optimistic cancel). Once
-    // a batch is Cancelled, the UI trusts the user's click over
-    // lib's eventual confirmation. All subsequent batch-scoped
-    // events for the current task are dropped. This eliminates
-    // the ~1-2s window where the badge flickered "encoding"
-    // after cancel (lib cancel latency breakdown §3.8.7.6) and
-    // the late `Event::BatchCancelled` flipping `phase` to
-    // `Done` (which would override the user's cancel intent).
-    //
-    // Non-batch events (`HistoryLoaded` / `ConfigSaved` /
-    // `AnalyzeStarted` / `AnalyzeFinished` / etc.) are NOT
-    // batch-scoped; the guard does not drop them.
-    if matches!(
-        evt,
-        Event::BatchStarted { .. }
-            | Event::FileStarted { .. }
-            | Event::Progress { .. }
-            | Event::FileCompleted { .. }
-            | Event::BatchCompleted { .. }
-            | Event::BatchCancelled { .. }
-            | Event::Error { .. }
-    ) && state
-        .tasks
-        .active
-        .as_ref()
-        .is_some_and(|t| t.phase == BatchPhase::Cancelled)
-    {
-        // Drop late events for the cancelled batch. lib cleanup
-        // happens silently in the background; user already saw
-        // the badge flip to [● CANCELLED] on click.
-        return;
-    }
     match evt {
-        Event::BatchStarted { id, total_files } => {
-            // Record the lib's batch_id on the active task
-            // (id-as-mapping; not a gating decision per
-            // §3.8.7.4). Phase is already Encoding by the time
-            // BatchStarted arrives — DryRunFinished set it before
-            // dispatching StartBatch (auto-encode path, review
-            // #133 part 3d).
-            if let Some(t) = state.tasks.active.as_mut() {
-                t.batch_id = Some(id);
-                t.total_files = total_files;
-                t.phase = BatchPhase::Encoding;
-                t.records.clear();
+        Event::CommandAccepted {
+            request_id,
+            batch_id,
+        } => {
+            // The lib admitted the request (design doc §3.11.3).
+            // The batch id binds now, and the phase follows the
+            // answer -- not the enqueue.
+            let pending = state.tasks.active.as_ref().and_then(|t| t.pending_request);
+            if pending != Some(request_id) {
+                // Not the request the UI is waiting for (a config
+                // save, a stale one): nothing to do.
+                return;
             }
+            let Some(t) = state.tasks.active.as_mut() else {
+                return;
+            };
+            t.pending_request = None;
+            if let Some(batch_id) = batch_id {
+                t.batch_id = Some(batch_id);
+            }
+            if t.phase == BatchPhase::Starting {
+                t.phase = BatchPhase::Encoding;
+                t.restore_phase = None;
+                // Clear dry_run_records so the file list switches
+                // from dry-run outcomes (Succeeded/Skipped/Failed
+                // from probe) to encoding outcomes (per-file
+                // FileCompleted events). Without this, the UI would
+                // keep showing the dry-run results during
+                // Encoding — misleading.
+                t.dry_run_records.clear();
+            }
+        }
+        Event::CommandRejected { request_id, reason } => {
+            // Benign: the request was refused (the busy gate, the
+            // guard, a stale cancel). The running batch is
+            // untouched -- this is NOT `Event::Error`, which is
+            // fatal-only. Tell the user, and put the state back the
+            // way it was before the request (design doc §3.11.3).
+            push_toast(state, reason.clone(), ToastKind::Warning);
+            let pending = state.tasks.active.as_ref().and_then(|t| t.pending_request);
+            if pending != Some(request_id) {
+                return;
+            }
+            let phase = state.tasks.active.as_ref().map(|t| t.phase);
+            let restore = state.tasks.active.as_ref().and_then(|t| t.restore_phase);
+            match phase {
+                Some(BatchPhase::Analyzing) => {
+                    // The dry run never started: there is no task.
+                    drop_active(state);
+                }
+                Some(BatchPhase::Starting) => {
+                    if let Some(t) = state.tasks.active.as_mut() {
+                        t.phase = restore.unwrap_or(BatchPhase::AwaitingConfirm);
+                        t.restore_phase = None;
+                        t.pending_request = None;
+                    }
+                }
+                Some(BatchPhase::Cancelling) => {
+                    if let Some(t) = state.tasks.active.as_mut() {
+                        t.phase = restore.unwrap_or(BatchPhase::Encoding);
+                        t.restore_phase = None;
+                        t.pending_request = None;
+                    }
+                }
+                _ => {
+                    if let Some(t) = state.tasks.active.as_mut() {
+                        t.pending_request = None;
+                    }
+                }
+            }
+        }
+        Event::BatchStarted { id, total_files } => {
+            // The batch's id on the active task (id-as-mapping; not a
+            // gating decision per §3.8.7.4). The accept event
+            // already bound it; this is the lib's own announcement.
+            let Some(t) = state.tasks.active.as_mut() else {
+                return;
+            };
+            if t.batch_id.is_some_and(|known| known != id) {
+                // Another batch's start -- not ours.
+                return;
+            }
+            t.batch_id = Some(id);
+            t.total_files = total_files;
+            t.records.clear();
         }
         Event::FileStarted { .. } => {
             // Could update a "current file" display; v1 lets
             // Progress / FileCompleted drive the view.
         }
         Event::Progress {
+            batch_id,
             file_index,
             frame,
             fps,
@@ -788,10 +1061,11 @@ fn apply_event(state: &mut AppState, evt: Event) {
             time_secs,
             eta_secs,
         } => {
-            if let Some(t) = &state.tasks.active {
-                if t.finished || t.cancelled {
-                    return;
-                }
+            if !is_active_batch(state, batch_id) {
+                return;
+            }
+            if state.tasks.active.as_ref().is_some_and(|t| t.finished) {
+                return;
             }
             state.progress.insert(
                 file_index,
@@ -804,7 +1078,26 @@ fn apply_event(state: &mut AppState, evt: Event) {
                 },
             );
         }
-        Event::DryRunFinished { records } => {
+        Event::DryRunFinished {
+            batch_id,
+            generation,
+            records,
+        } => {
+            // The user cancelled while the dry run was running: the
+            // result is discarded and the task goes away.
+            let cancelled = state
+                .tasks
+                .active
+                .as_ref()
+                .map(|t| t.cancelled)
+                .unwrap_or(false);
+            if cancelled {
+                state.tasks.active = None;
+                return;
+            }
+            if !is_active_batch(state, batch_id) {
+                return;
+            }
             // v1.2 final (review #133 follow-up): DryRunFinished
             // transitions to AwaitingConfirm (NOT auto-encode
             // anymore — user must explicitly click the bottom
@@ -824,23 +1117,9 @@ fn apply_event(state: &mut AppState, evt: Event) {
             // doesn't invoke ffmpeg). Matching only `Succeeded`
             // is correct.
             //
-            // Cancel-during-Analyzing guard: if user clicked
-            // Cancel during Analyzing (set `cancelled = true`),
-            // DryRunFinished still arrives — discard it.
-            let cancelled = state
-                .tasks
-                .active
-                .as_ref()
-                .map(|t| t.cancelled)
-                .unwrap_or(false);
-            if cancelled {
-                state.tasks.active = None;
-                return;
-            }
-            let to_encode = records
-                .iter()
-                .filter(|r| matches!(r.outcome, EncodingOutcome::Succeeded))
-                .count();
+            // The counts and the wording are the lib's (design doc
+            // §3.10.3) -- the UI lays them out, it does not count.
+            let counts = rencoder_lib::data::store::OutcomeCounts::of(&records);
             if state.tasks.active.is_none() {
                 return;
             }
@@ -855,12 +1134,16 @@ fn apply_event(state: &mut AppState, evt: Event) {
             // produces one record); if a file vanished mid-dry-run
             // and records.len() < total_files, subtracting gives a
             // stale 'skip' count.
-            let to_failed = total_files.saturating_sub(to_encode);
+            let plan = counts.plan(total_files);
             {
                 let t = state.tasks.active.as_mut().unwrap();
                 t.dry_run_records = records;
-                t.to_encode = to_encode;
-                t.to_failed = to_failed;
+                t.to_encode = plan.to_encode;
+                t.to_failed = plan.to_failed;
+                // The generation the plan was made under: the reuse
+                // check compares it with the current one (design doc
+                // §3.10.5).
+                t.dry_run_generation = Some(generation);
             }
             // v1.2 follow-up #2: dry-run summary toast. The
             // Analyze stats (`Found N to encode, M to skip` /
@@ -868,23 +1151,15 @@ fn apply_event(state: &mut AppState, evt: Event) {
             // list area is empty during Analyzing/AwaitingConfirm
             // (§3.8.7.6 + the file list render in app.rs). Toast
             // replaces the previous body-level summary line.
-            if to_encode == 0 {
-                push_toast(
-                    state,
-                    format!("0 encodable files ({to_failed} failed); pick a different dir"),
-                    ToastKind::Warning,
-                );
+            if plan.is_empty() {
+                push_toast(state, plan.line(), ToastKind::Warning);
                 finalize(state, |t| {
                     t.cancelled = false;
                     // t.finished stays false — plan never ran.
                 });
                 return;
             }
-            push_toast(
-                state,
-                format!("Found {to_encode} to encode ({to_failed} failed)"),
-                ToastKind::Info,
-            );
+            push_toast(state, plan.line(), ToastKind::Info);
             // AwaitingConfirm: user reviews the toast, then
             // clicks "Encode" (no count suffix — §3.8.7.1
             // decision 2). UserClickedStart's AwaitingConfirm
@@ -903,17 +1178,39 @@ fn apply_event(state: &mut AppState, evt: Event) {
             // renders it next to the NVENC switch.
             state.nvenc_capability = Some(capability);
         }
-        Event::ConfigSaved { .. } => {
-            // review-delta F1 (was empty): wire the lib's save
-            // success ack to the Setup-page save-status indicator.
-            // Command::SaveConfig (job.rs:1107) emits
-            // Event::ConfigSaved on success and Event::Error
-            // with a 'save failed:' prefix on failure. The
-            // Setup page reads state.config_save_status; the
-            // prior empty handler left it stuck at 'Saving…'.
+        Event::CapabilityChecked { report } => {
+            // The lib checked and wrote the report (design doc
+            // §3.10.7). The frontends **read the file** -- nobody
+            // recomputes the check.
+            state.capability_report = rencoder_lib::capability::read_report(&report);
+        }
+        Event::ConfigSaved { revision, .. } => {
+            // The receipt carries the revision it saved (design doc
+            // §3.10.5): the edits at or below it are on disk now and
+            // the file layer takes them over; the edits the user
+            // made while the save was in flight stay in the entry
+            // layer -- they are not on disk yet.
+            let saved: Vec<ConfigFieldKind> = state
+                .config_edits
+                .iter()
+                .filter(|(_, edit)| edit.revision <= revision)
+                .map(|(kind, _)| *kind)
+                .collect();
+            for kind in saved {
+                if let Some(edit) = state.config_edits.remove(&kind) {
+                    apply_field_edit(&mut state.config_draft, kind, edit.value);
+                }
+            }
+            // review-delta F1: the lib's save success ack drives the
+            // Setup-page save-status indicator.
             state.config_save_status = format!("Saved at {}", Local::now().format("%H:%M:%S"));
         }
-        Event::FileCompleted { record, .. } => {
+        Event::FileCompleted {
+            batch_id, record, ..
+        } => {
+            if !is_active_batch(state, batch_id) {
+                return;
+            }
             if let Some(t) = state.tasks.active.as_mut() {
                 t.records.push(record);
                 t.encoded += 1;
@@ -927,7 +1224,10 @@ fn apply_event(state: &mut AppState, evt: Event) {
             // stale fps/eta until next Event::Progress.)
             state.progress.clear();
         }
-        Event::BatchCompleted { records } => {
+        Event::BatchCompleted { batch_id, records } => {
+            if !is_active_batch(state, batch_id) {
+                return;
+            }
             finalize(state, |t| {
                 t.records = records;
                 t.finished = true;
@@ -935,7 +1235,14 @@ fn apply_event(state: &mut AppState, evt: Event) {
             });
             state.progress.clear();
         }
-        Event::BatchCancelled { completed, total } => {
+        Event::BatchCancelled {
+            batch_id,
+            completed,
+            total,
+        } => {
+            if !is_active_batch(state, batch_id) {
+                return;
+            }
             // v1.2 follow-up #2: phase guard at the top of
             // apply_event already dropped this event when the
             // active task is in `Cancelled` phase (the optimistic
@@ -959,15 +1266,15 @@ fn apply_event(state: &mut AppState, evt: Event) {
             finalize(state, |t| {
                 t.cancelled = true;
                 t.finished = true;
-                // Phase stays at whatever it was — could be
-                // AwaitingConfirm (best-effort cancel pre-Start)
-                // or Done (terminal cancel from a previous task).
-                // Don't force to Done because that would override
-                // a legitimate AwaitingConfirm in the best-effort
-                // case.
+                // The batch is over: the phase says so (design doc
+                // §3.11.3 -- the UI confirms the finish on the
+                // matching batch's terminal event).
+                t.phase = BatchPhase::Cancelled;
             });
         }
-        Event::LogLine { file_index, line } => {
+        Event::LogLine {
+            file_index, line, ..
+        } => {
             state.log.push_back(LogLine {
                 file_index,
                 source: LogSource::FfmpegStderr,
@@ -981,21 +1288,15 @@ fn apply_event(state: &mut AppState, evt: Event) {
         Event::HistoryLoaded { records } => {
             state.history = records;
         }
-        Event::CommandRejected { reason } => {
-            // Benign: the command was dropped (e.g. a batch is already
-            // running). The running batch is untouched -- this is NOT
-            // `Event::Error`, which is fatal-only and would finalize
-            // it. Just tell the user.
-            push_toast(state, reason.clone(), ToastKind::Warning);
-        }
-        Event::Error { message, .. } => {
-            // review-delta F1: if the lib's save failed (it
-            // emits this with the prefix 'save failed:'),
-            // surface the error on the Setup-page save-status
-            // indicator AND push a toast. Other Event::Error
-            // paths (transcoding failures etc.) set the global
-            // last_error banner but don't fire a toast —
-            // toasts are reserved for user-action feedback.
+        Event::OperationFailed {
+            request_id,
+            message,
+            ..
+        } => {
+            // A **non-batch** operation failed (the config save, the
+            // NVENC detection). It finalizes nothing: a failed save
+            // must not finalize the batch the user is watching
+            // (design doc §3.11.3).
             if let Some(rest) = message.strip_prefix("save failed:") {
                 // rest is the lib's I/O error string (e.g.
                 // " permission denied (os error 13)" with a
@@ -1005,34 +1306,41 @@ fn apply_event(state: &mut AppState, evt: Event) {
                 state.config_save_status = format!("Save failed: {detail}");
                 push_toast(state, format!("Save failed: {detail}"), ToastKind::Error);
             }
+            let _ = request_id;
             state.last_error = Some(message);
-            // Per §3.8.7.1: during Encoding, move to history
-            // (task did run, even if it failed); during
-            // Analyzing, drop without history (task never
-            // started). review #133 part 3d removed the
-            // AwaitingConfirm arm (unreachable under auto-encode).
-            let phase = state.tasks.active.as_ref().map(|t| t.phase);
-            match phase {
-                Some(BatchPhase::Encoding) => {
-                    finalize(state, |t| {
-                        t.finished = true;
-                        t.phase = BatchPhase::Done;
-                    });
-                }
-                Some(BatchPhase::Analyzing) => {
-                    drop_active(state);
-                }
-                _ => {
-                    // Future variants — silently drop (active
-                    // stays as-is). review #133 removed the
-                    // AwaitingConfirm arm; the catch-all covers
-                    // any new phases the lib might surface.
-                    let _ = state.tasks.active.as_ref();
-                }
-            }
         }
-        // #[non_exhaustive] future variants — silently drop.
-        _ => {}
+        Event::BatchFailed {
+            batch_id, message, ..
+        } => {
+            // The batch could not run (the guard refused the target,
+            // the encoder cache was unusable). It finalizes **this**
+            // batch and nothing else (design doc §3.11.3).
+            if !is_active_batch(state, batch_id) {
+                return;
+            }
+            state.last_error = Some(message.clone());
+            push_toast(state, message, ToastKind::Error);
+            finalize(state, |t| {
+                t.finished = true;
+                t.phase = BatchPhase::Done;
+            });
+            state.progress.clear();
+        }
+        Event::Error { message, .. } => {
+            // The actor itself failed -- **no scope**: no batch is
+            // running when this fires, so there is nothing to
+            // finalize. The batch-level failures travel through
+            // `BatchFailed` (design doc §3.11.3).
+            state.last_error = Some(message);
+        }
+        // The protocol is `#[non_exhaustive]`, and the UI is another
+        // crate -- so a wildcard arm is required. An event nobody
+        // handles is **logged**, not silently dropped: a protocol
+        // that grew a variant the UI does not know about should be
+        // visible.
+        _ => {
+            tracing::warn!("unhandled event variant (the protocol grew one the UI does not know)");
+        }
     }
 }
 
@@ -1042,7 +1350,10 @@ fn apply_event(state: &mut AppState, evt: Event) {
 /// there's a single source of truth for "how a TOML `[encode]`
 /// block becomes an `EncodeParams`".
 fn build_encode_params_from_draft(state: &AppState) -> rencoder_lib::types::EncodeParams {
-    rencoder_lib::types::EncodeParams::from_app_config(state.config_draft.encode.as_ref())
+    // The effective config: the file layer with the user's unsaved
+    // edits on top (design doc §3.10.5).
+    let config = state.effective_config();
+    rencoder_lib::types::EncodeParams::from_app_config(config.encode.as_ref())
 }
 
 /// Errors that `collect_input_files` can return. Distinguishes
@@ -1067,6 +1378,10 @@ enum CollectError {
     /// extensions or split the directory — surfaced as a toast
     /// with the count + max so they know by how much they overshot.
     BatchTooLarge { count: usize, max: u32 },
+    /// The single-instance guard refused this directory (design doc
+    /// §3.11.1.1): another instance holds it or an ancestor of it, or
+    /// the marker could not be used at all. The message says which.
+    Guard(String),
 }
 
 /// Collect input files from `state.input_dir`, filtered by the
@@ -1080,7 +1395,10 @@ enum CollectError {
 fn collect_input_files(
     state: &AppState,
 ) -> Result<Vec<rencoder_lib::types::InputPath>, CollectError> {
-    let config = &state.config_draft;
+    // The effective config: the extensions the user set (even
+    // before the save lands) decide what is collected (design doc
+    // §3.10.5).
+    let config = state.effective_config();
     let Some(dir) = state.input_dir.as_ref() else {
         return Err(CollectError::NoInputDir);
     };
@@ -1097,21 +1415,34 @@ fn collect_input_files(
     // StartBatch will actually process, AND the batch cap is enforced
     // uniformly at the same site as the lib.
     let max_batch_size = rencoder_lib::config::app::resolve_max_batch_size(config.encode.as_ref());
+    // The single-instance guard's cheap probe (design doc §3.11.1.1):
+    // another instance working on this directory (or an ancestor of
+    // it) means the numbers we are about to read are unreliable.
+    if let Err(e) = rencoder_lib::guard::probe(dir) {
+        return Err(CollectError::Guard(e.to_string()));
+    }
     let target = rencoder_lib::types::Target::Dir(dir.clone());
-    rencoder_lib::collect::collect_files(&target, &extensions, max_batch_size).map_err(
-        |e| match e {
-            rencoder_lib::error::EncodeError::BatchTooLarge { count, max } => {
-                CollectError::BatchTooLarge { count, max }
-            }
-            // v1.2 follow-up #5 fix: forward the lib's specific error
-            // rather than collapsing every non-BatchTooLarge into a
-            // generic UnreadableDir. The toast path uses
-            // `Display` (which the lib's thiserror derives) so the
-            // user sees "Probe error: walkdir: ..." vs "I/O error:
-            // ..." distinctly.
-            other => CollectError::UnreadableDir(other),
-        },
+    // The UI collects before the batch exists, so there is no cancel
+    // token to hand over yet (design doc §3.11.2 applies to the
+    // batch's own startup phase).
+    rencoder_lib::collect::collect_files(
+        &target,
+        &extensions,
+        max_batch_size,
+        &rencoder_lib::pipeline::cancel::CancelToken::new(),
     )
+    .map_err(|e| match e {
+        rencoder_lib::error::EncodeError::BatchTooLarge { count, max } => {
+            CollectError::BatchTooLarge { count, max }
+        }
+        // v1.2 follow-up #5 fix: forward the lib's specific error
+        // rather than collapsing every non-BatchTooLarge into a
+        // generic UnreadableDir. The toast path uses
+        // `Display` (which the lib's thiserror derives) so the
+        // user sees "Probe error: walkdir: ..." vs "I/O error:
+        // ..." distinctly.
+        other => CollectError::UnreadableDir(other),
+    })
 }
 
 /// Move the active task to history, applying `mutate` to it first.
@@ -1141,6 +1472,39 @@ fn drop_active(state: &mut AppState) {
     state.viewing_task = None;
 }
 
+/// Dispatch a dry run for the given files.
+///
+/// The task keeps its identity (the same task id): a re-plan is the
+/// same task, planned again (design doc §3.10.5).
+fn dispatch_dry_run(
+    state: &mut AppState,
+    cmd_tx: &crossbeam_channel::Sender<Request>,
+    files: Vec<rencoder_lib::types::InputPath>,
+) {
+    let params = build_encode_params_from_draft(state);
+    // What the plan is made of -- the reuse check compares against
+    // it (design doc §3.10.5).
+    let planning = Some(planning_params(state));
+    let snapshot = stat_inputs(&files);
+    if let Some(t) = state.tasks.active.as_mut() {
+        t.phase = BatchPhase::Analyzing;
+        t.dry_run_params = planning;
+        t.dry_run_inputs = snapshot;
+    }
+    match dispatch(state, cmd_tx, Command::DryRun { params, files }) {
+        Ok(request_id) => {
+            if let Some(t) = state.tasks.active.as_mut() {
+                t.pending_request = Some(request_id);
+            }
+        }
+        Err(e) => {
+            // The dry run never started: there is no task to keep.
+            drop_active(state);
+            push_toast(state, e, ToastKind::Error);
+        }
+    }
+}
+
 /// Dispatch a `Command::DryRun` for a freshly-created task (None or
 /// Done re-arm). Caller is responsible for ensuring `tasks.active`
 /// is `None` before calling (the reducer's `Some(Done)` arm does
@@ -1155,7 +1519,7 @@ fn drop_active(state: &mut AppState) {
 /// `progress`/`log`, dispatches `Command::DryRun`.
 fn dispatch_dry_run_for_new_task(
     state: &mut AppState,
-    cmd_tx: &crossbeam_channel::Sender<Command>,
+    cmd_tx: &crossbeam_channel::Sender<Request>,
 ) {
     let files = match collect_input_files(state) {
         Ok(files) => files,
@@ -1193,10 +1557,19 @@ fn dispatch_dry_run_for_new_task(
             );
             return;
         }
+        Err(CollectError::Guard(message)) => {
+            // The guard refused this directory (design doc
+            // §3.11.1.1): reading it now would give unreliable
+            // numbers.
+            push_toast(state, message, ToastKind::Error);
+            return;
+        }
     };
     if files.is_empty() {
+        // The effective config: the extensions the user set (even
+        // before the save lands) decide what was collected.
         let extensions = state
-            .config_draft
+            .effective_config()
             .encode
             .as_ref()
             .and_then(|e| e.extensions.clone())
@@ -1218,7 +1591,6 @@ fn dispatch_dry_run_for_new_task(
         push_toast(state, detail, ToastKind::Warning);
         return;
     }
-    let params = build_encode_params_from_draft(state);
     state.last_error = None;
     state.progress.clear();
     state.log.clear();
@@ -1229,6 +1601,8 @@ fn dispatch_dry_run_for_new_task(
     state.tasks.active = Some(TaskInfo {
         task_id: task_id.clone(),
         batch_id: None,
+        pending_request: None,
+        restore_phase: None,
         phase: BatchPhase::Analyzing,
         dir,
         total_files,
@@ -1239,25 +1613,105 @@ fn dispatch_dry_run_for_new_task(
         finished: false,
         records: Vec::new(),
         dry_run_records: Vec::new(),
+        dry_run_generation: None,
+        dry_run_params: None,
+        dry_run_inputs: Vec::new(),
     });
     state.viewing_task = Some(task_id);
-    let _ = cmd_tx.try_send(Command::DryRun { params, files });
+    // The dry run is a batch: it gets a request id, and the lib's
+    // answer binds the batch id (design doc §3.11.3).
+    dispatch_dry_run(state, cmd_tx, files);
 }
 
-/// v1.2 review #133 part 2d: Setup-page real-time save helper.
-/// The reducer arm for `Msg::UserEditedConfigField` calls this
-/// to update the in-memory `config_draft`. The
-/// `Command::SaveConfig` dispatch (separate) atomically
-/// persists the full `AppConfig` to TOML via `write_atomic`.
+/// The planning parameters of the effective config, normalized.
 ///
-/// Defensive: missing `encode` section in `config_draft` is
-/// populated with a default so the first edit doesn't crash.
-fn apply_config_field_edit(state: &mut AppState, kind: ConfigFieldKind, value: ConfigFieldValue) {
-    use rencoder_lib::config::app::EncodeConfig;
-    if state.config_draft.encode.is_none() {
-        state.config_draft.encode = Some(EncodeConfig::default());
+/// A config without an `[encode]` section and one with a default
+/// section are the same plan -- the comparison must not see a
+/// difference where there is none.
+fn planning_params(state: &AppState) -> rencoder_lib::config::app::EncodeConfig {
+    state.effective_config().encode.clone().unwrap_or_default()
+}
+
+/// The stat of every planned input.
+fn stat_inputs(files: &[rencoder_lib::types::InputPath]) -> Vec<(PathBuf, InputStat)> {
+    files
+        .iter()
+        .map(|file| {
+            let path = file.as_path().to_path_buf();
+            let meta = std::fs::metadata(&path).ok();
+            let stat = InputStat {
+                size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                mtime: meta.as_ref().and_then(|m| m.modified().ok()),
+            };
+            (path, stat)
+        })
+        .collect()
+}
+
+/// Why the dry run's plan cannot be reused (design doc §3.10.5).
+///
+/// Returns `None` when the plan still holds. The four things that
+/// can move under a plan:
+///
+/// 1. **the task list** -- files were added or removed;
+/// 2. **the effective planning parameters** -- the user changed the
+///    format, the crf, the caps, the encoders;
+/// 3. **the capability generation** -- a re-probe published a new
+///    one, and the plan may pick a different encoder;
+/// 4. **the inputs on disk** -- the plan depends on the media probe,
+///    so an input that changed invalidates it.
+fn plan_is_stale(
+    state: &AppState,
+    files: &[rencoder_lib::types::InputPath],
+) -> Option<&'static str> {
+    let task = state.tasks.active.as_ref()?;
+    // 1. the task list
+    let planned: Vec<&std::path::Path> = task
+        .dry_run_inputs
+        .iter()
+        .map(|(path, _)| path.as_path())
+        .collect();
+    let current: Vec<&std::path::Path> = files.iter().map(|f| f.as_path()).collect();
+    if planned != current {
+        return Some("the file list changed");
     }
-    let enc = state.config_draft.encode.as_mut().expect("just inserted");
+    // 2. the effective planning parameters
+    let current_params = planning_params(state);
+    if task.dry_run_params.as_ref() != Some(&current_params) {
+        return Some("the parameters changed");
+    }
+    // 3. the capability generation
+    let current_generation = state.nvenc_capability.as_ref().map(|c| c.generation());
+    if task.dry_run_generation != current_generation {
+        return Some("the machine's capability changed");
+    }
+    // 4. the inputs on disk
+    for (path, stat) in &task.dry_run_inputs {
+        let meta = std::fs::metadata(path).ok();
+        let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let mtime = meta.as_ref().and_then(|m| m.modified().ok());
+        if size != stat.size || mtime != stat.mtime {
+            return Some("an input changed on disk");
+        }
+    }
+    None
+}
+
+/// Apply one field edit to a config.
+///
+/// The same shape for the file layer (the draft) and for the
+/// effective config -- one implementation, so the two layers cannot
+/// drift apart.
+fn apply_field_edit(
+    config: &mut rencoder_lib::config::app::AppConfig,
+    kind: ConfigFieldKind,
+    value: ConfigFieldValue,
+) {
+    use rencoder_lib::config::app::EncodeConfig;
+    if config.encode.is_none() {
+        config.encode = Some(EncodeConfig::default());
+    }
+    let enc = config.encode.as_mut().expect("just inserted");
     match (kind, value) {
         (ConfigFieldKind::Format, ConfigFieldValue::Format(v)) => {
             enc.format = Some(v);
@@ -1334,9 +1788,35 @@ mod tests {
         sample_record(path, EncodingOutcome::Failed)
     }
 
-    fn cmd_tx() -> Sender<Command> {
-        let (tx, _rx) = crossbeam_channel::unbounded::<Command>();
+    /// A command sender whose receiver stays alive.
+    ///
+    /// The receiver is leaked on purpose: a dropped receiver
+    /// disconnects the channel, and every send would then fail --
+    /// which is a path the reducer handles by restoring the state
+    /// (design doc §3.11.3).
+    fn cmd_tx() -> Sender<Request> {
+        let (tx, rx) = crossbeam_channel::unbounded::<Request>();
+        std::mem::forget(rx);
         tx
+    }
+
+    /// The command of the next dispatched request.
+    ///
+    /// The channel carries `Request` (a command + its id), so the
+    /// tests unwrap the command and keep the id for the matching.
+    fn next_command(rx: &crossbeam_channel::Receiver<Request>) -> Command {
+        let Request { command, .. } = rx
+            .try_recv()
+            .expect("a command should have been dispatched");
+        command
+    }
+
+    /// The id of the next dispatched request.
+    fn next_request_id(rx: &crossbeam_channel::Receiver<Request>) -> RequestId {
+        let Request { id, .. } = rx
+            .try_recv()
+            .expect("a request should have been dispatched");
+        id
     }
 
     /// Construct a minimal valid `AppState` with the v1 task
@@ -1353,13 +1833,10 @@ mod tests {
     #[test]
     fn detect_nv_dispatches_a_forced_detect_command() {
         use crossbeam_channel::unbounded;
-        let (tx, rx) = unbounded::<Command>();
+        let (tx, rx) = unbounded::<Request>();
         let mut state = fresh_state();
         reduce(&mut state, Msg::UserClickedDetectNv, &tx);
-        match rx
-            .try_recv()
-            .expect("a command should have been dispatched")
-        {
+        match next_command(&rx) {
             Command::Detect { force } => assert!(force, "the button must force a probe"),
             _ => panic!("expected Command::Detect"),
         }
@@ -1368,33 +1845,225 @@ mod tests {
     #[test]
     fn nvenc_capability_event_updates_the_state() {
         use crossbeam_channel::unbounded;
-        let (tx, _rx) = unbounded::<Command>();
+        let (tx, _rx) = unbounded::<Request>();
         let mut state = fresh_state();
         assert!(state.nvenc_capability.is_none());
-        let capability = rencoder_lib::types::NvencCapability {
-            support: vec![rencoder_lib::types::NvencSupport {
+        let capability = rencoder_lib::encoder::nvenc::Capability::from_support(vec![
+            rencoder_lib::types::NvencSupport {
                 encoder: "av1_nvenc".into(),
                 usable: false,
                 reason: Some("No NVENC capable devices found".into()),
-            }],
-            probed_at: Some(DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap()),
-            review_due: true,
-        };
+            },
+        ]);
         reduce(
             &mut state,
             Msg::Lib(Event::NvencCapability(capability.clone())),
             &tx,
         );
         let stored = state.nvenc_capability.expect("capability should be stored");
-        assert_eq!(stored.support.len(), 1);
-        assert!(stored.review_due);
-        assert_eq!(stored.support[0].encoder, "av1_nvenc");
+        assert_eq!(stored.support().len(), 1);
+        assert!(!stored.usable("av1_nvenc"));
+        assert_eq!(stored.support()[0].encoder, "av1_nvenc");
+    }
+
+    /// A task in AwaitingConfirm with a dry-run plan over `files`.
+    ///
+    /// The plan is what the dry run made: the file list with the
+    /// stats it saw, the planning parameters, and the capability
+    /// generation it froze.
+    fn task_with_plan(
+        dir: &std::path::Path,
+        files: &[rencoder_lib::types::InputPath],
+        generation: u64,
+    ) -> AppState {
+        let mut state = fresh_state();
+        state.input_dir = Some(dir.to_path_buf());
+        state.nvenc_capability =
+            Some(rencoder_lib::encoder::nvenc::Capability::default().with_generation(generation));
+        let planning = Some(planning_params(&state));
+        state.tasks.active = Some(TaskInfo {
+            task_id: TaskId("20260101000000".into()),
+            batch_id: None,
+            pending_request: None,
+            restore_phase: None,
+            phase: BatchPhase::AwaitingConfirm,
+            dir: dir.to_path_buf(),
+            total_files: files.len(),
+            to_encode: files.len(),
+            to_failed: 0,
+            encoded: 0,
+            cancelled: false,
+            finished: false,
+            records: vec![],
+            dry_run_records: vec![],
+            dry_run_generation: Some(generation),
+            dry_run_params: planning,
+            dry_run_inputs: stat_inputs(files),
+        });
+        state
+    }
+
+    /// A directory with one video file in it.
+    fn plan_dir(label: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("rencoder_ui_plan_{label}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.mp4"), b"video").unwrap();
+        dir
     }
 
     #[test]
-    fn editing_the_nv_field_updates_the_config_draft() {
+    fn an_unchanged_plan_is_reused() {
+        // Nothing moved under the plan: the Encode click starts the
+        // batch (design doc §3.10.5).
+        let dir = plan_dir("unchanged");
+        let files = vec![rencoder_lib::types::InputPath::new(&dir.join("a.mp4")).unwrap()];
+        let mut state = task_with_plan(&dir, &files, 1);
+        let (tx, rx) = crossbeam_channel::unbounded::<Request>();
+        reduce(&mut state, Msg::UserClickedStart, &tx);
+
+        match next_command(&rx) {
+            Command::StartBatch { .. } => {}
+            other => panic!("the plan still holds -- the batch must start, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_changed_parameter_re_plans_instead_of_encoding() {
+        // The user changed a planning parameter after the dry run:
+        // the plan they reviewed is not the plan that would run.
+        let dir = plan_dir("params");
+        let files = vec![rencoder_lib::types::InputPath::new(&dir.join("a.mp4")).unwrap()];
+        let mut state = task_with_plan(&dir, &files, 1);
+        // The crf changes (the entry layer, not yet saved).
+        reduce(
+            &mut state,
+            Msg::UserEditedConfigField {
+                kind: ConfigFieldKind::Crf,
+                value: ConfigFieldValue::Crf(28),
+            },
+            &crossbeam_channel::unbounded::<Request>().0,
+        );
+        let (tx, rx) = crossbeam_channel::unbounded::<Request>();
+        reduce(&mut state, Msg::UserClickedStart, &tx);
+
+        match next_command(&rx) {
+            Command::DryRun { .. } => {}
+            other => panic!("the parameters moved -- the plan must be re-made, got {other:?}"),
+        }
+        assert_eq!(
+            state.tasks.active.as_ref().unwrap().phase,
+            BatchPhase::Analyzing,
+            "the re-plan puts the task back into Analyzing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_changed_capability_generation_re_plans_instead_of_encoding() {
+        // A re-probe published a new generation: the plan may pick a
+        // different encoder, so it is re-made (design doc §3.10.5).
+        let dir = plan_dir("generation");
+        let files = vec![rencoder_lib::types::InputPath::new(&dir.join("a.mp4")).unwrap()];
+        let mut state = task_with_plan(&dir, &files, 1);
+        // The new generation arrives.
+        reduce(
+            &mut state,
+            Msg::Lib(Event::NvencCapability(
+                rencoder_lib::encoder::nvenc::Capability::default().with_generation(2),
+            )),
+            &crossbeam_channel::unbounded::<Request>().0,
+        );
+        let (tx, rx) = crossbeam_channel::unbounded::<Request>();
+        reduce(&mut state, Msg::UserClickedStart, &tx);
+
+        match next_command(&rx) {
+            Command::DryRun { .. } => {}
+            other => panic!("the generation moved -- the plan must be re-made, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_input_changed_on_disk_re_plans_instead_of_encoding() {
+        // The plan depends on the media probe: an input that changed
+        // invalidates it (design doc §3.10.5).
+        let dir = plan_dir("input_changed");
+        let files = vec![rencoder_lib::types::InputPath::new(&dir.join("a.mp4")).unwrap()];
+        let mut state = task_with_plan(&dir, &files, 1);
+        // The file changes under the plan.
+        std::fs::write(dir.join("a.mp4"), b"a different video").unwrap();
+        let (tx, rx) = crossbeam_channel::unbounded::<Request>();
+        reduce(&mut state, Msg::UserClickedStart, &tx);
+
+        match next_command(&rx) {
+            Command::DryRun { .. } => {}
+            other => panic!("an input changed -- the plan must be re-made, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_changed_file_list_re_plans_instead_of_encoding() {
+        // A file appeared in the directory: the task list moved.
+        let dir = plan_dir("file_list");
+        let files = vec![rencoder_lib::types::InputPath::new(&dir.join("a.mp4")).unwrap()];
+        let mut state = task_with_plan(&dir, &files, 1);
+        std::fs::write(dir.join("b.mp4"), b"video").unwrap();
+        let (tx, rx) = crossbeam_channel::unbounded::<Request>();
+        reduce(&mut state, Msg::UserClickedStart, &tx);
+
+        match next_command(&rx) {
+            Command::DryRun { .. } => {}
+            other => panic!("the file list moved -- the plan must be re-made, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_capability_report_is_read_from_the_file() {
+        // The frontends read the file (design doc §3.10.7): the lib
+        // checked and wrote it, the UI shows what the file says --
+        // nobody recomputes the check here.
         use crossbeam_channel::unbounded;
-        let (tx, _rx) = unbounded::<Command>();
+        let (tx, _rx) = unbounded::<Request>();
+        let mut state = fresh_state();
+        let dir =
+            std::env::temp_dir().join(format!("rencoder_ui_capability_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let report = dir.join("capabilities.json");
+        std::fs::write(
+            &report,
+            r#"{"checks":[{"name":"operation directory","status":"ok"}]}"#,
+        )
+        .unwrap();
+
+        reduce(
+            &mut state,
+            Msg::Lib(Event::CapabilityChecked {
+                report: report.clone(),
+            }),
+            &tx,
+        );
+
+        let read = state
+            .capability_report
+            .expect("the report must be read from the file");
+        assert_eq!(read.checks.len(), 1);
+        assert_eq!(read.checks[0].name, "operation directory");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn editing_a_field_updates_the_entry_layer_not_the_draft() {
+        // Design doc §3.10.5: the draft's values express the **file
+        // layer**; the user's unsaved edits are the entry layer. The
+        // draft takes an edit over only when the save that carried
+        // it succeeds.
+        use crossbeam_channel::unbounded;
+        let (tx, _rx) = unbounded::<Request>();
         let mut state = fresh_state();
         reduce(
             &mut state,
@@ -1406,8 +2075,115 @@ mod tests {
         );
         assert_eq!(
             state.config_draft.encode.as_ref().and_then(|e| e.nv),
+            None,
+            "the draft is the file layer: an unsaved edit does not touch it"
+        );
+        assert_eq!(
+            state
+                .config_edits
+                .get(&ConfigFieldKind::Nv)
+                .map(|edit| edit.revision),
+            Some(1),
+            "the edit is recorded with a fresh revision"
+        );
+        assert_eq!(
+            state.effective_config().encode.as_ref().and_then(|e| e.nv),
             Some(true),
-            "the draft should carry the nv switch"
+            "the effective config carries the edit"
+        );
+    }
+
+    #[test]
+    fn a_receipt_clears_only_the_edits_it_covered() {
+        // Design doc §3.10.5: the receipt carries the revision it
+        // saved; the edits at or below it are on disk now, the ones
+        // the user made while the save was in flight are not.
+        let mut state = fresh_state();
+        let tx = cmd_tx();
+        // The first edit: revision 1.
+        reduce(
+            &mut state,
+            Msg::UserEditedConfigField {
+                kind: ConfigFieldKind::Crf,
+                value: ConfigFieldValue::Crf(28),
+            },
+            &tx,
+        );
+        // The second edit (another field) while the first save is in
+        // flight: revision 2.
+        reduce(
+            &mut state,
+            Msg::UserEditedConfigField {
+                kind: ConfigFieldKind::Nv,
+                value: ConfigFieldValue::Nv(true),
+            },
+            &tx,
+        );
+        // The receipt for revision 1 arrives.
+        reduce(
+            &mut state,
+            Msg::Lib(Event::ConfigSaved {
+                path: PathBuf::from("/tmp/rencoder.toml"),
+                revision: 1,
+            }),
+            &tx,
+        );
+        assert!(
+            !state.config_edits.contains_key(&ConfigFieldKind::Crf),
+            "the covered edit is on disk now"
+        );
+        assert!(
+            state.config_edits.contains_key(&ConfigFieldKind::Nv),
+            "the newer edit is not on disk yet -- it stays"
+        );
+        assert_eq!(
+            state.config_draft.encode.as_ref().map(|e| e.crf),
+            Some(28),
+            "the file layer took the saved edit over"
+        );
+        assert_eq!(
+            state.effective_config().encode.as_ref().and_then(|e| e.nv),
+            Some(true),
+            "the newer edit is still in force"
+        );
+    }
+
+    #[test]
+    fn a_failed_save_keeps_the_baseline_and_the_edits() {
+        // Design doc §3.10.5: a failed save keeps the baseline and
+        // the draft; the edits stay in the entry layer.
+        let mut state = fresh_state();
+        let tx = cmd_tx();
+        reduce(
+            &mut state,
+            Msg::UserEditedConfigField {
+                kind: ConfigFieldKind::Crf,
+                value: ConfigFieldValue::Crf(28),
+            },
+            &tx,
+        );
+        reduce(
+            &mut state,
+            Msg::Lib(Event::OperationFailed {
+                request_id: 1,
+                category: rencoder_lib::types::ErrorCategory::ConfigError,
+                message: "save failed: permission denied".into(),
+            }),
+            &tx,
+        );
+        assert!(
+            state.config_edits.contains_key(&ConfigFieldKind::Crf),
+            "the edit stays: it was not saved"
+        );
+        assert_eq!(
+            state.config_draft.encode.as_ref().map(|e| e.crf),
+            None,
+            "the file layer is untouched"
+        );
+        assert_eq!(
+            state.effective_config().encode.as_ref().map(|e| e.crf),
+            Some(28),
+            "the edit is still in force"
         );
     }
 
@@ -1421,6 +2197,22 @@ mod tests {
     }
 
     #[test]
+    fn user_selected_dir_tells_the_lib_to_recheck() {
+        // The working directory moved: the lib re-checks and writes
+        // the report into the new operation directory (design doc
+        // §3.10.7). The UI reads the file when the check lands.
+        use crossbeam_channel::unbounded;
+        let (tx, rx) = unbounded::<Request>();
+        let mut state = fresh_state();
+        let p = PathBuf::from("/some/dir");
+        reduce(&mut state, Msg::UserSelectedDir(p.clone()), &tx);
+        match next_command(&rx) {
+            Command::SetWorkingDir { dir } => assert_eq!(dir, p),
+            _ => panic!("expected Command::SetWorkingDir"),
+        }
+    }
+
+    #[test]
     fn user_selected_dir_rejected_when_task_active() {
         let mut state = fresh_state();
         let tx = cmd_tx();
@@ -1428,6 +2220,8 @@ mod tests {
         state.tasks.active = Some(TaskInfo {
             task_id: TaskId("20260101000000".into()),
             batch_id: None,
+            pending_request: None,
+            restore_phase: None,
             phase: BatchPhase::Analyzing,
             dir: PathBuf::from("/x"),
             total_files: 0,
@@ -1438,6 +2232,9 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         reduce(&mut state, Msg::UserSelectedDir(PathBuf::from("/y")), &tx);
         assert!(state.input_dir.is_none());
@@ -1467,6 +2264,8 @@ mod tests {
         state.tasks.active = Some(TaskInfo {
             task_id: TaskId("20260101000000".into()),
             batch_id: None,
+            pending_request: None,
+            restore_phase: None,
             phase: BatchPhase::Analyzing,
             dir: PathBuf::from("/x"),
             total_files: 5,
@@ -1477,6 +2276,9 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         state.input_dir = Some(PathBuf::from("/y"));
         reduce(&mut state, Msg::UserClickedStart, &tx);
@@ -1502,6 +2304,8 @@ mod tests {
         state.tasks.active = Some(TaskInfo {
             task_id: prev_id.clone(),
             batch_id: Some(1),
+            pending_request: None,
+            restore_phase: None,
             phase: BatchPhase::Done,
             dir: PathBuf::from("/x"),
             total_files: 5,
@@ -1512,6 +2316,9 @@ mod tests {
             finished: true,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         state.input_dir = Some(std::path::PathBuf::from("/tmp"));
         reduce(&mut state, Msg::UserClickedStart, &tx);
@@ -1546,6 +2353,8 @@ mod tests {
         state.tasks.active = Some(TaskInfo {
             task_id: TaskId("20260101000000".into()),
             batch_id: None,
+            pending_request: None,
+            restore_phase: None,
             phase: BatchPhase::Encoding,
             dir: PathBuf::from("/x"),
             total_files: 5,
@@ -1556,6 +2365,9 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         state.last_error = Some("previous unrelated error".into());
         reduce(&mut state, Msg::UserSelectedDir(PathBuf::from("/y")), &tx);
@@ -1575,6 +2387,8 @@ mod tests {
         state.tasks.active = Some(TaskInfo {
             task_id: task_id.clone(),
             batch_id: Some(1),
+            pending_request: None,
+            restore_phase: None,
             phase: BatchPhase::Encoding,
             dir: PathBuf::from("/x"),
             total_files: 2,
@@ -1585,11 +2399,17 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         state.viewing_task = Some(task_id.clone());
         reduce(
             &mut state,
-            Msg::Lib(Event::BatchCompleted { records: vec![] }),
+            Msg::Lib(Event::BatchCompleted {
+                batch_id: 1,
+                records: vec![],
+            }),
             &tx,
         );
         assert!(state.tasks.active.is_none());
@@ -1610,6 +2430,8 @@ mod tests {
         state.tasks.active = Some(TaskInfo {
             task_id: TaskId("20260101000000".into()),
             batch_id: None,
+            pending_request: None,
+            restore_phase: None,
             phase: BatchPhase::Encoding,
             dir: PathBuf::from("/x"),
             total_files: 5,
@@ -1620,6 +2442,9 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         reduce(
             &mut state,
@@ -1641,7 +2466,9 @@ mod tests {
         let tx = cmd_tx();
         state.tasks.active = Some(TaskInfo {
             task_id: TaskId("20260101000000".into()),
-            batch_id: None,
+            batch_id: Some(1),
+            pending_request: None,
+            restore_phase: None,
             phase: BatchPhase::Encoding,
             dir: PathBuf::from("/x"),
             total_files: 2,
@@ -1652,10 +2479,14 @@ mod tests {
             finished: true, // simulate post-BatchCompleted but still in active
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         reduce(
             &mut state,
             Msg::Lib(Event::Progress {
+                batch_id: 1,
                 file_index: 0,
                 frame: 100,
                 fps: 30.0,
@@ -1676,6 +2507,7 @@ mod tests {
             reduce(
                 &mut state,
                 Msg::Lib(Event::LogLine {
+                    batch_id: 1,
                     file_index: 0,
                     line: format!("line {i}"),
                 }),
@@ -1704,17 +2536,18 @@ mod tests {
     }
 
     #[test]
-    fn user_clicked_cancel_sets_phase_to_cancelled_immediately() {
-        // v1.2 follow-up #2: optimistic cancel. The Encoding arm
-        // of `Msg::UserClickedCancel` sets `phase = Cancelled`
-        // immediately + dispatches `Command::Cancel`. The lib's
-        // eventual `Event::BatchCancelled` is filtered out by
-        // `apply_event`'s phase guard (separate test).
+    fn user_clicked_cancel_waits_for_the_batch_to_confirm() {
+        // Design doc §3.11.3: the cancel names the batch, and the UI
+        // waits for the batch's terminal event. The phase says
+        // `Cancelling` -- the batch is still finishing, and saying
+        // "cancelled" before the lib confirms it would be a lie.
         let mut state = fresh_state();
-        let (tx, rx) = crossbeam_channel::unbounded::<Command>();
+        let (tx, rx) = crossbeam_channel::unbounded::<Request>();
         state.tasks.active = Some(TaskInfo {
             task_id: TaskId("20260101000000".into()),
             batch_id: Some(1),
+            pending_request: None,
+            restore_phase: None,
             phase: BatchPhase::Encoding,
             dir: PathBuf::from("/x"),
             total_files: 5,
@@ -1725,63 +2558,209 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         reduce(&mut state, Msg::UserClickedCancel, &tx);
 
-        // Phase flips to Cancelled synchronously (no wait for
-        // lib's late Event::BatchCancelled).
         assert_eq!(
             state.tasks.active.as_ref().unwrap().phase,
-            BatchPhase::Cancelled,
-            "optimistic cancel: phase must be Cancelled in <1ms"
+            BatchPhase::Cancelling,
+            "the phase waits for the batch's terminal event"
         );
-        assert!(
-            state.tasks.active.as_ref().unwrap().cancelled,
-            "cancelled flag set alongside phase"
-        );
-        // Command::Cancel dispatched.
-        assert!(
-            matches!(rx.try_recv(), Ok(Command::Cancel)),
-            "Command::Cancel must be dispatched"
-        );
-        // No movement to history yet — the in-flight records stay
-        // visible until the user re-clicks Encode or picks a new
-        // dir (per §3.8.7.1 decision 5).
+        // The cancel names the batch it stops.
+        match next_command(&rx) {
+            Command::Cancel { batch_id } => assert_eq!(batch_id, 1),
+            other => panic!("expected Command::Cancel, got {other:?}"),
+        }
+        // No movement to history yet -- the batch is still finishing.
         assert_eq!(state.task_history.len(), 0);
+
+        // The batch's terminal event confirms it.
+        reduce(
+            &mut state,
+            Msg::Lib(Event::BatchCancelled {
+                batch_id: 1,
+                completed: 2,
+                total: 5,
+            }),
+            &tx,
+        );
+        assert!(state.tasks.active.is_none(), "the task is over");
+        assert_eq!(state.task_history.len(), 1);
+        assert_eq!(state.task_history[0].phase, BatchPhase::Cancelled);
+        assert!(state.task_history[0].cancelled);
     }
 
     #[test]
-    fn cancelled_phase_filter_drops_late_batch_events() {
-        // v1.2 follow-up #2: phase guard at top of apply_event
-        // drops batch-scoped events (BatchStarted / FileStarted /
-        // Progress / FileCompleted / BatchCompleted /
-        // BatchCancelled / Error) when the active task is in
-        // Cancelled phase. This is the optimistic-cancel
-        // invariant: user click wins over lib's eventual
-        // confirmation.
+    fn the_accept_event_admits_the_batch() {
+        // Design doc §3.11.3: the phase follows the lib's answer,
+        // not the enqueue. `Starting` becomes `Encoding` when the
+        // answer arrives, and the answer binds the batch id.
+        let mut state = fresh_state();
+        let tx = cmd_tx();
+        state.tasks.active = Some(TaskInfo {
+            task_id: TaskId("20260101000000".into()),
+            batch_id: None,
+            pending_request: Some(3),
+            restore_phase: Some(BatchPhase::AwaitingConfirm),
+            phase: BatchPhase::Starting,
+            dir: PathBuf::from("/x"),
+            total_files: 5,
+            to_encode: 5,
+            to_failed: 0,
+            encoded: 0,
+            cancelled: false,
+            finished: false,
+            records: vec![],
+            dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
+        });
+        reduce(
+            &mut state,
+            Msg::Lib(Event::CommandAccepted {
+                request_id: 3,
+                batch_id: Some(11),
+            }),
+            &tx,
+        );
+        let t = state.tasks.active.as_ref().unwrap();
+        assert_eq!(t.phase, BatchPhase::Encoding, "the batch is admitted");
+        assert_eq!(t.batch_id, Some(11), "the answer binds the batch id");
+        assert_eq!(t.pending_request, None, "the request is answered");
+    }
+
+    #[test]
+    fn a_rejected_start_restores_the_previous_phase() {
+        // The refusal puts the state back where it was (design doc
+        // §3.11.3): the plan is still there, the user can try again.
+        let mut state = fresh_state();
+        let tx = cmd_tx();
+        state.tasks.active = Some(TaskInfo {
+            task_id: TaskId("20260101000000".into()),
+            batch_id: None,
+            pending_request: Some(4),
+            restore_phase: Some(BatchPhase::AwaitingConfirm),
+            phase: BatchPhase::Starting,
+            dir: PathBuf::from("/x"),
+            total_files: 5,
+            to_encode: 5,
+            to_failed: 0,
+            encoded: 0,
+            cancelled: false,
+            finished: false,
+            records: vec![],
+            dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
+        });
+        reduce(
+            &mut state,
+            Msg::Lib(Event::CommandRejected {
+                request_id: 4,
+                reason: "another batch is already running".into(),
+            }),
+            &tx,
+        );
+        let t = state.tasks.active.as_ref().unwrap();
+        assert_eq!(
+            t.phase,
+            BatchPhase::AwaitingConfirm,
+            "the state is restored"
+        );
+        assert_eq!(t.pending_request, None);
+    }
+
+    #[test]
+    fn a_rejected_cancel_restores_the_encoding_phase() {
+        // A refused cancel (the batch is not the one the user means)
+        // puts the phase back: the batch is still running.
         let mut state = fresh_state();
         let tx = cmd_tx();
         state.tasks.active = Some(TaskInfo {
             task_id: TaskId("20260101000000".into()),
             batch_id: Some(1),
-            phase: BatchPhase::Cancelled,
+            pending_request: Some(5),
+            restore_phase: Some(BatchPhase::Encoding),
+            phase: BatchPhase::Cancelling,
+            dir: PathBuf::from("/x"),
+            total_files: 5,
+            to_encode: 5,
+            to_failed: 0,
+            encoded: 0,
+            cancelled: false,
+            finished: false,
+            records: vec![],
+            dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
+        });
+        reduce(
+            &mut state,
+            Msg::Lib(Event::CommandRejected {
+                request_id: 5,
+                reason: "no active batch 1 to cancel".into(),
+            }),
+            &tx,
+        );
+        let t = state.tasks.active.as_ref().unwrap();
+        assert_eq!(t.phase, BatchPhase::Encoding, "the batch is still running");
+    }
+
+    #[test]
+    fn every_command_carries_a_request_id() {
+        // The UI allocates the id; the lib answers with it (design
+        // doc §3.11.3).
+        let mut state = fresh_state();
+        let (tx, rx) = crossbeam_channel::unbounded::<Request>();
+        reduce(&mut state, Msg::UserClickedDetectNv, &tx);
+        let first = next_request_id(&rx);
+        reduce(&mut state, Msg::UserClickedDetectNv, &tx);
+        let second = next_request_id(&rx);
+        assert!(second > first, "the ids are monotonic");
+    }
+
+    #[test]
+    fn events_from_another_batch_are_dropped() {
+        // Design doc §3.11.3: every batch event carries its batch
+        // id. An event from a batch the UI is not watching (the
+        // previous one, still draining) must not touch the task the
+        // user is looking at -- its file index means something else
+        // there.
+        let mut state = fresh_state();
+        let tx = cmd_tx();
+        state.tasks.active = Some(TaskInfo {
+            task_id: TaskId("20260101000000".into()),
+            batch_id: Some(2),
+            pending_request: None,
+            restore_phase: None,
+            phase: BatchPhase::Encoding,
             dir: PathBuf::from("/x"),
             total_files: 5,
             to_encode: 5,
             to_failed: 0,
             encoded: 2,
-            cancelled: true,
+            cancelled: false,
             finished: false,
             records: vec![sample_record("/a.mp4", EncodingOutcome::Succeeded)],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
 
-        // Late BatchCancelled — must be dropped (no state change).
+        // A late event of batch 1 -- dropped (no state change).
         let before_records_len = state.tasks.active.as_ref().unwrap().records.len();
         let before_encoded = state.tasks.active.as_ref().unwrap().encoded;
         reduce(
             &mut state,
             Msg::Lib(Event::BatchCancelled {
+                batch_id: 1,
                 completed: 2,
                 total: 5,
             }),
@@ -1789,29 +2768,25 @@ mod tests {
         );
         assert_eq!(
             state.tasks.active.as_ref().unwrap().phase,
-            BatchPhase::Cancelled,
-            "phase stays Cancelled after late BatchCancelled"
+            BatchPhase::Encoding,
+            "another batch's terminal event must not finalize this one"
         );
         assert_eq!(
             state.tasks.active.as_ref().unwrap().records.len(),
             before_records_len,
-            "late BatchCancelled must NOT clear records"
+            "another batch's event must NOT clear records"
         );
         assert_eq!(
             state.tasks.active.as_ref().unwrap().encoded,
             before_encoded,
-            "late BatchCancelled must NOT touch encoded count"
-        );
-        assert!(
-            state.last_error.is_none(),
-            "phase guard drops the event entirely; no last_error set"
+            "another batch's event must NOT touch the encoded count"
         );
 
-        // Late FileCompleted — must be dropped.
-        let before_records_len_2 = state.tasks.active.as_ref().unwrap().records.len();
+        // A late FileCompleted of batch 1 -- dropped.
         reduce(
             &mut state,
             Msg::Lib(Event::FileCompleted {
+                batch_id: 1,
                 index: 2,
                 record: sample_record("/late.mp4", EncodingOutcome::Succeeded),
             }),
@@ -1819,8 +2794,24 @@ mod tests {
         );
         assert_eq!(
             state.tasks.active.as_ref().unwrap().records.len(),
-            before_records_len_2,
-            "late FileCompleted dropped"
+            before_records_len,
+            "another batch's FileCompleted is dropped"
+        );
+
+        // The matching batch's event still lands.
+        reduce(
+            &mut state,
+            Msg::Lib(Event::FileCompleted {
+                batch_id: 2,
+                index: 2,
+                record: sample_record("/mine.mp4", EncodingOutcome::Succeeded),
+            }),
+            &tx,
+        );
+        assert_eq!(
+            state.tasks.active.as_ref().unwrap().records.len(),
+            before_records_len + 1,
+            "the active batch's event lands"
         );
     }
 
@@ -1831,6 +2822,8 @@ mod tests {
         state.tasks.active = Some(TaskInfo {
             task_id: TaskId("20260101000000".into()),
             batch_id: Some(1),
+            pending_request: None,
+            restore_phase: None,
             phase: BatchPhase::Encoding,
             dir: PathBuf::from("/x"),
             total_files: 2,
@@ -1841,11 +2834,15 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         let rec = sample_record("/first.mp4", EncodingOutcome::Succeeded);
         reduce(
             &mut state,
             Msg::Lib(Event::FileCompleted {
+                batch_id: 1,
                 index: 0,
                 record: rec.clone(),
             }),
@@ -1866,12 +2863,17 @@ mod tests {
         state.tasks.active = Some(TaskInfo {
             task_id: TaskId("20260101000000".into()),
             batch_id: Some(1),
+            pending_request: None,
+            restore_phase: None,
             phase: BatchPhase::Encoding,
             dir: std::path::PathBuf::from("/tmp/whatever"),
             total_files: 10,
             encoded: 3,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
             to_encode: 10,
             to_failed: 0,
             finished: false,
@@ -1880,6 +2882,7 @@ mod tests {
         reduce(
             &mut state,
             Msg::Lib(Event::CommandRejected {
+                request_id: 99,
                 reason: "another batch is already running".into(),
             }),
             &tx,
@@ -1916,14 +2919,16 @@ mod tests {
     }
 
     #[test]
-    fn error_during_encoding_moves_task_to_history() {
-        // Per §3.8.7.1: Encoding-phase Error is a completed
-        // task (it ran); goes to task_history.
+    fn a_batch_failure_finalizes_that_batch() {
+        // Design doc §3.11.3: a batch-level failure is scoped to its
+        // batch -- it finalizes that batch and nothing else.
         let mut state = fresh_state();
         let tx = cmd_tx();
         state.tasks.active = Some(TaskInfo {
             task_id: TaskId("20260101000000".into()),
             batch_id: Some(1),
+            pending_request: None,
+            restore_phase: None,
             phase: BatchPhase::Encoding,
             dir: PathBuf::from("/x"),
             total_files: 5,
@@ -1934,10 +2939,14 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         reduce(
             &mut state,
-            Msg::Lib(Event::Error {
+            Msg::Lib(Event::BatchFailed {
+                batch_id: 1,
                 category: rencoder_lib::types::ErrorCategory::FfmpegNonzeroExit,
                 message: "encode failed".into(),
             }),
@@ -1948,17 +2957,63 @@ mod tests {
         let h = &state.task_history[0];
         assert_eq!(h.phase, BatchPhase::Done);
         assert!(h.finished);
+        assert_eq!(state.last_error.as_deref(), Some("encode failed"));
     }
 
     #[test]
-    fn error_during_analyzing_drops_without_history() {
-        // Per §3.8.7.1: Analyzing-phase Error means task never
-        // started; not filed in task_history.
+    fn an_unscoped_error_finalizes_nothing() {
+        // The actor-level error has no scope: no batch is running
+        // when it fires, so there is nothing to finalize (design doc
+        // §3.11.3).
+        let mut state = fresh_state();
+        let tx = cmd_tx();
+        state.tasks.active = Some(TaskInfo {
+            task_id: TaskId("20260101000000".into()),
+            batch_id: Some(1),
+            pending_request: None,
+            restore_phase: None,
+            phase: BatchPhase::Encoding,
+            dir: PathBuf::from("/x"),
+            total_files: 5,
+            to_encode: 5,
+            to_failed: 0,
+            encoded: 1,
+            cancelled: false,
+            finished: false,
+            records: vec![],
+            dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
+        });
+        reduce(
+            &mut state,
+            Msg::Lib(Event::Error {
+                category: rencoder_lib::types::ErrorCategory::FfmpegNonzeroExit,
+                message: "encode failed".into(),
+            }),
+            &tx,
+        );
+        assert!(
+            state.tasks.active.is_some(),
+            "an unscoped error must not finalize the running batch"
+        );
+        assert!(state.task_history.is_empty());
+        assert_eq!(state.last_error.as_deref(), Some("encode failed"));
+    }
+
+    #[test]
+    fn a_rejected_dry_run_drops_the_task_without_history() {
+        // A refused dry run never started: there is no task to keep
+        // (design doc §3.11.3 -- the refusal restores the state the
+        // UI was in before the request).
         let mut state = fresh_state();
         let tx = cmd_tx();
         state.tasks.active = Some(TaskInfo {
             task_id: TaskId("20260101000000".into()),
             batch_id: None,
+            pending_request: Some(7),
+            restore_phase: None,
             phase: BatchPhase::Analyzing,
             dir: PathBuf::from("/x"),
             total_files: 5,
@@ -1969,17 +3024,23 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         reduce(
             &mut state,
-            Msg::Lib(Event::Error {
-                category: rencoder_lib::types::ErrorCategory::ConfigError,
-                message: "another batch is already running".into(),
+            Msg::Lib(Event::CommandRejected {
+                request_id: 7,
+                reason: "another batch is already running".into(),
             }),
             &tx,
         );
         assert!(state.tasks.active.is_none());
         assert!(state.task_history.is_empty());
+        // The user is told why.
+        assert_eq!(state.toasts.len(), 1);
+        assert!(state.toasts[0].message.contains("another batch"));
     }
 
     #[test]
@@ -1995,7 +3056,9 @@ mod tests {
         state.input_dir = Some(std::path::PathBuf::from("/nonexistent-for-test"));
         state.tasks.active = Some(TaskInfo {
             task_id: TaskId("20260101000000".into()),
-            batch_id: None,
+            batch_id: Some(1),
+            pending_request: None,
+            restore_phase: None,
             phase: BatchPhase::Analyzing,
             dir: PathBuf::from("/nonexistent-for-test"),
             total_files: 3,
@@ -2006,13 +3069,24 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         let records = vec![
-            sample_record("/a.mp4", EncodingOutcome::Succeeded),
+            sample_record("/a.mp4", EncodingOutcome::Ready),
             sample_failed("/b.mp4"),
             sample_record("/c.mp4", EncodingOutcome::Failed),
         ];
-        reduce(&mut state, Msg::Lib(Event::DryRunFinished { records }), &tx);
+        reduce(
+            &mut state,
+            Msg::Lib(Event::DryRunFinished {
+                batch_id: 1,
+                generation: 1,
+                records,
+            }),
+            &tx,
+        );
         // AwaitingConfirm path: phase transitioned, no StartBatch
         // dispatched (the reducer doesn't touch cmd_tx in this
         // branch). dry_run_records populated for the UI.
@@ -2051,7 +3125,9 @@ mod tests {
         state.input_dir = Some(tmp.clone());
         state.tasks.active = Some(TaskInfo {
             task_id: TaskId("20260101000000".into()),
-            batch_id: None,
+            batch_id: Some(1),
+            pending_request: None,
+            restore_phase: None,
             phase: BatchPhase::Analyzing,
             dir: tmp.clone(),
             total_files: 1,
@@ -2062,11 +3138,22 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
-        // Step 1: DryRunFinished with a Succeeded record — moves
+        // Step 1: DryRunFinished with a Ready record — moves
         // phase to AwaitingConfirm.
-        let records = vec![sample_record("/dummy.mp4", EncodingOutcome::Succeeded)];
-        reduce(&mut state, Msg::Lib(Event::DryRunFinished { records }), &tx);
+        let records = vec![sample_record("/dummy.mp4", EncodingOutcome::Ready)];
+        reduce(
+            &mut state,
+            Msg::Lib(Event::DryRunFinished {
+                batch_id: 1,
+                generation: 1,
+                records,
+            }),
+            &tx,
+        );
         assert_eq!(
             state.tasks.active.as_ref().unwrap().phase,
             BatchPhase::AwaitingConfirm
@@ -2122,7 +3209,9 @@ mod tests {
         state.input_dir = Some(std::path::PathBuf::from("/nonexistent-for-test"));
         state.tasks.active = Some(TaskInfo {
             task_id: TaskId("20260101000000".into()),
-            batch_id: None,
+            batch_id: Some(1),
+            pending_request: None,
+            restore_phase: None,
             phase: BatchPhase::Analyzing,
             dir: PathBuf::from("/nonexistent-for-test"),
             // Pathological: total_files < records.len(). Pretend the
@@ -2138,13 +3227,24 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         let records = vec![
-            sample_record("/a.mp4", EncodingOutcome::Succeeded),
+            sample_record("/a.mp4", EncodingOutcome::Ready),
             sample_failed("/b.mp4"),
             sample_failed("/c.mp4"),
         ];
-        reduce(&mut state, Msg::Lib(Event::DryRunFinished { records }), &tx);
+        reduce(
+            &mut state,
+            Msg::Lib(Event::DryRunFinished {
+                batch_id: 1,
+                generation: 1,
+                records,
+            }),
+            &tx,
+        );
         // to_encode = 1, to_failed = saturating_sub(0, 1) = 0.
         // Phase: AwaitingConfirm (positive count).
         let t = state.tasks.active.as_ref().unwrap();
@@ -2164,7 +3264,9 @@ mod tests {
         let tx = cmd_tx();
         state.tasks.active = Some(TaskInfo {
             task_id: TaskId("20260101000000".into()),
-            batch_id: None,
+            batch_id: Some(1),
+            pending_request: None,
+            restore_phase: None,
             phase: BatchPhase::Analyzing,
             dir: PathBuf::from("/x"),
             total_files: 2,
@@ -2175,9 +3277,20 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         let records = vec![sample_failed("/a.mp4"), sample_failed("/b.mp4")];
-        reduce(&mut state, Msg::Lib(Event::DryRunFinished { records }), &tx);
+        reduce(
+            &mut state,
+            Msg::Lib(Event::DryRunFinished {
+                batch_id: 1,
+                generation: 1,
+                records,
+            }),
+            &tx,
+        );
         assert!(state.tasks.active.is_none());
         assert_eq!(state.task_history.len(), 1);
         let h = &state.task_history[0];
@@ -2205,6 +3318,8 @@ mod tests {
         state.tasks.active = Some(TaskInfo {
             task_id: TaskId("20260101000000".into()),
             batch_id: None,
+            pending_request: None,
+            restore_phase: None,
             phase: BatchPhase::Analyzing,
             dir: PathBuf::from("/x"),
             total_files: 1,
@@ -2215,10 +3330,15 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         reduce(
             &mut state,
             Msg::Lib(Event::DryRunFinished {
+                batch_id: 1,
+                generation: 1,
                 records: vec![sample_record("/a.mp4", EncodingOutcome::Succeeded)],
             }),
             &tx,
@@ -2242,6 +3362,8 @@ mod tests {
         state.tasks.active = Some(TaskInfo {
             task_id: TaskId("20260101000000".into()),
             batch_id: None,
+            pending_request: None,
+            restore_phase: None,
             phase: BatchPhase::Analyzing,
             dir: PathBuf::from("/x"),
             total_files: 1,
@@ -2252,6 +3374,9 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         // User cancels (Cancel sends Command::Cancel + sets
         // cancelled = true per §3.8.7.1 cancel-during-Analyzing
@@ -2262,6 +3387,8 @@ mod tests {
         reduce(
             &mut state,
             Msg::Lib(Event::DryRunFinished {
+                batch_id: 1,
+                generation: 1,
                 records: vec![sample_record("/a.mp4", EncodingOutcome::Succeeded)],
             }),
             &tx,
@@ -2271,16 +3398,17 @@ mod tests {
     }
 
     #[test]
-    fn user_edited_config_field_updates_draft_and_saves() {
+    fn user_edited_config_field_updates_the_entry_layer_and_saves() {
         // review #133 part 2d/3d: each Setup-page field edit
-        //   (a) updates state.config_draft (the Setup form reads
-        //       it on next render),
+        //   (a) records the edit in the entry layer -- the effective
+        //       config (what the Setup form reads on next render)
+        //       carries it,
         //   (b) sets config_save_status to "Saving…",
         //   (c) fires Command::SaveConfig for atomic TOML write.
         // The receiver side is tested separately by the lib;
         // here we verify the reducer's three side effects.
         use crossbeam_channel::unbounded;
-        let (tx, rx) = unbounded::<Command>();
+        let (tx, rx) = unbounded::<Request>();
         let mut state = fresh_state();
         reduce(
             &mut state,
@@ -2290,26 +3418,33 @@ mod tests {
             },
             &tx,
         );
-        // (a) config_draft updated.
-        let enc = state
-            .config_draft
+        // (a) the edit is in the entry layer, and the effective
+        // config carries it (design doc §3.10.5: the draft is the
+        // file layer; an unsaved edit does not touch it).
+        let effective = state.effective_config();
+        let enc = effective
             .encode
             .as_ref()
             .expect("encode section should be auto-populated");
         assert_eq!(enc.crf, 28);
+        assert!(
+            state.config_edits.contains_key(&ConfigFieldKind::Crf),
+            "the edit waits in the entry layer"
+        );
         // (b) save status set.
         assert_eq!(state.config_save_status, "Saving…");
         // (c) SaveConfig dispatched -- carrying the edited draft, not
         // the lib's startup copy. Without the payload the lib would
         // write back the config it loaded and the edit would be lost.
-        let cmd = rx.try_recv().expect("expected a SaveConfig command");
+        let cmd = next_command(&rx);
         match cmd {
-            Command::SaveConfig { config } => {
+            Command::SaveConfig { config, revision } => {
                 assert_eq!(
                     config.encode.as_ref().map(|e| e.crf),
                     Some(28),
                     "the payload must carry the edit"
                 );
+                assert_eq!(revision, 1, "the save carries the revision");
             }
             _ => panic!("expected SaveConfig"),
         }
@@ -2320,7 +3455,7 @@ mod tests {
         // The NVENC switch has to reach the lib, otherwise the toggle
         // is cosmetic.
         use crossbeam_channel::unbounded;
-        let (tx, rx) = unbounded::<Command>();
+        let (tx, rx) = unbounded::<Request>();
         let mut state = fresh_state();
         reduce(
             &mut state,
@@ -2330,8 +3465,8 @@ mod tests {
             },
             &tx,
         );
-        match rx.try_recv().expect("expected a SaveConfig command") {
-            Command::SaveConfig { config } => {
+        match next_command(&rx) {
+            Command::SaveConfig { config, .. } => {
                 assert_eq!(config.encode.as_ref().and_then(|e| e.nv), Some(true));
             }
             _ => panic!("expected SaveConfig"),
@@ -2354,7 +3489,7 @@ mod tests {
             },
             &tx,
         );
-        let enc = state.config_draft.encode.as_ref().unwrap();
+        let enc = state.effective_config().encode.clone().unwrap();
         assert_eq!(
             enc.extensions,
             Some(vec!["mp4".into(), "mkv".into(), "mov".into()])
@@ -2368,7 +3503,8 @@ mod tests {
             },
             &tx,
         );
-        let enc = state.config_draft.encode.as_ref().unwrap();
+        let effective = state.effective_config();
+        let enc = effective.encode.as_ref().unwrap();
         assert_eq!(enc.extensions, None, "empty csv should clear filter");
     }
 
@@ -2387,6 +3523,7 @@ mod tests {
             &mut state,
             Msg::Lib(Event::ConfigSaved {
                 path: std::path::PathBuf::from("/tmp/rencoder.toml"),
+                revision: 1,
             }),
             &tx,
         );
@@ -2408,17 +3545,20 @@ mod tests {
 
     #[test]
     fn event_error_save_failed_updates_save_status() {
-        // review-delta F1: the lib emits Event::Error with the
-        // prefix 'save failed:' on Command::SaveConfig failure
-        // (job.rs:1119). The UI must surface this on the
-        // Setup-page save-status indicator (separate from the
-        // global last_error banner).
+        // review-delta F1: the lib emits a failure event with the
+        // prefix 'save failed:' on Command::SaveConfig failure.
+        // The UI must surface this on the Setup-page save-status
+        // indicator (separate from the global last_error banner).
+        //
+        // The failure is **non-batch** (design doc §3.11.3): it
+        // finalizes nothing.
         let mut state = fresh_state();
         let tx = cmd_tx();
         state.config_save_status = "Saving…".into();
         reduce(
             &mut state,
-            Msg::Lib(Event::Error {
+            Msg::Lib(Event::OperationFailed {
+                request_id: 1,
                 category: rencoder_lib::types::ErrorCategory::ConfigError,
                 message: "save failed: permission denied".into(),
             }),
@@ -2465,6 +3605,8 @@ mod tests {
         q.active = Some(TaskInfo {
             task_id: TaskId("t".into()),
             batch_id: None,
+            pending_request: None,
+            restore_phase: None,
             phase: BatchPhase::Analyzing,
             dir: PathBuf::from("/x"),
             total_files: 0,
@@ -2475,6 +3617,9 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         assert!(!q.has_room());
     }

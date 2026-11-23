@@ -71,6 +71,112 @@ pub fn output_path_for(input: &Path, format: VideoFormat) -> PathBuf {
     }
 }
 
+/// The final output paths for a batch of inputs.
+///
+/// Two inputs can want the same output: `movie.mp4` and `movie.avi`
+/// in one directory both want `movie.mkv`. The colliding group is
+/// **renamed** instead of failing the batch: each member gets
+/// `<stem>_<source extension>_<n>.<target extension>`
+/// (`movie_mp4_1.mkv`, `movie_avi_2.mkv`) -- the source format and a
+/// number, so the names cannot repeat.
+///
+/// The order inside a group is by path, so the names do not depend on
+/// the order the files were collected in: a run that named them
+/// differently would leave the previous files behind.
+///
+/// An output never lands on a source file (the inputs are taken too),
+/// so the same-file guard stays a backstop rather than the rule.
+pub fn plan_outputs(inputs: &[PathBuf], format: VideoFormat) -> Vec<PathBuf> {
+    let naive: Vec<PathBuf> = inputs
+        .iter()
+        .map(|input| output_path_for(input, format))
+        .collect();
+
+    // The groups: the inputs that want the same output.
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut group_keys: Vec<String> = Vec::new();
+    for (index, output) in naive.iter().enumerate() {
+        let key = file_key(output);
+        match group_keys.iter().position(|known| *known == key) {
+            Some(position) => groups[position].push(index),
+            None => {
+                group_keys.push(key);
+                groups.push(vec![index]);
+            }
+        }
+    }
+
+    // The names already taken: every input and every naive output. A
+    // renamed output must not land on any of them.
+    let mut taken: Vec<String> = inputs.iter().map(|input| file_key(input)).collect();
+    taken.extend(naive.iter().map(|output| file_key(output)));
+
+    let mut planned = naive.clone();
+    for mut members in groups {
+        if members.len() < 2 {
+            continue;
+        }
+        // Sorted by path: the numbers must not depend on the order the
+        // files were collected in.
+        members.sort_by(|a, b| inputs[*a].cmp(&inputs[*b]));
+        for (position, index) in members.iter().enumerate() {
+            let mut number = position + 1;
+            let candidate = loop {
+                let candidate = disambiguated_output(&naive[*index], &inputs[*index], number);
+                if !taken.contains(&file_key(&candidate)) {
+                    break candidate;
+                }
+                number += 1;
+            };
+            taken.push(file_key(&candidate));
+            planned[*index] = candidate;
+        }
+    }
+    planned
+}
+
+/// The renamed output: `<stem>_<source extension>_<n>.<target extension>`.
+fn disambiguated_output(output: &Path, input: &Path, number: usize) -> PathBuf {
+    let stem = output
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "output".to_string());
+    let target_ext = output
+        .extension()
+        .map(|ext| ext.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let source_ext = input
+        .extension()
+        .map(|ext| ext.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    let mut name = stem;
+    if !source_ext.is_empty() {
+        name.push('_');
+        name.push_str(&source_ext);
+    }
+    name.push('_');
+    name.push_str(&number.to_string());
+    if !target_ext.is_empty() {
+        name.push('.');
+        name.push_str(&target_ext);
+    }
+    output.parent().unwrap_or_else(|| Path::new("")).join(name)
+}
+
+/// The identity of a file: the same directory (canonicalized) and the
+/// same name (case-insensitively -- macOS and Windows filesystems are
+/// case-insensitive by default).
+fn file_key(path: &Path) -> String {
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let dir = normalize(parent);
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    format!("{}|{}", dir.display(), name)
+}
+
 /// Do two paths point at the same file?
 ///
 /// Compares the **canonicalized parent directories** and the **file
@@ -148,6 +254,99 @@ mod tests {
 
     // ---- is_same_file ----
 
+    // ---- plan_outputs (the batch's output naming) ----
+
+    #[test]
+    fn a_colliding_group_is_renamed_with_the_format_and_a_number() {
+        // `movie.mp4` and `movie.avi` both want `movie.mkv` -- they
+        // must not overwrite each other.
+        let dir = PathBuf::from("/d");
+        let planned = plan_outputs(
+            &[dir.join("movie.mp4"), dir.join("movie.avi")],
+            VideoFormat::Av1,
+        );
+
+        // The vector follows the inputs (movie.mp4 first); the
+        // numbers follow the sorted paths, so they are the same on
+        // every run.
+        assert_eq!(
+            planned,
+            vec![
+                PathBuf::from("/d/movie_mp4_2.mkv"),
+                PathBuf::from("/d/movie_avi_1.mkv"),
+            ],
+            "the colliding group gets the format and a number"
+        );
+    }
+
+    #[test]
+    fn the_names_do_not_depend_on_the_order_the_files_came_in() {
+        let dir = PathBuf::from("/d");
+        let inputs = [dir.join("movie.mp4"), dir.join("movie.avi")];
+        let reversed = [inputs[1].clone(), inputs[0].clone()];
+
+        let forward = plan_outputs(&inputs, VideoFormat::Av1);
+        let backward = plan_outputs(&reversed, VideoFormat::Av1);
+
+        // The vector follows the inputs; the *mapping* (input ->
+        // output) must not depend on the order they came in.
+        let mut forward_pairs: Vec<(PathBuf, PathBuf)> =
+            inputs.iter().cloned().zip(forward).collect();
+        forward_pairs.sort();
+        let mut backward_pairs: Vec<(PathBuf, PathBuf)> =
+            reversed.iter().cloned().zip(backward).collect();
+        backward_pairs.sort();
+        assert_eq!(
+            forward_pairs, backward_pairs,
+            "the same inputs must get the same names, whatever the order"
+        );
+    }
+
+    #[test]
+    fn a_batch_without_collisions_keeps_the_plain_names() {
+        let dir = PathBuf::from("/d");
+        let planned = plan_outputs(&[dir.join("a.mp4"), dir.join("b.mp4")], VideoFormat::Av1);
+
+        assert_eq!(
+            planned,
+            vec![PathBuf::from("/d/a.mkv"), PathBuf::from("/d/b.mkv")],
+            "only the colliding group is renamed"
+        );
+    }
+
+    #[test]
+    fn a_planned_output_never_lands_on_a_source_file() {
+        // The inputs are taken too: `movie.mp4` and `movie_mp4_1.mp4`
+        // would both want a name the other could take.
+        let dir = PathBuf::from("/d");
+        let planned = plan_outputs(
+            &[
+                dir.join("movie.mp4"),
+                dir.join("movie.avi"),
+                dir.join("movie_mp4_1.mp4"),
+            ],
+            VideoFormat::Av1,
+        );
+
+        let sources = [
+            dir.join("movie.mp4"),
+            dir.join("movie.avi"),
+            dir.join("movie_mp4_1.mp4"),
+        ];
+        for output in &planned {
+            assert!(
+                !sources.iter().any(|source| is_same_file(source, output)),
+                "an output must not land on a source file: {output:?}"
+            );
+        }
+        // And the names are unique.
+        for (index, output) in planned.iter().enumerate() {
+            for other in planned.iter().skip(index + 1) {
+                assert!(!is_same_file(output, other), "the names must differ");
+            }
+        }
+    }
+
     #[test]
     fn is_same_file_exact_match() {
         assert!(is_same_file(
@@ -213,6 +412,9 @@ mod tests {
         assert_eq!(p, PathBuf::from("/d/clip_encoded.mkv"));
     }
 
+    // ---- the temp file and the commit (design doc §3.11.2) ----
+
+    #[cfg(unix)]
     // v1.2 follow-up #3: collision guard matrix — every
     // (format, input ext) pair where the format's default
     // extension matches the input's extension MUST trip the

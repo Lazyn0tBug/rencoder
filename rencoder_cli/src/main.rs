@@ -17,27 +17,94 @@ mod tracing_init;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use rencoder_lib::pipeline::cancel::CancelToken;
 use rencoder_lib::{
+    capability::{Capabilities, MachineFacts},
     collect::collect_files,
-    config::{AnalyzeFormatArg, AppConfig},
+    config::{paths::Paths, AnalyzeFormatArg, AppConfig},
     data::extract::probe_video_metadata,
-    encoder::nvenc::{self, CapabilityVerdicts},
+    encoder::nvenc::{self},
     pipeline::context::BatchContext,
     pipeline::{batch::transcode_batch, cache::cache_from_resolution},
-    types::{EncodeParams, EncodingOutcome, ProcessOutput, Target},
+    types::{EncodeParams, ProcessOutput, Target},
 };
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use tracing::{info, instrument, warn};
 
 fn main() -> Result<()> {
-    tracing_init::init().context("initialize tracing")?;
     let cli = args::Cli::parse();
+
+    // The signal handler comes **first** (design doc §3.11.2): before
+    // the handler is installed, a signal takes the default action --
+    // the process dies, the records are lost, the partial output stays.
+    // That window must not exist, so the handler is installed before
+    // anything else happens. The cancel request's path is filled in
+    // once the paths resolve (§3.6).
+    let cancel_slot = signal::new_cancel_slot();
+    signal::install_handler(&cancel_slot);
+
     match cli.command {
-        args::Command::Encode(encode_args) => encode_cmd(encode_args, cli.detect),
-        args::Command::Analyze(analyze_args) => analyze_cmd(analyze_args),
+        args::Command::Encode(encode_args) => encode_cmd(encode_args, cli.detect, &cancel_slot),
+        args::Command::Analyze(analyze_args) => analyze_cmd(analyze_args, &cancel_slot),
         args::Command::Detect(_) => detect_cmd(),
     }
+}
+
+/// Everything a run needs before it starts: the config, the paths
+/// (design doc §3.6), and the cancel channel (design doc §3.11.2).
+///
+/// The order matters (design doc §3.11.2): the signal handler goes in
+/// **before any work whose interruption would lose state** -- the
+/// capability probe, the file collection, the encoding. A signal
+/// before that takes the default action: the process dies. Nothing is
+/// lost, because nothing has been produced yet (the config write is
+/// atomic).
+///
+/// The cancel request is a file: the handler writes it, the batch
+/// polls for it, and anyone who can write that file can stop a running
+/// batch.
+fn prepare(
+    config_override: Option<&Path>,
+    op_dir: Option<&Path>,
+    cancel_slot: &signal::CancelSlot,
+) -> Result<(AppConfig, Paths, CancelToken)> {
+    let app_dir = rencoder_lib::config::paths::app_dir().unwrap_or_else(|| PathBuf::from("."));
+    let config_path =
+        rencoder_lib::config::paths::config_file(config_override).ok_or_else(|| {
+            anyhow::anyhow!(
+                "could not determine config location: no --config, $RENENCODER_CONFIG \
+             is unset, and binary directory is unavailable. Pass --config explicitly."
+            )
+        })?;
+    // The config is created on first run; the notice is logged after
+    // tracing is up (below), because the log directory comes from the
+    // config itself (design doc §3.6).
+    let config_existed = config_path.exists();
+    let app_config = AppConfig::load(&config_path)
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+    // No operation directory means the run acts on no directory of
+    // its own (`rencoder detect`): its state stays with the app.
+    let op_dir = op_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| app_dir.clone());
+    let paths = Paths::resolve(config_path, app_dir, op_dir, &app_config);
+
+    tracing_init::init(&paths.log_dir).context("initialize tracing")?;
+    if !config_existed {
+        info!(
+            config_path = %paths.config_file.display(),
+            "{}",
+            rencoder_lib::config::app::CREATED_CONFIG_NOTICE
+        );
+    }
+
+    // A leftover request would cancel this run as well.
+    let _ = std::fs::remove_file(&paths.cancel_file);
+    // Point the handler at the file the batch watches.
+    signal::set_cancel_path(cancel_slot, &paths.cancel_file);
+    let cancel = CancelToken::watching(paths.cancel_file.clone());
+    Ok((app_config, paths, cancel))
 }
 
 /// `rencoder detect` -- probe this machine's NVENC capability, store the
@@ -47,11 +114,44 @@ fn main() -> Result<()> {
 /// actually run" becomes something the user can ask, instead of
 /// something they only learn from a fallback warning.
 fn detect_cmd() -> Result<()> {
-    let cache_path = rencoder_lib::config::path::resolve_nvenc_cache();
+    let slot = signal::new_cancel_slot();
+    signal::install_handler(&slot);
+    let (_config, paths, cancel) = prepare(None, None, &slot)?;
+    // The probe is part of the startup phase: a cancel must not wait
+    // for it (design doc §3.11.2).
     let resolution =
-        nvenc::resolve_and_store(cache_path.as_deref(), true).context("NVENC detection failed")?;
-    print!("{}", nvenc::report(&resolution.record));
+        match nvenc::resolve_and_store_with(Some(&paths.capability_record), true, |args| {
+            if cancel.is_cancelled() {
+                return Err(rencoder_lib::error::EncodeError::UserCancel);
+            }
+            rencoder_lib::encoder::nvenc::run_ffmpeg(args)
+        }) {
+            Ok(resolution) => resolution,
+            Err(rencoder_lib::error::EncodeError::UserCancel) => {
+                std::process::exit(130);
+            }
+            Err(e) => return Err(e).context("NVENC detection failed"),
+        };
+    print!("{}", nvenc::report(&resolution));
     Ok(())
+}
+
+/// Log the capability report (design doc §3.10.7).
+///
+/// The report is a file the frontends read; a failed check does
+/// **not** refuse the start -- it is information: the user is told
+/// what cannot be done here and decides.
+fn report_capabilities(capabilities: &Capabilities) {
+    for line in capabilities.lines() {
+        info!("capability: {line}");
+    }
+    for failure in capabilities.failures() {
+        warn!(
+            check = failure.name,
+            detail = failure.detail.as_deref().unwrap_or_default(),
+            "this run cannot do that part"
+        );
+    }
 }
 
 /// What the user answered when advised that the stored capability is
@@ -68,8 +168,9 @@ enum Refresh {
 /// Advise the user that the stored NVENC capability may be stale.
 ///
 /// The record stays valid until the user says otherwise -- nobody knows
-/// the state of a machine better than its owner. A decline pushes the
-/// next advice 30 days out so we never nag on every run.
+/// the state of a machine better than its owner. The lib pushed the
+/// review date when it reported the stale record, so a decline keeps
+/// the next advice 30 days out.
 fn advise_refresh() -> Result<Refresh> {
     if !std::io::stdin().is_terminal() {
         println!(
@@ -96,11 +197,11 @@ fn advise_refresh() -> Result<Refresh> {
 /// write per-file records to `<app_dir>/data/encoding-*.parquet`
 /// (U18; honors `$RENENCODER_DATA_DIR`).
 #[instrument(skip_all, fields(files = tracing::field::Empty))]
-fn encode_cmd(args: args::EncodeArgs, force_detect: bool) -> Result<()> {
-    let app_config = load_app_config(args.config.as_deref())?;
-
-    let enc = app_config.encode.as_ref();
-
+fn encode_cmd(
+    args: args::EncodeArgs,
+    force_detect: bool,
+    cancel_slot: &signal::CancelSlot,
+) -> Result<()> {
     let target = if let Some(file) = &args.file {
         Target::File(file.clone())
     } else if let Some(dir) = &args.dir {
@@ -108,6 +209,23 @@ fn encode_cmd(args: args::EncodeArgs, force_detect: bool) -> Result<()> {
     } else {
         anyhow::bail!("either --file or --dir must be provided (or use --interactive)");
     };
+
+    // The operation directory: where this run acts (design doc §3.6).
+    let op_dir = target.operation_dir();
+    // The single-instance guard (design doc §3.11.1.1): one instance
+    // per target tree. It is taken right after the target is known --
+    // before the config, the collection, the encoding -- so a conflict
+    // shows up before this run has done anything.
+    // Held in an Option: the cancel path releases it explicitly (the
+    // process exits there, and `process::exit` skips the destructors).
+    let mut target_guard = Some(
+        rencoder_lib::guard::TargetGuard::acquire(&op_dir)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("cannot take the target")?,
+    );
+    let (app_config, paths, cancel) = prepare(args.config.as_deref(), Some(&op_dir), cancel_slot)?;
+
+    let enc = app_config.encode.as_ref();
 
     // One mapping from the config to the per-run params:
     // `EncodeParams::from_app_config` is the single entry point (design
@@ -125,12 +243,26 @@ fn encode_cmd(args: args::EncodeArgs, force_detect: bool) -> Result<()> {
     // would trip on entry #1.
     let max_batch_size = rencoder_lib::config::app::resolve_max_batch_size(enc);
 
-    let files = collect_files(&target, &extensions, max_batch_size).with_context(|| {
-        format!(
-            "failed to collect files from {}",
-            target_path(&target).display()
-        )
-    })?;
+    // The collection is part of the startup phase, so it takes the
+    // cancel token too (design doc §3.11.2): Ctrl-C during a long
+    // walk must not wait for the walk.
+    let files = match collect_files(&target, &extensions, max_batch_size, &cancel) {
+        Ok(files) => files,
+        Err(rencoder_lib::error::EncodeError::UserCancel) => {
+            // The run never started: release the target and leave
+            // with the cancel exit code (130).
+            drop(target_guard.take());
+            std::process::exit(130);
+        }
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "failed to collect files from {}",
+                    target_path(&target).display()
+                )
+            });
+        }
+    };
 
     if files.is_empty() {
         warn!("no files matched; nothing to do");
@@ -175,136 +307,142 @@ fn encode_cmd(args: args::EncodeArgs, force_detect: bool) -> Result<()> {
         params.format
     );
 
-    // NVENC capability: prefer the stored record (probing costs
-    // ~200-500ms per encoder, and the answer barely changes). `--detect`
-    // forces a fresh probe; a record past its review date only gets the
-    // user asked about it.
+    // The machine facts: gathered once (design doc §3.10.7). Prefer
+    // the stored record (probing costs ~200-500ms per encoder, and
+    // the answer barely changes). `--detect` forces a fresh probe; a
+    // record past its review date only gets the user asked about it.
     //
     // The capability is resolved whether or not this run uses NVENC:
     // it is a fact about the machine, and `nv` is this run's choice
     // (design doc §3.10.5). Resolving it costs a file read when the
     // stored record is fresh.
-    let cache_path = rencoder_lib::config::path::resolve_nvenc_cache();
-    let mut resolution = nvenc::resolve_and_store(cache_path.as_deref(), force_detect)
-        .context("NVENC detection failed")?;
+    let mut resolution =
+        match nvenc::resolve_and_store_with(Some(&paths.capability_record), force_detect, |args| {
+            // The probe is part of the startup phase: a cancel must
+            // not wait for it (design doc §3.11.2). The runner is the
+            // seam every ffmpeg call goes through, so this is the one
+            // place to check.
+            if cancel.is_cancelled() {
+                return Err(rencoder_lib::error::EncodeError::UserCancel);
+            }
+            rencoder_lib::encoder::nvenc::run_ffmpeg(args)
+        }) {
+            Ok(resolution) => resolution,
+            Err(rencoder_lib::error::EncodeError::UserCancel) => {
+                // Cancelled before the batch started.
+                drop(target_guard.take());
+                std::process::exit(130);
+            }
+            Err(e) => {
+                // ffmpeg does not run. The check still reports what it
+                // found -- the report is information, not a gate --
+                // and then this run fails.
+                let capabilities = rencoder_lib::capability::check_run_capabilities(
+                    &paths,
+                    &MachineFacts::ffmpeg_broken(),
+                );
+                report_capabilities(&capabilities);
+                return Err(e).context("NVENC detection failed");
+            }
+        };
 
-    // The staleness advisory only matters when this run actually uses
-    // NVENC -- otherwise the user is asked about a knob they don't
-    // touch.
-    if resolution.review_due && !force_detect && enable_nv {
+    // The staleness advisory. The review cycle belongs to the lib: the
+    // resolve already pushed the review date when the record was due,
+    // so the advisory is shown once and the next run is quiet. Showing
+    // it is this front end's part of the contract -- the CLI asks in
+    // the terminal, the GUI shows a line with a "re-detect" button.
+    if resolution.review_due && !force_detect {
         match advise_refresh()? {
             Refresh::Yes => {
-                resolution = nvenc::resolve_and_store(cache_path.as_deref(), true)
+                resolution = nvenc::resolve_and_store(Some(&paths.capability_record), true)
                     .context("NVENC detection failed")?;
             }
-            Refresh::No => {
-                // Nothing to do: `resolve_and_store` already pushed
-                // the review date 30 days out when it reported the
-                // expired record, so the next run stays quiet.
+            Refresh::No | Refresh::Skip => {
+                // Declined (or not asked in a non-interactive shell):
+                // the date is already pushed, so the next run stays
+                // quiet for another 30 days.
             }
-            Refresh::Skip => {}
         }
     }
+
+    // The check: one call, the whole result (design doc §3.10.7). The
+    // facts come from the resolution above -- the check adopts them
+    // instead of probing the machine a second time, and the report
+    // says what this run is actually going to do.
+    let facts = MachineFacts::from_resolution(&resolution);
+    let capabilities = rencoder_lib::capability::check_run_capabilities(&paths, &facts);
+    report_capabilities(&capabilities);
 
     // `resolve_and_store` already persisted a freshly probed record.
     let cache = cache_from_resolution(&resolution);
 
-    // Install signal handler; the per-batch loop registers/unregisters
-    // the current output path so a SIGINT cleans up the partial file.
-    let current_output = signal::install_handler();
+    // The signal handler only sets the cancel token: the lib's
+    // execution path kills the in-flight ffmpeg, removes its partial
+    // output and stops the batch at the next file boundary -- and the
+    // records of the files that finished are written below (design doc
+    // §3.11.2). The handler itself was installed in `main`, before
+    // any of this started.
 
     // The batch context: this command's parameters, the encoder
-    // cache, the runtime config and the NVENC verdicts (an encoder
-    // that fails at runtime is not tried again for the rest of the
-    // command).
-    let mut ctx = BatchContext::new(
-        params,
-        std::sync::Arc::new(cache),
-        CapabilityVerdicts::default(),
-    );
+    // cache and this machine's NVENC capability (an encoder that
+    // fails at runtime is not tried again for the rest of the command).
+    let mut ctx = BatchContext::new(params, std::sync::Arc::new(cache), resolution.capability());
 
-    let records = transcode_batch(
-        &files,
-        &mut ctx,
-        ProcessOutput::Inherit,
-        Some(&current_output),
-        None,
-    );
+    let report = transcode_batch(&files, &mut ctx, ProcessOutput::Inherit, &cancel, None);
+    let records = report.records;
 
     // Default output: timestamped Parquet in <app_dir>/data/ (U18; honors
     // $RENENCODER_DATA_DIR). Extension of -o picks the format: .parquet
     // | .jsonl | .csv.
     let output_path = match &args.output {
         Some(p) => p.clone(),
-        None => default_data_path()?,
+        None => rencoder_lib::data::store::default_encoding_path_in(&paths.records_dir)?,
     };
-    write_records(&records, &output_path)?;
+    rencoder_lib::data::store::write_records(&records, &output_path)
+        .with_context(|| format!("failed to write {}", output_path.display()))?;
+    eprintln!(
+        "Wrote {} record(s) to {}",
+        records.len(),
+        output_path.display()
+    );
     print_encode_summary(&records);
 
-    Ok(())
-}
+    // The target is released before the exit: `process::exit` skips
+    // the destructors, and the user's directory must not keep a
+    // leftover marker (design doc §3.11.1.1).
+    drop(target_guard.take());
 
-/// `<app_dir>/data/encoding-<UTC-ISO8601>Z.parquet` -- one file per run,
-/// named by start time. Uses the canonical UTC timestamp formatter from
-/// `rencoder_lib::utils::time` so the format stays in sync with the
-/// library's docs. Honors `$RENENCODER_DATA_DIR` (U18 step 11).
-///
-/// Filesystem errors (directory creation / mode bits) propagate up via
-/// `Result` so the user sees a clean error instead of a panic. When
-/// `resolve_data_dir` returns `None` (app_dir undeterminable and no
-/// env override), falls back to CWD-relative `data/` so legacy hosts
-/// without a determinable binary dir still produce output (tracing_init
-/// has the same fallback for `log/`).
-fn default_data_path() -> anyhow::Result<PathBuf> {
-    use anyhow::Context;
-
-    let dir =
-        rencoder_lib::config::path::resolve_data_dir().unwrap_or_else(|| PathBuf::from("data"));
-    std::fs::create_dir_all(&dir).context("create data dir")?;
-    rencoder_lib::config::fs_perms::set_app_dir_mode(&dir).context("set data dir mode bits")?;
-    Ok(dir.join(format!(
-        "encoding-{}.parquet",
-        rencoder_lib::utils::time::utc_timestamp()
-    )))
-}
-
-/// Write the records to the given path. Extension determines format.
-fn write_records(
-    records: &[rencoder_lib::types::EncodingRecord],
-    path: &std::path::Path,
-) -> Result<()> {
-    use rencoder_lib::data::store;
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create directory {}", parent.display()))?;
-        }
+    // An interrupted run is not a successful one: the records are on
+    // disk, but the exit code says the batch did not finish (130 =
+    // 128 + SIGINT, the shell convention).
+    if matches!(
+        report.termination,
+        rencoder_lib::pipeline::task::Termination::Cancelled { .. }
+    ) {
+        std::process::exit(130);
     }
-    let bytes = match path.extension().and_then(|e| e.to_str()) {
-        Some("parquet") => {
-            store::records_to_parquet(records).with_context(|| "parquet encode failed")?
-        }
-        Some("jsonl") | Some("ndjson") => store::records_to_jsonl(records).into_bytes(),
-        Some("csv") => store::records_to_csv(records).into_bytes(),
-        other => anyhow::bail!(
-            "unsupported output extension {:?}; use .parquet, .jsonl, or .csv",
-            other
-        ),
-    };
-    std::fs::write(path, bytes).with_context(|| format!("failed to write {}", path.display()))?;
-    eprintln!("Wrote {} record(s) to {}", records.len(), path.display());
+
     Ok(())
 }
 
 /// `rencoder analyze ...` -- probes each file, groups by rounded fps,
 /// prints summary, optionally writes a detailed file.
 #[instrument(skip_all, fields(dir = ?args.dir, file = ?args.file))]
-fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
-    let app_config = load_app_config(args.config.as_deref())?;
-    let an = app_config.analyze.as_ref();
-
+fn analyze_cmd(args: args::AnalyzeArgs, cancel_slot: &signal::CancelSlot) -> Result<()> {
     let target =
         target_from_analyze_args(&args).with_context(|| "failed to determine target directory")?;
+
+    // The operation directory: where this run acts (design doc §3.6).
+    let op_dir = target.operation_dir();
+    // The single-instance guard's cheap probe (design doc §3.11.1.1):
+    // an analyze run writes nothing, so it does not hold the target --
+    // but reading a directory another instance is writing gives
+    // unreliable numbers, so it refuses instead.
+    rencoder_lib::guard::probe(&op_dir)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("cannot analyze this directory")?;
+    let (app_config, paths, cancel) = prepare(args.config.as_deref(), Some(&op_dir), cancel_slot)?;
+    let an = app_config.analyze.as_ref();
 
     let extensions = an.and_then(|a| a.extensions.clone()).unwrap_or_default();
 
@@ -318,27 +456,46 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
     let max_batch_size =
         rencoder_lib::config::app::resolve_max_batch_size(app_config.encode.as_ref());
 
-    let files = collect_files(&target, &extensions, max_batch_size).with_context(|| {
-        format!(
-            "failed to collect files from {}",
-            target_path(&target).display()
-        )
-    })?;
+    // The collection takes the cancel token (design doc §3.11.2).
+    let files = match collect_files(&target, &extensions, max_batch_size, &cancel) {
+        Ok(files) => files,
+        Err(rencoder_lib::error::EncodeError::UserCancel) => {
+            // Cancelled before the analysis started.
+            std::process::exit(130);
+        }
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "failed to collect files from {}",
+                    target_path(&target).display()
+                )
+            });
+        }
+    };
+
+    // The check: one call, the whole result (design doc §3.10.7). An
+    // analyze run needs no encoder, so nobody resolved the machine's
+    // NVENC capability -- the check reads the stored record (no probe)
+    // and asks ffmpeg once.
+    let capabilities =
+        rencoder_lib::capability::check_run_capabilities(&paths, &MachineFacts::default());
+    report_capabilities(&capabilities);
 
     info!("analyzing {} file(s)", files.len());
 
     let parallel = an.and_then(|a| a.parallel).unwrap_or(false);
     tracing::Span::current().record("parallel", parallel);
 
-    let records = if parallel {
+    let report = if parallel {
         // The parallel analyzer takes `&[PathBuf]` and bypasses the
         // `InputPath` boundary (probe-only, no argv injection risk).
         // Convert at the CLI boundary; the lib's signature stays
         // untouched per the review #109 plan.
         let paths: Vec<std::path::PathBuf> =
             files.iter().map(|ip| ip.as_path().to_path_buf()).collect();
-        rencoder_lib::analyzer::records::analyze_records_parallel(&paths)
-            .with_context(|| "fps analysis failed")?
+        let records = rencoder_lib::analyzer::records::analyze_records_parallel(&paths, &cancel)
+            .with_context(|| "fps analysis failed")?;
+        rencoder_lib::pipeline::task::BatchReport::completed(records)
     } else {
         // U19 step 5: serial analyze routes through TaskManager so the
         // scaffold logs (batch start/end + per-task start/end) are
@@ -347,16 +504,14 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
         // records, no log calls. The parallel variant keeps its own
         // log path because rayon's worker pool has no ordering
         // guarantee.
-        let tasks: Vec<rencoder_lib::types::TranscodeTask> = files
-            .iter()
-            .map(|input| rencoder_lib::types::TranscodeTask {
-                input: input.clone(),
-                output: None,
-            })
-            .collect();
-        let manager = rencoder_lib::pipeline::task::TaskManager::new(None);
-        manager
-            .run(&tasks, "analyze", target_path(&target), |task, _ctx| {
+        let tasks = rencoder_lib::analyzer::records::analyze_tasks(&files);
+        let manager = rencoder_lib::pipeline::task::TaskManager::new();
+        manager.run(
+            &tasks,
+            "analyze",
+            target_path(&target),
+            &cancel,
+            |task, _ctx| {
                 let file_bytes = std::fs::metadata(task.input.as_path())
                     .map(|m| m.len())
                     .unwrap_or(0);
@@ -376,10 +531,20 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
                         file_bytes,
                     )),
                 }
-            })
-            .unwrap_or_default()
+            },
+        )
     };
-    let stats = rencoder_lib::analyzer::records::aggregate_records(&records);
+    let records = &report.records;
+    let stats = rencoder_lib::analyzer::records::aggregate_records(records);
+
+    // An interrupted analysis says so with its exit code, like the
+    // encode path (design doc §3.11.2).
+    if matches!(
+        report.termination,
+        rencoder_lib::pipeline::task::Termination::Cancelled { .. }
+    ) {
+        std::process::exit(130);
+    }
 
     // One-line summary to stderr regardless of output format.
     eprintln!(
@@ -413,10 +578,10 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
 
     match format {
         AnalyzeFormatArg::Csv => {
-            render(rencoder_lib::analyzer::records::records_to_csv(&records))?;
+            render(rencoder_lib::analyzer::records::records_to_csv(records))?;
         }
         AnalyzeFormatArg::Table => {
-            let df = rencoder_lib::analyzer::records::records_to_dataframe(&records)
+            let df = rencoder_lib::analyzer::records::records_to_dataframe(records)
                 .map_err(|e| anyhow::anyhow!("dataframe build: {e}"))?;
             render(format!("{df}"))?;
         }
@@ -424,7 +589,7 @@ fn analyze_cmd(args: args::AnalyzeArgs) -> Result<()> {
             render(stats.summary())?;
         }
         AnalyzeFormatArg::Json => {
-            render(records_to_jsonl(&records))?;
+            render(records_to_jsonl(records))?;
         }
     }
 
@@ -457,30 +622,13 @@ fn records_to_jsonl(records: &[rencoder_lib::analyzer::records::AnalysisRecord])
 }
 
 fn print_encode_summary(results: &[rencoder_lib::types::EncodingRecord]) {
-    let total = results.len();
-    let success = results
-        .iter()
-        .filter(|r| matches!(r.outcome, EncodingOutcome::Succeeded))
-        .count();
-    let reduced = results
-        .iter()
-        .filter(|r| matches!(r.outcome, EncodingOutcome::ReducedFps))
-        .count();
-    // No `Skipped` / `PartialSkip` counters: re-encoding is the rule
-    // (design doc §3.3.4), so nothing is skipped any more. The
-    // `SkippedReason` variants stay in the record schema for history
-    // written by older versions.
-    let failed = results
-        .iter()
-        .filter(|r| matches!(r.outcome, EncodingOutcome::Failed))
-        .count();
-
+    // The wording is the lib's (design doc §3.10.3); the CLI lays it
+    // out.
     println!();
     println!("Summary:");
-    println!("  Total:       {total}");
-    println!("  Success:     {success}");
-    println!("  Reduced:     {reduced}");
-    println!("  Failed:      {failed}");
+    for line in rencoder_lib::data::store::summary_lines(results) {
+        println!("  {line}");
+    }
 }
 
 /// Resolve the CLI args to a `Target`. `--file` wins over `--dir`; with
@@ -502,29 +650,6 @@ fn target_path(target: &Target) -> &Path {
         Target::File(p) => p,
         Target::Dir(p) => p,
     }
-}
-
-/// Load `AppConfig` from `--config` if given, otherwise resolve via
-/// `path::resolve_config()` (U18 step 5):
-///   1. `$RENENCODER_CONFIG` if set
-///   2. `<app_dir>/rencoder.toml` (binary's parent dir)
-///
-/// Missing file at the resolved path is NOT an error — `AppConfig::load`
-/// auto-creates a default config with mode bits 0o644 (Unix).
-/// Schema validation rejects malformed TOML.
-fn load_app_config(path: Option<&Path>) -> Result<AppConfig> {
-    let resolved = if let Some(p) = path {
-        p.to_path_buf()
-    } else {
-        rencoder_lib::config::path::resolve_config().ok_or_else(|| {
-            anyhow::anyhow!(
-                "could not determine config location: no --config, $RENENCODER_CONFIG \
-                 is unset, and binary directory is unavailable. Pass --config explicitly."
-            )
-        })?
-    };
-    AppConfig::load(&resolved)
-        .with_context(|| format!("failed to load config from {}", resolved.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -599,7 +724,7 @@ mod tests {
         let path = dir.join("rencoder.toml");
         assert!(!path.exists(), "precondition: file must not exist");
 
-        let cfg = load_app_config(Some(&path)).expect("auto-create load");
+        let cfg = AppConfig::load(&path).expect("auto-create load");
         assert!(path.exists(), "auto-create must write the file");
 
         // The auto-generated content has explicit values (bitrate=5000
@@ -621,7 +746,7 @@ mod tests {
         let path = dir.join("rencoder.toml");
         std::fs::write(&path, "[encode]\nformat = \"hevc\"\nmax_fps = 30\n").unwrap();
 
-        let cfg = load_app_config(Some(&path)).expect("load existing");
+        let cfg = AppConfig::load(&path).expect("load existing");
         let enc = cfg.encode.as_ref().expect("encode section");
         assert_eq!(enc.format, Some(FormatArg::Hevc));
         assert_eq!(enc.max_fps, Some(30));

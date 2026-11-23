@@ -17,33 +17,10 @@
 //! processes. This module owns the "build a cache from a resolved
 //! capability" part.
 
+use crate::capability::MachineFacts;
 use crate::encoder::nvenc;
 use crate::error::EncodeError;
 use crate::types::EncoderCache;
-
-/// Build an `EncoderCache` for the current run, probing NVENC.
-///
-/// The probe is **not** conditional on the `nv` switch: the capability
-/// is a fact about the machine, and `nv` is this run's choice (design
-/// doc §3.10.5). Encoders that fail the probe are simply not usable,
-/// and `select_encoder` falls back to software encoding with a
-/// warning.
-///
-/// This is the "no store" path (any caller that has not resolved the
-/// capability yet). Callers that keep the capability on disk resolve it
-/// with [`crate::encoder::nvenc::resolve`] and build the cache with
-/// [`cache_from_resolution`].
-pub fn init_encoder_cache() -> Result<EncoderCache, EncodeError> {
-    let encoders_output = nvenc::run_ffmpeg(&["-encoders"])?;
-    let support = nvenc::probe(&encoders_output);
-    if !support.iter().any(|s| s.usable) {
-        tracing::info!("no NVENC encoder passed the capability probe; software encoding only");
-    }
-    Ok(EncoderCache {
-        encoders_output,
-        nvenc: support,
-    })
-}
 
 /// Build an `EncoderCache` from an already-resolved NVENC capability.
 ///
@@ -52,81 +29,58 @@ pub fn init_encoder_cache() -> Result<EncoderCache, EncodeError> {
 pub fn cache_from_resolution(resolution: &nvenc::Resolution) -> EncoderCache {
     EncoderCache {
         encoders_output: resolution.encoders_output.clone(),
-        nvenc: resolution.support.clone(),
-    }
-}
-
-/// Build the encoder cache for a session, resolving the NVENC
-/// capability through the on-disk record.
-///
-/// The record (`<app_dir>/nvenc-capability.json`) is shared with the
-/// CLI: a fresh record is reused as-is (no probe), a missing or
-/// mismatching one is probed and stored. `capability` carries the
-/// summary for the UI.
-pub fn init_encoder_cache_with_capability() -> (
-    Result<EncoderCache, EncodeError>,
-    Option<crate::types::NvencCapability>,
-) {
-    init_encoder_cache_with_capability_runner(crate::encoder::nvenc::run_ffmpeg)
-}
-
-/// Same, with an injectable ffmpeg runner (the test seam).
-///
-/// The runner answers every ffmpeg invocation the resolution makes
-/// (`-encoders`, `-version`, the 1-frame capability probes) -- the
-/// same seam [`crate::encoder::nvenc::resolve_with`] takes. The GUI
-/// actor injects its runner so its tests never spawn ffmpeg.
-pub fn init_encoder_cache_with_capability_runner<F>(
-    runner: F,
-) -> (
-    Result<EncoderCache, EncodeError>,
-    Option<crate::types::NvencCapability>,
-)
-where
-    F: Fn(&[&str]) -> Result<String, EncodeError> + Send + Sync + 'static,
-{
-    let path = crate::config::path::resolve_nvenc_cache();
-    match crate::encoder::nvenc::resolve_and_store_with(path.as_deref(), false, runner) {
-        Ok(resolution) => {
-            let capability = crate::types::NvencCapability {
-                support: resolution.support.clone(),
-                probed_at: Some(resolution.record.probed_at),
-                review_due: resolution.review_due,
-            };
-            (Ok(cache_from_resolution(&resolution)), Some(capability))
-        }
-        Err(e) => (Err(e), None),
     }
 }
 
 /// What the background cache init produces: the cache (or the error
-/// that prevented building it) plus the NVENC capability summary the
-/// UI shows next to the NVENC switch.
+/// that prevented building it) plus the machine facts the run shares.
 #[derive(Debug)]
 pub struct CacheInit {
     pub cache: Result<EncoderCache, EncodeError>,
-    /// `None` when NVENC is disabled or the resolve failed.
-    pub capability: Option<crate::types::NvencCapability>,
+    /// The resolution the cache came from, when there was one.
+    ///
+    /// The actor needs it to **arrange the persistence** (design doc
+    /// §3.10.6 step 5): the probe does not write the capability
+    /// record, the publisher does -- so an older probe's result
+    /// cannot overwrite a newer record on disk.
+    pub resolution: Option<nvenc::Resolution>,
+    /// The facts this resolution produced: can ffmpeg run, and what
+    /// can NVENC do (design doc §3.10.7).
+    ///
+    /// The one capability the whole chain shares: the capability
+    /// check adopts it, the encoder selection reads it, the runtime
+    /// fallback updates it, the UI shows it (design doc §3.10.5).
+    pub facts: MachineFacts,
 }
 
-/// Build an `EncoderCache` on a background thread; return a receiver
-/// the caller can poll/await (review #126).
+/// The cache plus the machine facts, from one resolution.
 ///
-/// `ffmpeg -encoders` takes ~50-200ms on a cold start; `nvidia-smi -L`
-/// adds another 50-100ms. Blocking the actor thread for this duration
-/// delays `Command::StartBatch` processing. By spawning the init on a
-/// background thread and returning a one-shot receiver, the actor can
-/// drain the `cmd_rx` loop while the cache is being built.
-///
-/// The receiver delivers the final `Result<EncoderCache, EncodeError>`
-/// exactly once. A failed init returns `Err(EncodeError::Probe(...))`;
-/// consumers should map that to `Event::Error` like the sync variant.
-pub fn init_encoder_cache_async_with_capability() -> std::sync::mpsc::Receiver<CacheInit> {
-    init_encoder_cache_async_with_capability_runner(crate::encoder::nvenc::run_ffmpeg)
+/// The **only** place a resolution becomes what the frontends see
+/// (design doc §3.10.3: the wording and the mapping live in the lib,
+/// the frontends only display).
+pub fn cache_init_from_resolution(resolution: &nvenc::Resolution) -> CacheInit {
+    CacheInit {
+        cache: Ok(cache_from_resolution(resolution)),
+        facts: MachineFacts::from_resolution(resolution),
+        resolution: Some(resolution.clone()),
+    }
 }
 
-/// Same, with an injectable ffmpeg runner (the test seam).
-pub fn init_encoder_cache_async_with_capability_runner<F>(
+/// Build the cache on a background thread; return a receiver the
+/// caller can poll/await (review #126).
+///
+/// `ffmpeg -encoders` takes ~50-200ms on a cold start, and the
+/// capability probe spawns a 1-frame encode per NVENC encoder. Blocking
+/// the actor thread for that delays `Command::StartBatch` processing,
+/// so the init runs on its own thread.
+///
+/// The record's path is a **parameter**: the caller decides where the
+/// capability record lives (the app directory in production, a
+/// temporary directory in a test). The lib does not resolve it -- a
+/// test that resolved it would write the developer's real capability
+/// record (design doc §3.10.4).
+pub fn init_encoder_cache_async_with_capability_at<F>(
+    path: Option<std::path::PathBuf>,
     runner: F,
 ) -> std::sync::mpsc::Receiver<CacheInit>
 where
@@ -134,16 +88,28 @@ where
 {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
-        .name("rencoder-cache-init".into())
+        .name("renencoder-cache-init".into())
         .spawn(move || {
-            let (cache, capability) = init_encoder_cache_with_capability_runner(runner);
-            let result = CacheInit { cache, capability };
+            // The probe only -- the **store** is the publisher's job
+            // (design doc §3.10.6 step 5): the actor publishes the
+            // result and arranges the persistence, so an older
+            // probe's result cannot overwrite a newer record.
+            let init =
+                match nvenc::resolve_with_clock(path.as_deref(), false, runner, chrono::Utc::now())
+                {
+                    Ok(resolution) => cache_init_from_resolution(&resolution),
+                    Err(e) => CacheInit {
+                        cache: Err(e),
+                        facts: MachineFacts::ffmpeg_broken(),
+                        resolution: None,
+                    },
+                };
             // Block on the send until the consumer picks up. With
             // sync_channel(1), the first send succeeds (buffer slot
             // empty); subsequent sends would fail because the
             // consumer has already received. We only call once so
             // this is fine.
-            let _ = tx.send(result);
+            let _ = tx.send(init);
         })
         .expect("spawn cache-init thread");
     rx
@@ -177,7 +143,6 @@ Encoders:
     fn has_encoder_substring_match() {
         let cache = EncoderCache {
             encoders_output: ENCODERS_BASIC.to_string(),
-            nvenc: Vec::new(),
         };
         assert!(cache.has_encoder("libsvtav1"));
         assert!(cache.has_encoder("libx264"));
@@ -189,7 +154,6 @@ Encoders:
     fn has_encoder_finds_nvenc_in_full_list() {
         let cache = EncoderCache {
             encoders_output: ENCODERS_WITH_NVENC.to_string(),
-            nvenc: Vec::new(),
         };
         assert!(cache.has_encoder("av1_nvenc"));
         assert!(cache.has_encoder("h264_nvenc"));
@@ -218,9 +182,12 @@ Encoders:
             review_due: false,
         };
         let cache = cache_from_resolution(&resolution);
-        assert!(cache.nvenc_usable("av1_nvenc"));
-        assert!(!cache.nvenc_usable("hevc_nvenc"));
         assert!(cache.has_encoder("libsvtav1"));
+        // The NVENC conclusion is not in the cache any more -- it is
+        // the capability (design doc §3.10.5).
+        let capability = resolution.capability();
+        assert!(capability.usable("av1_nvenc"));
+        assert!(!capability.usable("hevc_nvenc"));
     }
 
     // Review delta #8 (delta-review): regression coverage for
@@ -229,18 +196,54 @@ Encoders:
     // round-trip. A failure to populate the channel would hang
     // here (timeout).
     #[test]
-    fn init_encoder_cache_async_delivers_result() {
-        // Use a custom runner via init_encoder_cache_impl would
-        // require re-plumbing; instead we exercise the real path
-        // but tolerate the ffmpeg binary missing on the test host.
-        let rx = init_encoder_cache_async_with_capability();
+    fn init_encoder_cache_async_delivers_result_into_the_given_path() {
+        // The record path is a parameter: the test points it at a
+        // temporary directory, so the test never writes the
+        // developer's real capability record -- and it never spawns
+        // the real ffmpeg (the fake runner answers every call).
+        let dir = std::env::temp_dir().join(format!(
+            "renencoder_cache_async_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the temp dir must be created");
+        let record_path = dir.join("nvenc-capability.json");
+
+        let rx = init_encoder_cache_async_with_capability_at(Some(record_path.clone()), |_args| {
+            Ok(String::new())
+        });
         let result = rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("init_encoder_cache_async channel closed without result");
-        // Either Ok (ffmpeg present) or Err (ffmpeg missing) is
-        // acceptable -- what we're testing is that the channel
-        // delivers a result within the timeout. The exact
-        // variant depends on the host.
-        let _ = result; // suppress unused warning
+
+        assert!(result.cache.is_ok(), "the fake runner always answers");
+        assert!(
+            result.facts.nvenc.is_some(),
+            "the capability summary must ride along"
+        );
+        // The init **probes**; the publisher stores (design doc
+        // §3.10.6 step 5). The resolution rides along so the actor
+        // can arrange the persistence -- an older probe's result must
+        // not overwrite a newer record on disk.
+        let resolution = result
+            .resolution
+            .expect("the resolution must ride along with the cache");
+        assert!(
+            !record_path.exists(),
+            "the init must not write the record: {}",
+            record_path.display()
+        );
+        // The publisher's write: it lands in the path the caller gave.
+        nvenc::store_resolution(Some(record_path.as_path()), &resolution, chrono::Utc::now());
+        assert!(
+            record_path.exists(),
+            "the record must land in the path the caller gave: {}",
+            record_path.display()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

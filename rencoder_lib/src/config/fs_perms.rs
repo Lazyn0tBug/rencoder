@@ -53,6 +53,26 @@ fn apply_mode<P: AsRef<Path>>(path: P, mode_bits: u32) -> io::Result<()> {
     Ok(())
 }
 
+/// Check that a file can be created in `dir`, leaving nothing behind.
+///
+/// The **filesystem** part of the run capability check (design doc
+/// §3.10.7): the app directory holds the config, the records and the
+/// cancel request, so a directory that cannot be written means the run
+/// cannot finish. That is a precondition, checked before the work
+/// starts -- not something to discover when the run is over, or when a
+/// signal arrives.
+///
+/// The probe file's name starts with a dash so the input collector
+/// skips it even if this process dies between the write and the
+/// delete.
+pub fn ensure_dir_writable(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let probe = dir.join(format!("-rencoder-write-probe.{}", std::process::id()));
+    std::fs::write(&probe, b"")?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

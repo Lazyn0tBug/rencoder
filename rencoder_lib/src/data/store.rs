@@ -409,11 +409,12 @@ fn columns_to_records(df: &DataFrame) -> PolarsResult<Vec<EncodingRecord>> {
 }
 
 /// Parse the Debug-formatted outcome string back to `EncodingOutcome`.
-/// Format: `"Succeeded"`, `"ReducedFps"`, `"Failed"`, or
+/// Format: `"Ready"`, `"Succeeded"`, `"ReducedFps"`, `"Failed"`, or
 /// `"Skipped(SameCodec)"` / `"Skipped(OutputExists)"` /
 /// `"Skipped(PartialOutput)"`.
 fn parse_outcome(s: &str) -> EncodingOutcome {
     match s {
+        "Ready" => EncodingOutcome::Ready,
         "Succeeded" => EncodingOutcome::Succeeded,
         "ReducedFps" => EncodingOutcome::ReducedFps,
         "Failed" => EncodingOutcome::Failed,
@@ -438,6 +439,160 @@ fn parse_error_category(s: &str) -> ErrorCategory {
         // Unknown category → IoError as a safe fallback.
         _ => ErrorCategory::IoError,
     }
+}
+
+/// Write the batch records to `path`.
+///
+/// The extension picks the format -- the same three the writers above
+/// produce: `.parquet`, `.jsonl` (or `.ndjson`) and `.csv`. Anything
+/// else is a parameter error.
+///
+/// The mechanics of "where the records go" live here, so both
+/// frontends write the same file the same way (design doc §3.11.4).
+pub fn write_records(records: &[EncodingRecord], path: &Path) -> Result<(), EncodeError> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                EncodeError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("failed to create directory {}: {e}", parent.display()),
+                ))
+            })?;
+        }
+    }
+    let bytes: Vec<u8> = match path.extension().and_then(|e| e.to_str()) {
+        Some("parquet") => records_to_parquet(records)
+            .map_err(|e| EncodeError::Probe(format!("parquet encode: {e}")))?,
+        Some("jsonl") | Some("ndjson") => records_to_jsonl(records).into_bytes(),
+        Some("csv") => records_to_csv(records).into_bytes(),
+        other => {
+            return Err(EncodeError::InvalidParam(format!(
+                "unsupported output extension {other:?}; use .parquet, .jsonl, or .csv"
+            )))
+        }
+    };
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
+/// The default path for a batch's records: `<records_dir>/encoding-<ts>.parquet`.
+///
+/// One place decides the name -- so the CLI and the actor write files
+/// the history reader recognises (design doc §3.11.4).
+///
+/// The caller says *where*: the app's records directory in production
+/// (design doc §3.6), a temporary one in a test. The name is the
+/// lib's, so every writer produces a file the history reader
+/// recognises.
+pub fn default_encoding_path_in(dir: &Path) -> Result<std::path::PathBuf, EncodeError> {
+    std::fs::create_dir_all(dir)?;
+    crate::config::fs_perms::set_app_dir_mode(dir)?;
+    Ok(dir.join(format!(
+        "encoding-{}.parquet",
+        crate::utils::time::utc_timestamp()
+    )))
+}
+
+/// The counts of a record set.
+///
+/// One place counts the outcomes (design doc §3.10.3): the frontends
+/// lay the numbers out, the lib decides what they are — two frontends
+/// counting the same records is two answers waiting to drift apart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OutcomeCounts {
+    /// How many records there are.
+    pub total: usize,
+    /// How many are **plans** (the dry run's `Ready` records).
+    pub ready: usize,
+    /// How many ended up encoded as asked.
+    pub succeeded: usize,
+    /// How many were encoded with a reduced frame rate.
+    pub reduced: usize,
+    /// How many failed.
+    pub failed: usize,
+}
+
+impl OutcomeCounts {
+    /// Count a record set's outcomes.
+    pub fn of(records: &[EncodingRecord]) -> Self {
+        let count = |f: fn(&EncodingRecord) -> bool| records.iter().filter(|r| f(r)).count();
+        Self {
+            total: records.len(),
+            ready: count(|r| matches!(r.outcome, EncodingOutcome::Ready)),
+            succeeded: count(|r| matches!(r.outcome, EncodingOutcome::Succeeded)),
+            reduced: count(|r| matches!(r.outcome, EncodingOutcome::ReducedFps)),
+            // No `Skipped` / `PartialSkip` counters: re-encoding is the
+            // rule (design doc §3.3.4), so nothing is skipped any more.
+            // The `SkippedReason` variants stay in the record schema for
+            // history written by older versions.
+            failed: count(|r| matches!(r.outcome, EncodingOutcome::Failed)),
+        }
+    }
+
+    /// The batch summary: one line per count (the CLI prints these).
+    pub fn summary_lines(&self) -> Vec<String> {
+        vec![
+            format!("Total:       {}", self.total),
+            format!("Success:     {}", self.succeeded),
+            format!("Reduced:     {}", self.reduced),
+            format!("Failed:      {}", self.failed),
+        ]
+    }
+
+    /// The plan summary: how many files this run will encode, and how
+    /// many it will not (the GUI shows it).
+    ///
+    /// `total_files` is the batch's file count — it can be larger than
+    /// the records (a file vanished mid-run), and the count of the
+    /// files that will **not** be encoded comes from it.
+    pub fn plan(&self, total_files: usize) -> PlanSummary {
+        PlanSummary {
+            // The dry run's records mark the encodable ones as
+            // `Ready` (the plan says "this one can be encoded").
+            to_encode: self.ready,
+            to_failed: total_files.saturating_sub(self.ready),
+        }
+    }
+}
+
+/// The plan summary: the counts and the wording the GUI shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlanSummary {
+    /// How many files this run will encode.
+    pub to_encode: usize,
+    /// How many it will not.
+    pub to_failed: usize,
+}
+
+impl PlanSummary {
+    /// The one line the toast shows.
+    pub fn line(&self) -> String {
+        if self.is_empty() {
+            format!(
+                "0 encodable files ({} failed); pick a different dir",
+                self.to_failed
+            )
+        } else {
+            format!(
+                "Found {} to encode ({} failed)",
+                self.to_encode, self.to_failed
+            )
+        }
+    }
+
+    /// Nothing to encode: the GUI warns instead of counting on.
+    pub fn is_empty(&self) -> bool {
+        self.to_encode == 0
+    }
+}
+
+/// The batch summary: one line per count.
+///
+/// The same wording for every frontend (design doc §3.10.3): the CLI
+/// prints it, the GUI renders it. The frontends lay it out, the lib
+/// decides what it says.
+pub fn summary_lines(records: &[EncodingRecord]) -> Vec<String> {
+    OutcomeCounts::of(records).summary_lines()
 }
 
 #[cfg(test)]
@@ -480,6 +635,73 @@ mod tests {
             outcome: EncodingOutcome::Succeeded,
             error: None,
         }
+    }
+
+    fn record_with(outcome: EncodingOutcome) -> EncodingRecord {
+        EncodingRecord {
+            outcome,
+            ..sample_record()
+        }
+    }
+
+    #[test]
+    fn the_counts_are_the_libs() {
+        // One place counts the outcomes (design doc §3.10.3).
+        let records = vec![
+            record_with(EncodingOutcome::Succeeded),
+            record_with(EncodingOutcome::Succeeded),
+            record_with(EncodingOutcome::ReducedFps),
+            record_with(EncodingOutcome::Failed),
+        ];
+
+        let counts = OutcomeCounts::of(&records);
+
+        assert_eq!(counts.total, 4);
+        assert_eq!(counts.succeeded, 2);
+        assert_eq!(counts.reduced, 1);
+        assert_eq!(counts.failed, 1);
+        assert_eq!(
+            counts.summary_lines(),
+            vec![
+                "Total:       4".to_string(),
+                "Success:     2".to_string(),
+                "Reduced:     1".to_string(),
+                "Failed:      1".to_string(),
+            ],
+            "the wording is the lib's"
+        );
+    }
+
+    #[test]
+    fn the_plan_counts_what_will_not_be_encoded() {
+        // The dry run's records mark the encodable ones as
+        // `Succeeded`; the rest comes from the batch's file count --
+        // it can exceed the records when a file vanished mid-run.
+        // The dry run's records: the encodable ones are `Ready` (the
+        // plan says "this one can be encoded"), the rest failed.
+        let records = vec![
+            record_with(EncodingOutcome::Ready),
+            record_with(EncodingOutcome::Ready),
+            record_with(EncodingOutcome::Failed),
+        ];
+
+        let plan = OutcomeCounts::of(&records).plan(4);
+
+        assert_eq!(plan.to_encode, 2);
+        assert_eq!(plan.to_failed, 2, "the vanished file counts as not encoded");
+        assert!(!plan.is_empty());
+        assert_eq!(plan.line(), "Found 2 to encode (2 failed)");
+    }
+
+    #[test]
+    fn an_empty_plan_says_so() {
+        let plan = OutcomeCounts::of(&[]).plan(3);
+
+        assert!(plan.is_empty());
+        assert_eq!(
+            plan.line(),
+            "0 encodable files (3 failed); pick a different dir"
+        );
     }
 
     #[test]
