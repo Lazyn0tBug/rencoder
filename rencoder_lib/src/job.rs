@@ -1758,18 +1758,17 @@ fn run_actor(
                             ..
                         } = probed;
                         // The encoder cache, from the resolution when
-                        // there is one, else from the init.
-                        let cache = match outcome.resolution.as_ref() {
-                            Some(resolution) => Ok(Arc::new(
+                        // there is one, else from the init. `None` when
+                        // the probe failed without producing a cache
+                        // (a failed re-probe: the old cache is still
+                        // the right one -- the build did not change).
+                        let cache: Option<CacheSlot> = match outcome.resolution.as_ref() {
+                            Some(resolution) => Some(Ok(Arc::new(
                                 crate::pipeline::cache::cache_from_resolution(resolution),
-                            )),
-                            None => match outcome.cache {
-                                Some(Ok(cache)) => Ok(Arc::new(cache)),
-                                Some(Err(e)) => Err(Arc::new(e)),
-                                None => Err(Arc::new(EncodeError::Probe(
-                                    "encoder cache init produced no cache".into(),
-                                ))),
-                            },
+                            ))),
+                            None => outcome
+                                .cache
+                                .map(|cache| cache.map(Arc::new).map_err(Arc::new)),
                         };
                         // The record on disk. The **publisher** writes
                         // it: the probe threads do not, so an older
@@ -1784,14 +1783,29 @@ fn run_actor(
                         }
                         match outcome.failure {
                             Some((category, message)) => {
-                                // The cache still lands: a batch must
-                                // see the failure at once, not wait
-                                // for the timeout.
-                                publish_state(
-                                    &published_cell,
-                                    cache,
-                                    Capability::default(),
-                                );
+                                // A failed detection **keeps the current
+                                // snapshot** (design doc §3.10.6 step
+                                // 5): the machine did not change, only
+                                // the probe failed. Publishing an empty
+                                // capability here would silently turn
+                                // NVENC off for the next batch.
+                                //
+                                // The cache error still lands when
+                                // nothing has been published yet (the
+                                // startup probe failed): a batch must
+                                // see the failure at once, not wait for
+                                // the timeout.
+                                {
+                                    let mut guard = published_cell.lock();
+                                    if guard.is_none() {
+                                        if let Some(cache) = cache {
+                                            *guard = Some(PublishedState {
+                                                cache,
+                                                capability: Capability::default(),
+                                            });
+                                        }
+                                    }
+                                }
                                 // The startup failure is the actor's
                                 // own (no scope); a re-probe's failure
                                 // belongs to the request that asked
@@ -1848,7 +1862,15 @@ fn run_actor(
                                 // batch that waits for the cache
                                 // therefore waits for the published
                                 // capability too.
-                                publish_state(&published_cell, cache, published.clone());
+                                publish_state(
+                                    &published_cell,
+                                    cache.unwrap_or_else(|| {
+                                        Err(Arc::new(EncodeError::Probe(
+                                            "the probe produced no encoder cache".into(),
+                                        )))
+                                    }),
+                                    published.clone(),
+                                );
                                 // The UI hears about the capability
                                 // from here -- one publisher, one
                                 // event.
@@ -4136,6 +4158,71 @@ mod mock_tests {
             saw_usable.load(AtomicOrdering::SeqCst),
             1,
             "the batch must see the machine's capability"
+        );
+    }
+
+    #[test]
+    fn a_failed_re_probe_keeps_the_current_capability() {
+        // Design doc §3.10.6 step 5: a failed detection keeps the
+        // current snapshot. Publishing an empty capability instead
+        // would silently turn NVENC off for the next batch -- the
+        // machine is fine, only the probe failed.
+        let capability = Capability::from_support(vec![crate::types::NvencSupport {
+            encoder: "h264_nvenc".into(),
+            usable: true,
+            reason: None,
+        }]);
+        let saw_usable = Arc::new(AtomicUsize::new(0));
+        let saw_usable_clone = saw_usable.clone();
+        let (cmd_tx, evt_rx) = run_test_controller_with_runner(
+            move |task: &EncodeTask,
+                  ctx: &mut BatchContext,
+                  _: &CancelToken,
+                  _: &mut dyn FnMut(FfmpegProgress)| {
+                if ctx.capability().any_usable() {
+                    saw_usable_clone.fetch_add(1, AtomicOrdering::SeqCst);
+                }
+                Ok(fake_record(&task.input))
+            },
+            None,
+            Some(capability),
+            // The probe fails.
+            Arc::new(|_args: &[&str]| Err(EncodeError::Probe("probe failed".into()))),
+        );
+
+        // The forced re-probe: it fails.
+        cmd_tx
+            .send(Request::new(1, Command::Detect { force: true }))
+            .unwrap();
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::OperationFailed { .. })),
+            "the failed probe must be reported: {events:?}"
+        );
+
+        // The next batch still sees the machine's capability.
+        cmd_tx
+            .send(Request::new(
+                2,
+                Command::StartBatch {
+                    params: EncodeParams::default(),
+                    files: batch_files("failed_probe", 1),
+                },
+            ))
+            .unwrap();
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::BatchCompleted { .. })),
+            "the batch must run: {events:?}"
+        );
+        assert_eq!(
+            saw_usable.load(AtomicOrdering::SeqCst),
+            1,
+            "the failed probe must not have wiped the capability"
         );
     }
 
