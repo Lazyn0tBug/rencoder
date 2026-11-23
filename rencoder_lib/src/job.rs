@@ -33,7 +33,7 @@ use crate::analyzer::records::{analyze_records_with_probe_and_progress_parallel,
 use crate::config::app::AppConfig;
 use crate::config::paths::{self, Paths};
 use crate::data::extract::probe_video_metadata_auto;
-use crate::encoder::nvenc::{Capability, CapabilityVerdicts};
+use crate::encoder::nvenc::Capability;
 use crate::error::EncodeError;
 use crate::pipeline::batch::{FfmpegFileEncoder, FfmpegProgress, FileEncoder};
 use crate::pipeline::cancel::CancelToken;
@@ -1135,22 +1135,6 @@ type PublishedCell = Arc<Mutex<Option<PublishedState>>>;
 
 /// The machine facts, gathered once and shared (design doc §3.10.7).
 ///
-/// Put the actor's authoritative capability into the published state.
-///
-/// The runtime corrections land in the actor's copy (the merge is
-/// generation-scoped, see [`apply_verdict_updates`]), and the next
-/// batch must inherit them -- so the published state carries the
-/// actor's copy, not the probe's original.
-///
-/// The lock is held only for the swap -- no IO inside (§3.10.1
-/// rule 2).
-fn update_published_capability(cell: &PublishedCell, capability: &Capability) {
-    let mut guard = cell.lock();
-    if let Some(state) = guard.as_mut() {
-        state.capability = capability.clone();
-    }
-}
-
 /// Publish a probe's answer: the encoder cache and the capability.
 ///
 /// Only the **actor** calls this -- the actor is the publisher (design
@@ -1167,6 +1151,219 @@ fn update_published_capability(cell: &PublishedCell, capability: &Capability) {
 fn publish_state(cell: &PublishedCell, cache: CacheSlot, capability: Capability) {
     let mut guard = cell.lock();
     *guard = Some(PublishedState { cache, capability });
+}
+
+/// What a publication produced.
+struct Publication {
+    /// The published capability (with its generation).
+    capability: Capability,
+    /// The machine facts, carrying the published capability.
+    facts: crate::capability::MachineFacts,
+    /// The failure, when the probe failed.
+    failure: Option<(ErrorCategory, String)>,
+}
+
+/// The actor's capability publication state.
+///
+/// One object owns the rules that used to be spread across the
+/// actor's branches:
+///
+/// - the **request sequence** -- which probe asked later;
+/// - the **published generation** -- which snapshot is current;
+/// - the **capability** -- the check's conclusion plus the run's
+///   corrections (the authoritative copy);
+/// - the **published state** -- the encoder cache and the capability
+///   a batch takes.
+///
+/// The rules are in the methods, not in the callers. The one that
+/// matters most: a **failed** probe produced no answer, so it
+/// publishes nothing and advances nothing -- it cannot supersede a
+/// result that is still on its way (design doc §3.10.6 step 5). No
+/// caller can skip that rule, because only this object advances the
+/// sequence.
+struct CapabilityPublisher {
+    /// The next probe request number.
+    next_seq: u64,
+    /// The newest **published** request. A result older than this is
+    /// dropped: it must not overwrite a newer snapshot -- or a newer
+    /// record on disk.
+    published_seq: u64,
+    /// The generation the next publication carries.
+    next_generation: u64,
+    /// The authoritative capability.
+    capability: Capability,
+    /// The published state the batches take. This object is its only
+    /// writer.
+    state: PublishedCell,
+}
+
+impl CapabilityPublisher {
+    fn new(state: PublishedCell) -> Self {
+        Self {
+            next_seq: 0,
+            published_seq: 0,
+            next_generation: 1,
+            capability: Capability::default(),
+            state,
+        }
+    }
+
+    /// A probe request takes the next sequence number.
+    fn request(&mut self) -> u64 {
+        self.next_seq += 1;
+        self.next_seq
+    }
+
+    /// Publish a probe's result -- if it is the newest one.
+    ///
+    /// `None` means the result was stale and dropped.
+    fn publish(
+        &mut self,
+        seq: u64,
+        outcome: ProbeOutcome,
+        record_path: &std::path::Path,
+    ) -> Option<Publication> {
+        // Only the newest probe result is published: an older one
+        // must not overwrite a newer snapshot -- or a newer record on
+        // disk.
+        if seq < self.published_seq {
+            return None;
+        }
+        // The encoder cache, from the resolution when there is one,
+        // else from the init. `None` when the probe failed without
+        // producing a cache (a failed re-probe: the old cache is
+        // still the right one -- the build did not change).
+        let cache: Option<CacheSlot> = match outcome.resolution.as_ref() {
+            Some(resolution) => Some(Ok(Arc::new(crate::pipeline::cache::cache_from_resolution(
+                resolution,
+            )))),
+            None => outcome
+                .cache
+                .map(|cache| cache.map(Arc::new).map_err(Arc::new)),
+        };
+        // The record on disk. The **publisher** writes it: the probe
+        // threads do not, so an older probe's result cannot overwrite
+        // a newer record (design doc §3.10.6 step 5).
+        if let Some(resolution) = &outcome.resolution {
+            crate::encoder::nvenc::store_resolution(
+                Some(record_path),
+                resolution,
+                chrono::Utc::now(),
+            );
+        }
+        match outcome.failure {
+            Some((category, message)) => {
+                // A failed detection **keeps the current snapshot**
+                // (design doc §3.10.6 step 5): the machine did not
+                // change, only the probe failed. Publishing an empty
+                // capability here would silently turn NVENC off for
+                // the next batch.
+                //
+                // The cache error still lands when nothing has been
+                // published yet (the startup probe failed): a batch
+                // must see the failure at once, not wait for the
+                // timeout.
+                {
+                    let mut guard = self.state.lock();
+                    if guard.is_none() {
+                        if let Some(cache) = cache {
+                            *guard = Some(PublishedState {
+                                cache,
+                                capability: Capability::default(),
+                            });
+                        }
+                    }
+                }
+                Some(Publication {
+                    capability: self.capability.clone(),
+                    facts: outcome.facts,
+                    failure: Some((category, message)),
+                })
+            }
+            None => {
+                // The sequence advances **only when a result is
+                // actually published**: a failed probe produced
+                // nothing, so it supersedes nothing. Otherwise a
+                // failed re-probe would discard the startup's
+                // still-pending result -- and with it the encoder
+                // cache the batches wait for.
+                self.published_seq = seq;
+                // Publish: this snapshot gets the next generation.
+                let published = outcome
+                    .facts
+                    .nvenc
+                    .clone()
+                    .unwrap_or_default()
+                    .with_generation(self.next_generation);
+                self.next_generation += 1;
+                // The machine facts carry the published capability
+                // (the report reads it).
+                let mut facts = outcome.facts.clone();
+                facts.nvenc = Some(published.clone());
+                self.capability = published.clone();
+                // The published state: the encoder cache and the
+                // capability, together. The publisher is the only
+                // writer -- a batch that waits for the cache
+                // therefore waits for the published capability too.
+                publish_state(
+                    &self.state,
+                    cache.unwrap_or_else(|| {
+                        Err(Arc::new(EncodeError::Probe(
+                            "the probe produced no encoder cache".into(),
+                        )))
+                    }),
+                    published.clone(),
+                );
+                Some(Publication {
+                    capability: published,
+                    facts,
+                    failure: None,
+                })
+            }
+        }
+    }
+
+    /// Fold a worker's runtime corrections into the authoritative
+    /// capability -- **only the current generation's**.
+    ///
+    /// A batch that ran under an older publication reported against
+    /// that publication: its conclusion ("this NVENC encoder is
+    /// broken") is about a machine state the current generation has
+    /// already replaced (design doc §3.10.6 step 5). Folding it in
+    /// would carry a stale hardware failure into the next batch
+    /// forever.
+    ///
+    /// The known cost: after a re-probe publishes a new generation,
+    /// the old generation's runtime corrections are not inherited --
+    /// the next batch may try an encoder that just fell back, and
+    /// fall back again (harmless: the product is still correct, one
+    /// file is encoded twice).
+    fn merge_verdicts(&mut self, updates: Vec<VerdictUpdate>) {
+        let generation = self.capability.generation();
+        for (reported_generation, encoder, usable) in updates {
+            if reported_generation != generation {
+                tracing::debug!(
+                    encoder = %encoder,
+                    reported_generation,
+                    generation,
+                    "dropping a verdict from an older generation"
+                );
+                continue;
+            }
+            self.capability.verdicts_mut().set(&encoder, usable);
+        }
+        // The next batch inherits the corrections.
+        let mut guard = self.state.lock();
+        if let Some(state) = guard.as_mut() {
+            state.capability = self.capability.clone();
+        }
+    }
+
+    /// The authoritative capability.
+    #[cfg(test)]
+    fn capability(&self) -> &Capability {
+        &self.capability
+    }
 }
 
 /// What a probe hands back to the actor.
@@ -1664,39 +1861,6 @@ fn take_published(cell: &PublishedCell, timeout: std::time::Duration) -> Option<
     }
 }
 
-/// Fold the verdicts a worker reported into the actor's copy.
-///
-/// **Only the current generation's reports are folded in.** A batch
-/// that ran under an older publication reported against that
-/// publication: its conclusion ("this NVENC encoder is broken") is
-/// about a machine state the current generation has already replaced
-/// (design doc §3.10.6 step 5). Folding it in would carry a stale
-/// hardware failure into the next batch forever.
-///
-/// The known cost: after a re-probe publishes a new generation, the
-/// old generation's runtime corrections are not inherited -- the next
-/// batch may try an encoder that just fell back, and fall back again
-/// (harmless: the product is still correct, one file is encoded
-/// twice).
-fn apply_verdict_updates(
-    verdicts: &mut CapabilityVerdicts,
-    generation: u64,
-    updates: Vec<VerdictUpdate>,
-) {
-    for (reported_generation, encoder, usable) in updates {
-        if reported_generation != generation {
-            tracing::debug!(
-                encoder = %encoder,
-                reported_generation,
-                generation,
-                "dropping a verdict from an older generation"
-            );
-            continue;
-        }
-        verdicts.set(&encoder, usable);
-    }
-}
-
 /// Turn a cache slot into the cache a batch needs, or into the error
 /// to report.
 fn cache_from_slot(slot: CacheSlot) -> Result<Arc<EncoderCache>, (ErrorCategory, String)> {
@@ -1765,14 +1929,10 @@ fn run_actor(
     // The probe channel: the probe threads hand their result back
     // here, and the actor publishes it (design doc §3.10.6 step 5).
     let (probe_tx, probe_rx) = unbounded::<ProbeResult>();
-    // The probe request counter. Every probe takes the next number:
-    // the startup one and every re-probe.
-    let mut probe_seq: u64 = 0;
     // The newest published probe request. A result older than this
     // is dropped -- it cannot overwrite a newer snapshot.
-    let mut published_probe_seq: u64 = 0;
     // The generation the next published capability carries.
-    let mut next_generation: u64 = 1;
+    let mut publisher = CapabilityPublisher::new(published_cell.clone());
     // The background init thread hands its result to the actor.
     let probe_tx_for_init = probe_tx.clone();
     std::thread::spawn(move || {
@@ -1833,7 +1993,6 @@ fn run_actor(
     // The authoritative capability: this machine's NVENC capability as
     // the session knows it. Each batch worker gets a snapshot and
     // reports its changes back (the done signal carries them).
-    let mut capability = Capability::default();
 
     loop {
         // Wait for the next command OR for a worker to report "done".
@@ -1842,78 +2001,30 @@ fn run_actor(
             recv(cmd_rx) -> req => req,
             recv(done_rx) -> done => {
                 if let Ok(BatchDone { updates }) = done {
-                    let generation = capability.generation();
-                    apply_verdict_updates(capability.verdicts_mut(), generation, updates);
-                    // The next batch inherits the corrections.
-                    update_published_capability(&published_cell, &capability);
+                    publisher.merge_verdicts(updates);
                     batch_running = false;
                     active_batch_id = None;
                 }
                 continue;
             }
             recv(probe_rx) -> probed => {
-                // A probe came back. The actor publishes it (design
-                // doc §3.10.6 step 5): it owns the probe request
-                // sequence and the published generation.
+                // A probe came back. The **publisher** decides (design
+                // doc §3.10.6 step 5): the rules -- what counts as
+                // newer, what a failure does -- live in it, not in
+                // this branch.
                 if let Ok(probed) = probed {
-                    // Only the newest probe result is published: an
-                    // older one must not overwrite a newer snapshot
-                    // -- or a newer record on disk.
-                    if probed.seq >= published_probe_seq {
-                        let ProbeResult {
-                            request_id,
-                            outcome,
-                            ..
-                        } = probed;
-                        // The encoder cache, from the resolution when
-                        // there is one, else from the init. `None` when
-                        // the probe failed without producing a cache
-                        // (a failed re-probe: the old cache is still
-                        // the right one -- the build did not change).
-                        let cache: Option<CacheSlot> = match outcome.resolution.as_ref() {
-                            Some(resolution) => Some(Ok(Arc::new(
-                                crate::pipeline::cache::cache_from_resolution(resolution),
-                            ))),
-                            None => outcome
-                                .cache
-                                .map(|cache| cache.map(Arc::new).map_err(Arc::new)),
-                        };
-                        // The record on disk. The **publisher** writes
-                        // it: the probe threads do not, so an older
-                        // probe's result cannot overwrite a newer
-                        // record (design doc §3.10.6 step 5).
-                        if let Some(resolution) = &outcome.resolution {
-                            crate::encoder::nvenc::store_resolution(
-                                Some(nvenc_cache_path.as_path()),
-                                resolution,
-                                chrono::Utc::now(),
-                            );
-                        }
-                        match outcome.failure {
+                    let ProbeResult {
+                        request_id,
+                        outcome,
+                        ..
+                    } = probed;
+                    if let Some(publication) = publisher.publish(
+                        probed.seq,
+                        outcome,
+                        nvenc_cache_path.as_path(),
+                    ) {
+                        match publication.failure {
                             Some((category, message)) => {
-                                // A failed detection **keeps the current
-                                // snapshot** (design doc §3.10.6 step
-                                // 5): the machine did not change, only
-                                // the probe failed. Publishing an empty
-                                // capability here would silently turn
-                                // NVENC off for the next batch.
-                                //
-                                // The cache error still lands when
-                                // nothing has been published yet (the
-                                // startup probe failed): a batch must
-                                // see the failure at once, not wait for
-                                // the timeout.
-                                {
-                                    let mut guard = published_cell.lock();
-                                    if guard.is_none() {
-                                        if let Some(cache) = cache {
-                                            *guard = Some(PublishedState {
-                                                cache,
-                                                capability: Capability::default(),
-                                            });
-                                        }
-                                    }
-                                }
                                 // The startup failure is the actor's
                                 // own (no scope); a re-probe's failure
                                 // belongs to the request that asked
@@ -1936,57 +2047,19 @@ fn run_actor(
                                 }
                             }
                             None => {
-                                // The sequence advances **only when a
-                                // result is actually published**: a
-                                // failed probe produced nothing, so it
-                                // supersedes nothing. Otherwise a
-                                // failed re-probe would discard the
-                                // startup's still-pending result --
-                                // and with it the encoder cache the
-                                // batches wait for.
-                                published_probe_seq = probed.seq;
-                                // Publish: this snapshot gets the
-                                // next generation.
-                                let published = outcome
-                                    .facts
-                                    .nvenc
-                                    .clone()
-                                    .unwrap_or_default()
-                                    .with_generation(next_generation);
-                                next_generation += 1;
-                                // The machine facts carry the
-                                // published capability (the report
-                                // reads it).
-                                let mut facts = outcome.facts.clone();
-                                facts.nvenc = Some(published.clone());
-                                if outcome.resolution.is_some() {
-                                    // The run capability report for
-                                    // the current operation directory.
-                                    crate::capability::check_run_capabilities(&paths, &facts);
-                                    send_evt_lossy(
-                                        &evt_tx,
-                                        Event::CapabilityChecked {
-                                            report: paths.capability_report.clone(),
-                                        },
-                                        &dropped_counter,
-                                    );
-                                }
-                                machine_facts = Some(facts);
-                                capability = published.clone();
-                                // The published state: the encoder
-                                // cache and the capability, together.
-                                // The actor is the only writer -- a
-                                // batch that waits for the cache
-                                // therefore waits for the published
-                                // capability too.
-                                publish_state(
-                                    &published_cell,
-                                    cache.unwrap_or_else(|| {
-                                        Err(Arc::new(EncodeError::Probe(
-                                            "the probe produced no encoder cache".into(),
-                                        )))
-                                    }),
-                                    published.clone(),
+                                machine_facts = Some(publication.facts.clone());
+                                // The run capability report for the
+                                // current operation directory.
+                                crate::capability::check_run_capabilities(
+                                    &paths,
+                                    &publication.facts,
+                                );
+                                send_evt_lossy(
+                                    &evt_tx,
+                                    Event::CapabilityChecked {
+                                        report: paths.capability_report.clone(),
+                                    },
+                                    &dropped_counter,
                                 );
                                 // The UI hears about the capability
                                 // from here -- one publisher, one
@@ -1998,7 +2071,7 @@ fn run_actor(
                                 // what a caller waits for.
                                 send_evt_lossy(
                                     &evt_tx,
-                                    Event::NvencCapability(published),
+                                    Event::NvencCapability(publication.capability),
                                     &dropped_counter,
                                 );
                             }
@@ -2034,10 +2107,7 @@ fn run_actor(
             Command::StartBatch { .. } | Command::DryRun { .. } | Command::Analyze { .. }
         ) {
             let (finished, updates) = drain_batch_done(&done_rx);
-            let generation = capability.generation();
-            apply_verdict_updates(capability.verdicts_mut(), generation, updates);
-            // The next batch inherits the corrections.
-            update_published_capability(&published_cell, &capability);
+            publisher.merge_verdicts(updates);
             if finished {
                 batch_running = false;
                 active_batch_id = None;
@@ -2391,8 +2461,7 @@ fn run_actor(
                 // The probe request takes the next sequence number:
                 // the actor publishes the result only if it is the
                 // newest one (design doc §3.10.6 step 5).
-                probe_seq += 1;
-                let seq = probe_seq;
+                let seq = publisher.request();
                 let probe_tx = probe_tx.clone();
                 std::thread::Builder::new()
                     .name("renencoder-detect".into())
@@ -4450,11 +4519,22 @@ mod mock_tests {
         // its result must be dropped.
         let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let release_for_runner = Arc::clone(&release);
+        // The runner announces its first call. **That is the anchor
+        // the test needs**: which probe blocks depends on the thread
+        // start order, which the system does not promise. Waiting
+        // for the announcement -- before sending the second Detect --
+        // makes "the first probe is the older one" a fact instead of
+        // an accident.
+        let (entered_tx, entered_rx) = crossbeam_channel::bounded::<()>(1);
+        let entered_for_runner = entered_tx.clone();
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_runner = Arc::clone(&calls);
         let runner: crate::job::DetectRunner = Arc::new(move |_args: &[&str]| {
             if calls_for_runner.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
-                // The first probe waits until the test lets it through.
+                // The **first** probe waits until the test lets it
+                // through. Only the first call blocks: a later probe
+                // that also blocked would never publish.
+                let _ = entered_for_runner.try_send(());
                 while !release_for_runner.load(std::sync::atomic::Ordering::SeqCst) {
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
@@ -4484,6 +4564,12 @@ mod mock_tests {
         cmd_tx
             .send(Request::new(1, Command::Detect { force: true }))
             .unwrap();
+        // Wait until the first probe is inside the runner. Only then
+        // is it certain that the probe which blocks is the **first**
+        // one -- the older request.
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the first probe must reach the runner");
         // The second probe: it runs through.
         cmd_tx
             .send(Request::new(2, Command::Detect { force: true }))
@@ -4519,19 +4605,23 @@ mod mock_tests {
         // older publication reported against that publication -- its
         // conclusion is about a machine state the current generation
         // has already replaced.
-        let mut verdicts = CapabilityVerdicts::default();
+        let mut publisher = CapabilityPublisher::new(Arc::new(Mutex::new(None)));
+        // The publisher starts at generation 0 (nothing published
+        // yet).
+        let current = publisher.capability().generation();
 
-        // A report from generation 1, while generation 2 is current.
-        apply_verdict_updates(&mut verdicts, 2, vec![(1, "h264_nvenc".to_string(), false)]);
+        // A report from a newer generation than the current one:
+        // dropped.
+        publisher.merge_verdicts(vec![(current + 1, "h264_nvenc".to_string(), false)]);
         assert!(
-            !verdicts.is_disabled("h264_nvenc"),
+            !publisher.capability().verdicts().is_disabled("h264_nvenc"),
             "a stale report must not disable the encoder"
         );
 
         // A report from the current generation lands.
-        apply_verdict_updates(&mut verdicts, 2, vec![(2, "h264_nvenc".to_string(), false)]);
+        publisher.merge_verdicts(vec![(current, "h264_nvenc".to_string(), false)]);
         assert!(
-            verdicts.is_disabled("h264_nvenc"),
+            publisher.capability().verdicts().is_disabled("h264_nvenc"),
             "the current generation's report must land"
         );
     }

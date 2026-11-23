@@ -2403,6 +2403,7 @@ UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `int
 | `analyzer/records.rs` | `AnalyzeProgress` struct + `AnalyzedFile { path, outcome: FileOutcome }` + `FileOutcome { Ok, ProbeFailed(EncodeError) }` | U22：进度回调 payload。`AnalyzedFile` 是新 type（不复用 `AnalysisRecord`——后者没有 `ProbeFailed` outcome 字段，复用得加 `error: Option<_>` 污染 success path）|
 | `job.rs` | `Command::Analyze { files }` arm | U22：调用 `analyze_records_with_probe_and_progress_parallel` with `probe = probe_video_metadata_auto`，`progress = |p| evt_tx.send(Event::AnalyzeProgress { ... })`。先发 `AnalyzeStarted { total }`，批结束发 `AnalyzeFinished`。**走** busy-gate（v1 限制——UI 不能同时跑 analyze + encode；analyze 是 read-only，理论上可与 encode 并存，但 v1 简化起见跟 DryRun 一致复用 busy-gate）|
 | `job.rs` | `Event::AnalyzeStarted` / `Event::AnalyzeProgress` / `Event::AnalyzeFinished` | U22：见 §3.8.3。`Event::AnalyzeProgress` 在 mock actor 里是 no-op（test seam，ref-count 即可）|
+| `job.rs` | `CapabilityPublisher` | 能力发布的**唯一归属**：探测请求序号 ✅ ✅、已发布代次 ✅ ✅、权威能力副本 ✅ ✅、批次取用的已发布状态 ✅ ✅。规则住在它的方法里 ✅ ✅——失败的探测**不发布、不推进序号** ✅ ✅（它没有产生答案 ✅ ✅，所以不能作废还在路上的结果 ✅ ✅），调用点跳过不了 ✅ ✅ |
 | `job.rs` | `PublishedState` + `Capability::generation()` | actor 发布的"这一代答案"：编码器缓存与能力对象**一起**发布、一起被批次取用（§3.10.6 步骤 5）——批次等缓存落地，也就等到了已发布的能力，不会拿着空能力开跑 |
 | `job.rs` | `Event::DryRunFinished { batch_id, generation, records }` | 预演结果带上它冻结的**能力代次**——计划只对它所规划的那一代有效，UI 复用前拿它与当前代次比（§3.10.5）|
 | `job.rs` | `Command::SaveConfig { config, revision }` / `Event::ConfigSaved { path, revision }` | 保存带修订号、回执带回它——UI 据此只清除这次保存覆盖的编辑（§3.10.5）|
@@ -3679,6 +3680,8 @@ anyhow = "1"
 | 几个读者？几个写者？ | 单一写者 → `Mutex`。读写之分只在"多读者并发读同一份不可变数据"时才有意义 |
 | 锁要持有多久？期间会做 IO 吗？ | 会做 IO（spawn 进程、跑 ffmpeg、读写文件）→ 锁内只取 `Arc`，锁外用 |
 | 状态会被替换吗，还是只写一次？ | 只写一次 → `OnceLock`；会被替换 → 可替换的 `Arc` 句柄 |
+
+**仲裁在一步之内**：需要仲裁的地方，仲裁点是一个**原语**——**跨进程**用内核的文件锁 ✅ ✅（守卫 ✅ ✅）、**跨信号**用状态文件 ✅ ✅（取消请求 ✅ ✅）、**同进程跨线程**用通道 ✅ ✅（探测结果 ✅ ✅）——不由时序定胜负 ✅ ✅。**规则住在原语里** ✅ ✅：调用方只报告事实 ✅ ✅（成功还是失败 ✅ ✅），不解释规则 ✅ ✅（谁算数 ✅ ✅、失败作不作废 ✅ ✅、谁进批次 ✅ ✅）。把规则散在分支里 ✅ ✅，就等于让分支各自解释一遍 ✅ ✅——新增一个分支就是一次错的机会 ✅ ✅。
 
 **本项目的五条规则**：
 
