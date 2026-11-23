@@ -28,10 +28,10 @@ use std::path::PathBuf;
     about = "Smart video transcoder and analyzer"
 )]
 pub struct Cli {
-    /// Force a fresh NVENC capability detection for this run and update
-    /// the stored result. Global: it works before or after the
-    /// subcommand (`rencoder --detect encode ...` ==
-    /// `rencoder encode --detect ...`).
+    /// Check this machine's NVENC capability for this run -- the stored
+    /// record is ignored (the machine may have changed) -- and update
+    /// it. Global: it works before or after the subcommand
+    /// (`rencoder --detect encode ...` == `rencoder encode --detect ...`).
     #[arg(long, global = true)]
     pub detect: bool,
 
@@ -45,13 +45,13 @@ pub enum Command {
     Encode(EncodeArgs),
     /// Analyze video frame-rate distribution.
     Analyze(AnalyzeArgs),
-    /// Detect this machine's NVENC capability, store the result and
+    /// Check this machine's NVENC capability, store the result and
     /// print a report.
     Detect(DetectArgs),
 }
 
 /// `rencoder detect` -- no options of its own; the global `--detect`
-/// flag is what forces a refresh elsewhere.
+/// flag is what asks for a check elsewhere.
 #[derive(Args, Debug)]
 pub struct DetectArgs {}
 

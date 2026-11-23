@@ -158,15 +158,28 @@ pub enum Command {
         config: Box<AppConfig>,
         revision: u64,
     },
-    /// Detect this machine's NVENC capability and report it back.
+    /// Check this machine's NVENC capability and report it back.
     ///
-    /// Same logic as the CLI's `rencoder detect`: the result is stored
-    /// in `<app_dir>/nvenc-capability.json`, and the stored record is
-    /// reused when it matches the current ffmpeg build.
+    /// **One check, and only when it is needed** (design doc
+    /// §3.10.7). There is no routine re-check: the machine's facts are
+    /// established once and shared by every batch. A batch never asks
+    /// for a check of its own -- it takes the published fact.
     ///
-    /// * `force = true` -- always probe (the "重新检测" button).
-    /// * `force = false` -- reuse the stored record when it is fresh.
-    Detect { force: bool },
+    /// * `ignore_record = false` -- *ensure the fact holds*: the
+    ///   stored record is reused when it is fresh and its fingerprint
+    ///   matches the current ffmpeg build; only when it does not is
+    ///   the machine checked. This is the chain's first stage (the
+    ///   startup probe) and the CLI's default run.
+    /// * `ignore_record = true` -- *the user says the record is
+    ///   stale*: the machine is checked once. Nobody but the user
+    ///   knows whether the machine changed (a driver was installed,
+    ///   a GPU was enabled), so this is the user's call -- the UI's
+    ///   "check now" button and the CLI's `--detect`.
+    ///
+    /// Either way: **at most one check per request**, and the answer
+    /// is published and shared by every batch (design doc §3.10.6
+    /// step 5).
+    CheckCapability { ignore_record: bool },
     /// The GUI's working directory changed.
     ///
     /// The operation directory moves with it (design doc §3.6): the
@@ -349,9 +362,10 @@ pub enum Event {
     /// the ones the user made while the save was in flight.
     ConfigSaved { path: PathBuf, revision: u64 },
 
-    /// The NVENC capability of this machine (after a `Command::Detect`
-    /// or the startup resolve). The UI shows it next to the NVENC
-    /// switch: which hardware encoders run here, and why not.
+    /// The NVENC capability of this machine (after a
+    /// `Command::CheckCapability` or the startup resolve). The UI shows
+    /// it next to the NVENC switch: which hardware encoders run here,
+    /// and why not.
     NvencCapability(crate::encoder::nvenc::Capability),
 
     /// The run capability report is written; here is its path.
@@ -495,7 +509,9 @@ mod tests {
                 config: Box::new(AppConfig::default()),
                 revision: 1,
             },
-            Command::Detect { force: true },
+            Command::CheckCapability {
+                ignore_record: true,
+            },
             Command::SetWorkingDir {
                 dir: std::path::PathBuf::from("/tmp"),
             },
@@ -510,7 +526,7 @@ mod tests {
                 | Command::Cancel { .. }
                 | Command::LoadHistory { .. }
                 | Command::SaveConfig { .. }
-                | Command::Detect { .. }
+                | Command::CheckCapability { .. }
                 | Command::SetWorkingDir { .. }
                 | Command::Analyze { .. } => {}
             }
@@ -1355,7 +1371,7 @@ impl CapabilityPublisher {
                 // The sequence advances **only when a result is
                 // actually published**: a failed probe produced
                 // nothing, so it supersedes nothing. Otherwise a
-                // failed re-probe would discard the startup's
+                // failed check would discard the startup's
                 // still-pending result -- and with it the encoder
                 // cache the batches wait for.
                 self.published_seq = seq;
@@ -1404,7 +1420,7 @@ impl CapabilityPublisher {
     /// would carry a stale hardware failure into the next batch
     /// forever.
     ///
-    /// The known cost: after a re-probe publishes a new generation,
+    /// The known cost: after a check publishes a new generation,
     /// the old generation's runtime corrections are not inherited --
     /// the next batch may try an encoder that just fell back, and
     /// fall back again (harmless: the product is still correct, one
@@ -1443,13 +1459,18 @@ impl CapabilityPublisher {
 /// **publisher** decides what to do with the result (design doc
 /// §3.10.6 step 5).
 ///
-/// The startup probe and a re-probe take **the same path** -- the
-/// startup is simply a probe that is not forced (it reuses a fresh
-/// record instead of probing again). One path, one rule.
+/// The startup probe and a user-requested check take **the same
+/// path** -- the startup is simply a check that does not ignore the
+/// record (it reuses a fresh record instead of probing again). One
+/// path, one rule.
+///
+/// `ignore_record` is the whole difference between "ensure the fact
+/// holds" and "the user says the record is stale" -- see
+/// [`Command::CheckCapability`].
 fn spawn_probe<F>(
     seq: u64,
     request_id: Option<RequestId>,
-    force: bool,
+    ignore_record: bool,
     cache_path: PathBuf,
     runner: F,
     probe_tx: Sender<ProbeResult>,
@@ -1465,7 +1486,7 @@ fn spawn_probe<F>(
             // probe's result cannot overwrite a newer record.
             let outcome = match crate::encoder::nvenc::resolve_with_clock(
                 Some(cache_path.as_path()),
-                force,
+                ignore_record,
                 runner,
                 chrono::Utc::now(),
             ) {
@@ -1514,7 +1535,7 @@ struct ProbeOutcome {
     /// The machine facts the probe established (including the
     /// capability it found).
     facts: crate::capability::MachineFacts,
-    /// The resolution behind a re-probe: it carries the encoder list
+    /// The resolution behind a check: it carries the encoder list
     /// (a new cache) and the record to store.
     resolution: Option<crate::encoder::nvenc::Resolution>,
     /// The failure, when the probe failed.
@@ -2058,13 +2079,14 @@ fn run_actor(
         next_batch_id: 0,
         publisher: CapabilityPublisher::new(published_cell.clone()),
     };
-    // The chain's **first stage**: the capability probe. It runs on a
-    // worker (it spawns ffmpeg) and the actor publishes its result
+    // The chain's **first stage**: "ensure the fact holds". It runs on
+    // a worker (it spawns ffmpeg) and the actor publishes its result
     // (design doc §3.10.6 step 5).
     //
-    // The startup probe is not forced: a fresh record on disk is
-    // reused as-is (the record is shared with the CLI), a missing one
-    // is probed. The path is the same one a re-probe takes.
+    // The startup check does **not** ignore the record: a fresh record
+    // on disk is reused as-is (the record is shared with the CLI), a
+    // missing or mismatched one is checked once. The path is the same
+    // one a user-requested check takes -- only `ignore_record` differs.
     {
         let seq = state.publisher.request();
         // The **injected** runner: a test must never touch the real
@@ -2127,7 +2149,7 @@ fn run_actor(
                         match publication.failure {
                             Some((category, message)) => {
                                 // The startup failure is the actor's
-                                // own (no scope); a re-probe's failure
+                                // own (no scope); a user's check's failure
                                 // belongs to the request that asked
                                 // for it.
                                 match request_id {
@@ -2321,7 +2343,7 @@ fn run_actor(
                     // The published state: the cache and the
                     // capability of one publication (design doc
                     // §3.10.6 step 5). The batch freezes this
-                    // generation -- a re-probe during the batch does
+                    // generation -- a check during the batch does
                     // not change what this batch encodes with.
                     let published = take_published(&published_cell_for_worker, CACHE_WAIT_TIMEOUT)
                         .ok_or((
@@ -2529,7 +2551,7 @@ fn run_actor(
                 // doc §3.10.5).
             }
 
-            Command::Detect { force } => {
+            Command::CheckCapability { ignore_record } => {
                 send_evt_lossy(
                     &evt_tx,
                     Event::CommandAccepted {
@@ -2538,9 +2560,11 @@ fn run_actor(
                     },
                     &dropped_counter,
                 );
-                // Same path as the CLI's `rencoder detect`: resolve
-                // through the on-disk record, store a fresh probe, and
-                // report what this machine can actually run.
+                // One check, and only when it is needed (design doc
+                // §3.10.7). Same path as the CLI's `rencoder detect`:
+                // resolve through the on-disk record, store the
+                // fresh result, and report what this machine can
+                // actually run.
                 //
                 // The probe spawns ffmpeg subprocesses (up to ~1.5s),
                 // so it runs on its own thread: doing it here would
@@ -2555,7 +2579,7 @@ fn run_actor(
                 spawn_probe(
                     seq,
                     Some(request_id),
-                    force,
+                    ignore_record,
                     cache_path.clone(),
                     move |args| detect_runner(args),
                     probe_tx.clone(),
@@ -3903,12 +3927,17 @@ mod mock_tests {
     }
 
     #[test]
-    fn detect_command_emits_a_capability_event() {
-        // The actor's Command::Detect arm: the capability comes back
+    fn a_capability_check_emits_a_capability_event() {
+        // The actor's Command::CheckCapability arm: the capability comes back
         // as an event so the UI can render it.
         let (cmd_tx, evt_rx) = run_test_controller(make_succeeding_mock().0, None);
         cmd_tx
-            .send(Request::new(1, Command::Detect { force: true }))
+            .send(Request::new(
+                1,
+                Command::CheckCapability {
+                    ignore_record: true,
+                },
+            ))
             .unwrap();
         // The command channel stays open: closing it tells the actor
         // "nobody left to serve", and it exits. The actor is the
@@ -4513,7 +4542,7 @@ mod mock_tests {
     }
 
     #[test]
-    fn a_failed_re_probe_keeps_the_current_capability() {
+    fn a_failed_check_keeps_the_current_capability() {
         // Design doc §3.10.6 step 5: a failed detection keeps the
         // current snapshot. Publishing an empty capability instead
         // would silently turn NVENC off for the next batch -- the
@@ -4527,7 +4556,7 @@ mod mock_tests {
         let saw_usable_clone = saw_usable.clone();
         // The probe fails -- but only from the **second** probe on: the
         // first one is the startup, which must succeed (the scenario
-        // is "the machine is fine, the re-probe failed").
+        // is "the machine is fine, the check failed").
         let probes = Arc::new(AtomicUsize::new(0));
         let probes_for_runner = probes.clone();
         let scripted = scripted_probe_runner(Some(&capability));
@@ -4555,13 +4584,18 @@ mod mock_tests {
 
         // The startup's publication comes first: the runner counts
         // the probes, so the test has to know which probe is which
-        // before it sends the re-probe.
+        // before it sends the check.
         let startup = next_capability_event(&evt_rx);
         assert_eq!(startup.generation(), 1, "the startup publishes first");
 
-        // The forced re-probe: it fails.
+        // The user's check (the record is ignored): it fails.
         cmd_tx
-            .send(Request::new(1, Command::Detect { force: true }))
+            .send(Request::new(
+                1,
+                Command::CheckCapability {
+                    ignore_record: true,
+                },
+            ))
             .unwrap();
         let failure = wait_for_event(&evt_rx, |e| matches!(e, Event::OperationFailed { .. }));
         assert!(
@@ -4594,8 +4628,8 @@ mod mock_tests {
     }
 
     #[test]
-    fn a_re_probe_publishes_a_new_generation() {
-        // A forced re-probe publishes a new capability -- a new
+    fn a_check_publishes_a_new_generation() {
+        // A user-requested check publishes a new capability -- a new
         // generation -- and the next batch freezes that one (design
         // doc §3.10.6 step 5).
         let generations = Arc::new(Mutex::new(Vec::<u64>::new()));
@@ -4630,9 +4664,14 @@ mod mock_tests {
             "the first batch must run: {events:?}"
         );
 
-        // The forced re-probe.
+        // The user's check.
         cmd_tx
-            .send(Request::new(2, Command::Detect { force: true }))
+            .send(Request::new(
+                2,
+                Command::CheckCapability {
+                    ignore_record: true,
+                },
+            ))
             .unwrap();
         let event = wait_for_event(&evt_rx, |e| matches!(e, Event::NvencCapability(_)));
         let events = [event];
@@ -4640,7 +4679,7 @@ mod mock_tests {
             events
                 .iter()
                 .any(|e| matches!(e, Event::NvencCapability(_))),
-            "the re-probe must publish a capability: {events:?}"
+            "the check must publish a capability: {events:?}"
         );
 
         // The second batch: the new generation.
@@ -4666,7 +4705,7 @@ mod mock_tests {
         assert_eq!(seen[0], 1, "the first batch froze the startup generation");
         assert!(
             seen[1] > seen[0],
-            "the re-probe must publish a newer generation: {seen:?}"
+            "the check must publish a newer generation: {seen:?}"
         );
     }
 
@@ -4685,7 +4724,7 @@ mod mock_tests {
         // The runner announces its first call. **That is the anchor
         // the test needs**: which probe blocks depends on the thread
         // start order, which the system does not promise. Waiting
-        // for the announcement -- before sending the second Detect --
+        // for the announcement -- before sending the second check --
         // makes "the first probe is the older one" a fact instead of
         // an accident.
         // The fixture blocks the probe that comes **after** the test
@@ -4726,11 +4765,21 @@ mod mock_tests {
         block_next.store(true, AtomicOrdering::SeqCst);
         // The first probe: it blocks.
         cmd_tx
-            .send(Request::new(1, Command::Detect { force: true }))
+            .send(Request::new(
+                1,
+                Command::CheckCapability {
+                    ignore_record: true,
+                },
+            ))
             .unwrap();
         // The second probe: it runs through.
         cmd_tx
-            .send(Request::new(2, Command::Detect { force: true }))
+            .send(Request::new(
+                2,
+                Command::CheckCapability {
+                    ignore_record: true,
+                },
+            ))
             .unwrap();
 
         // The second probe's publication: it is the newer one.
@@ -4784,8 +4833,8 @@ mod mock_tests {
     #[test]
     fn a_late_verdict_from_an_old_batch_does_not_disable_the_new_generation() {
         // The scenario: a batch runs under generation 1 and finds an
-        // NVENC encoder unusable; while it is still running, a forced
-        // re-probe publishes generation 2; the batch's late report
+        // NVENC encoder unusable; while it is still running, a
+        // user-requested check publishes generation 2; the batch's late report
         // must not disable the encoder for the next batch (design doc
         // §3.10.6 step 5).
         let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -4797,7 +4846,7 @@ mod mock_tests {
                   ctx: &mut BatchContext,
                   _: &CancelToken,
                   _: &mut dyn FnMut(FfmpegProgress)| {
-                // The batch blocks here until the re-probe has
+                // The batch blocks here until the check has
                 // published the new generation.
                 while !release_for_mock.load(std::sync::atomic::Ordering::SeqCst) {
                     std::thread::sleep(std::time::Duration::from_millis(5));
@@ -4833,10 +4882,15 @@ mod mock_tests {
             }
         }
 
-        // The forced re-probe: it publishes a new generation while the
+        // The user's check: it publishes a new generation while the
         // first batch is still running.
         cmd_tx
-            .send(Request::new(2, Command::Detect { force: true }))
+            .send(Request::new(
+                2,
+                Command::CheckCapability {
+                    ignore_record: true,
+                },
+            ))
             .unwrap();
         loop {
             match evt_rx.recv_timeout(std::time::Duration::from_secs(10)) {
@@ -4899,7 +4953,7 @@ mod mock_tests {
         std::fs::create_dir_all(&dir).expect("the temp dir must be created");
 
         // The stored record is what makes the review advisory
-        // appear: the probe reuses it (it is not forced) and reports
+        // appear: the check reuses it (the record is not ignored) and reports
         // that it is past its review date.
         let record = crate::encoder::nvenc::CapabilityRecord {
             version: crate::encoder::nvenc::RECORD_VERSION,
@@ -4941,6 +4995,109 @@ mod mock_tests {
             capability.review_due(),
             "the UI needs the advisory flag to show the advisory"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_record_is_reused_unless_the_user_says_the_machine_changed() {
+        // "必要时的一次检查"（§3.10.7）：记录成立（新鲜 + 指纹对得上）就
+        // **沿用**，不查机器；用户说机器变了才**检查一次**。
+        //
+        // The runner counts the 1-frame probes (the calls that carry
+        // `-c:v`): the fingerprint calls (`-encoders` / `-version`)
+        // always happen -- they are how the record's validity is
+        // decided -- but a probe is a check of the machine.
+        let dir = unique_tmp("record_reuse");
+        std::fs::create_dir_all(&dir).expect("the temp dir must be created");
+
+        // A fresh record whose fingerprint matches the fake machine.
+        //
+        // The machine offers one NVENC encoder: the fake `-encoders`
+        // answer lists it, so a check of the machine really runs a
+        // 1-frame probe (an empty encoder list would skip the probe
+        // entirely -- level 1 of the check, §3.10.5).
+        let support = vec![crate::types::NvencSupport {
+            encoder: "h264_nvenc".into(),
+            usable: true,
+            reason: None,
+        }];
+        let record = crate::encoder::nvenc::CapabilityRecord {
+            version: crate::encoder::nvenc::RECORD_VERSION,
+            ffmpeg_version: PROBE_VERSION.to_string(),
+            ffmpeg_fingerprint: crate::encoder::nvenc::fingerprint(PROBE_VERSION, "h264_nvenc"),
+            probed_at: chrono::Utc::now() - chrono::Duration::days(1),
+            next_review_at: chrono::Utc::now() + chrono::Duration::days(30),
+            encoders: support.clone(),
+        };
+        std::fs::write(
+            dir.join("nvenc-capability.json"),
+            serde_json::to_string(&record).expect("the record must serialize"),
+        )
+        .expect("the record must be written");
+
+        let capability = Capability::from_support(support);
+        let scripted = scripted_probe_runner(Some(&capability));
+        let probes = Arc::new(AtomicUsize::new(0));
+        let probes_for_runner = probes.clone();
+        let runner: crate::job::DetectRunner = Arc::new(move |args: &[&str]| {
+            if args.contains(&"-c:v") {
+                probes_for_runner.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+            scripted(args)
+        });
+
+        let (cmd_tx, evt_rx) = run_test_controller_with_runner(
+            make_succeeding_mock().0,
+            Some(dir.clone()),
+            Some(capability),
+            Some(runner),
+        );
+
+        // The startup check: the record holds, so the machine is not
+        // checked.
+        let startup = next_capability_event(&evt_rx);
+        assert_eq!(startup.generation(), 1, "the startup publishes first");
+        assert_eq!(
+            probes.load(AtomicOrdering::SeqCst),
+            0,
+            "a fresh record must be reused -- no check of the machine"
+        );
+
+        // A check that does not ignore the record: still no check of
+        // the machine.
+        cmd_tx
+            .send(Request::new(
+                1,
+                Command::CheckCapability {
+                    ignore_record: false,
+                },
+            ))
+            .unwrap();
+        let second = next_capability_event(&evt_rx);
+        assert_eq!(second.generation(), 2, "the check publishes a generation");
+        assert_eq!(
+            probes.load(AtomicOrdering::SeqCst),
+            0,
+            "the record still holds -- it must be reused"
+        );
+
+        // A check that ignores the record: the user says the machine
+        // changed, so it is checked once.
+        cmd_tx
+            .send(Request::new(
+                2,
+                Command::CheckCapability {
+                    ignore_record: true,
+                },
+            ))
+            .unwrap();
+        let third = next_capability_event(&evt_rx);
+        assert_eq!(third.generation(), 3, "the check publishes a generation");
+        assert!(
+            probes.load(AtomicOrdering::SeqCst) > 0,
+            "ignoring the record must check the machine"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

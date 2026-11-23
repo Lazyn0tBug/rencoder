@@ -620,11 +620,11 @@ fn SetupPage(
                                     onclick: move |_| {
                                         if let Some(tx) = tx_c.clone() {
                                             state_c.with_mut(|s| {
-                                                reduce(s, Msg::UserClickedDetectNv, &tx)
+                                                reduce(s, Msg::UserClickedCheckCapability, &tx)
                                             });
                                         }
                                     },
-                                    "re-detect"
+                                    "check now"
                                 }
                             }
                         }

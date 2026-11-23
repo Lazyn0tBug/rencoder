@@ -174,13 +174,13 @@ enum Refresh {
 fn advise_refresh() -> Result<Refresh> {
     if !std::io::stdin().is_terminal() {
         println!(
-            "NVENC 检测结果已超过 {} 天，如需更新请运行 `rencoder detect`。",
+            "NVENC 能力记录已超过 {} 天，如需更新请运行 `rencoder detect`。",
             nvenc::REVIEW_INTERVAL_DAYS
         );
         return Ok(Refresh::Skip);
     }
     print!(
-        "NVENC 检测结果已超过 {} 天，可能已过期。是否重新检测？[y/N] ",
+        "NVENC 能力记录已超过 {} 天，可能已过期。是否现在检查一次？[y/N] ",
         nvenc::REVIEW_INTERVAL_DAYS
     );
     std::io::stdout().flush()?;
@@ -309,8 +309,9 @@ fn encode_cmd(
 
     // The machine facts: gathered once (design doc §3.10.7). Prefer
     // the stored record (probing costs ~200-500ms per encoder, and
-    // the answer barely changes). `--detect` forces a fresh probe; a
-    // record past its review date only gets the user asked about it.
+    // the answer barely changes). `--detect` ignores the record and
+    // checks the machine once; a record past its review date only
+    // gets the user asked about it.
     //
     // The capability is resolved whether or not this run uses NVENC:
     // it is a fact about the machine, and `nv` is this run's choice
@@ -350,7 +351,7 @@ fn encode_cmd(
     // resolve already pushed the review date when the record was due,
     // so the advisory is shown once and the next run is quiet. Showing
     // it is this front end's part of the contract -- the CLI asks in
-    // the terminal, the GUI shows a line with a "re-detect" button.
+    // the terminal, the GUI shows a line with a "check now" button.
     if resolution.review_due && !force_detect {
         match advise_refresh()? {
             Refresh::Yes => {

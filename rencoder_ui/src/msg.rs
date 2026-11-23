@@ -220,7 +220,7 @@ pub struct AppState {
     /// NVENC capability of this machine, as reported by the lib
     /// (`Event::NvencCapability`). `None` until the first report
     /// arrives — the lib resolves it at startup and on every
-    /// `Command::Detect`.
+    /// `Command::CheckCapability`.
     pub nvenc_capability: Option<rencoder_lib::encoder::nvenc::Capability>,
     /// The run capability report for the current working directory,
     /// read from the file the lib wrote (design doc §3.10.7).
@@ -563,10 +563,12 @@ pub enum Msg {
     /// start deferred.
     #[allow(dead_code)]
     UserClickedLoadHistory,
-    /// User clicked "重新检测" next to the NVENC switch: force a
-    /// fresh capability probe. The lib stores the result and
-    /// reports it back via `Event::NvencCapability`.
-    UserClickedDetectNv,
+    /// User clicked "check now" next to the NVENC switch: the machine
+    /// may have changed (a driver was installed, a GPU was enabled),
+    /// so the stored record cannot be trusted -- check the machine
+    /// once. The lib stores the result and reports it back via
+    /// `Event::NvencCapability`.
+    UserClickedCheckCapability,
     /// User clicked a top-bar tab. Reducer writes
     /// `state.active_page`. No lib command.
     UserClickedTab(Page),
@@ -688,11 +690,19 @@ pub fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Request>) {
                 push_toast(state, e, ToastKind::Error);
             }
         }
-        Msg::UserClickedDetectNv => {
-            // Force a fresh probe. The lib stores the result in
+        Msg::UserClickedCheckCapability => {
+            // The user says the machine may have changed, so the
+            // stored record cannot be trusted: check the machine once
+            // (`ignore_record = true`). The lib stores the result in
             // `<app_dir>/nvenc-capability.json` and reports it back
             // via `Event::NvencCapability`.
-            if let Err(e) = dispatch(state, cmd_tx, Command::Detect { force: true }) {
+            if let Err(e) = dispatch(
+                state,
+                cmd_tx,
+                Command::CheckCapability {
+                    ignore_record: true,
+                },
+            ) {
                 push_toast(state, e, ToastKind::Error);
             }
         }
@@ -1174,8 +1184,8 @@ fn apply_event(state: &mut AppState, evt: Event) {
         }
         Event::NvencCapability(capability) => {
             // The lib resolved this machine's NVENC capability (at
-            // startup or after a `Command::Detect`). The Setup page
-            // renders it next to the NVENC switch.
+            // startup or after a `Command::CheckCapability`). The Setup
+            // page renders it next to the NVENC switch.
             state.nvenc_capability = Some(capability);
         }
         Event::CapabilityChecked { report } => {
@@ -1828,17 +1838,20 @@ mod tests {
         }
     }
 
-    // ---- NVENC detect ----
+    // ---- NVENC capability ----
 
     #[test]
-    fn detect_nv_dispatches_a_forced_detect_command() {
+    fn checking_the_capability_ignores_the_stored_record() {
         use crossbeam_channel::unbounded;
         let (tx, rx) = unbounded::<Request>();
         let mut state = fresh_state();
-        reduce(&mut state, Msg::UserClickedDetectNv, &tx);
+        reduce(&mut state, Msg::UserClickedCheckCapability, &tx);
         match next_command(&rx) {
-            Command::Detect { force } => assert!(force, "the button must force a probe"),
-            _ => panic!("expected Command::Detect"),
+            Command::CheckCapability { ignore_record } => assert!(
+                ignore_record,
+                "the button means \"the machine may have changed\": the record must not be trusted"
+            ),
+            _ => panic!("expected Command::CheckCapability"),
         }
     }
 
@@ -2718,9 +2731,9 @@ mod tests {
         // doc §3.11.3).
         let mut state = fresh_state();
         let (tx, rx) = crossbeam_channel::unbounded::<Request>();
-        reduce(&mut state, Msg::UserClickedDetectNv, &tx);
+        reduce(&mut state, Msg::UserClickedCheckCapability, &tx);
         let first = next_request_id(&rx);
-        reduce(&mut state, Msg::UserClickedDetectNv, &tx);
+        reduce(&mut state, Msg::UserClickedCheckCapability, &tx);
         let second = next_request_id(&rx);
         assert!(second > first, "the ids are monotonic");
     }
