@@ -14,16 +14,19 @@
 # .dmg with macOS' built-in `hdiutil` (cargo-dist 0.32 has no dmg
 # installer type).
 #
-# Triggers on tag push matching `v[0-9]*.[0-9]*.[0-9]*` -- note this is
-# a glob, not a regex: `+` is a literal character here, so the older
-# `v[0-9]+.[0-9]+.[0-9]+*` pattern never matched `v1.2.3`.
+# Triggers on **every** tag push -- the tag is the gate: a branch push
+# never reaches this workflow. The release is published for every
+# pushed tag, non-SemVer ones included (design doc, "Portable
+# distribution and tag releases"). The older
+# `v[0-9]*.[0-9]*.[0-9]*` glob was narrower than that: it let
+# `nightly-2026-11-23` and `v1.2` through without a release.
 
 name: Release
 
 on:
   push:
     tags:
-      - 'v[0-9]*.[0-9]*.[0-9]*'
+      - '*'
   workflow_dispatch:
     inputs:
       tag:
