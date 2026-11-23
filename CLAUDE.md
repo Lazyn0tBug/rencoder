@@ -145,42 +145,53 @@ saying a change is done.
 
 ## Batch check, batch fix, batch verify
 
-A change that spans several files is one change, not several. One round trip:
+A change that spans several files is one change, not several. The unit of
+work is the **task**, and the unit of the batch is the task too.
 
-1. **Batch check.** One command that surfaces every error at once:
-   `cargo check --workspace --all-targets` (not `cargo check -p <crate>`,
-   which hides the errors in the crates you did not name, and not a
-   per-file loop). Collect the whole error list with its locations.
-2. **Batch fix.** Apply every fix in one pass, then compile once. A
-   systematic mistake (a renamed field, a changed signature) shows up as
-   N errors at N sites; fixing them one at a time costs N compiles, and
-   each compile reveals only the next error, never the shape of the
-   change.
-3. **Batch verify.** Run the gate once at the end (`cargo clippy
-   --workspace --all-targets -- -D warnings`, `cargo test --workspace`,
-   `cargo fmt --check`) and say what it proved.
+**Outer loop: read, plan, then iterate.**
+
+1. **Spread out the whole picture and read it once.** Before planning,
+   read everything the work touches in one pass (the files, the call
+   sites, the tests). Reading piecemeal while editing is what produces a
+   plan built on half the picture.
+2. **Decompose into tasks.** Each task has one intent, one verification,
+   and a file list you can name up front. The task list is the iteration
+   order.
+3. **Per task: one check, one fix pass, one verification.**
+   - **Batch check.** One command that surfaces every error of this task
+     at once: `cargo check --workspace --all-targets` (not
+     `cargo check -p <crate>`, which hides the errors in the crates you
+     did not name, and not a per-file loop). Collect the whole error
+     list with its locations.
+   - **Batch fix.** Apply every fix of this task in one pass, then
+     compile once. A systematic mistake (a renamed field, a changed
+     signature) shows up as N errors at N sites; fixing them one at a
+     time costs N compiles, and each compile reveals only the next
+     error, never the shape of the change.
+   - **Batch verify.** Run the gate once at the end of the task
+     (`cargo clippy --workspace --all-targets -- -D warnings`,
+     `cargo test --workspace`, `cargo fmt --check`) and say what it
+     proved.
+4. **Then the next task.** The iteration is over tasks; inside a task
+   there is no iteration, only one cycle.
 
 Do not interleave edit -> compile -> edit -> compile. Each round trip is
 a full compile, and the interleaving hides the fact that the errors share
 one cause.
 
-**The batch is one task, not a bag of errors.** The first check is aimed
-at the task as a whole: it covers the task's full blast radius (every
-crate the task touches), so the fix pass can address one intent instead
-of a pile of unrelated sites. A check narrower than the task hides the
-errors outside it; they surface in the next round, which is exactly the
+**A check narrower than the task hides errors.** The check must cover the
+task's full blast radius (every crate the task touches), otherwise the
+errors outside it surface in the next round, which is exactly the
 interleaving this rule exists to stop.
 
 **Granularity is a trade-off.** Too coarse and the task stops being one
 unit: the fix pass becomes unrelated edits, and the verification can no
 longer attribute anything to what it proved. Too fine and the compile
-overhead per task dominates, so batching buys nothing. A task is the
-right size when it has one intent, one verification, and a file list you
-can name before you start. If you cannot name that list, the task is not
-scoped yet: scope it first (step 1 of the methodology below), then batch
-it.
+overhead per task dominates, so batching buys nothing. If you cannot name
+a task's file list, the task is not scoped yet: scope it first (step 1 of
+the methodology below), then batch it.
 
-State the batch before running it: what this round checks, what it fixes,
+State the batch before running it: what this task checks, what it fixes,
 what proves it.
 
 ## Refactor / rename methodology
