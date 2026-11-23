@@ -1659,6 +1659,7 @@ fn run_actor(
                     "encoder cache init channel closed".into(),
                 )),
                 facts: crate::capability::MachineFacts::ffmpeg_broken(),
+                resolution: None,
             });
         // The cache init failed -> the failure rides with the result,
         // and the actor reports it (one publisher, one event).
@@ -1672,7 +1673,10 @@ fn run_actor(
             outcome: ProbeOutcome {
                 cache: Some(init.cache),
                 facts: init.facts,
-                resolution: None,
+                // The resolution rides along: the actor stores the
+                // record (the publisher arranges the persistence --
+                // design doc §3.10.6 step 5).
+                resolution: init.resolution,
                 failure,
             },
         });
@@ -1735,8 +1739,41 @@ fn run_actor(
                             outcome,
                             ..
                         } = probed;
+                        // The encoder cache, from the resolution when
+                        // there is one, else from the init.
+                        let cache = match outcome.resolution.as_ref() {
+                            Some(resolution) => Ok(Arc::new(
+                                crate::pipeline::cache::cache_from_resolution(resolution),
+                            )),
+                            None => match outcome.cache {
+                                Some(Ok(cache)) => Ok(Arc::new(cache)),
+                                Some(Err(e)) => Err(Arc::new(e)),
+                                None => Err(Arc::new(EncodeError::Probe(
+                                    "encoder cache init produced no cache".into(),
+                                ))),
+                            },
+                        };
+                        // The record on disk. The **publisher** writes
+                        // it: the probe threads do not, so an older
+                        // probe's result cannot overwrite a newer
+                        // record (design doc §3.10.6 step 5).
+                        if let Some(resolution) = &outcome.resolution {
+                            crate::encoder::nvenc::store_resolution(
+                                Some(nvenc_cache_path.as_path()),
+                                resolution,
+                                chrono::Utc::now(),
+                            );
+                        }
                         match outcome.failure {
                             Some((category, message)) => {
+                                // The cache still lands: a batch must
+                                // see the failure at once, not wait
+                                // for the timeout.
+                                publish_state(
+                                    &published_cell,
+                                    cache,
+                                    Capability::default(),
+                                );
                                 // The startup failure is the actor's
                                 // own (no scope); a re-probe's failure
                                 // belongs to the request that asked
@@ -1773,17 +1810,7 @@ fn run_actor(
                                 // reads it).
                                 let mut facts = outcome.facts.clone();
                                 facts.nvenc = Some(published.clone());
-                                if let Some(resolution) = &outcome.resolution {
-                                    // A re-probe: the record on disk.
-                                    // The
-                                    // publisher writes it: an older
-                                    // probe's result must not
-                                    // overwrite a newer record.
-                                    crate::encoder::nvenc::store_resolution(
-                                        Some(nvenc_cache_path.as_path()),
-                                        resolution,
-                                        chrono::Utc::now(),
-                                    );
+                                if outcome.resolution.is_some() {
                                     // The run capability report for
                                     // the current operation directory.
                                     crate::capability::check_run_capabilities(&paths, &facts);
@@ -1803,21 +1830,6 @@ fn run_actor(
                                 // batch that waits for the cache
                                 // therefore waits for the published
                                 // capability too.
-                                let cache = match outcome.resolution.as_ref() {
-                                    // A re-probe: a new encoder list.
-                                    Some(resolution) => Ok(Arc::new(
-                                        crate::pipeline::cache::cache_from_resolution(resolution),
-                                    )),
-                                    // The startup probe: the cache
-                                    // came with the result.
-                                    None => match outcome.cache {
-                                        Some(Ok(cache)) => Ok(Arc::new(cache)),
-                                        Some(Err(e)) => Err(Arc::new(e)),
-                                        None => Err(Arc::new(EncodeError::Probe(
-                                            "encoder cache init produced no cache".into(),
-                                        ))),
-                                    },
-                                };
                                 publish_state(&published_cell, cache, published.clone());
                                 // The UI hears about the capability
                                 // from here -- one publisher, one
@@ -2600,6 +2612,7 @@ mod mock_tests {
                 cache: Ok(EncoderCache {
                     encoders_output: String::new(),
                 }),
+                resolution: None,
                 // The facts the resolution would have produced: the
                 // fake runner answers, so ffmpeg works.
                 facts: crate::capability::MachineFacts {

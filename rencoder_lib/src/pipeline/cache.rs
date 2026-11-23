@@ -37,6 +37,13 @@ pub fn cache_from_resolution(resolution: &nvenc::Resolution) -> EncoderCache {
 #[derive(Debug)]
 pub struct CacheInit {
     pub cache: Result<EncoderCache, EncodeError>,
+    /// The resolution the cache came from, when there was one.
+    ///
+    /// The actor needs it to **arrange the persistence** (design doc
+    /// §3.10.6 step 5): the probe does not write the capability
+    /// record, the publisher does -- so an older probe's result
+    /// cannot overwrite a newer record on disk.
+    pub resolution: Option<nvenc::Resolution>,
     /// The facts this resolution produced: can ffmpeg run, and what
     /// can NVENC do (design doc §3.10.7).
     ///
@@ -55,6 +62,7 @@ pub fn cache_init_from_resolution(resolution: &nvenc::Resolution) -> CacheInit {
     CacheInit {
         cache: Ok(cache_from_resolution(resolution)),
         facts: MachineFacts::from_resolution(resolution),
+        resolution: Some(resolution.clone()),
     }
 }
 
@@ -82,13 +90,20 @@ where
     std::thread::Builder::new()
         .name("renencoder-cache-init".into())
         .spawn(move || {
-            let init = match nvenc::resolve_and_store_with(path.as_deref(), false, runner) {
-                Ok(resolution) => cache_init_from_resolution(&resolution),
-                Err(e) => CacheInit {
-                    cache: Err(e),
-                    facts: MachineFacts::ffmpeg_broken(),
-                },
-            };
+            // The probe only -- the **store** is the publisher's job
+            // (design doc §3.10.6 step 5): the actor publishes the
+            // result and arranges the persistence, so an older
+            // probe's result cannot overwrite a newer record.
+            let init =
+                match nvenc::resolve_with_clock(path.as_deref(), false, runner, chrono::Utc::now())
+                {
+                    Ok(resolution) => cache_init_from_resolution(&resolution),
+                    Err(e) => CacheInit {
+                        cache: Err(e),
+                        facts: MachineFacts::ffmpeg_broken(),
+                        resolution: None,
+                    },
+                };
             // Block on the send until the consumer picks up. With
             // sync_channel(1), the first send succeeds (buffer slot
             // empty); subsequent sends would fail because the
@@ -210,6 +225,20 @@ Encoders:
             result.facts.nvenc.is_some(),
             "the capability summary must ride along"
         );
+        // The init **probes**; the publisher stores (design doc
+        // §3.10.6 step 5). The resolution rides along so the actor
+        // can arrange the persistence -- an older probe's result must
+        // not overwrite a newer record on disk.
+        let resolution = result
+            .resolution
+            .expect("the resolution must ride along with the cache");
+        assert!(
+            !record_path.exists(),
+            "the init must not write the record: {}",
+            record_path.display()
+        );
+        // The publisher's write: it lands in the path the caller gave.
+        nvenc::store_resolution(Some(record_path.as_path()), &resolution, chrono::Utc::now());
         assert!(
             record_path.exists(),
             "the record must land in the path the caller gave: {}",
