@@ -2403,6 +2403,7 @@ UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `int
 | `analyzer/records.rs` | `AnalyzeProgress` struct + `AnalyzedFile { path, outcome: FileOutcome }` + `FileOutcome { Ok, ProbeFailed(EncodeError) }` | U22：进度回调 payload。`AnalyzedFile` 是新 type（不复用 `AnalysisRecord`——后者没有 `ProbeFailed` outcome 字段，复用得加 `error: Option<_>` 污染 success path）|
 | `job.rs` | `Command::Analyze { files }` arm | U22：调用 `analyze_records_with_probe_and_progress_parallel` with `probe = probe_video_metadata_auto`，`progress = |p| evt_tx.send(Event::AnalyzeProgress { ... })`。先发 `AnalyzeStarted { total }`，批结束发 `AnalyzeFinished`。**走** busy-gate（v1 限制——UI 不能同时跑 analyze + encode；analyze 是 read-only，理论上可与 encode 并存，但 v1 简化起见跟 DryRun 一致复用 busy-gate）|
 | `job.rs` | `Event::AnalyzeStarted` / `Event::AnalyzeProgress` / `Event::AnalyzeFinished` | U22：见 §3.8.3。`Event::AnalyzeProgress` 在 mock actor 里是 no-op（test seam，ref-count 即可）|
+| `job.rs` | `PublishedState` + `Capability::generation()` | actor 发布的"这一代答案"：编码器缓存与能力对象**一起**发布、一起被批次取用（§3.10.6 步骤 5）——批次等缓存落地，也就等到了已发布的能力，不会拿着空能力开跑 |
 | `job.rs` | `Event::CommandRejected { request_id, reason }` | 命令被拒（闸门拒绝等）——良性，**不是** fatal：UI 弹一条 toast 即可，正在跑的那批不受影响；`request_id` 说明是哪一个请求被拒，UI 据此恢复原状态（§3.11.3）|
 | `job.rs` | `Request { id, command }` + `RequestId` | 通道上跑的是"命令 + 提交方的号"——答复（接纳/拒绝）指名道姓，UI 才知道该恢复哪个状态（§3.11.3）|
 | `job.rs` | `Event::CommandAccepted { request_id, batch_id }` | 接纳的答复：请求号 + 它开启的批次号——UI 的 `Starting` 相位由它推动（§3.11.3）|
@@ -3706,8 +3707,8 @@ anyhow = "1"
 | busy 闸门（单批次） | actor | actor | **无锁**——actor 本地 `bool`（批次在 worker 上跑之后，闸门只有 actor 读写） |
 | 批次完成信号 | worker | actor | 通道 `bounded(1)`——回话走通道，不共享可变状态 |
 | 降级回报通道 | worker（发现降级时） | worker 自己收，批次结束时并进 done 信号 | 通道（无界） |
-| 编码器缓存（**可替换**） | 初始化线程 / nv 变化时的刷新线程 | worker（等初始化落地后取一张快照） | `Arc<Mutex<Option<CacheSlot>>>` |
-| NVENC 能力对象（检查结论 + 本次运行内的修正） | worker（发现降级时）/ actor（汇总） | `select_encoder`（选编码器时） | **无锁**——持有者独占：actor 持权威副本，每批给 worker 一份快照，修正经 done 通道回报 |
+| 已发布状态（编码器缓存 + 能力对象，**可替换**） | actor（唯一的发布者） | worker（等发布落地后取一份快照） | `Arc<Mutex<Option<PublishedState>>>`——两者是**同一次探测的答案**，一起发布、一起被取用（§3.10.6 步骤 5） |
+| NVENC 能力对象（检查结论 + 本次运行内的修正） | actor（发布）/ worker（发现降级时，经 done 通道回报） | `select_encoder`（选编码器时） | **无锁**——持有者独占：actor 持权威副本（带代次），每批给 worker 一份快照 |
 | 丢弃事件计数 | 各发送方自己 | 只有它自己 | 每个发送方一个 `DropCounter`——不再跨发送方共享 |
 | 日志文件写入 | tracing sink | 各线程的日志 | `Mutex<Inner>`（`std::sync`）——**序列化 IO 的例外**，见规则 2 |
 | UI 日志接收端 | `tracing_init::init` | UI 的 use_hook | `OnceLock<Receiver<String>>`（只写一次） |
@@ -3719,8 +3720,8 @@ anyhow = "1"
 |---|---|---|---|
 | actor | `start_controller` | 处理 Command、发 Event、起 worker | 进程 |
 | 批次 worker | actor（`StartBatch` / `DryRun` / `Analyze`） | 跑一批文件（`TaskManager::run` 的同步循环） | 一批，结束即退 |
-| 缓存初始化 | `start_controller` | `ffmpeg -encoders` + NVENC 能力解析 | 一次，结束即退 |
-| NVENC 探测 | `Command::Detect` / nv 变化 | 能力实测 + 写记录 | 一次，结束即退 |
+| 缓存初始化 | `start_controller` | `ffmpeg -encoders` + NVENC 能力解析 → **结果交给 actor** | 一次，结束即退 |
+| NVENC 探测 | `Command::Detect` / nv 变化 | 能力实测 → **结果交给 actor**（落盘由 actor 安排） | 一次，结束即退 |
 | stderr 读取 | 每次 ffmpeg | 收集 stderr 尾部（有上限） | 随 ffmpeg 子进程 |
 | signal 监听 | `install_handler` | 收 SIGINT/TERM/HUP → 清理半成品 | 进程 |
 | UI 事件泵 | `App()` 的 use_hook | 阻塞 `recv()` → `state.with_mut` | 进程 |
@@ -4037,7 +4038,7 @@ Capability {
 |---|---|---|
 | 解析（`nvenc::resolve_and_store*`） | —— | 产出它（整条链唯一的一次检查） |
 | `BatchContext` | 一份 | 选型读它；回退写它 |
-| actor | 权威副本 | 每批给 worker 一份快照，worker 的修改回报回来合并 |
+| actor | 权威副本（**带代次**） | 发布每次探测的结果（只有最新的一次算数，§3.10.6 步骤 5）；每批给 worker 一份快照，worker 的修改回报回来合并 |
 | CLI / GUI | 一份 | 显示（`lines()`、`review_advisory()`） |
 
 **读它的三条规则**：

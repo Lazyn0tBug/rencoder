@@ -157,6 +157,19 @@ pub struct Capability {
     probed_at: Option<DateTime<Utc>>,
     review_due: bool,
     verdicts: CapabilityVerdicts,
+    /// Which publication this capability is (design doc §3.10.6
+    /// step 5).
+    ///
+    /// The generation is what makes "publish" mean something: two
+    /// capability snapshots are comparable only if we can say which
+    /// is newer. `0` = never published (a capability built by hand --
+    /// the CLI's one-shot resolution, a test fixture).
+    ///
+    /// It rides along with the capability so every copy says which
+    /// publication it came from: the batch's snapshot, the worker's
+    /// report, the actor's authoritative copy.
+    #[serde(default)]
+    generation: u64,
 }
 
 impl Capability {
@@ -183,6 +196,9 @@ impl Capability {
             probed_at,
             review_due,
             verdicts: CapabilityVerdicts::default(),
+            // Never published: the publisher stamps the generation
+            // (design doc §3.10.6 step 5).
+            generation: 0,
         }
     }
 
@@ -253,6 +269,22 @@ impl Capability {
     /// The runtime corrections, mutably -- the fallback writes here.
     pub fn verdicts_mut(&mut self) -> &mut CapabilityVerdicts {
         &mut self.verdicts
+    }
+
+    /// Which publication this capability is (design doc §3.10.6
+    /// step 5). `0` = never published.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Stamp the publication this capability is.
+    ///
+    /// The **publisher** stamps it -- the actor, which owns the
+    /// published generation (design doc §3.10.6 step 5). A candidate
+    /// that nobody published has no generation: it is not yet an
+    /// answer the chain may act on.
+    pub fn with_generation(self, generation: u64) -> Self {
+        Self { generation, ..self }
     }
 
     /// One line per encoder, same wording for every frontend.
@@ -495,6 +527,32 @@ where
     })
 }
 
+/// Store the resolution's record, when it is worth storing.
+///
+/// Split out of [`resolve_and_store_with_clock`]: the GUI actor
+/// probes on a worker thread and **publishes** the result itself
+/// (design doc §3.10.6 step 5), so the write belongs to the
+/// publisher -- an older probe's result must not overwrite a newer
+/// record on disk.
+///
+/// A store failure is not fatal: the capability is still usable for
+/// this run, it just will not be reused next time.
+pub fn store_resolution(path: Option<&Path>, resolution: &Resolution, now: DateTime<Utc>) {
+    let Some(record) = record_to_store(resolution, now) else {
+        return;
+    };
+    let Some(path) = path else {
+        return;
+    };
+    if let Err(e) = save(path, &record) {
+        tracing::warn!(
+            error = %e,
+            path = %path.display(),
+            "could not store the NVENC capability record"
+        );
+    }
+}
+
 /// Resolve the capability and store the result when it is new.
 ///
 /// Two write cases:
@@ -547,16 +605,8 @@ where
     let mut resolution = resolve_with_clock(path, force, runner, now)?;
     if let Some(record) = record_to_store(&resolution, now) {
         resolution.record = record.clone();
-        if let Some(path) = path {
-            if let Err(e) = save(path, &record) {
-                tracing::warn!(
-                    error = %e,
-                    path = %path.display(),
-                    "could not store the NVENC capability record"
-                );
-            }
-        }
     }
+    store_resolution(path, &resolution, now);
     Ok(resolution)
 }
 
