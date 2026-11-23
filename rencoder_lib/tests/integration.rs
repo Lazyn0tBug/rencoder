@@ -336,20 +336,30 @@ fn actor_cancel_aborts_the_batch_and_removes_the_partial_output() {
         ..Default::default()
     };
     cmd_tx
-        .send(rencoder_lib::job::Command::StartBatch {
-            params,
-            files: vec![rencoder_lib::types::InputPath::new(&input).unwrap()],
-        })
+        .send(rencoder_lib::job::Request::new(
+            1,
+            rencoder_lib::job::Command::StartBatch {
+                params,
+                files: vec![rencoder_lib::types::InputPath::new(&input).unwrap()],
+            },
+        ))
         .unwrap();
 
-    // Wait for the encode to actually start.
+    // Wait for the encode to actually start -- and learn the batch
+    // id (the cancel names it, design doc §3.11.3).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut batch_id = None;
     loop {
         let remaining = deadline
             .checked_duration_since(std::time::Instant::now())
             .expect("timed out waiting for the encode to start");
         match evt_rx.recv_timeout(remaining) {
-            Ok(rencoder_lib::job::Event::Progress { .. }) => break,
+            Ok(rencoder_lib::job::Event::BatchStarted { id, .. }) => batch_id = Some(id),
+            Ok(rencoder_lib::job::Event::Progress { .. }) => {
+                if batch_id.is_some() {
+                    break;
+                }
+            }
             Ok(rencoder_lib::job::Event::Error { message, .. }) => {
                 panic!("encode failed before it started: {message}")
             }
@@ -357,8 +367,14 @@ fn actor_cancel_aborts_the_batch_and_removes_the_partial_output() {
             Err(e) => panic!("no progress event: {e}"),
         }
     }
+    let batch_id = batch_id.expect("the batch must announce its id");
 
-    cmd_tx.send(rencoder_lib::job::Command::Cancel).unwrap();
+    cmd_tx
+        .send(rencoder_lib::job::Request::new(
+            2,
+            rencoder_lib::job::Command::Cancel { batch_id },
+        ))
+        .unwrap();
 
     // The batch must end as cancelled -- not as "completed with one
     // failed file".
@@ -366,7 +382,9 @@ fn actor_cancel_aborts_the_batch_and_removes_the_partial_output() {
     let mut outcome = None;
     while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
         match evt_rx.recv_timeout(remaining) {
-            Ok(rencoder_lib::job::Event::BatchCancelled { completed, total }) => {
+            Ok(rencoder_lib::job::Event::BatchCancelled {
+                completed, total, ..
+            }) => {
                 outcome = Some((completed, total));
                 break;
             }

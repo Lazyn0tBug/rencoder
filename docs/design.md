@@ -2132,13 +2132,24 @@ UI actor (Dioxus)  ──Command──►  lib actor (BatchController bg thread)
 **Command（UI → lib）**
 
 ```rust
+/// 命令 + 提交方给的请求号（§3.11.3）。通道上跑的是 `Request`，不是
+/// `Command`：每个命令都有号，lib 的"接纳 / 拒绝"才能指名道姓地回答
+/// "我哪一个请求被拒了"。
+pub struct Request {
+    id: RequestId,
+    command: Command,
+}
+
 #[non_exhaustive]
 pub enum Command {
     StartBatch { params: EncodeParams, files: Vec<PathBuf> },
-    /// 中止当前批（包括正在处理的单文件）：等效于 SIGINT 但由 UI 触发。
-    /// 单文件跳过不暴露——用户要么让当前文件跑完，要么按 Cancel 中整批。
+    /// 中止 `batch_id` 那一批（包括正在处理的单文件）：等效于 SIGINT 但由
+    /// UI 触发。单文件跳过不暴露——用户要么让当前文件跑完，要么按 Cancel
+    /// 中整批。
+    /// **必须点名批次**（§3.11.3）：点了别的批次（过期的一次取消）就被拒，
+    /// 不会误伤现在正在跑的那批。
     /// **不**影响 `Command::Analyze` 批（v1 限制——见 §3.4 "分析进度上报"）。
-    Cancel,
+    Cancel { batch_id: BatchId },
     /// 从 `<app_dir>/data/encoding-*.parquet` 回读历史。
     /// - `limit`：返回最多 N 条最新记录；`None` 表示全部
     /// - `after`：仅返回 `started_at >= after` 的记录；`None` 表示不限时间
@@ -2173,25 +2184,40 @@ pub enum Command {
 ```rust
 #[non_exhaustive]
 pub enum Event {
+    // Request topic（命令的答复）
+    /// lib 接纳了这个请求：`request_id` 是提交方给的号，`batch_id` 是它开
+    /// 启的批次（非批次命令为 None）。UI 的 `Starting` 相位由**这个**事件
+    /// 推动——入队只说明"命令在路上"，接纳才说明"lib 收下了"。
+    CommandAccepted { request_id: RequestId, batch_id: Option<BatchId> },
+    /// 命令被拒（良性）：闸门拒绝、守卫拒绝、过期取消……
+    /// `request_id` 说明**哪一个**请求被拒，UI 才能把状态放回原样。
+    CommandRejected { request_id: RequestId, reason: String },
+
     // Lifecycle topic（低频，批级 / 文件级）
+    // 每个批次事件都带 `batch_id`（§3.11.3）：UI 靠它把事件对回批次，
+    // 上一批的迟到事件不会污染现在这一批。
     BatchStarted { id: u64, total_files: usize },
-    FileStarted { index: usize, total: usize, source: PathBuf },
-    FileCompleted { index: usize, record: EncodingRecord },
-    BatchCompleted { records: Vec<EncodingRecord> },
+    FileStarted { batch_id: u64, index: usize, total: usize, source: PathBuf },
+    FileCompleted { batch_id: u64, index: usize, record: EncodingRecord },
+    BatchCompleted { batch_id: u64, records: Vec<EncodingRecord> },
     /// 由 `Command::Cancel` 或 SIGINT 触发：`completed` 是取消前已完成的文件数。
     /// partial 输出由 `PartialOutputHandle` 在 SIGINT 路径清理；Cancel 路径
     /// 沿用同一清理逻辑。
-    BatchCancelled { completed: usize, total: usize },
+    BatchCancelled { batch_id: u64, completed: usize, total: usize },
+    /// 这一批没能跑起来（守卫拒绝目标、编码器缓存不可用……）：**按批次**归
+    /// 档，只终结它自己（§3.11.3）。
+    BatchFailed { batch_id: u64, category: ErrorCategory, message: String },
 
     // Progress topic（高频，~2/sec/文件）
     Progress {
+        batch_id: u64,
         file_index: usize,
         frame: u64, fps: f64, speed: f64,
         time_secs: f64, eta_secs: Option<f64>,
     },
 
     // Log topic（中频，~10/sec）
-    LogLine { file_index: usize, line: String },
+    LogLine { batch_id: u64, file_index: usize, line: String },
 
     // State topic
     HistoryLoaded { records: Vec<EncodingRecord> },
@@ -2206,11 +2232,12 @@ pub enum Event {
     // Analyze topic (U22 / Tier 3 #9) —— 见 §3.4 "分析进度上报"
     /// `Command::Analyze` 接收后、第一个文件 probe 之前发。`total` =
     /// `files.len()`，给 UI 端一个清晰的"开始"信号和总数。
-    AnalyzeStarted { total: usize },
+    AnalyzeStarted { batch_id: u64, total: usize },
     /// 每个文件 probe 完成后发一次。`done` / `total` / `failed` 单调
     /// 递增；`last` 让 UI 能显示"刚完成哪个文件"（结果流，A 模式）。
     /// 顺序非确定（rayon worker race），UI 只看 `done` 计数。
     AnalyzeProgress {
+        batch_id: u64,
         done: usize,
         total: usize,
         failed: usize,
@@ -2219,6 +2246,7 @@ pub enum Event {
     /// 整批结束。`failed_count` 应等于 `records` 里 `outcome =
     /// ProbeFailed` 的行数（设计约束——UI 端可对账）。
     AnalyzeFinished {
+        batch_id: u64,
         records: Vec<AnalysisRecord>,
         failed_count: usize,
     },
@@ -2232,19 +2260,20 @@ pub enum Event {
     // signal that carries no reason. Revisit if the UI ever needs to
     // tell "the controller stopped" apart from "the UI closed".
 
-    // Rejection topic（命令被拒，但什么都没坏）
-    /// 命令被拒：闸门拒绝（已经有批在跑）、参数不合法这类**良性**拒绝。
-    /// 与 `Event::Error` 分开是必须的——`Error` 是 fatal-only，UI 收到它
-    /// 会把正在跑的那批 finalize 成 Done。一次良性的"重复 StartBatch 被拒"
-    /// 不该被当成"这批失败了"。
-    CommandRejected { reason: String },
-
     // Error topic（仅 fatal；per-file 失败走 EncodingRecord.error）
-    /// 仅 fatal 错误；payload 故意精简为 `(category, message)`。
+    /// **非批次**操作失败（保存配置、NVENC 探测……）：带 `RequestId`，
+    /// **不终结任何批次**——保存失败不该把用户正在看的那批 finalize 掉
+    /// （§3.11.3）。
+    OperationFailed {
+        request_id: RequestId,
+        category: ErrorCategory,
+        message: String,
+    },
+    /// fatal 错误，**无作用域**：actor 自己出了事（编码器缓存起不来）。
+    /// 触发时没有批次在跑，所以没有可终结的东西。
     ///
-    /// **作用域**：fatal 是"这一批 / 这个子系统出事了"，不是"有什么失败了"。
-    /// UI 收到它要能判断该不该动当前正在跑的那批——与批无关的 fatal
-    /// （例如配置保存失败）不能 finalize 活动任务（§3.11.3）。
+    /// 批次级失败走 `BatchFailed`（带批次号）；per-file 失败走
+    /// `EncodingRecord.error`（§3.11.3）。
     ///
     /// **不**携带 `ErrorContext.ffmpeg_stderr_tail`——大多数 fatal 类别
     /// (`ProbeFailed` / `EncoderSelectionFailed` / `FfmpegSpawnFailed` /
@@ -2374,7 +2403,10 @@ UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `int
 | `analyzer/records.rs` | `AnalyzeProgress` struct + `AnalyzedFile { path, outcome: FileOutcome }` + `FileOutcome { Ok, ProbeFailed(EncodeError) }` | U22：进度回调 payload。`AnalyzedFile` 是新 type（不复用 `AnalysisRecord`——后者没有 `ProbeFailed` outcome 字段，复用得加 `error: Option<_>` 污染 success path）|
 | `job.rs` | `Command::Analyze { files }` arm | U22：调用 `analyze_records_with_probe_and_progress_parallel` with `probe = probe_video_metadata_auto`，`progress = |p| evt_tx.send(Event::AnalyzeProgress { ... })`。先发 `AnalyzeStarted { total }`，批结束发 `AnalyzeFinished`。**走** busy-gate（v1 限制——UI 不能同时跑 analyze + encode；analyze 是 read-only，理论上可与 encode 并存，但 v1 简化起见跟 DryRun 一致复用 busy-gate）|
 | `job.rs` | `Event::AnalyzeStarted` / `Event::AnalyzeProgress` / `Event::AnalyzeFinished` | U22：见 §3.8.3。`Event::AnalyzeProgress` 在 mock actor 里是 no-op（test seam，ref-count 即可）|
-| `job.rs` | `Event::CommandRejected { reason }` | 命令被拒（闸门拒绝等）——良性，**不是** fatal：UI 弹一条 toast 即可，正在跑的那批不受影响（§3.8.7.6）|
+| `job.rs` | `Event::CommandRejected { request_id, reason }` | 命令被拒（闸门拒绝等）——良性，**不是** fatal：UI 弹一条 toast 即可，正在跑的那批不受影响；`request_id` 说明是哪一个请求被拒，UI 据此恢复原状态（§3.11.3）|
+| `job.rs` | `Request { id, command }` + `RequestId` | 通道上跑的是"命令 + 提交方的号"——答复（接纳/拒绝）指名道姓，UI 才知道该恢复哪个状态（§3.11.3）|
+| `job.rs` | `Event::CommandAccepted { request_id, batch_id }` | 接纳的答复：请求号 + 它开启的批次号——UI 的 `Starting` 相位由它推动（§3.11.3）|
+| `job.rs` | `Event::BatchFailed { batch_id, .. }` / `Event::OperationFailed { request_id, .. }` | 两级失败作用域：批次级（只终结那一批）与非批次级（什么都不终结）（§3.11.3）|
 | `data/store.rs` | `read_records(path)` | 单 Parquet 文件回读(v1 不使用,v1.1 启用) |
 | `encoder/ffmpeg_arg.rs` | `ExtraArg` enum + `ExtraArg::parse` factory + char-class 模块 | 类型级 ffmpeg argv 安全边界(§3.3.7)——非法 argv 在 parse 阶段被拒,运行时无法塞 unsafe 值。替换 v1 的 runtime `validate_extra_args` |
 | `config/app.rs` | `EncodersConfig::for_format` | 按格式取编码器覆盖；空字符串视为未设（否则 `has_encoder("")` 恒真） |
@@ -4249,6 +4281,16 @@ worker 拿不到时**这一批开不了工** ✅ ✅ → 终态错误事件 ✅ 
 - 生命周期、命令确认和结果可靠传递，进度可以合并或丢弃。进度背压不得阻塞取消入口或子进程监督。每批只有一个终态。
 - 文件失败进入文件记录，批次级失败进入匹配批次的终态，配置保存等非批次操作用带 `RequestId` 的独立失败事件。UI 根据事件类型和标识处理，无需解析错误文案。
 
+**协议形状**（§3.8.3 是代码草图，这里是规则）：
+
+- 通道上跑的是 `Request { id, command }`——`Command` 只说"做什么"，`Request` 额外说"我是谁"。命令的答复（`CommandAccepted` / `CommandRejected`）必须带上这个号，否则 UI 无法分辨自己哪一个请求被拒。
+- **三种作用域，三种事件**：批次级失败走 `BatchFailed { batch_id }`（只终结那一批）；非批次操作失败走 `OperationFailed { request_id }`（什么都不终结）；actor 自己的 fatal 走 `Error`（无作用域）。per-file 失败**不是** fatal——它在记录的 `error` 字段里（§3.8.3）。
+- **批次号是事件的地址**：每个批次事件带 `batch_id`，UI 只把当前批次的号对上才动状态。上一批的迟到事件（它的文件序号在当前批次里另有所指）落到别的批次上，就是数据损坏。
+- **取消要点名**：取消请求带 `batch_id`；lib 只取消匹配的活动批次，点错批次（过期的一次取消）被当作良性拒绝——它绝不能停掉现在正在跑的那批。
+- **相位跟着答复走**：入队不是接纳。`Starting` 等 `CommandAccepted`（接纳 → `Encoding`；拒绝 → 恢复提交前的相位），`Cancelling` 等匹配批次的终态（`BatchCancelled` → `Cancelled`）。批次还没被接纳时没有批次号，取消无从点名——那扇门关着是对的。
+- **终态在释放名额之后发布**：worker 先交还运行名额，再发终态事件。UI 一收到确认就能直接重启；反过来（先发终态后放名额），UI 的"重启"会输给 actor 的闸门，被当成"已经有批在跑"拒掉。
+- **每批只有一个终态**：完成、取消、失败三选一，终态带批次号，UI 据此收尾。
+
 #### 3.11.4 结果：保留已完成工作
 
 批次执行返回 `BatchReport<R> { records, termination }`（`R` 是记录元素类型，编码批为 `EncodingRecord`）。`termination` 区分 `Completed`、`Cancelled` 和 `Failed(error)`。逐文件错误写入记录，允许其余文件继续。任何终态都保留已完成文件的记录，由 CLI 和 GUI 按同一规则保存。执行层组装唯一的报告，CLI 直接消费，actor 以该报告生成带批次 ID 的终态事件。未开始的任务不计为完成，正常处理完毕的失败文件计为完成但不计为成功。
@@ -4424,7 +4466,7 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 74 | 缝 = 单方法 trait `FileEncoder`（`&self`，可跨批共享）+ 注入的 `ActorEnv`；测试替身驱动**同一个** actor，协议只有一份实现（mock actor 删除，-280 行） | ✅ |
 | 75 | `nvenc::resolve_and_store_with`：探测与落盘一起换掉 runner——否则测试会把 NVENC 记录写进开发者的真实 app 目录 | ✅ |
 | 76 | 闸门拒绝走 `Event::CommandRejected`（良性），不再复用 fatal-only 的 `Event::Error`——否则 UI 会把正在跑的那批 finalize 成 Done | ✅ |
-| 77 | 任务模型与执行契约（§3.11） | future |
+| 77 | 任务模型与执行契约（§3.11）——剩**能力代次**（§3.10.6 步骤 5 ✅ ✅）：探测请求序号 ✅ ✅、已发布代次 ✅ ✅、批次冻结代次 ✅ ✅、旧代次的运行时修正不再继承 ✅ ✅ | future |
 | 78 | per-file 失败走 `EncodingRecord.error`，**不再**发 fatal-only 的 `Event::Error`（协议 §3.8.3 早就这么写，代码违反了两轮） | ✅ |
 | 79 | 编码器找不到 = 一个文件的失败（`Failed` record），不是 panic——GUI 不再卡死在 Analyzing，CLI 不再 exit 101 丢光记录 | ✅ |
 | 80 | partial-output 只在真的要写输出时登记——信号处理器不会删掉上一轮已完成的文件 | ✅ |
@@ -4449,6 +4491,7 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 97 | **路径写进配置**（§3.6）：`[paths]` 段覆盖各路径，优先级 = 入口显式值（env / CLI）> 文件显式值 > 内建默认值；配置文件自身的位置仍由 `--config` / `$RENENCODER_CONFIG` 决定 | ✅ |
 | 98 | **路径一处决定**（§3.6）：lib 的 `config::paths::Paths` 一次解析出全部路径，前端不再各自现算；操作目录里的应用文件（`cancel`、`capabilities.json`）按名字跳过，不被当成输入 | ✅ |
 | 99 | **单例守卫**（§3.11.1.1）：范围是一棵目录树（自己 ✅ ✅、祖先 ✅ ✅、后代 ✅ ✅）；互斥交给内核文件锁 ✅ ✅（进程死了内核放锁 ✅ ✅、取得占用是原子的 ✅ ✅、不需要 pid 判活 ✅ ✅）；标记只记 pid 与开始时刻 ✅ ✅，用完就删 ✅ ✅（先删名字后放锁 ✅ ✅）；冲突整趟拒绝 ✅ ✅，文件系统不支持锁则报错拒绝这一趟 ✅ ✅；GUI 空闲不占 ✅ ✅（只在会写产物的批次期间持有 ✅ ✅） | ✅ |
+| 104 | **GUI 命令协议**（§3.11.3）：通道上跑 `Request { id, command }` ✅ ✅（答复指名道姓 ✅ ✅）；`CommandAccepted` / `CommandRejected` 回传请求号 ✅ ✅，接纳时绑定批次号 ✅ ✅；所有批次事件带 `BatchId` ✅ ✅（上一批的迟到事件污染不到当前批 ✅ ✅）；`Cancel { batch_id }` 只影响匹配的活动批次 ✅ ✅（过期取消被拒 ✅ ✅）；三级失败作用域：批次级 `BatchFailed` ✅ ✅ / 非批次级 `OperationFailed` ✅ ✅ / 无作用域 `Error` ✅ ✅；per-file 失败**不再**发 fatal 事件 ✅ ✅（它在记录的 `error` 里 ✅ ✅）；UI 相位 `Starting` / `Cancelling` ✅ ✅（相位跟着答复走 ✅ ✅，拒绝恢复原状态 ✅ ✅）；终态在释放运行名额**之后**发布 ✅ ✅（UI 收到确认即可重启 ✅ ✅）| ✅ |
 | 103 | **任务类型收紧 + 统一构造入口**（§3.11.1 ✅ ✅）：`EncodeTask` 的输出不再是可选项 ✅ ✅（`Option<PathBuf>` 让每个读者都问"这是不是分析？" ✅ ✅），分析有自己的 `AnalyzeTask` ✅ ✅；编码与预演共用 `pipeline::batch::encode_tasks` ✅ ✅（任务与输出名只有一处产生 ✅ ✅）；预演的记录说 `Ready` ✅ ✅，不说 `Succeeded` ✅ ✅ | ✅ |
 | 102 | **启动期可取消**（§3.11.2）：采集每 64 个条目查一次取消令牌 ✅ ✅；NVENC 探测走 ffmpeg 调用那道缝 ✅ ✅、每次调用前查一次 ✅ ✅；取消发生在开工前 ✅ ✅ → 不产出任何东西 ✅ ✅，退出码 130 ✅ ✅ | ✅ |
 | 101 | **批内输出规划**（§3.11.1）：两个输入指向同一输出时**改名**而不是整批终止 ✅ ✅ —— `<词干>_<输入扩展名>_<序号>.<目标扩展名>` ✅ ✅；序号按排序后的路径分配 ✅ ✅（名字不随采集顺序变 ✅ ✅）；输出不落在任何输入上 ✅ ✅ | ✅ |
