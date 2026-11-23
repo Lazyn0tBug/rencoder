@@ -266,6 +266,37 @@ impl TempDir {
     }
 }
 
+/// A fresh, uniquely named temporary directory, as a path.
+///
+/// The name carries the pid, a counter and the clock, so two tests --
+/// or two concurrent test runs -- never share one. A **shared** temp
+/// path is a race: one run removes the file the other is about to
+/// read, and the failure looks like a product bug.
+///
+/// Unlike [`TempDir`] there is no guard: the directory stays until
+/// the machine cleans the temp dir. These helpers are for the tests
+/// that want a plain path, not a lifetime-bound fixture.
+pub fn unique_temp_dir(label: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let path = std::env::temp_dir().join(format!(
+        "rencoder_{label}_{}_{n}_{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&path).expect("create temp dir");
+    path
+}
+
+/// A fresh, uniquely named path for a file (the file need not
+/// exist). See [`unique_temp_dir`] for why the name must be unique.
+pub fn unique_temp_file(label: &str) -> PathBuf {
+    unique_temp_dir(label).join("config.toml")
+}
+
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);

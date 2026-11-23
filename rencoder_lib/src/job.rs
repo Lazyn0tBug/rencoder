@@ -1860,7 +1860,6 @@ fn run_actor(
                     // older one must not overwrite a newer snapshot
                     // -- or a newer record on disk.
                     if probed.seq >= published_probe_seq {
-                        published_probe_seq = probed.seq;
                         let ProbeResult {
                             request_id,
                             outcome,
@@ -1937,6 +1936,15 @@ fn run_actor(
                                 }
                             }
                             None => {
+                                // The sequence advances **only when a
+                                // result is actually published**: a
+                                // failed probe produced nothing, so it
+                                // supersedes nothing. Otherwise a
+                                // failed re-probe would discard the
+                                // startup's still-pending result --
+                                // and with it the encoder cache the
+                                // batches wait for.
+                                published_probe_seq = probed.seq;
                                 // Publish: this snapshot gets the
                                 // next generation.
                                 let published = outcome
@@ -2200,6 +2208,14 @@ fn run_actor(
                 // A dry run never encodes, so it cannot change the
                 // capability -- it only reads it. It reads the
                 // published one, like every other batch.
+                //
+                // A dry run is a batch of its own: it takes a
+                // **fresh** cancel token. The token is shared with
+                // `Command::Cancel` (which cancels whatever is
+                // current), so inheriting the previous batch's
+                // token would let an old cancel abort this dry run
+                // before it started.
+                cancel_token = CancelToken::new();
                 let cancel_for_worker = cancel_token.clone();
                 // The dry run is a batch too: it gets a batch id, so
                 // its events can be matched (design doc §3.11.3).
@@ -2956,6 +2972,17 @@ mod mock_tests {
                 )
             })
             .collect()
+    }
+
+    /// The next capability publication, skipping the other events.
+    fn next_capability_event(rx: &Receiver<Event>) -> Capability {
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(Event::NvencCapability(capability)) => return capability,
+                Ok(_) => continue,
+                Err(e) => panic!("no capability event: {e}"),
+            }
+        }
     }
 
     /// Drain events until the batch's **terminal event**, the sender
@@ -4444,6 +4471,15 @@ mod mock_tests {
             runner,
         );
 
+        // The startup's publication comes first, and it is
+        // **deterministic**: no probe has been sent yet, so nothing
+        // can supersede it. (Sending the probes first let the
+        // newer probe win, and the startup's result was then dropped
+        // by the sequence check -- the test's assumption, not the
+        // product's behaviour, was wrong.)
+        let startup = next_capability_event(&evt_rx);
+        assert_eq!(startup.generation(), 1, "the startup publishes first");
+
         // The first probe: it blocks.
         cmd_tx
             .send(Request::new(1, Command::Detect { force: true }))
@@ -4453,25 +4489,19 @@ mod mock_tests {
             .send(Request::new(2, Command::Detect { force: true }))
             .unwrap();
 
-        // Wait for the second probe's publication (the second
-        // `NvencCapability` event: the startup one is the first).
-        let mut published = Vec::new();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while published.len() < 2 {
-            let remaining = deadline
-                .checked_duration_since(std::time::Instant::now())
-                .expect("timed out waiting for the publications");
-            match evt_rx.recv_timeout(remaining) {
-                Ok(Event::NvencCapability(capability)) => published.push(capability.generation()),
-                Ok(_) => continue,
-                Err(e) => panic!("no capability event: {e}"),
-            }
-        }
-        // Let the first probe finish.
+        // The second probe's publication: it is the newer one.
+        let newer = next_capability_event(&evt_rx);
+        assert_eq!(
+            newer.generation(),
+            2,
+            "the newer probe publishes the next generation"
+        );
+
+        // Let the first probe finish: its result is the older one.
         release.store(true, std::sync::atomic::Ordering::SeqCst);
 
-        // Give the dropped result time to arrive (and be dropped).
-        let extra = collect_events(&evt_rx, std::time::Duration::from_millis(500));
+        // It must not publish: the sequence check drops it.
+        let extra = collect_events(&evt_rx, std::time::Duration::from_secs(2));
         let extra_publications = extra
             .iter()
             .filter(|e| matches!(e, Event::NvencCapability(_)))
@@ -4479,11 +4509,6 @@ mod mock_tests {
         assert_eq!(
             extra_publications, 0,
             "the older probe's result must not publish: {extra:?}"
-        );
-        assert_eq!(
-            published,
-            vec![1, 2],
-            "exactly two publications: the startup one and the newer probe"
         );
     }
 

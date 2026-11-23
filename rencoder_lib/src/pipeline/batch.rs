@@ -1683,7 +1683,7 @@ Encoders:
             eprintln!("skipping: ffmpeg not available");
             return;
         }
-        let dir = std::env::temp_dir().join("rencoder_reexists");
+        let dir = crate::test_support::unique_temp_dir("reexists");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let input = make_video(&dir, "input.mp4");
@@ -1715,7 +1715,7 @@ Encoders:
     #[test]
     fn fails_when_input_and_output_are_the_same_file() {
         // Same-file guard: ffmpeg must never be pointed at the source.
-        let dir = std::env::temp_dir().join("rencoder_same_path");
+        let dir = crate::test_support::unique_temp_dir("same_path");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let input = dir.join("movie.mkv");
@@ -1749,7 +1749,7 @@ Encoders:
         // The stored capability was stale: the NVENC encode fails. The
         // file must be re-encoded with the software encoder instead of
         // being reported as a failure.
-        let dir = std::env::temp_dir().join("rencoder_batch_nvenc_fallback");
+        let dir = crate::test_support::unique_temp_dir("batch_nvenc_fallback");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let input = dir.join("in.mp4");
@@ -1843,7 +1843,7 @@ Encoders:
         let mut capability = Capability::default();
         capability.verdicts_mut().set("usable_nvenc", true);
 
-        let dir = std::env::temp_dir().join("rencoder_batch_nvenc_usable");
+        let dir = crate::test_support::unique_temp_dir("batch_nvenc_usable");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let input = dir.join("in.mp4");
@@ -1912,7 +1912,7 @@ Encoders:
         let mut capability = Capability::default();
         capability.verdicts_mut().set("bothfail_nvenc", false);
 
-        let dir = std::env::temp_dir().join("rencoder_batch_nvenc_both_fail");
+        let dir = crate::test_support::unique_temp_dir("batch_nvenc_both_fail");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let input = dir.join("in.mp4");
@@ -1983,7 +1983,7 @@ Encoders:
         // Mock run_ffmpeg failure: ffmpeg spawn fails because the program
         // path is invalid. We use a fake argv with a non-existent program
         // to force a spawn error.
-        let dir = std::env::temp_dir().join("rencoder_batch_fail");
+        let dir = crate::test_support::unique_temp_dir("batch_fail");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let input = dir.join("in.webm");

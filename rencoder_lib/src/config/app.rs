@@ -707,8 +707,7 @@ mod tests {
 
     #[test]
     fn parses_minimal_toml() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("rencoder_minimal.toml");
+        let path = crate::test_support::unique_temp_file("minimal");
         std::fs::write(&path, "[encode]\nformat = \"av1\"\n").unwrap();
         let cfg = AppConfig::load(&path).unwrap();
         assert_eq!(
@@ -720,8 +719,7 @@ mod tests {
 
     #[test]
     fn invalid_max_fps_rejected() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("rencoder_bad_fps.toml");
+        let path = crate::test_support::unique_temp_file("bad_fps");
         std::fs::write(&path, "[encode]\nmax_fps = 15\n").unwrap();
         let err = AppConfig::load(&path).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidValue { .. }));
@@ -730,8 +728,7 @@ mod tests {
 
     #[test]
     fn zero_bitrate_rejected() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("rencoder_zero_bitrate.toml");
+        let path = crate::test_support::unique_temp_file("zero_bitrate");
         std::fs::write(&path, "[encode]\nbitrate = 0\n").unwrap();
         let err = AppConfig::load(&path).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidValue { .. }));
@@ -740,8 +737,7 @@ mod tests {
 
     #[test]
     fn unknown_keys_rejected() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("rencoder_unknown.toml");
+        let path = crate::test_support::unique_temp_file("unknown");
         std::fs::write(&path, "[encode]\nthis_is_a_typo = true\n").unwrap();
         assert!(AppConfig::load(&path).is_err());
         std::fs::remove_file(&path).ok();
@@ -752,8 +748,7 @@ mod tests {
         // U18 step 6: `crf: u32` with serde default = 45 (libsvtav1 medium).
         // A config that omits `crf` entirely must still load — the field
         // is non-Option with a default, so deserialization fills in 45.
-        let dir = std::env::temp_dir();
-        let path = dir.join("rencoder_crf_default.toml");
+        let path = crate::test_support::unique_temp_file("crf_default");
         std::fs::write(&path, "[encode]\nformat = \"av1\"\n").unwrap();
         let cfg = AppConfig::load(&path).expect("load should succeed");
         let enc = cfg.encode.as_ref().expect("encode section");
@@ -763,8 +758,7 @@ mod tests {
 
     #[test]
     fn crf_explicit_value_accepted() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("rencoder_crf_explicit.toml");
+        let path = crate::test_support::unique_temp_file("crf_explicit");
         std::fs::write(&path, "[encode]\ncrf = 25\n").unwrap();
         let cfg = AppConfig::load(&path).expect("load should succeed");
         assert_eq!(cfg.encode.unwrap().crf, 25);
@@ -775,8 +769,7 @@ mod tests {
     fn crf_zero_accepted_as_bitrate_sentinel() {
         // crf = 0 is the sentinel for bitrate mode (uses the `bitrate` field).
         // Validation must allow it; the runtime semantics are CLI-side.
-        let dir = std::env::temp_dir();
-        let path = dir.join("rencoder_crf_zero.toml");
+        let path = crate::test_support::unique_temp_file("crf_zero");
         std::fs::write(&path, "[encode]\ncrf = 0\nbitrate = 8000\n").unwrap();
         let cfg = AppConfig::load(&path).expect("load should succeed");
         assert_eq!(cfg.encode.unwrap().crf, 0);
@@ -787,8 +780,7 @@ mod tests {
     fn crf_out_of_range_rejected() {
         // libsvtav1 max is 63; values above are silently accepted by ffmpeg
         // but produce undefined behavior, so we reject them at load time.
-        let dir = std::env::temp_dir();
-        let path = dir.join("rencoder_crf_oor.toml");
+        let path = crate::test_support::unique_temp_file("crf_oor");
         std::fs::write(&path, "[encode]\ncrf = 64\n").unwrap();
         let err = AppConfig::load(&path).unwrap_err();
         match err {

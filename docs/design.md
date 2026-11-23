@@ -3707,6 +3707,9 @@ anyhow = "1"
 | `PartialOutputHandle`（当前输出路径） | CLI 每轮转码登记 / 清除 | CLI signal handler | `Arc<Mutex<Option<TaskContext>>>`（parking_lot）——**只有 CLI 路径用**；actor 路径的 cancel 分支自己删半成品，不需要它 |
 | `CancelToken` | actor（`Command::Cancel`） | worker（在飞行的 ffmpeg 上轮询） | `Arc<AtomicBool>`——**唯一正当的跨线程 bit**（§3.10.1.1） |
 | busy 闸门（单批次） | actor | actor | **无锁**——actor 本地 `bool`（批次在 worker 上跑之后，闸门只有 actor 读写） |
+| 命令通道 | UI | actor | 通道 `bounded(16)`——满了就丢（UI 报错并保留原状态 ✅ ✅）|
+| 事件通道 | actor / worker / rayon worker | UI | 通道 `bounded(1024)`——进度类满了就丢 ✅ ✅，结构性事件阻塞发送 ✅ ✅（宁可 actor 慢，也不能丢终态 ✅ ✅）|
+| 探测结果通道 | 探测线程（启动 / 重检） | actor | 通道（无界）——结果带请求序号 ✅ ✅，actor 只发布最新的那个 ✅ ✅ |
 | 批次完成信号 | worker | actor | 通道 `bounded(1)`——回话走通道，不共享可变状态 |
 | 降级回报通道 | worker（发现降级时） | worker 自己收，批次结束时并进 done 信号 | 通道（无界）——**回报带代次**，actor 只合并当前代的（§3.10.6 步骤 5） |
 | 已发布状态（编码器缓存 + 能力对象，**可替换**） | actor（唯一的发布者；运行期修正也由它合并回来） | worker（等发布落地后取一份快照） | `Arc<Mutex<Option<PublishedState>>>`——两者是**同一次探测的答案**，一起发布、一起被取用（§3.10.6 步骤 5） |
