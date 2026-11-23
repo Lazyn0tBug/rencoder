@@ -1627,8 +1627,8 @@ log "task N/M (source) interrupted" 而不是光秃秃的 path。同步把 `epri
   `rencoder_lib` 加 `publish = false`——明确"内部 lib，不要
   `cargo publish`"。
 - **lib 完成核心工作**：业务逻辑、配置加载、FFmpeg 命令构造全部在 `rencoder_lib`；
-  `rencoder_cli`（及未来的 GUI / Tauri）是 thin wrapper，只负责 args 解析 + 编排。
-  CLI / GUI / Tauri 共享同一份 `rencoder.toml`，UX 一致。
+  `rencoder_cli` 与 `rencoder_ui`（Dioxus desktop，§3.8）是 thin wrapper，只负责
+  args 解析 + 编排。CLI / GUI 共享同一份 `rencoder.toml`，UX 一致。
 - **运行时是单目录应用**：binary 自己 resolve 出父目录（`current_exe().parent()`），
   所有持久化状态（config / log / data）从 `<app_dir>` 派生。U17 的 `./rencoder.toml`
   / `./log/` / `./data/` CWD 相对路径不再是默认行为。
@@ -4365,27 +4365,18 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 
 ---
 
-## 7. 开发计划
+## 7. 现状
 
-| Phase | 内容 |
-|---|---|
-| 1 | 创建两个 crate，设置 workspace |
-| 2 | 实现核心库基础功能（错误类型、路径工具、数据结构） |
-| 3 | 实现元数据探测 + 帧率解析 |
-| 4 | 实现编码器缓存 + 编码器选择（含 NVENC 能力探测） |
-| 5 | 实现最大帧率控制（`MaxFpsConfig`） |
-| 6 | 实现命令构建（含 `-r` 输出选项 + MAX_FPS 参数映射） |
-| 7 | 实现单文件转码（`ProcessOutput::Inherit`） |
-| 8 | 实现批量转码（失败不中断） |
-| 9 | 实现视频分析模块（串行） |
-| 10 | 实现文件收集（`walkdir`） |
-| 11 | 实现 CLI 前端（参数解析、信号处理、日志） |
-| 12 | 实现交互模式 |
-| 13 | 实现分析子命令 |
-| 14 | 集成测试与文档 |
-| 15 | （可选）`parallel-analyze`：`rayon` 并行分析 |
-| 16 | （可选）`c-probe`：C FFI 桥接层 |
-| 17 | GUI 前端（`rencoder_ui`，U21）：Dioxus desktop（0.6），actor 模型（§3.8），`Command` / `Event` 双通道；lib 新增 `start_controller` + `CancelToken` + `run_ffmpeg_with_progress` + Parquet 回读 |
+三个 crate 已就位（`rencoder_lib` + `rencoder_cli` + `rencoder_ui`），核心流程按
+§3.11 的执行契约实现：单例守卫、批内输出规划、直接写入、启动期可取消、GUI 命令
+协议、能力代次。
+
+**剩下的工作都在 §8 的表里** —— 那里逐条记着每个确认点的状态（✅ 已完成 /
+future 待做 / ⚠️ 已作废），§8 就是当前的路线图。
+
+历史上的阶段划分（Phase 1–17：lib 基础 → 探测 → 编码器选择 → 帧率 → 命令构建
+→ 转码 → 批量 → 分析 → 收集 → CLI → 分析子命令 → 集成测试 → `parallel-analyze`
+→ `c-probe` → GUI）已全部完成，不再单列。
 
 ---
 

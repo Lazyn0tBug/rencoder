@@ -89,8 +89,8 @@ cargo build --features c-probe        # macOS: brew install pkg-config ffmpeg
 ## Test
 
 ```bash
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 cargo fmt --check
 ```
 
@@ -107,7 +107,7 @@ cargo fmt --check
 - Library errors: `thiserror`. CLI errors: `anyhow`. `EncodeError` is `#[non_exhaustive]`.
 - `EncoderCache` is passed by `&` -- never cloned.
 - `-r <fps>` is an FFmpeg output option: `build_ffmpeg_command` must place it after `-i`, before the output path.
-- Phase 2 (this commit) covers workspace + base data structures. Subsequent phases per `docs/design.md` §7.
+- The design doc's §8 table tracks what is left; §3.11 is the execution contract.
 
 ## Review checklist
 
