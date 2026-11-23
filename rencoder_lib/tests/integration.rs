@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use rencoder_lib::{
     data::extract::probe_video_metadata,
     pipeline::batch::{transcode_batch, transcode_single},
-    types::{EncodeParams, EncoderCache, ProcessOutput, Target, TranscodeTask, VideoFormat},
+    types::{EncodeParams, EncodeTask, EncoderCache, ProcessOutput, Target, VideoFormat},
 };
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -218,9 +218,9 @@ fn transcode_batch_reencodes_when_output_exists() {
     // `fails_when_input_and_output_are_the_same_file` unit test.)
     let output = make_video(&dir, "out.mkv", 30, 1);
 
-    let task = TranscodeTask {
+    let task = EncodeTask {
         input: rencoder_lib::types::InputPath::new(&input).unwrap(),
-        output: Some(output.clone()),
+        output: output.clone(),
     };
     // The cache must offer the software default for the target
     // format -- the file is re-encoded now, so an encoder has to be

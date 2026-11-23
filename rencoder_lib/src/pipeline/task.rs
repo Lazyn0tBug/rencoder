@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::EncodeError;
 use crate::pipeline::cancel::CancelToken;
-use crate::types::TranscodeTask;
+use crate::types::BatchTask;
 
 /// Task metadata passed alongside the per-task closure.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -127,16 +127,17 @@ impl TaskManager {
     /// `Ok(Failed record)` via [`build_failed_record`]) never
     /// produce `Err` here. `Err` is reserved for the cancel / UI-
     /// disconnected paths.
-    pub fn run<P, R>(
+    pub fn run<T, P, R>(
         &self,
-        tasks: &[TranscodeTask],
+        tasks: &[T],
         label: &str,
         batch_path: &Path,
         cancel: &CancelToken,
         mut processor: P,
     ) -> BatchReport<R>
     where
-        P: FnMut(&TranscodeTask, &TaskContext) -> Result<R, EncodeError>,
+        T: BatchTask,
+        P: FnMut(&T, &TaskContext) -> Result<R, EncodeError>,
     {
         let total = tasks.len();
         tracing::info!(
@@ -152,8 +153,8 @@ impl TaskManager {
                 total,
                 batch_label: label.to_string(),
                 batch_path: batch_path.to_path_buf(),
-                source: task.input.clone(),
-                output: task.output.clone(),
+                source: task.input().clone(),
+                output: task.output().map(Path::to_path_buf),
             };
             // Task-level scaffold: filename + timestamp. The timestamp
             // lets post-mortem tools correlate with external wall-clock
@@ -319,7 +320,7 @@ impl<R> BatchReport<R> {
 /// defaulted to all-zeros, which made Failed records invisible
 /// to config-based queries.
 pub fn build_failed_record(
-    task: &TranscodeTask,
+    task: &crate::types::EncodeTask,
     err: EncodeError,
     params: &crate::types::EncodeParams,
 ) -> crate::types::EncodingRecord {
@@ -346,10 +347,7 @@ pub fn build_failed_record(
         encoder_settings: encoder_settings_from_params(params),
         ffmpeg_argv: vec![],
         ffmpeg_stderr_tail: String::new(),
-        output_path: task
-            .output
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned()),
+        output_path: Some(task.output.to_string_lossy().into_owned()),
         output_size_bytes: None,
         output_duration_secs: None,
         output_codec: None,
@@ -366,14 +364,15 @@ pub fn build_failed_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::EncodeTask;
     use std::path::PathBuf;
 
-    fn make_tasks(n: usize) -> Vec<TranscodeTask> {
+    fn make_tasks(n: usize) -> Vec<EncodeTask> {
         (0..n)
-            .map(|i| TranscodeTask {
+            .map(|i| EncodeTask {
                 input: crate::types::InputPath::new(&PathBuf::from(format!("/in/{i}.mp4")))
                     .unwrap(),
-                output: Some(PathBuf::from(format!("/out/{i}.mkv"))),
+                output: PathBuf::from(format!("/out/{i}.mkv")),
             })
             .collect()
     }

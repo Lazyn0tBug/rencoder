@@ -2094,7 +2094,7 @@ mod tests {
             dry_run_records: vec![],
         });
         let records = vec![
-            sample_record("/a.mp4", EncodingOutcome::Succeeded),
+            sample_record("/a.mp4", EncodingOutcome::Ready),
             sample_failed("/b.mp4"),
             sample_record("/c.mp4", EncodingOutcome::Failed),
         ];
@@ -2149,9 +2149,9 @@ mod tests {
             records: vec![],
             dry_run_records: vec![],
         });
-        // Step 1: DryRunFinished with a Succeeded record — moves
+        // Step 1: DryRunFinished with a Ready record — moves
         // phase to AwaitingConfirm.
-        let records = vec![sample_record("/dummy.mp4", EncodingOutcome::Succeeded)];
+        let records = vec![sample_record("/dummy.mp4", EncodingOutcome::Ready)];
         reduce(&mut state, Msg::Lib(Event::DryRunFinished { records }), &tx);
         assert_eq!(
             state.tasks.active.as_ref().unwrap().phase,
@@ -2226,7 +2226,7 @@ mod tests {
             dry_run_records: vec![],
         });
         let records = vec![
-            sample_record("/a.mp4", EncodingOutcome::Succeeded),
+            sample_record("/a.mp4", EncodingOutcome::Ready),
             sample_failed("/b.mp4"),
             sample_failed("/c.mp4"),
         ];

@@ -29,8 +29,8 @@ use crate::pipeline::context::{BatchContext, FilePlan};
 use crate::pipeline::task::BatchReport;
 use crate::pipeline::task::TaskManager;
 use crate::types::{
-    EncodeParams, EncodingOutcome, EncodingRecord, ErrorCategory, ErrorContext, FpsDecision,
-    ProcessOutput, TranscodeTask, VideoMetadata,
+    EncodeParams, EncodeTask, EncodingOutcome, EncodingRecord, ErrorCategory, ErrorContext,
+    FpsDecision, ProcessOutput, VideoFormat, VideoMetadata,
 };
 
 /// Maximum bytes the stderr reader thread will keep in memory for the
@@ -77,7 +77,7 @@ type ResultCallback = dyn Fn(&EncodingRecord);
 /// `cancel` is the run's cancel token: the ffmpeg child is killed and
 /// reaped when it is set (design doc §3.11.2).
 pub fn transcode_single(
-    task: &TranscodeTask,
+    task: &EncodeTask,
     ctx: &mut BatchContext,
     output: ProcessOutput,
     cancel: &CancelToken,
@@ -109,7 +109,7 @@ pub trait FileEncoder: Send + Sync + 'static {
     /// Encode one file, reporting progress through `on_progress`.
     fn encode(
         &self,
-        task: &TranscodeTask,
+        task: &EncodeTask,
         ctx: &mut BatchContext,
         cancel: &CancelToken,
         on_progress: &mut dyn FnMut(FfmpegProgress),
@@ -124,7 +124,7 @@ pub struct FfmpegFileEncoder;
 impl FileEncoder for FfmpegFileEncoder {
     fn encode(
         &self,
-        task: &TranscodeTask,
+        task: &EncodeTask,
         ctx: &mut BatchContext,
         cancel: &CancelToken,
         on_progress: &mut dyn FnMut(FfmpegProgress),
@@ -146,7 +146,7 @@ impl FileEncoder for FfmpegFileEncoder {
 /// is polled between progress reads; `on_progress` is invoked once per
 /// `progress=continue` / `progress=end` block from ffmpeg.
 pub fn transcode_single_with_progress(
-    task: &TranscodeTask,
+    task: &EncodeTask,
     ctx: &mut BatchContext,
     cancel: &CancelToken,
     on_progress: &mut dyn FnMut(FfmpegProgress),
@@ -188,20 +188,17 @@ enum EncodePrepareResult {
 /// build either a final `EncodingRecord` (failed) or proceed to invoke
 /// ffmpeg.
 fn encode_prepare(
-    task: &TranscodeTask,
+    task: &EncodeTask,
     ctx: &BatchContext,
     started_at_meta: chrono::DateTime<chrono::Utc>,
     started_at_instant: Instant,
 ) -> EncodePrepareResult {
     let params = ctx.params();
     // transcode_single(_with_progress) is only invoked via task graphs
-    // that build `TranscodeTask { output: Some(...) }`. Treat `None`
+    // that build `EncodeTask { output: Some(...) }`. Treat `None`
     // as a programming error rather than a soft "skip" -- there's no
     // input-defined output path to compare against.
-    let output_path = task
-        .output
-        .clone()
-        .expect("transcode_single called with TranscodeTask.output = None");
+    let output_path = task.output.clone();
 
     // Same-file guard (design doc §3.3 "同路径保护"). The output must
     // never point at the input: ffmpeg would truncate the source, and
@@ -291,7 +288,7 @@ fn encode_prepare(
 /// ffmpeg.run + on_progress streaming) lives in the `run_ffmpeg`
 /// closure. The shared record construction + skip policy live here.
 fn transcode_inner<F, R>(
-    task: &TranscodeTask,
+    task: &EncodeTask,
     mut plan: FilePlan,
     ctx: &mut BatchContext,
     mut run_ffmpeg: F,
@@ -393,7 +390,7 @@ impl FallbackNote {
 /// Review #119: thin wrapper around `transcode_inner` that supplies
 /// the sync ffmpeg runner.
 fn transcode_with_argv(
-    task: &TranscodeTask,
+    task: &EncodeTask,
     plan: FilePlan,
     ctx: &mut BatchContext,
     output: ProcessOutput,
@@ -412,7 +409,7 @@ fn transcode_with_argv(
 /// Build a fresh argv after an NVENC failure: the encoder selection now
 /// skips the encoder that just failed, so this picks the software one.
 fn rebuild_argv_after_nvenc_failure(
-    task: &TranscodeTask,
+    task: &EncodeTask,
     ctx: &BatchContext,
     metadata: &VideoMetadata,
 ) -> Option<Vec<String>> {
@@ -439,7 +436,7 @@ fn rebuild_argv_after_nvenc_failure(
 /// Review #119: thin wrapper around `transcode_inner` that supplies
 /// the cancellable ffmpeg runner with on_progress streaming.
 fn transcode_with_progress(
-    task: &TranscodeTask,
+    task: &EncodeTask,
     plan: FilePlan,
     ctx: &mut BatchContext,
     cancel: &CancelToken,
@@ -498,7 +495,7 @@ fn remove_failed_output(output: &Path, started_at: chrono::DateTime<chrono::Utc>
 /// between CLI and GUI paths — both produce the same record shape;
 /// the difference is upstream (sync vs cancellable ffmpeg run).
 fn build_encode_record(
-    task: &TranscodeTask,
+    task: &EncodeTask,
     mut plan: FilePlan,
     ctx: &BatchContext,
     run_result: Result<(), (ErrorCategory, String, String)>,
@@ -735,26 +732,7 @@ pub fn transcode_batch(
     // The output paths are **planned** for the whole batch: two
     // inputs can want the same output, and the colliding ones are
     // renamed (`movie_mp4_1.mkv`) instead of overwriting each other.
-    let planned = crate::utils::fs::plan_outputs(
-        &files
-            .iter()
-            .map(|input| input.as_path().to_path_buf())
-            .collect::<Vec<_>>(),
-        params.format,
-    );
-    let tasks: Vec<TranscodeTask> = files
-        .iter()
-        .zip(planned)
-        .map(|(input, output)| {
-            // v1.2 follow-up #3: route through output_path_for
-            // for the `_encoded` collision guard (X264/HEVC/AV1 +
-            // .mkv input would otherwise overwrite input).
-            TranscodeTask {
-                input: input.clone(),
-                output: Some(output),
-            }
-        })
-        .collect();
+    let tasks = encode_tasks(files, params.format);
 
     // The batch label + path form the batch-level scaffold header
     // (U19 step 10). The path is the user's target (file or dir),
@@ -815,19 +793,10 @@ where
     let total = files.len();
     // The same planning as the encode path: the dry run must show the
     // names the encode will really use.
-    let planned = crate::utils::fs::plan_outputs(
-        &files
-            .iter()
-            .map(|file| file.as_path().to_path_buf())
-            .collect::<Vec<_>>(),
-        params.format,
-    );
+    let inputs: Vec<crate::types::InputPath> = files.iter().map(|file| (*file).clone()).collect();
+    let tasks = encode_tasks(&inputs, params.format);
     let mut records = Vec::new();
-    for (file, output_path) in files.into_iter().zip(planned) {
-        let task = TranscodeTask {
-            input: file.clone(),
-            output: Some(output_path),
-        };
+    for task in tasks {
         let prepare = encode_prepare(&task, ctx, Utc::now(), Instant::now());
         match prepare {
             EncodePrepareResult::Ready(plan) => {
@@ -862,7 +831,7 @@ where
 /// override only the bits this helper cares about (encoder_settings
 /// from `params`, planned output path).
 fn make_planned_ready_record(
-    task: &TranscodeTask,
+    task: &EncodeTask,
     params: &EncodeParams,
     metadata: &VideoMetadata,
     started_at: chrono::DateTime<chrono::Utc>,
@@ -873,10 +842,10 @@ fn make_planned_ready_record(
     let mut record = EncodingRecord::from_metadata(&task.input, source_size_bytes, Some(metadata));
     record.started_at = started_at;
     record.encoder_settings = encoder_settings_from_params(params);
-    record.output_path = task
-        .output
-        .as_ref()
-        .map(|p| p.to_string_lossy().into_owned());
+    record.output_path = Some(task.output.to_string_lossy().into_owned());
+    // A plan is not an encode: the dry run read the input and decided
+    // it can be encoded -- it wrote nothing (design doc §3.11.1).
+    record.outcome = EncodingOutcome::Ready;
     record
 }
 
@@ -908,7 +877,7 @@ pub fn batch_target_path_for_files(files: &[crate::types::InputPath]) -> std::pa
 /// and decides whether to skip; the actual execution is handled by
 /// `transcode_with_argv` (which `transcode_single` calls).
 fn build_argv(
-    task: &TranscodeTask,
+    task: &EncodeTask,
     ctx: &BatchContext,
     metadata: &VideoMetadata,
 ) -> Result<Vec<String>, EncodeError> {
@@ -921,10 +890,35 @@ fn build_argv(
     Ok(build_ffmpeg_command(task, params, &encoder, src_fps))
 }
 
+/// The encode tasks for a batch of inputs.
+///
+/// **One entry** (design doc §3.11.1): the encode path and the dry
+/// run build the same tasks, with the same output names — a dry run
+/// that shows different names than the encode will use is a dry run
+/// that lies.
+pub fn encode_tasks(files: &[crate::types::InputPath], format: VideoFormat) -> Vec<EncodeTask> {
+    // The output paths are planned for the whole batch: two inputs
+    // can want the same output, and the colliding ones are renamed
+    // (`movie_mp4_1.mkv`) instead of overwriting each other.
+    let planned = crate::utils::fs::plan_outputs(
+        &files
+            .iter()
+            .map(|input| input.as_path().to_path_buf())
+            .collect::<Vec<_>>(),
+        format,
+    );
+    files
+        .iter()
+        .cloned()
+        .zip(planned)
+        .map(|(input, output)| EncodeTask { input, output })
+        .collect()
+}
+
 /// Build a failed-probe record (used when probe_video_metadata_auto
 /// returns Err inside transcode_single or transcode_batch_with_processor).
 fn make_failed_record(
-    task: &TranscodeTask,
+    task: &EncodeTask,
     params: &EncodeParams,
     started_at: chrono::DateTime<chrono::Utc>,
     encoding_duration_secs: Option<f64>,
@@ -1484,7 +1478,7 @@ mod tests {
     use std::sync::Arc;
 
     /// Test helper: wrap a path literal in `InputPath`. Used at every
-    /// site that constructs a `TranscodeTask` literal in tests.
+    /// site that constructs a `EncodeTask` literal in tests.
     /// Production code goes through the boundary (`collect_files`),
     /// so this `.expect` is safe.
     fn ip(p: &Path) -> crate::types::InputPath {
@@ -1601,9 +1595,9 @@ Encoders:
         let output = dir.join("out.mkv");
         std::fs::write(&input, b"fake webm").unwrap();
 
-        let task = TranscodeTask {
+        let task = EncodeTask {
             input: ip(&input),
-            output: Some(output.clone()),
+            output: output.clone(),
         };
         let params = params_x264_crf();
         let _cache = cache_with_libx264_and_svtav1();
@@ -1615,7 +1609,7 @@ Encoders:
         // + step 4); the old `transcode_batch_with_processor_for_test`
         // shim was removed when `transcode_batch` started routing
         // through TaskManager.
-        let tasks = vec![TranscodeTask {
+        let tasks = vec![EncodeTask {
             input: task.input.clone(),
             output: task.output.clone(),
         }];
@@ -1640,7 +1634,7 @@ Encoders:
 
     /// Build a successful EncodingRecord for use in tests that mock the
     /// `transcode_with_argv` happy path.
-    fn test_succeeded_record(task: &TranscodeTask, params: &EncodeParams) -> EncodingRecord {
+    fn test_succeeded_record(task: &EncodeTask, params: &EncodeParams) -> EncodingRecord {
         use chrono::Utc;
         let now = Utc::now();
         EncodingRecord {
@@ -1667,13 +1661,7 @@ Encoders:
             ffmpeg_argv: Vec::new(),
             ffmpeg_stderr_tail: String::new(),
 
-            output_path: Some(
-                task.output
-                    .as_ref()
-                    .expect("encode TranscodeTask always has Some output")
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
+            output_path: Some(task.output.to_string_lossy().into_owned()),
             output_size_bytes: Some(512),
             output_duration_secs: Some(60.0),
             output_codec: Some("libx264".into()),
@@ -1702,9 +1690,9 @@ Encoders:
         let output = make_video(&dir, "out.mkv");
         let before = std::fs::metadata(&output).unwrap().len();
 
-        let task = TranscodeTask {
+        let task = EncodeTask {
             input: ip(&input),
-            output: Some(output.clone()),
+            output: output.clone(),
         };
         let params = params_x264_crf();
         let cache = cache_with_libx264_and_svtav1();
@@ -1733,9 +1721,9 @@ Encoders:
         let input = dir.join("movie.mkv");
         std::fs::write(&input, b"x").unwrap();
 
-        let task = TranscodeTask {
+        let task = EncodeTask {
             input: ip(&input),
-            output: Some(input.clone()),
+            output: input.clone(),
         };
         let params = params_x264_crf();
         let cache = cache_with_libx264_and_svtav1();
@@ -1768,9 +1756,9 @@ Encoders:
         let output = dir.join("out.mkv");
         std::fs::write(&input, b"x").unwrap();
 
-        let task = TranscodeTask {
+        let task = EncodeTask {
             input: ip(&input),
-            output: Some(output.clone()),
+            output: output.clone(),
         };
         let params = params_x264_crf();
         // The cache has no usable NVENC encoder, so the rebuilt argv
@@ -1862,9 +1850,9 @@ Encoders:
         let output = dir.join("out.mkv");
         std::fs::write(&input, b"x").unwrap();
 
-        let task = TranscodeTask {
+        let task = EncodeTask {
             input: ip(&input),
-            output: Some(output.clone()),
+            output: output.clone(),
         };
         let params = params_x264_crf();
         let cache = EncoderCache {
@@ -1931,9 +1919,9 @@ Encoders:
         let output = dir.join("out.mkv");
         std::fs::write(&input, b"x").unwrap();
 
-        let task = TranscodeTask {
+        let task = EncodeTask {
             input: ip(&input),
-            output: Some(output.clone()),
+            output: output.clone(),
         };
         let params = params_x264_crf();
         let cache = EncoderCache {
@@ -2002,9 +1990,9 @@ Encoders:
         let output = dir.join("out.mkv");
         std::fs::write(&input, b"x").unwrap();
 
-        let task = TranscodeTask {
+        let task = EncodeTask {
             input: ip(&input),
-            output: Some(output),
+            output,
         };
         let params = params_x264_crf();
         let _cache = cache_with_libx264_and_svtav1();
@@ -2019,7 +2007,7 @@ Encoders:
         let plan = FilePlan::new(
             VideoMetadata::default(),
             argv,
-            task.output.as_ref().unwrap().clone(),
+            task.output.clone(),
             Utc::now(),
             Instant::now(),
         );
@@ -2156,6 +2144,27 @@ Encoders:
             output.display()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_planned_record_says_ready_never_succeeded() {
+        // The dry run writes nothing: its records say "this one can be
+        // encoded" (`Ready`), never "encoded" (`Succeeded`) -- design
+        // doc §3.11.1.
+        let task = EncodeTask {
+            input: crate::types::InputPath::new(std::path::Path::new("/in.mp4")).unwrap(),
+            output: std::path::PathBuf::from("/out.mkv"),
+        };
+        let params = EncodeParams::default();
+
+        let record = make_planned_ready_record(
+            &task,
+            &params,
+            &crate::types::VideoMetadata::default(),
+            chrono::Utc::now(),
+        );
+
+        assert_eq!(record.outcome, EncodingOutcome::Ready);
     }
 
     #[test]

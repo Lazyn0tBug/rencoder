@@ -39,7 +39,7 @@ use crate::pipeline::batch::{FfmpegFileEncoder, FfmpegProgress, FileEncoder};
 use crate::pipeline::cancel::CancelToken;
 use crate::pipeline::context::BatchContext;
 use crate::pipeline::task::TaskManager;
-use crate::types::{EncodeParams, EncoderCache, ErrorCategory, TranscodeTask};
+use crate::types::{EncodeParams, EncodeTask, EncoderCache, ErrorCategory};
 
 // Re-export for UI consumers — `Event::FileCompleted` and
 // `Event::BatchCompleted` carry `EncodingRecord`, so consumers
@@ -1035,7 +1035,7 @@ impl BatchUpdates {
 /// the worker, so the whole batch reads as one ordered stream.
 #[allow(clippy::too_many_arguments)]
 fn spawn_task_batch<P, F>(
-    tasks: Vec<TranscodeTask>,
+    tasks: Vec<EncodeTask>,
     label: &'static str,
     batch_path: PathBuf,
     // Where the finished batch's records are written (the app's records
@@ -1051,7 +1051,7 @@ fn spawn_task_batch<P, F>(
     done_tx: Sender<BatchDone>,
 ) where
     P: FnMut(
-            &TranscodeTask,
+            &EncodeTask,
             &crate::pipeline::task::TaskContext,
         ) -> Result<EncodingRecord, EncodeError>
         + Send
@@ -1194,7 +1194,7 @@ fn make_encode_processor(
     update_tx: Sender<(String, bool)>,
     encoder: Arc<dyn FileEncoder>,
 ) -> impl FnMut(
-    &TranscodeTask,
+    &EncodeTask,
     &crate::pipeline::task::TaskContext,
 ) -> Result<EncodingRecord, EncodeError>
        + Send
@@ -1202,7 +1202,7 @@ fn make_encode_processor(
     // What the actor already knows: the verdicts this batch started
     // with. The comparison tells us what the encode changed.
     let mut reported = batch_ctx.capability().verdicts().clone();
-    move |task: &TranscodeTask, ctx: &crate::pipeline::task::TaskContext| {
+    move |task: &EncodeTask, ctx: &crate::pipeline::task::TaskContext| {
         // FileStarted uses 0-indexed (matches the v1 UI contract).
         // TaskManager passes 1-indexed in `ctx.index`; convert.
         let idx = ctx.index - 1;
@@ -1597,30 +1597,10 @@ fn run_actor(
                 // Review #122: extension still hoisted (unused now — kept for
                 // the hoist comment / future use).
                 let _ext = params.format.default_extension();
-                // The output paths are **planned** for the whole
-                // batch: two inputs can want the same output, and
-                // the colliding ones are renamed (`movie_mp4_1.mkv`)
-                // instead of overwriting each other.
-                let planned = crate::utils::fs::plan_outputs(
-                    &files
-                        .iter()
-                        .map(|file| file.as_path().to_path_buf())
-                        .collect::<Vec<_>>(),
-                    params.format,
-                );
-                let tasks: Vec<TranscodeTask> = files
-                    .iter()
-                    .zip(planned)
-                    .map(|(file, output)| {
-                        // v1.2 follow-up #3: route through
-                        // output_path_for for the `_encoded`
-                        // collision guard.
-                        TranscodeTask {
-                            input: file.clone(),
-                            output: Some(output),
-                        }
-                    })
-                    .collect();
+                // The tasks come from the shared construction entry
+                // (design doc §3.11.1): the same names the encode
+                // path and the dry run use.
+                let tasks = crate::pipeline::batch::encode_tasks(&files, params.format);
 
                 let batch_path = crate::pipeline::batch::batch_target_path_for_files(&files);
 
@@ -2095,7 +2075,7 @@ mod mock_tests {
     ) -> (Sender<Command>, Receiver<Event>)
     where
         F: Fn(
-                &TranscodeTask,
+                &EncodeTask,
                 &BatchContext,
                 &CancelToken,
                 &mut dyn FnMut(FfmpegProgress),
@@ -2122,7 +2102,7 @@ mod mock_tests {
     ) -> (Sender<Command>, Receiver<Event>)
     where
         F: Fn(
-                &TranscodeTask,
+                &EncodeTask,
                 &BatchContext,
                 &CancelToken,
                 &mut dyn FnMut(FfmpegProgress),
@@ -2201,7 +2181,7 @@ mod mock_tests {
     impl<F> FileEncoder for MockFileEncoder<F>
     where
         F: Fn(
-                &TranscodeTask,
+                &EncodeTask,
                 &BatchContext,
                 &CancelToken,
                 &mut dyn FnMut(FfmpegProgress),
@@ -2212,7 +2192,7 @@ mod mock_tests {
     {
         fn encode(
             &self,
-            task: &TranscodeTask,
+            task: &EncodeTask,
             ctx: &mut BatchContext,
             cancel: &CancelToken,
             on_progress: &mut dyn FnMut(FfmpegProgress),
@@ -2256,7 +2236,7 @@ mod mock_tests {
     /// and counts calls. No progress events emitted.
     fn make_succeeding_mock() -> (
         impl Fn(
-                &TranscodeTask,
+                &EncodeTask,
                 &BatchContext,
                 &CancelToken,
                 &mut dyn FnMut(FfmpegProgress),
@@ -2268,7 +2248,7 @@ mod mock_tests {
     ) {
         let count = Arc::new(AtomicUsize::new(0));
         let count_clone = count.clone();
-        let f = move |task: &TranscodeTask,
+        let f = move |task: &EncodeTask,
                       _: &BatchContext,
                       _: &CancelToken,
                       _: &mut dyn FnMut(FfmpegProgress)|
@@ -2282,7 +2262,7 @@ mod mock_tests {
     /// Mock encoder that emits 2 progress blocks per file then
     /// returns Succeeded. Used to verify Event::Progress flow.
     fn make_progress_mock() -> impl Fn(
-        &TranscodeTask,
+        &EncodeTask,
         &BatchContext,
         &CancelToken,
         &mut dyn FnMut(FfmpegProgress),
@@ -2291,7 +2271,7 @@ mod mock_tests {
            + Sync
            + 'static {
         fn f(
-            task: &TranscodeTask,
+            task: &EncodeTask,
             _: &BatchContext,
             _: &CancelToken,
             on_progress: &mut dyn FnMut(FfmpegProgress),
@@ -3172,16 +3152,11 @@ mod mock_tests {
         );
 
         let (cmd_tx, evt_rx) = run_test_controller(
-            move |task: &TranscodeTask,
+            move |task: &EncodeTask,
                   _ctx: &BatchContext,
                   cancel: &CancelToken,
                   on_progress: &mut dyn FnMut(FfmpegProgress)| {
-                let output = task
-                    .output
-                    .as_ref()
-                    .expect("test: task has output")
-                    .to_string_lossy()
-                    .into_owned();
+                let output = task.output.to_string_lossy().into_owned();
                 let argv = vec![
                     "sh".to_string(),
                     "-c".to_string(),

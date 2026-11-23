@@ -409,11 +409,12 @@ fn columns_to_records(df: &DataFrame) -> PolarsResult<Vec<EncodingRecord>> {
 }
 
 /// Parse the Debug-formatted outcome string back to `EncodingOutcome`.
-/// Format: `"Succeeded"`, `"ReducedFps"`, `"Failed"`, or
+/// Format: `"Ready"`, `"Succeeded"`, `"ReducedFps"`, `"Failed"`, or
 /// `"Skipped(SameCodec)"` / `"Skipped(OutputExists)"` /
 /// `"Skipped(PartialOutput)"`.
 fn parse_outcome(s: &str) -> EncodingOutcome {
     match s {
+        "Ready" => EncodingOutcome::Ready,
         "Succeeded" => EncodingOutcome::Succeeded,
         "ReducedFps" => EncodingOutcome::ReducedFps,
         "Failed" => EncodingOutcome::Failed,
@@ -501,6 +502,8 @@ pub fn default_encoding_path_in(dir: &Path) -> Result<std::path::PathBuf, Encode
 pub struct OutcomeCounts {
     /// How many records there are.
     pub total: usize,
+    /// How many are **plans** (the dry run's `Ready` records).
+    pub ready: usize,
     /// How many ended up encoded as asked.
     pub succeeded: usize,
     /// How many were encoded with a reduced frame rate.
@@ -515,6 +518,7 @@ impl OutcomeCounts {
         let count = |f: fn(&EncodingRecord) -> bool| records.iter().filter(|r| f(r)).count();
         Self {
             total: records.len(),
+            ready: count(|r| matches!(r.outcome, EncodingOutcome::Ready)),
             succeeded: count(|r| matches!(r.outcome, EncodingOutcome::Succeeded)),
             reduced: count(|r| matches!(r.outcome, EncodingOutcome::ReducedFps)),
             // No `Skipped` / `PartialSkip` counters: re-encoding is the
@@ -544,9 +548,9 @@ impl OutcomeCounts {
     pub fn plan(&self, total_files: usize) -> PlanSummary {
         PlanSummary {
             // The dry run's records mark the encodable ones as
-            // `Succeeded` (the plan says "this one is ready").
-            to_encode: self.succeeded,
-            to_failed: total_files.saturating_sub(self.succeeded),
+            // `Ready` (the plan says "this one can be encoded").
+            to_encode: self.ready,
+            to_failed: total_files.saturating_sub(self.ready),
         }
     }
 }
@@ -673,9 +677,11 @@ mod tests {
         // The dry run's records mark the encodable ones as
         // `Succeeded`; the rest comes from the batch's file count --
         // it can exceed the records when a file vanished mid-run.
+        // The dry run's records: the encodable ones are `Ready` (the
+        // plan says "this one can be encoded"), the rest failed.
         let records = vec![
-            record_with(EncodingOutcome::Succeeded),
-            record_with(EncodingOutcome::Succeeded),
+            record_with(EncodingOutcome::Ready),
+            record_with(EncodingOutcome::Ready),
             record_with(EncodingOutcome::Failed),
         ];
 

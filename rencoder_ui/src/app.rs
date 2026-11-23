@@ -885,7 +885,8 @@ fn TaskPage(
                                 span { class: "path", "{r.source_path}" }
                                 span {
                                     class: match r.outcome {
-                                        rencoder_lib::types::EncodingOutcome::Succeeded => "outcome-encode",
+                                        rencoder_lib::types::EncodingOutcome::Ready
+                                        | rencoder_lib::types::EncodingOutcome::Succeeded => "outcome-encode",
                                         rencoder_lib::types::EncodingOutcome::Failed => "outcome-fail",
                                         _ => "outcome-skip",
                                     },

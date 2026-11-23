@@ -362,10 +362,10 @@ impl Default for Target {
 // validation to the type system so a runtime check can't be
 // forgotten.
 //
-// Status: WIRED THROUGH. `TranscodeTask.input`, `Command::*` file
+// Status: WIRED THROUGH. `EncodeTask.input`, `Command::*` file
 // vectors, and `Event::FileStarted.source` are all `InputPath` now.
 // The only raw `PathBuf` paths in ffmpeg-bound argv come from
-// `TranscodeTask.output` (the wrapper writes there; ffmpeg never
+// `EncodeTask.output` (the wrapper writes there; ffmpeg never
 // parses it as an option) and from `EncodingRecord.source_path`
 // (a serialised string for Parquet, not a runtime invariant).
 //
@@ -425,19 +425,62 @@ impl std::fmt::Display for InputPath {
     }
 }
 
-// ===== Single transcode task =====
+// ===== Batch tasks =====
 
+/// What a batch task is: the input it works on, and where it writes.
+///
+/// The encode task always writes; the analyze task never does. The
+/// difference is in the **type** (design doc §3.11.1), so a caller
+/// cannot hand an analyze task where an output is needed.
+pub trait BatchTask {
+    /// The source the task reads.
+    fn input(&self) -> &InputPath;
+    /// The path the task writes to (`None` for read-only tasks).
+    fn output(&self) -> Option<&Path>;
+}
+
+/// One encode: read the input, write the output.
+///
+/// The output is **not** optional: an encode without an output path
+/// is a programming error, not a variant to handle (the old
+/// `Option<PathBuf>` made every reader ask "is this an analyze?").
 #[derive(Clone, Debug)]
-pub struct TranscodeTask {
+pub struct EncodeTask {
     /// Source path the task reads. Type-level safety boundary via
     /// [`InputPath`] (review #109): dash-prefixed filenames are
     /// rejected at construction, so `build_ffmpeg_command` can
     /// pass this through to argv without any runtime check.
     pub input: InputPath,
-    /// Output path the task writes to. `Some` for encode (ffmpeg
-    /// output), `None` for analyze (read-only). The signal handler
-    /// removes the file at this path on SIGINT when `Some`.
-    pub output: Option<PathBuf>,
+    /// Output path the task writes to (ffmpeg's output).
+    pub output: PathBuf,
+}
+
+impl BatchTask for EncodeTask {
+    fn input(&self) -> &InputPath {
+        &self.input
+    }
+
+    fn output(&self) -> Option<&Path> {
+        Some(&self.output)
+    }
+}
+
+/// One analyze: read the input, write nothing.
+#[derive(Clone, Debug)]
+pub struct AnalyzeTask {
+    /// Source path the task reads (the same boundary as the encode
+    /// task's).
+    pub input: InputPath,
+}
+
+impl BatchTask for AnalyzeTask {
+    fn input(&self) -> &InputPath {
+        &self.input
+    }
+
+    fn output(&self) -> Option<&Path> {
+        None
+    }
 }
 
 // ===== Work-analysis record (encode pipeline output) =====
@@ -473,6 +516,10 @@ pub enum SkippedReason {
 /// legacy-read-only (see [`SkippedReason`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EncodingOutcome {
+    /// The **plan** is ready -- the dry run read the input and decided
+    /// it can be encoded (design doc §3.11.1). Nothing was written:
+    /// a dry run's record says `Ready`, never `Succeeded`.
+    Ready,
     Succeeded,
     ReducedFps,
     Skipped(SkippedReason),

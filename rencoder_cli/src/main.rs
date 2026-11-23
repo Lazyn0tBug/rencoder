@@ -504,13 +504,7 @@ fn analyze_cmd(args: args::AnalyzeArgs, cancel_slot: &signal::CancelSlot) -> Res
         // records, no log calls. The parallel variant keeps its own
         // log path because rayon's worker pool has no ordering
         // guarantee.
-        let tasks: Vec<rencoder_lib::types::TranscodeTask> = files
-            .iter()
-            .map(|input| rencoder_lib::types::TranscodeTask {
-                input: input.clone(),
-                output: None,
-            })
-            .collect();
+        let tasks = rencoder_lib::analyzer::records::analyze_tasks(&files);
         let manager = rencoder_lib::pipeline::task::TaskManager::new();
         manager.run(
             &tasks,

@@ -483,6 +483,19 @@ pub fn aggregate_records(records: &[AnalysisRecord]) -> VideoStats {
     }
 }
 
+/// The analyze tasks for a batch of inputs.
+///
+/// The analyze path keeps its own execution route (§3.11.1) but the
+/// task construction is shared: the tasks say what they read, and
+/// nothing about writing.
+pub fn analyze_tasks(files: &[crate::types::InputPath]) -> Vec<crate::types::AnalyzeTask> {
+    files
+        .iter()
+        .cloned()
+        .map(|input| crate::types::AnalyzeTask { input })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
