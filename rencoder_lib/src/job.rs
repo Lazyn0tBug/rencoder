@@ -21,7 +21,7 @@
 //! A second `StartBatch` while one is running returns
 //! `Event::Error(ConfigError)` rather than queueing.
 
-use crossbeam_channel::{bounded, select, unbounded, Receiver, Sender};
+use crossbeam_channel::{after, bounded, never, select, unbounded, Receiver, Sender};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -1178,20 +1178,60 @@ struct BatchAdmission {
     token: CancelToken,
 }
 
-/// The actor's own state: the batch gate, the active batch, the
-/// cancel token and the capability publication.
+/// Where a batch is in its chain (design doc §3.10.6).
+///
+/// The chain has one barrier before the work starts: the **facts**
+/// (the capability and the encoder cache) must be published before a
+/// batch can encode with them. The publisher releases that barrier;
+/// the batch does not poll for it.
+///
+/// No active batch means the chain is over.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Stage {
+    /// Admitted; waiting for the facts to be published.
+    Facts,
+    /// The worker is running.
+    Work,
+}
+
+/// The active batch: its id, where it is in its chain, and its token.
+struct ActiveBatch {
+    /// The batch's id (design doc §3.11.3).
+    id: BatchId,
+    /// Where the batch is in its chain.
+    stage: Stage,
+    /// The batch's cancel token.
+    token: CancelToken,
+}
+
+/// A batch that is admitted but has not started yet: it waits for the
+/// facts (the barrier).
+///
+/// The work is a closure: the actor holds the batch's inputs until the
+/// facts land, and then hands them over **frozen** (the generation the
+/// batch runs under).
+struct PendingBatch {
+    /// The batch's id.
+    id: BatchId,
+    /// How many files the batch has (the cancel event reports it).
+    total: usize,
+    /// When the facts must have landed. Past it, the batch fails
+    /// instead of hanging (the gate would stay closed forever).
+    deadline: std::time::Instant,
+    /// Starts the work, with the facts.
+    start: Box<dyn FnOnce(PublishedState) + Send>,
+}
+
+/// The actor's own state: the batch gate, the active batch and the
+/// capability publication.
 ///
 /// The admission lives here as **one operation**: every batch kind
 /// takes its gate, its id and its cancel token from it, so none of
 /// them can inherit the previous batch's, and none of them has to
 /// remember to reset anything (design doc §3.11.2).
 struct ActorState {
-    /// The busy gate: one batch at a time (§3.4).
-    batch_running: bool,
-    /// The batch the UI may cancel (design doc §3.11.3).
-    active_batch_id: Option<BatchId>,
-    /// The cancel token of the current batch.
-    cancel_token: CancelToken,
+    /// The active batch -- `None` means the gate is open (§3.4).
+    active: Option<ActiveBatch>,
     /// The next batch id.
     next_batch_id: BatchId,
     /// The capability publication (design doc §3.10.6 step 5).
@@ -1209,28 +1249,48 @@ impl ActorState {
     /// A leftover cancel file is removed first: it belongs to the
     /// previous run, and it would cancel this batch on its first
     /// poll.
+    ///
+    /// The batch starts in [`Stage::Facts`]: it waits for the facts
+    /// before it works (the chain's barrier).
     fn admit_batch(&mut self, cancel_file: Option<&std::path::Path>) -> BatchAdmission {
         let id = self.next_batch_id;
         self.next_batch_id += 1;
-        self.batch_running = true;
-        self.active_batch_id = Some(id);
-        self.cancel_token = match cancel_file {
+        let token = match cancel_file {
             Some(path) => {
                 let _ = std::fs::remove_file(path);
                 CancelToken::watching(path.to_path_buf())
             }
             None => CancelToken::new(),
         };
-        BatchAdmission {
+        self.active = Some(ActiveBatch {
             id,
-            token: self.cancel_token.clone(),
-        }
+            stage: Stage::Facts,
+            token: token.clone(),
+        });
+        BatchAdmission { id, token }
     }
 
     /// The batch ended: open the gate and forget the active batch.
     fn finish_batch(&mut self) {
-        self.batch_running = false;
-        self.active_batch_id = None;
+        self.active = None;
+    }
+
+    /// Is a batch in flight? The busy gate (one batch at a time,
+    /// §3.4).
+    fn is_running(&self) -> bool {
+        self.active.is_some()
+    }
+
+    /// Where the active batch is in its chain.
+    fn stage(&self) -> Option<Stage> {
+        self.active.as_ref().map(|b| b.stage)
+    }
+
+    /// The chain moves on: the batch's work starts.
+    fn set_stage(&mut self, batch_id: BatchId, stage: Stage) {
+        if let Some(active) = self.active.as_mut().filter(|b| b.id == batch_id) {
+            active.stage = stage;
+        }
     }
 
     /// Cancel the active batch -- if the request names it.
@@ -1239,10 +1299,10 @@ impl ActorState {
     /// (the user cancelled, then a new batch started) must not stop
     /// the batch that is running now (design doc §3.11.3).
     fn cancel(&mut self, batch_id: BatchId) -> bool {
-        if self.active_batch_id != Some(batch_id) {
+        let Some(active) = self.active.as_mut().filter(|b| b.id == batch_id) else {
             return false;
-        }
-        self.cancel_token.cancel();
+        };
+        active.token.cancel();
         true
     }
 }
@@ -1450,6 +1510,16 @@ impl CapabilityPublisher {
     #[cfg(test)]
     fn capability(&self) -> &Capability {
         &self.capability
+    }
+
+    /// The published fact, if it is there.
+    ///
+    /// The chain's barrier: a batch waits until this returns `Some`.
+    /// The publisher is the only writer, so the answer is one
+    /// consistent snapshot (the cache and the capability of the same
+    /// publication -- design doc §3.10.6 step 5).
+    fn published_fact(&self) -> Option<PublishedState> {
+        self.state.lock().clone()
     }
 }
 
@@ -1704,7 +1774,7 @@ fn spawn_task_batch<P, F>(
         ) -> Result<EncodingRecord, EncodeError>
         + Send
         + 'static,
-    F: FnOnce(Sender<VerdictUpdate>) -> Result<P, (ErrorCategory, String)> + Send + 'static,
+    F: FnOnce(Sender<VerdictUpdate>) -> P + Send + 'static,
 {
     let BatchUpdates { tx, rx } = updates;
     std::thread::Builder::new()
@@ -1743,17 +1813,10 @@ fn spawn_task_batch<P, F>(
                         });
                     }
                 };
-                let mut processor = match make_processor(tx) {
-                    Ok(processor) => processor,
-                    Err((category, message)) => {
-                        // The batch could not start (no encoder cache).
-                        return Some(Event::BatchFailed {
-                            batch_id,
-                            category,
-                            message,
-                        });
-                    }
-                };
+                // The facts are already frozen into the batch: the
+                // processor builds its context from them, and there is
+                // nothing left to wait for.
+                let mut processor = make_processor(tx);
                 // `TaskManager::new(None)`: the actor path has no signal
                 // handler — the cancel branch of `run_ffmpeg_with_progress`
                 // deletes the partial output itself.
@@ -1967,37 +2030,31 @@ fn make_encode_processor(
     }
 }
 
-/// How long a batch waits for the encoder cache to land.
+/// How long a batch waits for the facts (the capability + the encoder
+/// cache) before it gives up.
 ///
-/// The init spawns ffmpeg (`ffmpeg -encoders`), so it takes a moment.
-/// A batch that starts in that window waits for it instead of failing
-/// with "encoder cache init in progress" — that failure was a real
-/// bug: the first batch after startup could not start at all.
-const CACHE_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// The facts normally land in a second or two -- the startup check
+/// probes ffmpeg. The deadline exists so a probe that never answers
+/// fails the batch instead of holding the gate forever.
+const FACTS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Take the encoder cache, waiting for the one-time init to land.
+/// The chain's barrier: start the pending batch, if the facts are in.
 ///
-/// The wait happens in the batch worker, so the actor stays responsive
-/// while it waits. The cell is polled rather than waited on with a
-/// condition variable: the wait is short, happens once per process,
-/// and a poll keeps the shared-state inventory free of another
-/// primitive (§3.10.1).
-///
-/// A batch uses ONE snapshot: a batch is a unit, the encoder must not
-/// change under it.
-fn take_published(cell: &PublishedCell, timeout: std::time::Duration) -> Option<PublishedState> {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        // The lock is held only for the pointer clone — no IO inside
-        // (§3.10.1 rule 2).
-        if let Some(state) = { cell.lock().clone() } {
-            return Some(state);
-        }
-        if std::time::Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+/// The publisher releases the barrier (the actor's probe branch), and
+/// a batch that arrives after the publication does not wait at all.
+/// The facts are handed over **frozen**: the batch runs under the
+/// generation it was started with, whatever the publisher does later
+/// (design doc §3.10.1.2, §3.10.6 step 5).
+fn advance_pending(pending: &mut Option<PendingBatch>, state: &mut ActorState) {
+    if pending.is_none() {
+        return;
     }
+    let Some(fact) = state.publisher.published_fact() else {
+        return;
+    };
+    let p = pending.take().expect("the pending batch is there");
+    state.set_stage(p.id, Stage::Work);
+    (p.start)(fact);
 }
 
 /// Turn a cache slot into the cache a batch needs, or into the error
@@ -2070,12 +2127,10 @@ fn run_actor(
     // The newest published probe request. A result older than this
     // is dropped -- it cannot overwrite a newer snapshot.
     // The generation the next published capability carries.
-    // The actor's state: the gate, the active batch, the cancel
-    // token and the capability publication (design doc §3.11.2).
+    // The actor's state: the gate, the active batch and the capability
+    // publication (design doc §3.11.2).
     let mut state = ActorState {
-        batch_running: false,
-        active_batch_id: None,
-        cancel_token: CancelToken::new(),
+        active: None,
         next_batch_id: 0,
         publisher: CapabilityPublisher::new(published_cell.clone()),
     };
@@ -2118,7 +2173,25 @@ fn run_actor(
     // the session knows it. Each batch worker gets a snapshot and
     // reports its changes back (the done signal carries them).
 
+    // The batch that is admitted but has not started yet: it waits for
+    // the facts (the chain's barrier). The publisher releases it.
+    let mut pending: Option<PendingBatch> = None;
+
+    // The "no deadline" case: created once, not per iteration (the
+    // actor's loop is hot).
+    let no_deadline: Receiver<std::time::Instant> = never();
+
     loop {
+        // The pending batch's deadline: the facts must land in time.
+        // Without it, a probe that never answers would hold the gate
+        // forever.
+        let deadline_rx = match &pending {
+            Some(p) => after(
+                p.deadline
+                    .saturating_duration_since(std::time::Instant::now()),
+            ),
+            None => no_deadline.clone(),
+        };
         // Wait for the next command OR for a worker to report "done".
         // The done branch re-opens the gate and goes back to waiting.
         let request = select! {
@@ -2127,6 +2200,23 @@ fn run_actor(
                 if let Ok(BatchDone { updates }) = done {
                     state.publisher.merge_verdicts(updates);
                     state.finish_batch();
+                }
+                continue;
+            }
+            recv(deadline_rx) -> _ => {
+                // The facts did not land in time: the batch fails
+                // instead of hanging.
+                if let Some(p) = pending.take() {
+                    state.finish_batch();
+                    send_evt_lossy(
+                        &evt_tx,
+                        Event::BatchFailed {
+                            batch_id: p.id,
+                            category: ErrorCategory::ConfigError,
+                            message: "the capability check timed out".into(),
+                        },
+                        &dropped_counter,
+                    );
                 }
                 continue;
             }
@@ -2201,6 +2291,10 @@ fn run_actor(
                         }
                     }
                 }
+                // The publication released the chain's barrier: the
+                // waiting batch starts, with this version of the
+                // facts frozen into it.
+                advance_pending(&mut pending, &mut state);
                 continue;
             }
         };
@@ -2234,7 +2328,7 @@ fn run_actor(
             if finished {
                 state.finish_batch();
             }
-            if state.batch_running {
+            if state.is_running() {
                 // Benign rejection: the command is dropped, the running
                 // batch continues. `Event::Error` would be fatal-only
                 // and the UI would finalize the running batch.
@@ -2311,10 +2405,7 @@ fn run_actor(
                     &dropped_counter,
                 );
                 // One cache snapshot per batch (a batch is a unit —
-                // the encoder must not change under it). The cache is
-                // resolved *in the worker*: the one-time init may
-                // still be running, and waiting for it must not block
-                // the actor.
+                // the encoder must not change under it).
                 //
                 // Review #122: extension still hoisted (unused now — kept for
                 // the hoist comment / future use).
@@ -2326,63 +2417,89 @@ fn run_actor(
 
                 let batch_path = crate::pipeline::batch::batch_target_path_for_files(&files);
 
-                let published_cell_for_worker = Arc::clone(&published_cell);
-                let params_for_worker = params.clone();
                 let cancel_for_worker = admission.token.clone();
                 let evt_tx_for_worker = evt_tx.clone();
                 let dropped_for_worker = DropCounter::default();
                 let file_encoder_for_worker = Arc::clone(&file_encoder);
+                let records_dir_for_worker = records_dir.clone();
+                let done_tx_for_worker = done_tx.clone();
                 // The processor and the worker each hold a handle on
                 // the same token (the `move` closure would otherwise
                 // take it).
                 let cancel_for_processor = cancel_for_worker.clone();
-                let make_processor = move |update_tx: Sender<VerdictUpdate>| {
-                    // The context is built here, in the worker: the
-                    // cache may still be initializing, and waiting for
-                    // it must not block the actor (§3.10.1.1 rule 5).
-                    // The published state: the cache and the
-                    // capability of one publication (design doc
-                    // §3.10.6 step 5). The batch freezes this
-                    // generation -- a check during the batch does
-                    // not change what this batch encodes with.
-                    let published = take_published(&published_cell_for_worker, CACHE_WAIT_TIMEOUT)
-                        .ok_or((
-                            ErrorCategory::ConfigError,
-                            "encoder cache init timed out".into(),
-                        ))?;
-                    let cache = cache_from_slot(published.cache)?;
-                    // The capability of **this** publication: the
-                    // batch freezes the generation it was admitted
-                    // with (design doc §3.10.6 step 5).
-                    let batch_ctx =
-                        BatchContext::new(params_for_worker, cache, published.capability);
-                    Ok(make_encode_processor(
-                        batch_ctx,
-                        id,
-                        cancel_for_processor,
-                        evt_tx_for_worker,
-                        dropped_for_worker,
-                        update_tx,
-                        file_encoder_for_worker,
-                    ))
-                };
+                // The chain's barrier: the batch waits for the facts
+                // (the capability + the encoder cache). The actor
+                // holds it here and hands it over **frozen** -- the
+                // generation the batch runs under (design doc §3.10.6
+                // step 5).
+                //
+                // The worker does not wait for the facts: it is
+                // started **with** them. That is what lets a cancel
+                // interrupt the wait: the waiting belongs to the
+                // actor, and a cancel is a command the actor
+                // processes.
+                let start = Box::new(move |fact: PublishedState| {
+                    let cache = match cache_from_slot(fact.cache) {
+                        Ok(cache) => cache,
+                        Err((category, message)) => {
+                            // The encoder cache is unusable: this
+                            // batch cannot run (design doc §3.11.3 --
+                            // a batch-scoped failure).
+                            send_evt_lossy(
+                                &evt_tx_for_worker,
+                                Event::BatchFailed {
+                                    batch_id: id,
+                                    category,
+                                    message,
+                                },
+                                &dropped_for_worker,
+                            );
+                            return;
+                        }
+                    };
+                    let evt_tx_for_processor = evt_tx_for_worker.clone();
+                    let make_processor = move |update_tx: Sender<VerdictUpdate>| {
+                        // The capability of **this** publication: the
+                        // batch freezes the generation it was admitted
+                        // with (design doc §3.10.6 step 5).
+                        let batch_ctx = BatchContext::new(params, cache, fact.capability.clone());
+                        make_encode_processor(
+                            batch_ctx,
+                            id,
+                            cancel_for_processor,
+                            evt_tx_for_processor.clone(),
+                            dropped_for_worker,
+                            update_tx,
+                            file_encoder_for_worker.clone(),
+                        )
+                    };
 
-                // The batch runs on its own thread: the actor stays
-                // responsive, so `Command::Cancel` reaches the
-                // in-flight ffmpeg.
-                spawn_task_batch(
+                    // The batch runs on its own thread: the actor stays
+                    // responsive, so `Command::Cancel` reaches the
+                    // in-flight ffmpeg.
+                    spawn_task_batch(
+                        id,
+                        tasks,
+                        "encoding",
+                        batch_path,
+                        Some(records_dir_for_worker.clone()),
+                        cancel_for_worker.clone(),
+                        make_processor,
+                        BatchUpdates::new(),
+                        evt_tx_for_worker.clone(),
+                        DropCounter::default(),
+                        done_tx_for_worker.clone(),
+                    );
+                });
+                pending = Some(PendingBatch {
                     id,
-                    tasks,
-                    "encoding",
-                    batch_path,
-                    Some(records_dir.clone()),
-                    cancel_for_worker.clone(),
-                    make_processor,
-                    BatchUpdates::new(),
-                    evt_tx.clone(),
-                    DropCounter::default(),
-                    done_tx.clone(),
-                );
+                    total: files.len(),
+                    deadline: std::time::Instant::now() + FACTS_DEADLINE,
+                    start,
+                });
+                // The facts may already be there (every batch but the
+                // first): then the barrier is already released.
+                advance_pending(&mut pending, &mut state);
             }
 
             Command::DryRun { params, files } => {
@@ -2390,7 +2507,6 @@ fn run_actor(
                 // StartBatch, but no ffmpeg invocation. The busy gate
                 // (checked above) applies so a real batch can't sneak
                 // in during dry-run.
-                let published_cell_for_worker = Arc::clone(&published_cell);
                 // A dry run never encodes, so it cannot change the
                 // capability -- it only reads it. It reads the
                 // published one, like every other batch.
@@ -2406,6 +2522,7 @@ fn run_actor(
                 // The dry run is a batch too: it gets a batch id, so
                 // its events can be matched (design doc §3.11.3).
                 let id = admission.id;
+                let total = files.len();
                 send_evt_lossy(
                     &evt_tx,
                     Event::CommandAccepted {
@@ -2414,53 +2531,60 @@ fn run_actor(
                     },
                     &dropped_counter,
                 );
-                spawn_batch_job(
-                    move || {
-                        // The cache is resolved here, in the worker: the
-                        // one-time init may still be running, and
-                        // waiting for it must not block the actor.
-                        let Some(published) =
-                            take_published(&published_cell_for_worker, CACHE_WAIT_TIMEOUT)
-                        else {
-                            return Some(Event::BatchFailed {
-                                batch_id: id,
-                                category: ErrorCategory::ConfigError,
-                                message: "encoder cache init timed out".into(),
-                            });
-                        };
-                        let cache = match cache_from_slot(published.cache) {
-                            Ok(cache) => cache,
-                            Err((category, message)) => {
-                                return Some(Event::BatchFailed {
+                let evt_tx_for_worker = evt_tx.clone();
+                let done_tx_for_worker = done_tx.clone();
+                let dropped_for_worker = DropCounter::default();
+                // The chain's barrier -- the same one the encode batch
+                // waits at (the facts are the facts).
+                let start = Box::new(move |fact: PublishedState| {
+                    let cache = match cache_from_slot(fact.cache) {
+                        Ok(cache) => cache,
+                        Err((category, message)) => {
+                            send_evt_lossy(
+                                &evt_tx_for_worker,
+                                Event::BatchFailed {
                                     batch_id: id,
                                     category,
                                     message,
-                                });
-                            }
-                        };
-                        // The capability of this publication: the
-                        // dry run freezes the generation too.
-                        // The generation this dry run froze: the
-                        // plan is only valid for it (design doc
-                        // §3.10.5).
-                        let generation = published.capability.generation();
-                        let batch_ctx = BatchContext::new(params, cache, published.capability);
-                        let report = crate::pipeline::batch::dry_run_batch(
-                            &batch_ctx,
-                            files.iter(),
-                            &cancel_for_worker,
-                        );
-                        Some(Event::DryRunFinished {
-                            batch_id: id,
-                            generation,
-                            records: report.records,
-                        })
-                    },
-                    done_tx.clone(),
-                    None,
-                    evt_tx.clone(),
-                    DropCounter::default(),
-                );
+                                },
+                                &dropped_for_worker,
+                            );
+                            return;
+                        }
+                    };
+                    // The capability of this publication: the
+                    // dry run freezes the generation too.
+                    // The generation this dry run froze: the
+                    // plan is only valid for it (design doc
+                    // §3.10.5).
+                    let generation = fact.capability.generation();
+                    let batch_ctx = BatchContext::new(params, cache, fact.capability.clone());
+                    spawn_batch_job(
+                        move || {
+                            let report = crate::pipeline::batch::dry_run_batch(
+                                &batch_ctx,
+                                files.iter(),
+                                &cancel_for_worker,
+                            );
+                            Some(Event::DryRunFinished {
+                                batch_id: id,
+                                generation,
+                                records: report.records,
+                            })
+                        },
+                        done_tx_for_worker.clone(),
+                        None,
+                        evt_tx_for_worker.clone(),
+                        DropCounter::default(),
+                    );
+                });
+                pending = Some(PendingBatch {
+                    id,
+                    total,
+                    deadline: std::time::Instant::now() + FACTS_DEADLINE,
+                    start,
+                });
+                advance_pending(&mut pending, &mut state);
             }
 
             Command::Cancel { batch_id } => {
@@ -2491,6 +2615,27 @@ fn run_actor(
                 // polls it -- the in-flight ffmpeg is killed (and its
                 // partial output removed), and the batch stops at the
                 // next file boundary.
+                //
+                // **Unless** the batch has not started yet: then it is
+                // waiting at the chain's barrier (the facts), and the
+                // wait ends here -- the worker is never started. That
+                // is the whole point of the waiting belonging to the
+                // actor: a cancel is a command, and the actor is the
+                // one who processes it.
+                if state.stage() == Some(Stage::Facts) {
+                    if let Some(p) = pending.take() {
+                        state.finish_batch();
+                        send_evt_lossy(
+                            &evt_tx,
+                            Event::BatchCancelled {
+                                batch_id: p.id,
+                                completed: 0,
+                                total: p.total,
+                            },
+                            &dropped_counter,
+                        );
+                    }
+                }
             }
 
             Command::LoadHistory { limit, after } => {
@@ -2627,6 +2772,10 @@ fn run_actor(
                 // The analyze run is a batch too: it gets a batch id
                 // (design doc §3.11.3).
                 let id = state.admit_batch(None).id;
+                // The analyze batch does not wait for the facts: it
+                // probes the media, it does not encode with them. So
+                // its chain has no barrier -- it starts right away.
+                state.set_stage(id, Stage::Work);
                 send_evt_lossy(
                     &evt_tx,
                     Event::CommandAccepted {
@@ -3634,6 +3783,78 @@ mod mock_tests {
             }
             _ => panic!("expected BatchCancelled, got {last:?}"),
         }
+    }
+
+    #[test]
+    fn a_cancel_interrupts_the_wait_for_the_facts() {
+        // The chain's barrier can be interrupted (design doc §3.10.6):
+        // a batch that waits for the facts and is cancelled ends
+        // **there** -- the worker is never started, and the batch does
+        // not sit in the wait until the facts land.
+        //
+        // The facts never land here: the probe waits for the test. That
+        // is the point -- the wait used to be the worker's, and the
+        // cancel could not reach it.
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release_for_runner = Arc::clone(&release);
+        let runner: crate::job::DetectRunner = Arc::new(move |_args: &[&str]| {
+            while !release_for_runner.load(AtomicOrdering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Ok(String::new())
+        });
+        let (cmd_tx, evt_rx) = run_test_controller_with_runner(
+            |task: &EncodeTask,
+             _: &mut BatchContext,
+             _: &CancelToken,
+             _: &mut dyn FnMut(FfmpegProgress)| Ok(fake_record(&task.input)),
+            None,
+            None,
+            Some(runner),
+        );
+
+        // The batch: admitted, waiting at the barrier.
+        cmd_tx
+            .send(Request::new(
+                1,
+                Command::StartBatch {
+                    params: EncodeParams::default(),
+                    files: batch_files("cancel_at_barrier", 1),
+                },
+            ))
+            .unwrap();
+        let batch_id = match wait_for_event(&evt_rx, |e| {
+            matches!(
+                e,
+                Event::CommandAccepted {
+                    batch_id: Some(_),
+                    ..
+                }
+            )
+        }) {
+            Event::CommandAccepted { batch_id, .. } => batch_id.expect("the batch has an id"),
+            other => unreachable!("the predicate matched: {other:?}"),
+        };
+
+        // The cancel arrives while the batch waits for the facts.
+        cmd_tx
+            .send(Request::new(2, Command::Cancel { batch_id }))
+            .unwrap();
+
+        // The batch ends at once.
+        let event = wait_for_event(&evt_rx, |e| matches!(e, Event::BatchCancelled { .. }));
+        match event {
+            Event::BatchCancelled {
+                completed, total, ..
+            } => {
+                assert_eq!(completed, 0, "no file started");
+                assert_eq!(total, 1, "the batch had one file");
+            }
+            other => panic!("expected BatchCancelled, got {other:?}"),
+        }
+
+        // Let the probe out: it publishes into a batch that is gone.
+        release.store(true, AtomicOrdering::SeqCst);
     }
 
     #[test]
@@ -4733,12 +4954,17 @@ mod mock_tests {
         // order), so a count would block the wrong probe.
         let block_next = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let block_next_for_runner = Arc::clone(&block_next);
+        // The announcement: the blocked probe says so. The test waits
+        // for it **before** it sends the second check -- so "the first
+        // probe is the older one" is a fact, not an accident.
+        let (blocked_tx, blocked_rx) = unbounded::<()>();
         let runner: crate::job::DetectRunner = Arc::new(move |args: &[&str]| {
             if args.contains(&"-encoders")
                 && block_next_for_runner.swap(false, AtomicOrdering::SeqCst)
             {
                 // This probe waits until the test lets it through --
                 // it is the probe whose result must arrive late.
+                let _ = blocked_tx.send(());
                 while !release_for_runner.load(std::sync::atomic::Ordering::SeqCst) {
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
@@ -4763,7 +4989,7 @@ mod mock_tests {
 
         // Arm the fixture: the next probe blocks.
         block_next.store(true, AtomicOrdering::SeqCst);
-        // The first probe: it blocks.
+        // The first check: its probe blocks -- and announces it.
         cmd_tx
             .send(Request::new(
                 1,
@@ -4772,7 +4998,13 @@ mod mock_tests {
                 },
             ))
             .unwrap();
-        // The second probe: it runs through.
+        // The announcement: the probe that blocks is the first one --
+        // it is the only probe in flight. Now "the older result
+        // arrives late" is a fact, not an accident.
+        blocked_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the first probe must block");
+        // The second check: its probe runs through.
         cmd_tx
             .send(Request::new(
                 2,
