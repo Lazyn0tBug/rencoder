@@ -2817,20 +2817,44 @@ mod mock_tests {
             .collect()
     }
 
-    /// Drain events until `evt_rx` returns Err (sender dropped) or
-    /// the deadline expires. Tests use a generous deadline because
-    /// the mock actor runs synchronously on a thread; events should
-    /// be available almost immediately after the command is sent.
+    /// Drain events until the batch's **terminal event**, the sender
+    /// drops, or the deadline expires.
+    ///
+    /// The terminal event is the natural end of a batch's event
+    /// stream: after it, the batch is over and none of its events
+    /// arrive any more. Waiting for a wall-clock window instead
+    /// makes the test depend on how loaded the machine is -- the
+    /// batch's start waits for the published capability, so a fixed
+    /// two-second window is a coin flip on a busy machine (the
+    /// window is a safety net, not the thing being waited for).
     fn collect_events(rx: &Receiver<Event>, timeout: std::time::Duration) -> Vec<Event> {
         let mut events = Vec::new();
         let deadline = std::time::Instant::now() + timeout;
         while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
             match rx.recv_timeout(remaining) {
-                Ok(evt) => events.push(evt),
+                Ok(evt) => {
+                    let terminal = is_terminal_event(&evt);
+                    events.push(evt);
+                    if terminal {
+                        break;
+                    }
+                }
                 Err(_) => break,
             }
         }
         events
+    }
+
+    /// Is this event the end of a batch?
+    fn is_terminal_event(event: &Event) -> bool {
+        matches!(
+            event,
+            Event::BatchCompleted { .. }
+                | Event::BatchCancelled { .. }
+                | Event::BatchFailed { .. }
+                | Event::DryRunFinished { .. }
+                | Event::AnalyzeFinished { .. }
+        )
     }
 
     #[test]
@@ -2863,7 +2887,7 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
         assert!(
             events
                 .iter()
@@ -2911,7 +2935,7 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
         assert!(
             events
                 .iter()
@@ -2945,7 +2969,7 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = batch_events(collect_events(&evt_rx, std::time::Duration::from_secs(2)));
+        let events = batch_events(collect_events(&evt_rx, std::time::Duration::from_secs(10)));
         // Expected sequence: per-file events interleave (each
         // process_one_file emits FileStarted then FileCompleted
         // before moving to the next file).
@@ -3039,7 +3063,7 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = batch_events(collect_events(&evt_rx, std::time::Duration::from_secs(2)));
+        let events = batch_events(collect_events(&evt_rx, std::time::Duration::from_secs(10)));
         // Expected: CommandAccepted + BatchStarted
         //   + (FileStarted + Progress×2 + FileCompleted) × 2 + BatchCompleted
         assert_eq!(events.len(), 2 + (1 + 2 + 1) * 2 + 1);
@@ -3089,7 +3113,7 @@ mod mock_tests {
             ))
             .unwrap();
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
         assert!(
             events.iter().any(|e| matches!(
                 e,
@@ -3136,7 +3160,7 @@ mod mock_tests {
         // learn the batch id (the cancel names it, design doc
         // §3.11.3).
         let batch_id = loop {
-            match evt_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            match evt_rx.recv_timeout(std::time::Duration::from_secs(10)) {
                 Ok(Event::BatchStarted { id, .. }) => break id,
                 Ok(_) => continue,
                 Err(e) => panic!("no BatchStarted event: {e}"),
@@ -3147,7 +3171,7 @@ mod mock_tests {
             .send(Request::new(2, Command::Cancel { batch_id }))
             .unwrap();
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
         let last = events.last().expect("expected a terminal event");
         match last {
             Event::BatchCancelled {
@@ -3199,7 +3223,7 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
         // First file completes (FileStarted + FileCompleted) before
         // cancel propagates; then BatchCancelled with completed = 1.
         // (Mock cancels on file 1 itself, but the file's FileCompleted
@@ -3244,7 +3268,7 @@ mod mock_tests {
 
         // Wait for the batch to announce its id.
         let batch_id = loop {
-            match evt_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            match evt_rx.recv_timeout(std::time::Duration::from_secs(10)) {
                 Ok(Event::BatchStarted { id, .. }) => break id,
                 Ok(_) => continue,
                 Err(e) => panic!("no BatchStarted event: {e}"),
@@ -3261,7 +3285,7 @@ mod mock_tests {
             ))
             .unwrap();
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
         assert!(
             events
                 .iter()
@@ -3311,7 +3335,7 @@ mod mock_tests {
             ))
             .unwrap();
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
         assert!(
             events
                 .iter()
@@ -3342,7 +3366,7 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = batch_events(collect_events(&evt_rx, std::time::Duration::from_secs(2)));
+        let events = batch_events(collect_events(&evt_rx, std::time::Duration::from_secs(10)));
         // The request is answered first (design doc §3.11.3), then
         // the result.
         assert_eq!(events.len(), 2);
@@ -3393,7 +3417,7 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = batch_events(collect_events(&evt_rx, std::time::Duration::from_secs(2)));
+        let events = batch_events(collect_events(&evt_rx, std::time::Duration::from_secs(10)));
         assert_eq!(events.len(), 2);
         match &events[1] {
             Event::HistoryLoaded { records: loaded } => {
@@ -3432,7 +3456,7 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(5));
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
         assert!(
             events
                 .iter()
@@ -3488,7 +3512,7 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
         assert!(
             events
                 .iter()
@@ -3517,7 +3541,7 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
         assert!(
             events
                 .iter()
@@ -3551,7 +3575,7 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
         let report = events
             .iter()
             .find_map(|e| match e {
@@ -3610,7 +3634,7 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = batch_events(collect_events(&evt_rx, std::time::Duration::from_secs(2)));
+        let events = batch_events(collect_events(&evt_rx, std::time::Duration::from_secs(10)));
         // Expected: 1 CommandAccepted + 1 AnalyzeStarted
         //            + 3 AnalyzeProgress + 1 AnalyzeFinished.
         assert_eq!(events.len(), 6, "expected 6 events, got: {events:?}");
@@ -3691,7 +3715,7 @@ mod mock_tests {
         // publisher (design doc §3.10.6 step 5), so an actor that
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
-        let events = batch_events(collect_events(&evt_rx, std::time::Duration::from_secs(2)));
+        let events = batch_events(collect_events(&evt_rx, std::time::Duration::from_secs(10)));
         assert!(matches!(events[1], Event::AnalyzeStarted { .. }));
         assert!(matches!(
             events.last().unwrap(),
@@ -3722,7 +3746,7 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = batch_events(collect_events(&evt_rx, std::time::Duration::from_secs(2)));
+        let events = batch_events(collect_events(&evt_rx, std::time::Duration::from_secs(10)));
         assert_eq!(
             events.len(),
             3,
@@ -3780,7 +3804,7 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
         match &events[1] {
             Event::HistoryLoaded { records: loaded } => {
                 assert_eq!(loaded.len(), 3);
@@ -3831,7 +3855,7 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
         match &events[1] {
             Event::HistoryLoaded { records: loaded } => {
                 // started_at values: 0, 100, 200, 300, 400 (seconds offset).
@@ -3877,7 +3901,7 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(2));
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
         assert!(
             !events.iter().any(|e| matches!(e, Event::Error { .. })),
             "a file failure is not a fatal event: {events:?}"
@@ -4039,7 +4063,7 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let _events = collect_events(&evt_rx, std::time::Duration::from_secs(5));
+        let _events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
 
         assert!(
             !partial_check_b.exists(),
@@ -4091,7 +4115,7 @@ mod mock_tests {
             ))
             .unwrap();
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(5));
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
         assert!(
             events
                 .iter()
@@ -4134,7 +4158,7 @@ mod mock_tests {
                 },
             ))
             .unwrap();
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(5));
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
         assert!(
             events
                 .iter()
@@ -4146,7 +4170,7 @@ mod mock_tests {
         cmd_tx
             .send(Request::new(2, Command::Detect { force: true }))
             .unwrap();
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(5));
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
         assert!(
             events
                 .iter()
@@ -4164,7 +4188,7 @@ mod mock_tests {
                 },
             ))
             .unwrap();
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(5));
+        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
         assert!(
             events
                 .iter()
