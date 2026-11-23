@@ -146,9 +146,10 @@ saying a change is done.
 ## Batch check, batch fix, batch verify
 
 A change that spans several files is one change, not several. The unit of
-work is the **task**, and the unit of the batch is the task too.
+integration is the **task**: a coherent piece of work that can be
+implemented, checked and verified on its own.
 
-**Outer loop: read, plan, then iterate.**
+**Outer loop (the whole job):**
 
 1. **Spread out the whole picture and read it once.** Before planning,
    read everything the work touches in one pass (the files, the call
@@ -157,42 +158,47 @@ work is the **task**, and the unit of the batch is the task too.
 2. **Decompose into tasks.** Each task has one intent, one verification,
    and a file list you can name up front. The task list is the iteration
    order.
-3. **Per task: one check, one fix pass, one verification.**
-   - **Batch check.** One command that surfaces every error of this task
-     at once: `cargo check --workspace --all-targets` (not
-     `cargo check -p <crate>`, which hides the errors in the crates you
-     did not name, and not a per-file loop). Collect the whole error
-     list with its locations.
-   - **Batch fix.** Apply every fix of this task in one pass, then
-     compile once. A systematic mistake (a renamed field, a changed
-     signature) shows up as N errors at N sites; fixing them one at a
-     time costs N compiles, and each compile reveals only the next
-     error, never the shape of the change.
-   - **Batch verify.** Run the gate once at the end of the task
-     (`cargo clippy --workspace --all-targets -- -D warnings`,
-     `cargo test --workspace`, `cargo fmt --check`) and say what it
-     proved.
-4. **Then the next task.** The iteration is over tasks; inside a task
-   there is no iteration, only one cycle.
+3. **Run each task's inner loop**, in order. Tasks are independent: one
+   task's loop ends green before the next one starts.
+4. **Integrate.** After the last task, run one more whole check -> fix ->
+   verify over everything. If that surfaces problems too big to fix in
+   place, decompose them into new tasks and run their loops.
 
-Do not interleave edit -> compile -> edit -> compile. Each round trip is
-a full compile, and the interleaving hides the fact that the errors share
-one cause.
+**Inner loop (per task):**
+
+1. **Implement the whole task in one pass.** Write all of it before
+   compiling. The compiler tells you what you got wrong; it does not
+   tell you what to write.
+2. **Check, fix, verify -- then repeat.** One check that surfaces every
+   error of this task at once: `cargo check --workspace --all-targets`
+   (not `cargo check -p <crate>`, which hides the errors in the crates
+   you did not name, and not a per-file loop). Then one fix pass that
+   applies every fix in one go. Then the gate (`cargo clippy --workspace
+   --all-targets -- -D warnings`, `cargo test --workspace`,
+   `cargo fmt --check`). Iterate check -> fix -> verify until the task
+   is green.
+
+The discipline: **inside a task, the errors are handled in batches and
+the iteration happens between the batches.** A systematic mistake (a
+renamed field, a changed signature) shows up as N errors at N sites;
+fixing them one at a time costs N compiles, and each compile reveals
+only the next error, never the shape of the change.
 
 **A check narrower than the task hides errors.** The check must cover the
 task's full blast radius (every crate the task touches), otherwise the
-errors outside it surface in the next round, which is exactly the
-interleaving this rule exists to stop.
+errors outside it surface in the next round -- and a task that ends with
+errors outside it is not green.
 
 **Granularity is a trade-off.** Too coarse and the task stops being one
 unit: the fix pass becomes unrelated edits, and the verification can no
 longer attribute anything to what it proved. Too fine and the compile
-overhead per task dominates, so batching buys nothing. If you cannot name
-a task's file list, the task is not scoped yet: scope it first (step 1 of
-the methodology below), then batch it.
+overhead per task dominates, so batching buys nothing, and the
+integration point moves so often that nothing is ever verified as a
+whole. If you cannot name a task's file list, the task is not scoped
+yet: scope it first (step 1 of the methodology below), then batch it.
 
-State the batch before running it: what this task checks, what it fixes,
-what proves it.
+State the batch before running it: what this task implements, what it
+checks, what it fixes, what proves it.
 
 ## Refactor / rename methodology
 
