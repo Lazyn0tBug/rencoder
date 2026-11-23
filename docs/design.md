@@ -70,13 +70,13 @@ Rencoder 是一个独立的第三方应用，不是发布到 crates.io 的通用
 
 - **cfg 只出现在定义处**——写出平台特定逻辑的函数内部。
 - **调用处只看到 uniform signature**——一个名字、一个签名，跨平台一致。
-- **当前实现：Unix only**——我们目前只在 macOS 上构建和测试；Linux 路径
-  跟 macOS 共享 `#[cfg(unix)]` 分支，覆盖到时一并验证。非 Unix 平台的
-  等价行为**尚未实现**（future work）。
+- **当前实现：GUI 是 Unix only**（§8 row 35 ✅）；lib 与 CLI 在 macOS、
+  Linux、Windows 三台宿主机上构建并测试 ✅ ——CI（`.github/workflows/ci.yml` ✅）
+  在三台上跑闸门 ✅。非 Unix 平台的等价行为**尚未实现**（future work ✅）。
 - **新增平台行为只改一个文件**——后续要落非 Unix 平台特定特性时，只改
   定义处的实现，调用方零改动。
 
-#### 当前实现（Unix，macOS 已验证）
+#### 当前实现（Unix：macOS 已验证 ✅，Linux 由 CI 覆盖 ✅）
 
 | 操作 | Unix (macOS / Linux) | 非 Unix | 模块 |
 |------|----------------------|---------|------|
@@ -2101,7 +2101,7 @@ ffmpeg 一升级（macOS 定期抬 dylib major，Linux 各发行版 major 不同
 - **Dioxus desktop (0.6)**：纯 Rust、wry webview 后端，与 Tauri 同层但避免 IPC JSON 序列化税（每条 `Progress` 事件不跨 IPC 边界）。
 - **单 batch per process**：编码是 CPU 密集，多任务无益于效率。沿用 §3.4 的 `current_output` cell 单例约束——UI 一次只能有一个活跃批。**不**设计 `JobRegistry` / 多 job 抽象。
 - **位置**：作为第三个 crate 加入 workspace（`rencoder_ui`），依赖 `rencoder_lib`（`publish = false`，零外部发布）。**不**复用 `rencoder_cli::signal`（webview 自带 beforeunload / IPC 机制）。
-- **平台范围**：遵循 §1.3，当前实现 Unix-only（macOS 已验证；Linux 跟 macOS 共享 `#[cfg(unix)]` 分支，覆盖到时一并验证）。wry/Dioxus 的非 Unix 平台支持属于 future work——本节设计不阻止,但当前不投入测试。
+- **平台范围**：遵循 §1.3，GUI 当前是 Unix-only（macOS 已验证 ✅；Linux 由 CI 覆盖 ✅ ——CI 的 `ui` job 跑整个 workspace ✅）。wry/Dioxus 的非 Unix 平台支持属于 future work——本节设计不阻止,但当前不投入测试 ✅。
 
 #### 3.8.2 Actor 模型：UI 与 lib 是两个 actor
 

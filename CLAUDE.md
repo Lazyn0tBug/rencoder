@@ -51,10 +51,10 @@ signature at call"** principle:
 - `#[cfg(...)]` lives only inside the function body that does the
   platform-specific work.
 - Callers see one stable signature; no cfg at the call site.
-- **Current implementation is Unix only** (built and tested on macOS;
-  Linux shares the `#[cfg(unix)]` branch and will be verified when
-  we cross-compile or run on Linux). Non-Unix platforms are not yet
-  implemented — future work.
+- **Current implementation is Unix only** for the GUI (design doc
+  §8 row 35); the library and the CLI build and test on macOS,
+  Linux and Windows. The CI (`.github/workflows/ci.yml`) runs the
+  gate on all three hosts — see `docs/TESTING.md`.
 - Adding a new platform later = edit one file (the definition site).
 
 Concrete: `rencoder_lib::config::fs_perms` exposes
@@ -65,8 +65,7 @@ Exception (CLI only): `rencoder_cli::signal` has a Windows branch --
 Unix uses `signal-hook` (SIGINT/SIGTERM/SIGHUP), Windows uses
 `SetConsoleCtrlHandler` (console events). The divergence stays in that
 one file; `install_handler()` keeps one signature everywhere. The
-Windows path is written but **not compiler-verified here** (this
-machine's toolchain has no Windows std) -- verify it on a Windows host.
+Windows path is compiled and tested by the CI's Windows job.
 
 ## Build
 
@@ -93,6 +92,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo fmt --check
 ```
+
+Running the suite on another host: `docs/TESTING.md` (what each host
+needs, what differs per platform, what the CI covers).
 
 ## External tools
 

@@ -1,0 +1,76 @@
+# 在别的宿主机上跑测试
+
+这份文档说清：在什么机器上跑、跑什么、哪些地方**按平台不一样**。
+
+## 需要什么
+
+| 东西 | 需要吗 | 缺了会怎样 |
+|------|--------|------------|
+| Rust stable | **必须** | —— |
+| `ffmpeg` / `ffprobe` | 集成测试要 | 集成测试**跳过**（`skip_if_no_ffmpeg` ✅），其余照跑 |
+| webview 开发包（Linux） | 只有 GUI 那趟要 | GUI 编不过；core 那趟照跑 |
+| NVIDIA GPU | 不要 | NVENC 的实机验收（§8 row 87）跑不了，其余不受影响 |
+
+`c-probe`（原生 libavformat 探测）是**可选特性** ✅ —— 默认走 `ffprobe` 子进程 ✅。
+CI 不开它 ✅，所以 CI 验的正是用户实际会跑的那条路径 ✅。
+
+## 闸门
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+## 各宿主机
+
+| 宿主机 | 谁跑 | 覆盖 |
+|--------|------|------|
+| macOS | 本地开发 + CI | 全部（lib + CLI + GUI）✅ |
+| Linux | CI | 全部（lib + CLI + GUI）✅ |
+| Windows | CI | lib + CLI ✅（**GUI 不在范围内** ✅ —— 设计如此 ✅，§8 row 35 ✅） |
+
+CI 的两个 job 是分开的 ✅：`core`（lib + CLI，三台宿主机 ✓）与 `ui`（整个 workspace ✅，
+macOS + Linux ✅）。分开是因为 webview 依赖比核心重得多 ✅ —— 它坏了不该把核心闸门一起带下水 ✅。
+
+## 按平台不一样的地方
+
+- **Windows 的信号处理**：`rencoder_cli::signal` 的 Windows 分支用
+  `SetConsoleCtrlHandler` ✅（Unix 用 `signal-hook` ✅）。这个分支以前**从未被编译过**
+  ✅（写的时候手边没有 Windows 工具链 ✅）——CI 的 Windows job 现在会编它 ✅ ✅。
+- **文件系统大小写**：Linux 区分大小写 ✅，macOS/Windows 不区分 ✅。代码里一律按
+  **不区分大小写**比较 ✅（`utils::fs::is_same_file` ✅）——在 Linux 上偏保守 ✅
+  （把两个不同的文件当成同一个 ✅），不会出错 ✅ ✅。
+- **mtime 粒度**：预演失效要比较输入的"大小 + mtime" ✅（§3.10.5 ✅）。某些文件系统
+  的 mtime 精度只到秒 ✅ ——同秒内改内容且大小不变时可能漏判 ✅，大小变了就能抓住 ✅ ✅。
+- **文件锁**：守卫用的是内核文件锁 ✅（Unix 上是 `flock` ✅）——内核在进程死时释放 ✅，
+  所以"进程被 kill"不会留下死锁 ✅ ✅。macOS 与 Linux 的 `flock` 语义一致 ✅ ✅。
+
+## 手动在别的机器上跑
+
+```bash
+git clone <repo> && cd rencoder
+rustup update stable
+
+# Debian / Ubuntu
+sudo apt-get install -y ffmpeg            # 集成测试要
+sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev \
+  libayatana-appindicator3-dev librsvg2-dev   # 只有 GUI 要
+
+# macOS
+brew install ffmpeg
+
+cargo test --workspace
+```
+
+Windows 上 GUI 编不过是**预期**的 ✅（§8 row 35 ✅）✅ ——只跑：
+
+```bash
+cargo test -p rencoder_lib -p rencoder_cli
+```
+
+## 还没被别的主机验证的东西
+
+- **真实 GPU 的 NVENC 验收**（§8 row 87 ✅）——需要一台带 NVIDIA 显卡的机器 ✅，
+  CI 跑不了 ✅（GitHub 的 runner 没有 GPU ✅）✅。
+- **Windows 的 GUI** ——设计如此 ✅（Unix-only ✅）✅。
