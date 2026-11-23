@@ -471,67 +471,176 @@ mod tests {
     }
 
     #[test]
-    fn command_construction_is_constructible() {
-        // Sanity: the variants the design promises are reachable.
-        let _ = Command::StartBatch {
-            params: EncodeParams::default(),
-            files: vec![crate::types::InputPath::new(std::path::Path::new("/a.mp4")).unwrap()],
-        };
-        let _ = Command::Cancel { batch_id: 1 };
-        let _ = Command::LoadHistory {
-            limit: Some(10),
-            after: None,
-        };
+    fn every_command_variant_is_constructible() {
+        // The protocol's shape, pinned.
+        //
+        // The match is **exhaustive on purpose**: a new variant
+        // breaks the build until it is constructed here -- so nobody
+        // adds a command without its shape being looked at.
+        let commands = vec![
+            Command::StartBatch {
+                params: EncodeParams::default(),
+                files: vec![crate::types::InputPath::new(std::path::Path::new("/a.mp4")).unwrap()],
+            },
+            Command::DryRun {
+                params: EncodeParams::default(),
+                files: vec![crate::types::InputPath::new(std::path::Path::new("/a.mp4")).unwrap()],
+            },
+            Command::Cancel { batch_id: 1 },
+            Command::LoadHistory {
+                limit: Some(10),
+                after: None,
+            },
+            Command::SaveConfig {
+                config: Box::new(AppConfig::default()),
+                revision: 1,
+            },
+            Command::Detect { force: true },
+            Command::SetWorkingDir {
+                dir: std::path::PathBuf::from("/tmp"),
+            },
+            Command::Analyze {
+                files: vec![crate::types::InputPath::new(std::path::Path::new("/a.mp4")).unwrap()],
+            },
+        ];
+        for command in commands {
+            match command {
+                Command::StartBatch { .. }
+                | Command::DryRun { .. }
+                | Command::Cancel { .. }
+                | Command::LoadHistory { .. }
+                | Command::SaveConfig { .. }
+                | Command::Detect { .. }
+                | Command::SetWorkingDir { .. }
+                | Command::Analyze { .. } => {}
+            }
+        }
     }
 
     #[test]
-    fn event_construction_is_constructible() {
+    fn every_event_variant_is_constructible() {
+        // The protocol's shape, pinned -- exhaustive on purpose, see
+        // [`every_command_variant_is_constructible`].
         let rec = sample_record();
-        let _ = Event::BatchStarted {
-            id: 1,
-            total_files: 5,
-        };
-        let _ = Event::FileStarted {
-            batch_id: 1,
-            index: 0,
-            total: 5,
-            source: crate::types::InputPath::new(std::path::Path::new("/a.mp4")).unwrap(),
-        };
-        let _ = Event::FileCompleted {
-            batch_id: 1,
-            index: 0,
-            record: rec,
-        };
-        let _ = Event::BatchCompleted {
-            batch_id: 1,
-            records: vec![sample_record()],
-        };
-        let _ = Event::BatchCancelled {
-            batch_id: 1,
-            completed: 2,
-            total: 5,
-        };
-        let _ = Event::Progress {
-            batch_id: 1,
-            file_index: 0,
-            frame: 100,
-            fps: 30.0,
-            speed: 1.5,
-            time_secs: 5.0,
-            eta_secs: Some(40.0),
-        };
-        let _ = Event::LogLine {
-            batch_id: 1,
-            file_index: 0,
-            line: "frame= 100".into(),
-        };
-        let _ = Event::HistoryLoaded {
-            records: vec![sample_record()],
-        };
-        let _ = Event::Error {
-            category: ErrorCategory::FfmpegSpawnFailed,
-            message: "ffmpeg not found".into(),
-        };
+        let source = crate::types::InputPath::new(std::path::Path::new("/a.mp4")).unwrap();
+        let events = vec![
+            Event::CommandAccepted {
+                request_id: 1,
+                batch_id: Some(1),
+            },
+            Event::CommandRejected {
+                request_id: 1,
+                reason: "another batch is already running".into(),
+            },
+            Event::BatchStarted {
+                id: 1,
+                total_files: 5,
+            },
+            Event::FileStarted {
+                batch_id: 1,
+                index: 0,
+                total: 5,
+                source: source.clone(),
+            },
+            Event::FileCompleted {
+                batch_id: 1,
+                index: 0,
+                record: rec.clone(),
+            },
+            Event::BatchCompleted {
+                batch_id: 1,
+                records: vec![rec.clone()],
+            },
+            Event::DryRunFinished {
+                batch_id: 1,
+                generation: 1,
+                records: vec![rec.clone()],
+            },
+            Event::BatchCancelled {
+                batch_id: 1,
+                completed: 2,
+                total: 5,
+            },
+            Event::BatchFailed {
+                batch_id: 1,
+                category: ErrorCategory::ConfigError,
+                message: "the target is held".into(),
+            },
+            Event::Progress {
+                batch_id: 1,
+                file_index: 0,
+                frame: 100,
+                fps: 30.0,
+                speed: 1.5,
+                time_secs: 5.0,
+                eta_secs: Some(40.0),
+            },
+            Event::LogLine {
+                batch_id: 1,
+                file_index: 0,
+                line: "frame= 100".into(),
+            },
+            Event::HistoryLoaded {
+                records: vec![rec.clone()],
+            },
+            Event::ConfigSaved {
+                path: std::path::PathBuf::from("/tmp/rencoder.toml"),
+                revision: 1,
+            },
+            Event::NvencCapability(Capability::default()),
+            Event::CapabilityChecked {
+                report: std::path::PathBuf::from("/tmp/capabilities.json"),
+            },
+            Event::AnalyzeStarted {
+                batch_id: 1,
+                total: 3,
+            },
+            Event::AnalyzeProgress {
+                batch_id: 1,
+                done: 1,
+                total: 3,
+                failed: 0,
+                last: None,
+            },
+            Event::AnalyzeFinished {
+                batch_id: 1,
+                records: vec![],
+                failed_count: 0,
+            },
+            Event::OperationFailed {
+                request_id: 1,
+                category: ErrorCategory::ConfigError,
+                message: "save failed".into(),
+            },
+            Event::Error {
+                category: ErrorCategory::FfmpegSpawnFailed,
+                message: "ffmpeg not found".into(),
+            },
+        ];
+        for event in events {
+            match event {
+                Event::CommandAccepted { .. }
+                | Event::CommandRejected { .. }
+                | Event::BatchStarted { .. }
+                | Event::FileStarted { .. }
+                | Event::FileCompleted { .. }
+                | Event::BatchCompleted { .. }
+                | Event::DryRunFinished { .. }
+                | Event::BatchCancelled { .. }
+                | Event::BatchFailed { .. }
+                | Event::Progress { .. }
+                | Event::LogLine { .. }
+                | Event::HistoryLoaded { .. }
+                | Event::ConfigSaved { .. }
+                | Event::NvencCapability(_)
+                | Event::CapabilityChecked { .. }
+                | Event::AnalyzeStarted { .. }
+                | Event::AnalyzeProgress { .. }
+                | Event::AnalyzeFinished { .. }
+                | Event::OperationFailed { .. }
+                | Event::Error { .. } => {}
+            }
+        }
     }
 
     // ---- send_evt_lossy / bounded channel policy (review #111) ----

@@ -1333,8 +1333,14 @@ fn apply_event(state: &mut AppState, evt: Event) {
             // `BatchFailed` (design doc §3.11.3).
             state.last_error = Some(message);
         }
-        // #[non_exhaustive] future variants — silently drop.
-        _ => {}
+        // The protocol is `#[non_exhaustive]`, and the UI is another
+        // crate -- so a wildcard arm is required. An event nobody
+        // handles is **logged**, not silently dropped: a protocol
+        // that grew a variant the UI does not know about should be
+        // visible.
+        _ => {
+            tracing::warn!("unhandled event variant (the protocol grew one the UI does not know)");
+        }
     }
 }
 
