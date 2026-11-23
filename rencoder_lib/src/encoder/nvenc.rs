@@ -316,9 +316,13 @@ impl Capability {
 
     /// The advisory shown when the stored result is past its review
     /// date. `None` when it is still fresh.
+    ///
+    /// The wording matches the model's vocabulary: the record is old,
+    /// so a **check** is worth doing -- it is not a "re-detection"
+    /// that something does on its own (design doc §3.10.7).
     pub fn review_advisory(&self) -> Option<String> {
         self.review_due
-            .then(|| "detected over 30 days ago — recommend re-detecting".to_string())
+            .then(|| "checked over 30 days ago — recommend checking again".to_string())
     }
 }
 

@@ -449,7 +449,7 @@ df_to_csv  df_to_jsonl  df_to_parquet
 - 进程 ID 后缀（`a3f`）避免同一秒内并发冲突
 
 > 注：NVENC 探测失败（驱动缺失、卡不支持该编码器、会话额度耗尽）一律归为降级路径，
-> `init_encoder_cache` 不因此返回 `EncodeError`——不可用就是不可用，不是错误。
+> 能力检查不因此返回 `EncodeError`——不可用就是不可用，不是错误。
 > 能力探测**与 `nv` 开关无关**（§3.10.5）：`nv` 是"本次运行用不用 GPU"，
 > 能力是"这台机器行不行"——两回事。
 
@@ -504,7 +504,7 @@ ffmpeg 不带 `-r` 时并不等于"不干预帧率"——默认 vsync 行为会�
 - `data/store.rs` 拥有 Polars DataFrame writers（`records_to_dataframe`、`records_to_csv/jsonl/parquet`、`dataframe_to_*`）
 - `data/record.rs` 拥有 `EncodingRecord` 组装 helpers（`encoder_settings_from_params`）
 - `encoder/{command,select}.rs` 拥有 `build_ffmpeg_command` + `select_encoder`
-- `pipeline/{batch,cancel,cache}.rs` 拥有 `transcode_batch` + `CancelToken` + `init_encoder_cache`
+- `pipeline/{batch,cancel,cache}.rs` 拥有 `transcode_batch` + `CancelToken` + 从已解析能力构造编码器缓存（`cache_from_resolution`）
 - `utils/{fs,time}.rs` 拥有 `output_path_for` + `is_same_file` + `utc_timestamp_filename`
 - `config/mod.rs` 拥有配置的重导出（运行时 `Config` 已退役 —— §8 item 83）
 - `config/app.rs` 拥有 user-facing `AppConfig`（U18 重命名自 `project.rs`；TOML 加载在 U17 新增）
@@ -533,7 +533,7 @@ rencoder_lib/
 ├── pipeline/
 │   ├── mod.rs
 │   ├── batch.rs                 # 编排：collect_files → transcode_batch（按文件循环，写记录+日志）
-│   ├── cache.rs                 # init_encoder_cache（ffmpeg -encoders + NVENC 能力实测）
+│   ├── cache.rs                 # 从已解析的能力构造编码器缓存（cache_from_resolution）
 │   └── cancel.rs                # CancelToken（§3.8；Arc<AtomicBool> + cancel()/is_cancelled()）
 ├── types.rs                     # 跨模块共享类型（VideoFormat、EncodingRecord、MaxFpsConfig 等）
 └── utils/
@@ -966,13 +966,14 @@ pub fn collect_files(
 #### 编码器缓存与选择
 
 ```rust
-/// 初始化编码器缓存（一次，每进程）
+/// 能力检查（一次，每进程；§3.10.7）
 /// 能力实测**不受 `nv` 开关影响**（§3.10.5）：能力是机器事实，总是形成。
 /// 对 ffmpeg -encoders 里出现的每个 NVENC 编码器跑一次 1 帧试编码，成功即"这台机器能用"。
-/// 结果进程内缓存，同进程内多次批次复用；`nv` 只在**选参数**时与能力结果合并判断。
+/// 结论进**能力对象**（`Capability`，带代次），编码器缓存由它派生；同进程内多次批次
+/// 复用同一份；`nv` 只在**选参数**时与能力结果合并判断。
 /// 探测失败 / 不可用一律降级到软件编码（warn，不作为 EncodeError 传播）。
 /// 对齐 encode.zsh 的 init_encoder_cache()
-pub fn init_encoder_cache() -> Result<EncoderCache, EncodeError>;
+pub fn resolve_capability(...) -> Result<Capability, EncodeError>;
 
 /// 选择编码器
 /// 优先级：配置覆盖 > 可用的 NVENC 变体 > 软件默认。
@@ -1784,7 +1785,7 @@ CLI 解析参数 → EncodeParams
     ↓
 collect_files → 文件列表（walkdir）
     ↓
-init_encoder_cache(capability) → EncoderCache（一次，每进程）
+能力检查 → 能力对象 + 编码器缓存（一次，每进程；§3.10.7）
     ├─ ffmpeg -encoders（始终）
     └─ NVENC 能力实测（**不受 nv 开关影响**；1 帧试编码 / 进程内缓存）
     ↓
@@ -2443,7 +2444,7 @@ UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `int
 | `data/store.rs` | `read_records(path)` | 单 Parquet 文件回读(v1 不使用,v1.1 启用) |
 | `encoder/ffmpeg_arg.rs` | `ExtraArg` enum + `ExtraArg::parse` factory + char-class 模块 | 类型级 ffmpeg argv 安全边界(§3.3.7)——非法 argv 在 parse 阶段被拒,运行时无法塞 unsafe 值。替换 v1 的 runtime `validate_extra_args` |
 | `config/app.rs` | `EncodersConfig::for_format` | 按格式取编码器覆盖；空字符串视为未设（否则 `has_encoder("")` 恒真） |
-| `pipeline/cache.rs` | `init_encoder_cache_with_capability_runner` / `init_encoder_cache_async_with_capability_runner` | 能力解析的 runner 缝——测试不必真跑探测 |
+| `job.rs` | `ActorEnv::detect_runner` + `spawn_probe` | 能力检查的 runner 缝——测试不必真跑探测（§3.10.4：测试不许碰真机器） |
 | `types.rs` | `InputPath` newtype + `InputPath::new(&Path)` factory + `InputPathError` | 输入路径类型级安全边界(§3.3.8)——dash 前缀文件名在构造时就被拒,`build_ffmpeg_command` 不可能拿到 `-vf_negate.mp4`。替换 `collect_dir` 里的运行时 dash-prefix 检查(review #109 收尾) |
 
 **per-file 的可测试性**(§8 item 43 的意图)——当年抽 `process_one_file` 是为了给测试一个
@@ -4080,6 +4081,14 @@ schema 层仅对需要区分缺省的字段保留存在性：只有「缺省」�
 
 在文件采集前通过同一个入口完成解析，生成有效配置快照。采集、预演及执行使用同一结果。复用预演前比较任务清单、有效规划参数和相关能力代次。预演依赖媒体探测时还需检查输入是否变化，无法确认时重新规划。复用 EncodeParams、BatchContext 和 FilePlan。逐文件只按媒体信息和运行能力派生执行参数，编码器回退时重建相关参数组。
 
+**比较在点击时做，actor 不重复**：预演冻结的那一代（`DryRunFinished` 带上它）与"当前
+那一代"（`Event::NvencCapability` 带上它）都是 lib 给的事实，UI 比的是这两个事实。
+代次只有一处会动——**用户请求的一次检查**（§3.10.7）；那次检查是 UI 自己发起的，结论
+也回到 UI，所以 UI 一定看得见。批次的第一段**不再自己探**（它取已发布的事实，
+§3.10.1.2），所以"点击之后事实被刷新"这件事不存在。剩下的窗口只有一处：能力事件已经
+发出、还没被 UI 的事件泵取走的那一拍（毫秒级）——此时批次冻结的是新的一代，而计划是
+旧的一代。批次的记录写的是实际用的编码器（真相），计划与实际的差异只多这一次重规划。
+
 字段按消费位置作必要区分，只有共享校验或消除实际重复有收益时才提取结构。集合按字段约定替换、追加或按键合并。FFmpeg argv 按槽位构造，配置文件和入口的透传使用同一冲突规则。帧率、编码器和质量等受管选项的冲突应报错，记录以最终执行计划为依据。
 
 验收覆盖三层优先级、显式 0 / false、等效 CLI 和 GUI 参数产生相同计划、同一批次快照稳定、透传冲突及回退参数一致性。
@@ -4566,6 +4575,7 @@ future 待做 / ⚠️ 已作废），§8 就是当前的路线图。
 | 102 | **启动期可取消**（§3.11.2）：采集每 64 个条目查一次取消令牌 ✅ ✅；NVENC 探测走 ffmpeg 调用那道缝 ✅ ✅、每次调用前查一次 ✅ ✅；取消发生在开工前 ✅ ✅ → 不产出任何东西 ✅ ✅，退出码 130 ✅ ✅ | ✅ |
 | 101 | **批内输出规划**（§3.11.1）：两个输入指向同一输出时**改名**而不是整批终止 ✅ ✅ —— `<词干>_<输入扩展名>_<序号>.<目标扩展名>` ✅ ✅；序号按排序后的路径分配 ✅ ✅（名字不随采集顺序变 ✅ ✅）；输出不落在任何输入上 ✅ ✅ | ✅ |
 | 100 | **输出直写 + 写坏了就删**（§3.11.2）：编码器直接写目标路径 ✅ ✅（守卫保证没有第二个实例 ✅ ✅；中间文件只会多占一倍磁盘 ✅ ✅，不值 ✅ ✅）；中断删掉半截输出 ✅ ✅，失败删掉**这一次**写下的输出 ✅ ✅（ffmpeg 没动过输出就失败的话 ✅ ✅，旧产物留着 ✅ ✅）✅ ✅ | ✅ |
+| 108 | **预演失效的比较放在点击时**（§3.10.5 ✅ ✅）：预演冻结的代次与当前代次都是 lib 给的事实 ✅ ✅，UI 比的是这两个 ✅ ✅；代次只有一处会动——**用户请求的那次检查** ✅ ✅（UI 自己发起 ✅ ✅、结论回到 UI ✅ ✅）；批次的第一段**不再自己探** ✅ ✅（它取已发布的事实 ✅ ✅，§3.10.1.2 ✅ ✅），所以"点击之后事实被刷新"不存在 ✅ ✅——actor 不重复这次比较 ✅ ✅（剩下的窗口 = 能力事件在路上的一拍 ✅ ✅，毫秒级 ✅ ✅）| ✅ |
 | 107 | **链在 actor 里，每段一个 barrier**（§3.10.1.2）：接纳 → 事实成立 → 执行 → 终态 ✅ ✅；**等待归 actor** ✅ ✅（事实的发布落地 = 第一道 barrier 的释放点 ✅ ✅），worker **不再轮询**已发布状态 ✅ ✅（它拿到的是冻结的事实快照 ✅ ✅）；**取消能打断 barrier** ✅ ✅——批次停在第一段时取消就地结束 ✅ ✅（`BatchCancelled { completed: 0 }` ✅ ✅，worker 根本不起 ✅ ✅）；事实迟迟不落地 → actor 的 deadline 分支判失败 ✅ ✅（闸门不会永远关着 ✅ ✅）| ✅ |
 | 106 | **必要时的一次检查**（§3.10.7）：能力是**机器的事实**，成立一次就沿用 ✅ ✅——没有例行的"重检" ✅ ✅；检查只发生在两种必要时 ✅ ✅：记录不成立（没有 / 指纹对不上）✅ ✅，或用户说机器变了 ✅ ✅（GUI 的 "check now" ✅ ✅、CLI 的 `--detect` ✅ ✅）；一次请求最多一次检查 ✅ ✅；**批次不发起检查** ✅ ✅——它取已发布的事实 ✅ ✅（链的第一段 = "确保事实成立" ✅ ✅）；检查的结论发布一代，整体共享 ✅ ✅（§3.10.6 步骤 5 ✅ ✅）| ✅ |
 

@@ -18,8 +18,15 @@
 //!   per-frame event stream.
 //!
 //! Single-batch constraint: §3.4 — one batch in flight at a time.
-//! A second `StartBatch` while one is running returns
-//! `Event::Error(ConfigError)` rather than queueing.
+//! A second `StartBatch` while one is running is **rejected**
+//! (`Event::CommandRejected`) rather than queued — the running batch
+//! is untouched (design doc §3.11.3).
+//!
+//! The batch's chain (§3.10.1.2): the actor admits the batch, waits
+//! for the **facts** (the capability + the encoder cache) to be
+//! published, and only then starts the worker — with the facts
+//! frozen into it. The waiting belongs to the actor, so a cancel can
+//! interrupt it.
 
 use crossbeam_channel::{after, bounded, never, select, unbounded, Receiver, Sender};
 use std::path::PathBuf;
@@ -1020,11 +1027,9 @@ pub fn start_controller() -> ControllerHandle {
 
     let env = production_env(app_config.clone(), config_path.clone());
 
-    // Review #126: async cache init. The cache init spawns its own
-    // thread and returns a one-shot receiver; the actor can drain
-    // cmd_rx while init runs in the background. StartBatch
-    // handlers block on the receiver only when a batch actually
-    // starts.
+    // The capability check runs on its own thread and hands the
+    // result back; the actor publishes it (design doc §3.10.6
+    // step 5). The actor can drain cmd_rx while the check runs.
     // The NVENC capability is resolved through the on-disk record
     // (shared with the CLI): a fresh record is reused as-is, a missing
     // one is probed and stored. The summary rides along so the UI can
@@ -1899,8 +1904,9 @@ fn persist_batch_records(records: &[EncodingRecord], records_dir: Option<&std::p
 /// runs on the batch worker thread: the batch context (params, cache
 /// snapshot, config, verdicts), the cancel token and the event sender.
 ///
-/// The context is built *in the worker* (after the cache lands), so
-/// the actor never waits for the cache init (§3.10.1.1 rule 5).
+/// The context is built *in the worker*, from the facts the actor
+/// froze into the batch (design doc §3.10.1.2) -- the worker waits
+/// for nothing.
 fn make_encode_processor(
     mut batch_ctx: BatchContext,
     batch_id: BatchId,
@@ -2062,20 +2068,11 @@ fn advance_pending(pending: &mut Option<PendingBatch>, state: &mut ActorState) {
 fn cache_from_slot(slot: CacheSlot) -> Result<Arc<EncoderCache>, (ErrorCategory, String)> {
     match slot {
         Ok(cache) => Ok(cache),
-        Err(e) => Err((e.category(), format!("encoder cache init failed: {e}"))),
+        Err(e) => Err((e.category(), format!("the encoder cache is unusable: {e}"))),
     }
 }
 
-fn run_actor(
-    cmd_rx: Receiver<Request>,
-    evt_tx: Sender<Event>,
-    env: ActorEnv,
-    // Review #126: cache init runs on a background thread; this
-    // receiver yields the result when ready. The cmd_rx loop can
-    // process other commands (Cancel / LoadHistory / SaveConfig)
-    // while init runs. StartBatch handlers block on this when a
-    // batch actually starts.
-) {
+fn run_actor(cmd_rx: Receiver<Request>, evt_tx: Sender<Event>, env: ActorEnv) {
     // The injected dependencies, unpacked for the arms below.
     let config_path = env.config_path.clone();
     // The paths: the app-level ones never move, the run-level ones
@@ -2089,33 +2086,30 @@ fn run_actor(
     // Review #111: dropped-event counter for diagnostics. Each sender
     // owns one (it is never read by anyone but its own thread).
     let dropped_counter = DropCounter::default();
-    // Review #126: cache init is now async — see
-    // `init_encoder_cache_async`. The cmd_rx loop below runs
-    // immediately; the cache receiver is consumed lazily by
-    // StartBatch handlers.
+    // The published state: the encoder cache and the capability, as
+    // one answer (design doc §3.10.6 step 5). The publisher writes
+    // it; the actor reads one snapshot per batch and hands it to the
+    // worker frozen.
     //
     // The slot holds `Result<EncoderCache, EncodeError>` so a FAILED
-    // init stays observable: subsequent batches see `Err(...)` and
-    // can surface a meaningful "encoder cache init failed" error
+    // check stays observable: the batch sees `Err(...)` and can
+    // surface a meaningful "the encoder cache is unusable" error
     // rather than a generic "cache not available" fallback.
-    // The cache is refreshable: the UI can flip `[encode].nv` at
-    // runtime, and the NVENC capability has to be re-resolved for the
-    // next batch — so the slot has to be replaceable, not write-once.
     //
     // The cell holds an `Arc` so the read path is a pointer clone:
     // the reader drops the lock immediately and then encodes without
     // holding it. Holding a lock across an encode (minutes) would
-    // block the refresh thread for the whole file.
+    // block the publisher for the whole file.
     //
     // A plain `Mutex` is the right primitive -- there is exactly one
     // reader (the actor thread, which takes a snapshot per batch) and
-    // two writers (the init thread and the refresh thread), so a
-    // read/write split would buy nothing.
+    // one writer (the publisher), so a read/write split would buy
+    // nothing.
     let published_cell: PublishedCell = Arc::new(Mutex::new(None));
-    // The machine facts, gathered once by the cache init (design doc
-    // §3.10.7). The actor adopts them: a re-check after a working
-    // directory change reuses them instead of probing the machine
-    // again.
+    // The machine facts, gathered once by the capability check
+    // (design doc §3.10.7). The actor adopts them: a check after a
+    // working directory change reuses them instead of probing the
+    // machine again.
     //
     // A plain local, not a cell: the actor is the only reader *and*
     // the only writer (the probes hand their result to the actor,
