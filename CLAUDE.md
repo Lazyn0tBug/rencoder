@@ -164,6 +164,22 @@ Do not interleave edit -> compile -> edit -> compile. Each round trip is
 a full compile, and the interleaving hides the fact that the errors share
 one cause.
 
+**The batch is one task, not a bag of errors.** The first check is aimed
+at the task as a whole: it covers the task's full blast radius (every
+crate the task touches), so the fix pass can address one intent instead
+of a pile of unrelated sites. A check narrower than the task hides the
+errors outside it; they surface in the next round, which is exactly the
+interleaving this rule exists to stop.
+
+**Granularity is a trade-off.** Too coarse and the task stops being one
+unit: the fix pass becomes unrelated edits, and the verification can no
+longer attribute anything to what it proved. Too fine and the compile
+overhead per task dominates, so batching buys nothing. A task is the
+right size when it has one intent, one verification, and a file list you
+can name before you start. If you cannot name that list, the task is not
+scoped yet: scope it first (step 1 of the methodology below), then batch
+it.
+
 State the batch before running it: what this round checks, what it fixes,
 what proves it.
 
