@@ -2404,6 +2404,7 @@ UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `int
 | `job.rs` | `Command::Analyze { files }` arm | U22：调用 `analyze_records_with_probe_and_progress_parallel` with `probe = probe_video_metadata_auto`，`progress = |p| evt_tx.send(Event::AnalyzeProgress { ... })`。先发 `AnalyzeStarted { total }`，批结束发 `AnalyzeFinished`。**走** busy-gate（v1 限制——UI 不能同时跑 analyze + encode；analyze 是 read-only，理论上可与 encode 并存，但 v1 简化起见跟 DryRun 一致复用 busy-gate）|
 | `job.rs` | `Event::AnalyzeStarted` / `Event::AnalyzeProgress` / `Event::AnalyzeFinished` | U22：见 §3.8.3。`Event::AnalyzeProgress` 在 mock actor 里是 no-op（test seam，ref-count 即可）|
 | `job.rs` | `PublishedState` + `Capability::generation()` | actor 发布的"这一代答案"：编码器缓存与能力对象**一起**发布、一起被批次取用（§3.10.6 步骤 5）——批次等缓存落地，也就等到了已发布的能力，不会拿着空能力开跑 |
+| `job.rs` | `Event::DryRunFinished { batch_id, generation, records }` | 预演结果带上它冻结的**能力代次**——计划只对它所规划的那一代有效，UI 复用前拿它与当前代次比（§3.10.5）|
 | `job.rs` | `Command::SaveConfig { config, revision }` / `Event::ConfigSaved { path, revision }` | 保存带修订号、回执带回它——UI 据此只清除这次保存覆盖的编辑（§3.10.5）|
 | `job.rs` | `Event::CommandRejected { request_id, reason }` | 命令被拒（闸门拒绝等）——良性，**不是** fatal：UI 弹一条 toast 即可，正在跑的那批不受影响；`request_id` 说明是哪一个请求被拒，UI 据此恢复原状态（§3.11.3）|
 | `job.rs` | `Request { id, command }` + `RequestId` | 通道上跑的是"命令 + 提交方的号"——答复（接纳/拒绝）指名道姓，UI 才知道该恢复哪个状态（§3.11.3）|
@@ -4477,7 +4478,7 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 83 | **运行时 `Config` 退役**：`encoders` 与 `ffmpeg_args` 进了 `EncodeParams` → 启动时算一次的 grab-bag 类型整体消失，"这次运行用了什么配置"只有一个答案 | ✅ |
 | 84 | 分层配置与一次解析（§3.10.5）：入口显式值 > 文件显式值 > 系统内建默认值，整批共用有效快照 | ✅ |
 | 85 | **编码器找不到 = 一个文件的失败**，不是 panic（§3.11.3）——`build_argv` 返回 `Result`，GUI 不再卡死在 Analyzing，CLI 不再 exit 101 丢光记录 | ✅ |
-| 86 | **预演失效**（§3.10.5）：复用前比较任务清单、有效规划参数、能力代次、输入是否变化——预演依赖媒体探测时无法确认输入未变就重新规划 | future |
+| 86 | **预演失效**（§3.10.5 ✅ ✅）：复用前比较**任务清单** ✅ ✅、**有效规划参数** ✅ ✅、**能力代次** ✅ ✅（预演事件带上它冻结的代次 ✅ ✅）、**输入是否变化** ✅ ✅（大小 + mtime ✅ ✅，预演依赖媒体探测 ✅ ✅）——任一动了就**重新规划**而不是照旧计划开跑 ✅ ✅（同一个任务重新规划 ✅ ✅，不是新任务 ✅ ✅）| ✅ |
 | 87 | NVENC 夹具及真实 GPU 发布验收（§3.10.6） | future |
 | 88 | **能力判定分两级**（§3.10.5）：一级=构建带不带 NVENC，二级=机器能不能跑；记录存的是测试结果，一级失败是它的原因；每个候选都有一项，记录形状不随机器变化（磁盘格式升到 v2，旧记录作废重探） | ✅ |
 | 89 | **复审周期由 lib 掌管**（§2）：记录到期时解析把它推后 30 天并落盘，前端只负责显示提示；两个前端（及以后的前端）不必各自记着延期这件事 | ✅ |

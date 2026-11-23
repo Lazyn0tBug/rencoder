@@ -452,6 +452,31 @@ pub struct TaskInfo {
     /// Records from the DryRun phase. Kept until the next task
     /// lifecycle starts.
     pub dry_run_records: Vec<EncodingRecord>,
+    /// The capability generation the dry run froze (design doc
+    /// §3.10.5). The plan is only valid for the generation it was
+    /// planned under: a re-probe publishes a new one, and the plan
+    /// made under the old one may pick a different encoder.
+    pub dry_run_generation: Option<u64>,
+    /// The planning parameters the dry run ran under (the effective
+    /// `[encode]` section). A change invalidates the plan.
+    pub dry_run_params: Option<rencoder_lib::config::app::EncodeConfig>,
+    /// The inputs the dry run planned, with the stat it saw. The
+    /// plan depends on the media probe, so an input that changed
+    /// invalidates it.
+    pub dry_run_inputs: Vec<(PathBuf, InputStat)>,
+}
+
+/// What the dry run saw of one input: its size and its mtime.
+///
+/// The mtime is what says "changed": the size alone would miss an
+/// edit that keeps the size (design doc §3.10.5 -- the plan depends
+/// on the media probe, so an input that changed invalidates it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputStat {
+    /// The file's size in bytes.
+    pub size: u64,
+    /// The file's modification time, when the filesystem reports one.
+    pub mtime: Option<std::time::SystemTime>,
 }
 
 #[allow(dead_code)] // fields populated by lib, not all read yet by UI
@@ -741,6 +766,16 @@ pub fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Request>) {
                             format!("no files in {} (file list changed since DryRun)", dir),
                             ToastKind::Error,
                         );
+                        return;
+                    }
+                    // The plan the user reviewed must still be the
+                    // plan that runs (design doc §3.10.5): if the
+                    // file list, the parameters, the capability
+                    // generation or an input moved under it, the
+                    // plan is re-made instead of run.
+                    if let Some(reason) = plan_is_stale(state, &files) {
+                        push_toast(state, format!("re-planning: {reason}"), ToastKind::Info);
+                        dispatch_dry_run(state, cmd_tx, files);
                         return;
                     }
                     let params = build_encode_params_from_draft(state);
@@ -1042,7 +1077,11 @@ fn apply_event(state: &mut AppState, evt: Event) {
                 },
             );
         }
-        Event::DryRunFinished { batch_id, records } => {
+        Event::DryRunFinished {
+            batch_id,
+            generation,
+            records,
+        } => {
             // The user cancelled while the dry run was running: the
             // result is discarded and the task goes away.
             let cancelled = state
@@ -1100,6 +1139,10 @@ fn apply_event(state: &mut AppState, evt: Event) {
                 t.dry_run_records = records;
                 t.to_encode = plan.to_encode;
                 t.to_failed = plan.to_failed;
+                // The generation the plan was made under: the reuse
+                // check compares it with the current one (design doc
+                // §3.10.5).
+                t.dry_run_generation = Some(generation);
             }
             // v1.2 follow-up #2: dry-run summary toast. The
             // Analyze stats (`Found N to encode, M to skip` /
@@ -1422,6 +1465,39 @@ fn drop_active(state: &mut AppState) {
     state.viewing_task = None;
 }
 
+/// Dispatch a dry run for the given files.
+///
+/// The task keeps its identity (the same task id): a re-plan is the
+/// same task, planned again (design doc §3.10.5).
+fn dispatch_dry_run(
+    state: &mut AppState,
+    cmd_tx: &crossbeam_channel::Sender<Request>,
+    files: Vec<rencoder_lib::types::InputPath>,
+) {
+    let params = build_encode_params_from_draft(state);
+    // What the plan is made of -- the reuse check compares against
+    // it (design doc §3.10.5).
+    let planning = Some(planning_params(state));
+    let snapshot = stat_inputs(&files);
+    if let Some(t) = state.tasks.active.as_mut() {
+        t.phase = BatchPhase::Analyzing;
+        t.dry_run_params = planning;
+        t.dry_run_inputs = snapshot;
+    }
+    match dispatch(state, cmd_tx, Command::DryRun { params, files }) {
+        Ok(request_id) => {
+            if let Some(t) = state.tasks.active.as_mut() {
+                t.pending_request = Some(request_id);
+            }
+        }
+        Err(e) => {
+            // The dry run never started: there is no task to keep.
+            drop_active(state);
+            push_toast(state, e, ToastKind::Error);
+        }
+    }
+}
+
 /// Dispatch a `Command::DryRun` for a freshly-created task (None or
 /// Done re-arm). Caller is responsible for ensuring `tasks.active`
 /// is `None` before calling (the reducer's `Some(Done)` arm does
@@ -1506,7 +1582,6 @@ fn dispatch_dry_run_for_new_task(
         push_toast(state, detail, ToastKind::Warning);
         return;
     }
-    let params = build_encode_params_from_draft(state);
     state.last_error = None;
     state.progress.clear();
     state.log.clear();
@@ -1529,22 +1604,88 @@ fn dispatch_dry_run_for_new_task(
         finished: false,
         records: Vec::new(),
         dry_run_records: Vec::new(),
+        dry_run_generation: None,
+        dry_run_params: None,
+        dry_run_inputs: Vec::new(),
     });
     state.viewing_task = Some(task_id);
     // The dry run is a batch: it gets a request id, and the lib's
     // answer binds the batch id (design doc §3.11.3).
-    match dispatch(state, cmd_tx, Command::DryRun { params, files }) {
-        Ok(request_id) => {
-            if let Some(t) = state.tasks.active.as_mut() {
-                t.pending_request = Some(request_id);
-            }
-        }
-        Err(e) => {
-            // The dry run never started: there is no task to keep.
-            drop_active(state);
-            push_toast(state, e, ToastKind::Error);
+    dispatch_dry_run(state, cmd_tx, files);
+}
+
+/// The planning parameters of the effective config, normalized.
+///
+/// A config without an `[encode]` section and one with a default
+/// section are the same plan -- the comparison must not see a
+/// difference where there is none.
+fn planning_params(state: &AppState) -> rencoder_lib::config::app::EncodeConfig {
+    state.effective_config().encode.clone().unwrap_or_default()
+}
+
+/// The stat of every planned input.
+fn stat_inputs(files: &[rencoder_lib::types::InputPath]) -> Vec<(PathBuf, InputStat)> {
+    files
+        .iter()
+        .map(|file| {
+            let path = file.as_path().to_path_buf();
+            let meta = std::fs::metadata(&path).ok();
+            let stat = InputStat {
+                size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                mtime: meta.as_ref().and_then(|m| m.modified().ok()),
+            };
+            (path, stat)
+        })
+        .collect()
+}
+
+/// Why the dry run's plan cannot be reused (design doc §3.10.5).
+///
+/// Returns `None` when the plan still holds. The four things that
+/// can move under a plan:
+///
+/// 1. **the task list** -- files were added or removed;
+/// 2. **the effective planning parameters** -- the user changed the
+///    format, the crf, the caps, the encoders;
+/// 3. **the capability generation** -- a re-probe published a new
+///    one, and the plan may pick a different encoder;
+/// 4. **the inputs on disk** -- the plan depends on the media probe,
+///    so an input that changed invalidates it.
+fn plan_is_stale(
+    state: &AppState,
+    files: &[rencoder_lib::types::InputPath],
+) -> Option<&'static str> {
+    let task = state.tasks.active.as_ref()?;
+    // 1. the task list
+    let planned: Vec<&std::path::Path> = task
+        .dry_run_inputs
+        .iter()
+        .map(|(path, _)| path.as_path())
+        .collect();
+    let current: Vec<&std::path::Path> = files.iter().map(|f| f.as_path()).collect();
+    if planned != current {
+        return Some("the file list changed");
+    }
+    // 2. the effective planning parameters
+    let current_params = planning_params(state);
+    if task.dry_run_params.as_ref() != Some(&current_params) {
+        return Some("the parameters changed");
+    }
+    // 3. the capability generation
+    let current_generation = state.nvenc_capability.as_ref().map(|c| c.generation());
+    if task.dry_run_generation != current_generation {
+        return Some("the machine's capability changed");
+    }
+    // 4. the inputs on disk
+    for (path, stat) in &task.dry_run_inputs {
+        let meta = std::fs::metadata(path).ok();
+        let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let mtime = meta.as_ref().and_then(|m| m.modified().ok());
+        if size != stat.size || mtime != stat.mtime {
+            return Some("an input changed on disk");
         }
     }
+    None
 }
 
 /// Apply one field edit to a config.
@@ -1714,6 +1855,162 @@ mod tests {
         assert_eq!(stored.support().len(), 1);
         assert!(!stored.usable("av1_nvenc"));
         assert_eq!(stored.support()[0].encoder, "av1_nvenc");
+    }
+
+    /// A task in AwaitingConfirm with a dry-run plan over `files`.
+    ///
+    /// The plan is what the dry run made: the file list with the
+    /// stats it saw, the planning parameters, and the capability
+    /// generation it froze.
+    fn task_with_plan(
+        dir: &std::path::Path,
+        files: &[rencoder_lib::types::InputPath],
+        generation: u64,
+    ) -> AppState {
+        let mut state = fresh_state();
+        state.input_dir = Some(dir.to_path_buf());
+        state.nvenc_capability =
+            Some(rencoder_lib::encoder::nvenc::Capability::default().with_generation(generation));
+        let planning = Some(planning_params(&state));
+        state.tasks.active = Some(TaskInfo {
+            task_id: TaskId("20260101000000".into()),
+            batch_id: None,
+            pending_request: None,
+            restore_phase: None,
+            phase: BatchPhase::AwaitingConfirm,
+            dir: dir.to_path_buf(),
+            total_files: files.len(),
+            to_encode: files.len(),
+            to_failed: 0,
+            encoded: 0,
+            cancelled: false,
+            finished: false,
+            records: vec![],
+            dry_run_records: vec![],
+            dry_run_generation: Some(generation),
+            dry_run_params: planning,
+            dry_run_inputs: stat_inputs(files),
+        });
+        state
+    }
+
+    /// A directory with one video file in it.
+    fn plan_dir(label: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("rencoder_ui_plan_{label}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.mp4"), b"video").unwrap();
+        dir
+    }
+
+    #[test]
+    fn an_unchanged_plan_is_reused() {
+        // Nothing moved under the plan: the Encode click starts the
+        // batch (design doc §3.10.5).
+        let dir = plan_dir("unchanged");
+        let files = vec![rencoder_lib::types::InputPath::new(&dir.join("a.mp4")).unwrap()];
+        let mut state = task_with_plan(&dir, &files, 1);
+        let (tx, rx) = crossbeam_channel::unbounded::<Request>();
+        reduce(&mut state, Msg::UserClickedStart, &tx);
+
+        match next_command(&rx) {
+            Command::StartBatch { .. } => {}
+            other => panic!("the plan still holds -- the batch must start, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_changed_parameter_re_plans_instead_of_encoding() {
+        // The user changed a planning parameter after the dry run:
+        // the plan they reviewed is not the plan that would run.
+        let dir = plan_dir("params");
+        let files = vec![rencoder_lib::types::InputPath::new(&dir.join("a.mp4")).unwrap()];
+        let mut state = task_with_plan(&dir, &files, 1);
+        // The crf changes (the entry layer, not yet saved).
+        reduce(
+            &mut state,
+            Msg::UserEditedConfigField {
+                kind: ConfigFieldKind::Crf,
+                value: ConfigFieldValue::Crf(28),
+            },
+            &crossbeam_channel::unbounded::<Request>().0,
+        );
+        let (tx, rx) = crossbeam_channel::unbounded::<Request>();
+        reduce(&mut state, Msg::UserClickedStart, &tx);
+
+        match next_command(&rx) {
+            Command::DryRun { .. } => {}
+            other => panic!("the parameters moved -- the plan must be re-made, got {other:?}"),
+        }
+        assert_eq!(
+            state.tasks.active.as_ref().unwrap().phase,
+            BatchPhase::Analyzing,
+            "the re-plan puts the task back into Analyzing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_changed_capability_generation_re_plans_instead_of_encoding() {
+        // A re-probe published a new generation: the plan may pick a
+        // different encoder, so it is re-made (design doc §3.10.5).
+        let dir = plan_dir("generation");
+        let files = vec![rencoder_lib::types::InputPath::new(&dir.join("a.mp4")).unwrap()];
+        let mut state = task_with_plan(&dir, &files, 1);
+        // The new generation arrives.
+        reduce(
+            &mut state,
+            Msg::Lib(Event::NvencCapability(
+                rencoder_lib::encoder::nvenc::Capability::default().with_generation(2),
+            )),
+            &crossbeam_channel::unbounded::<Request>().0,
+        );
+        let (tx, rx) = crossbeam_channel::unbounded::<Request>();
+        reduce(&mut state, Msg::UserClickedStart, &tx);
+
+        match next_command(&rx) {
+            Command::DryRun { .. } => {}
+            other => panic!("the generation moved -- the plan must be re-made, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_input_changed_on_disk_re_plans_instead_of_encoding() {
+        // The plan depends on the media probe: an input that changed
+        // invalidates it (design doc §3.10.5).
+        let dir = plan_dir("input_changed");
+        let files = vec![rencoder_lib::types::InputPath::new(&dir.join("a.mp4")).unwrap()];
+        let mut state = task_with_plan(&dir, &files, 1);
+        // The file changes under the plan.
+        std::fs::write(dir.join("a.mp4"), b"a different video").unwrap();
+        let (tx, rx) = crossbeam_channel::unbounded::<Request>();
+        reduce(&mut state, Msg::UserClickedStart, &tx);
+
+        match next_command(&rx) {
+            Command::DryRun { .. } => {}
+            other => panic!("an input changed -- the plan must be re-made, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_changed_file_list_re_plans_instead_of_encoding() {
+        // A file appeared in the directory: the task list moved.
+        let dir = plan_dir("file_list");
+        let files = vec![rencoder_lib::types::InputPath::new(&dir.join("a.mp4")).unwrap()];
+        let mut state = task_with_plan(&dir, &files, 1);
+        std::fs::write(dir.join("b.mp4"), b"video").unwrap();
+        let (tx, rx) = crossbeam_channel::unbounded::<Request>();
+        reduce(&mut state, Msg::UserClickedStart, &tx);
+
+        match next_command(&rx) {
+            Command::DryRun { .. } => {}
+            other => panic!("the file list moved -- the plan must be re-made, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1926,6 +2223,9 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         reduce(&mut state, Msg::UserSelectedDir(PathBuf::from("/y")), &tx);
         assert!(state.input_dir.is_none());
@@ -1967,6 +2267,9 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         state.input_dir = Some(PathBuf::from("/y"));
         reduce(&mut state, Msg::UserClickedStart, &tx);
@@ -2004,6 +2307,9 @@ mod tests {
             finished: true,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         state.input_dir = Some(std::path::PathBuf::from("/tmp"));
         reduce(&mut state, Msg::UserClickedStart, &tx);
@@ -2050,6 +2356,9 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         state.last_error = Some("previous unrelated error".into());
         reduce(&mut state, Msg::UserSelectedDir(PathBuf::from("/y")), &tx);
@@ -2081,6 +2390,9 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         state.viewing_task = Some(task_id.clone());
         reduce(
@@ -2121,6 +2433,9 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         reduce(
             &mut state,
@@ -2155,6 +2470,9 @@ mod tests {
             finished: true, // simulate post-BatchCompleted but still in active
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         reduce(
             &mut state,
@@ -2231,6 +2549,9 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         reduce(&mut state, Msg::UserClickedCancel, &tx);
 
@@ -2285,6 +2606,9 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         reduce(
             &mut state,
@@ -2321,6 +2645,9 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         reduce(
             &mut state,
@@ -2360,6 +2687,9 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         reduce(
             &mut state,
@@ -2410,6 +2740,9 @@ mod tests {
             finished: false,
             records: vec![sample_record("/a.mp4", EncodingOutcome::Succeeded)],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
 
         // A late event of batch 1 -- dropped (no state change).
@@ -2492,6 +2825,9 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         let rec = sample_record("/first.mp4", EncodingOutcome::Succeeded);
         reduce(
@@ -2526,6 +2862,9 @@ mod tests {
             encoded: 3,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
             to_encode: 10,
             to_failed: 0,
             finished: false,
@@ -2591,6 +2930,9 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         reduce(
             &mut state,
@@ -2631,6 +2973,9 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         reduce(
             &mut state,
@@ -2670,6 +3015,9 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         reduce(
             &mut state,
@@ -2712,6 +3060,9 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         let records = vec![
             sample_record("/a.mp4", EncodingOutcome::Ready),
@@ -2722,6 +3073,7 @@ mod tests {
             &mut state,
             Msg::Lib(Event::DryRunFinished {
                 batch_id: 1,
+                generation: 1,
                 records,
             }),
             &tx,
@@ -2777,6 +3129,9 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         // Step 1: DryRunFinished with a Ready record — moves
         // phase to AwaitingConfirm.
@@ -2785,6 +3140,7 @@ mod tests {
             &mut state,
             Msg::Lib(Event::DryRunFinished {
                 batch_id: 1,
+                generation: 1,
                 records,
             }),
             &tx,
@@ -2862,6 +3218,9 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         let records = vec![
             sample_record("/a.mp4", EncodingOutcome::Ready),
@@ -2872,6 +3231,7 @@ mod tests {
             &mut state,
             Msg::Lib(Event::DryRunFinished {
                 batch_id: 1,
+                generation: 1,
                 records,
             }),
             &tx,
@@ -2908,12 +3268,16 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         let records = vec![sample_failed("/a.mp4"), sample_failed("/b.mp4")];
         reduce(
             &mut state,
             Msg::Lib(Event::DryRunFinished {
                 batch_id: 1,
+                generation: 1,
                 records,
             }),
             &tx,
@@ -2957,11 +3321,15 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         reduce(
             &mut state,
             Msg::Lib(Event::DryRunFinished {
                 batch_id: 1,
+                generation: 1,
                 records: vec![sample_record("/a.mp4", EncodingOutcome::Succeeded)],
             }),
             &tx,
@@ -2997,6 +3365,9 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         // User cancels (Cancel sends Command::Cancel + sets
         // cancelled = true per §3.8.7.1 cancel-during-Analyzing
@@ -3008,6 +3379,7 @@ mod tests {
             &mut state,
             Msg::Lib(Event::DryRunFinished {
                 batch_id: 1,
+                generation: 1,
                 records: vec![sample_record("/a.mp4", EncodingOutcome::Succeeded)],
             }),
             &tx,
@@ -3235,6 +3607,9 @@ mod tests {
             finished: false,
             records: vec![],
             dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
         });
         assert!(!q.has_room());
     }

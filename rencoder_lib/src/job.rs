@@ -278,6 +278,11 @@ pub enum Event {
     /// commit.
     DryRunFinished {
         batch_id: BatchId,
+        /// The capability generation the dry run froze (design doc
+        /// §3.10.5): the plan is only valid for the generation it
+        /// was planned under, so the UI compares it with the current
+        /// one before reusing the plan.
+        generation: u64,
         records: Vec<EncodingRecord>,
     },
     /// The batch was cancelled (by `Command::Cancel` or SIGINT).
@@ -2105,6 +2110,10 @@ fn run_actor(
                         };
                         // The capability of this publication: the
                         // dry run freezes the generation too.
+                        // The generation this dry run froze: the
+                        // plan is only valid for it (design doc
+                        // §3.10.5).
+                        let generation = published.capability.generation();
                         let batch_ctx = BatchContext::new(params, cache, published.capability);
                         let report = crate::pipeline::batch::dry_run_batch(
                             &batch_ctx,
@@ -2113,6 +2122,7 @@ fn run_actor(
                         );
                         Some(Event::DryRunFinished {
                             batch_id: id,
+                            generation,
                             records: report.records,
                         })
                     },
