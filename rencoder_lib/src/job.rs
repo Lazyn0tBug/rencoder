@@ -1017,15 +1017,11 @@ pub fn start_controller() -> ControllerHandle {
     // The capability does NOT depend on the `nv` switch: it is a fact
     // about the machine, and `nv` is this run's choice (design doc
     // §3.10.5). So the resolution happens either way.
-    let cache_rx = crate::pipeline::cache::init_encoder_cache_async_with_capability_at(
-        Some(env.paths.capability_record.clone()),
-        crate::encoder::nvenc::run_ffmpeg,
-    );
 
     std::thread::Builder::new()
         .name("renencoder-controller".into())
         .spawn(move || {
-            run_actor(cmd_rx, evt_tx, env, cache_rx);
+            run_actor(cmd_rx, evt_tx, env);
         })
         .expect("spawn controller thread");
 
@@ -1047,23 +1043,12 @@ pub fn start_controller_with(env: ActorEnv) -> ControllerHandle {
     let (cmd_tx, cmd_rx) = bounded::<Request>(CMD_TX_CAPACITY);
     let (evt_tx, evt_rx) = bounded::<Event>(EVT_TX_CAPACITY);
 
-    // The cache init goes through the injected runner, so a test never
-    // spawns ffmpeg (the fake runner answers every invocation). The
-    // record path travels with it: a test must not write the
-    // capability record into the real app directory (design doc
-    // §3.10.4).
-    let detect_runner_for_cache = Arc::clone(&env.detect_runner);
-    let cache_rx = crate::pipeline::cache::init_encoder_cache_async_with_capability_at(
-        Some(env.paths.capability_record.clone()),
-        move |args| detect_runner_for_cache(args),
-    );
-
     let app_config = Arc::clone(&env.app_config);
     let config_path = env.config_path.clone();
     std::thread::Builder::new()
         .name("renencoder-controller".into())
         .spawn(move || {
-            run_actor(cmd_rx, evt_tx, env, cache_rx);
+            run_actor(cmd_rx, evt_tx, env);
         })
         .expect("spawn controller thread");
 
@@ -1312,18 +1297,14 @@ impl CapabilityPublisher {
         if seq < self.published_seq {
             return None;
         }
-        // The encoder cache, from the resolution when there is one,
-        // else from the init. `None` when the probe failed without
-        // producing a cache (a failed re-probe: the old cache is
-        // still the right one -- the build did not change).
-        let cache: Option<CacheSlot> = match outcome.resolution.as_ref() {
-            Some(resolution) => Some(Ok(Arc::new(crate::pipeline::cache::cache_from_resolution(
+        // The encoder cache, from the resolution. A failed probe has
+        // none: the old cache is still the right one (the build did
+        // not change), so the failure does not touch it.
+        let cache: Option<CacheSlot> = outcome.resolution.as_ref().map(|resolution| {
+            Ok(Arc::new(crate::pipeline::cache::cache_from_resolution(
                 resolution,
-            )))),
-            None => outcome
-                .cache
-                .map(|cache| cache.map(Arc::new).map_err(Arc::new)),
-        };
+            )))
+        });
         // The record on disk. The **publisher** writes it: the probe
         // threads do not, so an older probe's result cannot overwrite
         // a newer record (design doc §3.10.6 step 5).
@@ -1349,12 +1330,19 @@ impl CapabilityPublisher {
                 {
                     let mut guard = self.state.lock();
                     if guard.is_none() {
-                        if let Some(cache) = cache {
-                            *guard = Some(PublishedState {
-                                cache,
-                                capability: Capability::default(),
-                            });
-                        }
+                        // Nothing has been published yet, so there is
+                        // no cache to keep: the failure itself becomes
+                        // the state, so a batch sees it at once instead
+                        // of waiting for the timeout.
+                        let cache = cache.unwrap_or_else(|| {
+                            Err(Arc::new(EncodeError::Probe(
+                                "the capability probe failed".into(),
+                            )))
+                        });
+                        *guard = Some(PublishedState {
+                            cache,
+                            capability: Capability::default(),
+                        });
                     }
                 }
                 Some(Publication {
@@ -1449,6 +1437,61 @@ impl CapabilityPublisher {
     }
 }
 
+/// Spawn a capability probe and hand the result to the actor.
+///
+/// The probe runs off the actor thread (it spawns ffmpeg); the
+/// **publisher** decides what to do with the result (design doc
+/// §3.10.6 step 5).
+///
+/// The startup probe and a re-probe take **the same path** -- the
+/// startup is simply a probe that is not forced (it reuses a fresh
+/// record instead of probing again). One path, one rule.
+fn spawn_probe<F>(
+    seq: u64,
+    request_id: Option<RequestId>,
+    force: bool,
+    cache_path: PathBuf,
+    runner: F,
+    probe_tx: Sender<ProbeResult>,
+) where
+    F: Fn(&[&str]) -> Result<String, EncodeError> + Send + Sync + 'static,
+{
+    std::thread::Builder::new()
+        .name("renencoder-probe".into())
+        .spawn(move || {
+            // The probe only -- the **store** is the publisher's job
+            // (design doc §3.10.6 step 5): the actor publishes the
+            // result and arranges the persistence, so an older
+            // probe's result cannot overwrite a newer record.
+            let outcome = match crate::encoder::nvenc::resolve_with_clock(
+                Some(cache_path.as_path()),
+                force,
+                runner,
+                chrono::Utc::now(),
+            ) {
+                Ok(resolution) => ProbeOutcome {
+                    facts: crate::capability::MachineFacts::from_resolution(&resolution),
+                    resolution: Some(resolution),
+                    failure: None,
+                },
+                Err(e) => ProbeOutcome {
+                    facts: crate::capability::MachineFacts::default(),
+                    resolution: None,
+                    failure: Some((
+                        ErrorCategory::ProbeFailed,
+                        format!("NVENC detection failed: {e}"),
+                    )),
+                },
+            };
+            let _ = probe_tx.send(ProbeResult {
+                seq,
+                request_id,
+                outcome,
+            });
+        })
+        .expect("spawn probe thread");
+}
+
 /// What a probe hands back to the actor.
 ///
 /// The probe runs off the actor thread (it spawns ffmpeg), and the
@@ -1468,14 +1511,6 @@ struct ProbeResult {
 
 /// What a probe produced.
 struct ProbeOutcome {
-    /// The encoder cache the init built. `None` for a re-probe: the
-    /// resolution carries the encoder list instead.
-    ///
-    /// The **actor** puts it in the cache cell, so "the cache is
-    /// there" means "the capability is published" too -- a batch that
-    /// waited for the cache cannot start with an unpublished
-    /// capability.
-    cache: Option<Result<crate::types::EncoderCache, EncodeError>>,
     /// The machine facts the probe established (including the
     /// capability it found).
     facts: crate::capability::MachineFacts,
@@ -1962,7 +1997,6 @@ fn run_actor(
     // process other commands (Cancel / LoadHistory / SaveConfig)
     // while init runs. StartBatch handlers block on this when a
     // batch actually starts.
-    cache_rx: std::sync::mpsc::Receiver<crate::pipeline::cache::CacheInit>,
 ) {
     // The injected dependencies, unpacked for the arms below.
     let config_path = env.config_path.clone();
@@ -2024,41 +2058,29 @@ fn run_actor(
         next_batch_id: 0,
         publisher: CapabilityPublisher::new(published_cell.clone()),
     };
-    // The background init thread hands its result to the actor.
-    let probe_tx_for_init = probe_tx.clone();
-    std::thread::spawn(move || {
-        // The receiver delivers exactly one `Result`. Use
-        // `unwrap_or_else` to surface a channel-disconnect as
-        // a sentinel error so the actor always gets an answer.
-        let init = cache_rx
-            .recv()
-            .unwrap_or_else(|_| crate::pipeline::cache::CacheInit {
-                cache: Err(EncodeError::Probe(
-                    "encoder cache init channel closed".into(),
-                )),
-                facts: crate::capability::MachineFacts::ffmpeg_broken(),
-                resolution: None,
-            });
-        // The cache init failed -> the failure rides with the result,
-        // and the actor reports it (one publisher, one event).
-        let failure = match &init.cache {
-            Err(e) => Some((e.category(), format!("encoder cache init failed: {e}"))),
-            Ok(_) => None,
-        };
-        let _ = probe_tx_for_init.send(ProbeResult {
-            seq: 0,
-            request_id: None,
-            outcome: ProbeOutcome {
-                cache: Some(init.cache),
-                facts: init.facts,
-                // The resolution rides along: the actor stores the
-                // record (the publisher arranges the persistence --
-                // design doc §3.10.6 step 5).
-                resolution: init.resolution,
-                failure,
-            },
-        });
-    });
+    // The chain's **first stage**: the capability probe. It runs on a
+    // worker (it spawns ffmpeg) and the actor publishes its result
+    // (design doc §3.10.6 step 5).
+    //
+    // The startup probe is not forced: a fresh record on disk is
+    // reused as-is (the record is shared with the CLI), a missing one
+    // is probed. The path is the same one a re-probe takes.
+    {
+        let seq = state.publisher.request();
+        // The **injected** runner: a test must never touch the real
+        // machine (design doc §3.10.4), and the production runner is
+        // the same seam (the actor's environment carries it).
+        let detect_runner_for_startup = Arc::clone(&detect_runner);
+        spawn_probe(
+            seq,
+            None,
+            false,
+            nvenc_cache_path.clone(),
+            move |args| detect_runner_for_startup(args),
+            probe_tx.clone(),
+        );
+    }
+
     // `app_config` is still held (referenced by `config_path`
     // for the SaveConfig handler). Don't drop yet.
 
@@ -2530,44 +2552,14 @@ fn run_actor(
                 // the actor publishes the result only if it is the
                 // newest one (design doc §3.10.6 step 5).
                 let seq = state.publisher.request();
-                let probe_tx = probe_tx.clone();
-                std::thread::Builder::new()
-                    .name("renencoder-detect".into())
-                    .spawn(move || {
-                        // The probe only -- the **store** and the
-                        // publication are the actor's, so an older
-                        // result cannot overwrite a newer record.
-                        let outcome = match crate::encoder::nvenc::resolve_with_clock(
-                            Some(cache_path.as_path()),
-                            force,
-                            move |args| detect_runner(args),
-                            chrono::Utc::now(),
-                        ) {
-                            Ok(resolution) => ProbeOutcome {
-                                cache: None,
-                                facts: crate::capability::MachineFacts::from_resolution(
-                                    &resolution,
-                                ),
-                                resolution: Some(resolution),
-                                failure: None,
-                            },
-                            Err(e) => ProbeOutcome {
-                                cache: None,
-                                facts: crate::capability::MachineFacts::default(),
-                                resolution: None,
-                                failure: Some((
-                                    ErrorCategory::ProbeFailed,
-                                    format!("NVENC detection failed: {e}"),
-                                )),
-                            },
-                        };
-                        let _ = probe_tx.send(ProbeResult {
-                            seq,
-                            request_id: Some(request_id),
-                            outcome,
-                        });
-                    })
-                    .expect("spawn detect thread");
+                spawn_probe(
+                    seq,
+                    Some(request_id),
+                    force,
+                    cache_path.clone(),
+                    move |args| detect_runner(args),
+                    probe_tx.clone(),
+                );
             }
 
             Command::SetWorkingDir { dir } => {
@@ -2871,12 +2863,7 @@ mod mock_tests {
             + Sync
             + 'static,
     {
-        run_test_controller_with_runner(
-            mock_fn,
-            data_dir,
-            capability,
-            Arc::new(|_args| Ok(String::new())),
-        )
+        run_test_controller_with_runner(mock_fn, data_dir, capability, None)
     }
 
     /// [`run_test_controller_with_capability`] with an injected NVENC
@@ -2891,7 +2878,7 @@ mod mock_tests {
         mock_fn: F,
         data_dir: Option<PathBuf>,
         capability: Option<Capability>,
-        detect_runner: crate::job::DetectRunner,
+        detect_runner: Option<crate::job::DetectRunner>,
     ) -> (Sender<Request>, Receiver<Event>)
     where
         F: Fn(
@@ -2906,25 +2893,6 @@ mod mock_tests {
     {
         let (cmd_tx, cmd_rx) = unbounded::<Request>();
         let (evt_tx, evt_rx) = unbounded::<Event>();
-
-        // The cache is fed through the same channel the production
-        // uses: `CacheInit`'s fields are public, so the test can
-        // pre-populate it without spawning ffmpeg.
-        let (cache_tx, cache_rx) = std::sync::mpsc::channel();
-        cache_tx
-            .send(crate::pipeline::cache::CacheInit {
-                cache: Ok(EncoderCache {
-                    encoders_output: String::new(),
-                }),
-                resolution: None,
-                // The facts the resolution would have produced: the
-                // fake runner answers, so ffmpeg works.
-                facts: crate::capability::MachineFacts {
-                    ffmpeg: Some(true),
-                    nvenc: capability,
-                },
-            })
-            .expect("send the pre-populated cache");
 
         // The temp dir plays the records directory: the writer and
         // the history reader must agree on it (design doc §3.6).
@@ -2957,14 +2925,62 @@ mod mock_tests {
             file_encoder: Arc::new(MockFileEncoder { f: mock_fn }),
             // The NVENC probe never runs against real ffmpeg: the
             // fake runner answers it.
-            detect_runner,
+            detect_runner: detect_runner
+                .unwrap_or_else(|| scripted_probe_runner(capability.as_ref())),
         };
 
         std::thread::spawn(move || {
-            run_actor(cmd_rx, evt_tx, env, cache_rx);
+            run_actor(cmd_rx, evt_tx, env);
         });
 
         (cmd_tx, evt_rx)
+    }
+
+    /// The version line the fake machine reports.
+    const PROBE_VERSION: &str = "ffmpeg version 6.0 (test)";
+
+    /// The fake machine's answers to the capability probe.
+    ///
+    /// The harness drives the **production** probe path: the runner
+    /// answers the encoder list, the version, and the 1-frame probes,
+    /// and the real probe turns those answers into the capability
+    /// (design doc §3.10.4 rule 2 -- a test double must not
+    /// re-implement the thing it tests).
+    fn scripted_probe_runner(capability: Option<&Capability>) -> crate::job::DetectRunner {
+        let encoders: Vec<String> = capability
+            .map(|c| c.support().iter().map(|e| e.encoder.clone()).collect())
+            .unwrap_or_default();
+        let usable: Vec<String> = capability
+            .map(|c| {
+                c.support()
+                    .iter()
+                    .filter(|e| e.usable)
+                    .map(|e| e.encoder.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let encoders_output = encoders.join("\n");
+        Arc::new(move |args: &[&str]| {
+            if args.contains(&"-encoders") {
+                return Ok(encoders_output.clone());
+            }
+            if args.contains(&"-version") {
+                return Ok(PROBE_VERSION.to_string());
+            }
+            // A 1-frame capability probe: it succeeds for the encoders
+            // this machine can run, and fails for the others.
+            let encoder = args
+                .windows(2)
+                .find(|pair| pair[0] == "-c:v")
+                .map(|pair| pair[1].to_string());
+            match encoder {
+                Some(encoder) if usable.contains(&encoder) => Ok(String::new()),
+                Some(_) => Err(EncodeError::Probe(
+                    "the 1-frame capability probe failed".into(),
+                )),
+                None => Ok(String::new()),
+            }
+        })
     }
 
     /// The test double for "encode one file".
@@ -3107,43 +3123,97 @@ mod mock_tests {
             .collect()
     }
 
-    /// The next capability publication, skipping the other events.
-    fn next_capability_event(rx: &Receiver<Event>) -> Capability {
+    /// The safety net for every wait in this module.
+    ///
+    /// A timeout is **not** a synchronization: it must never be the
+    /// thing a test relies on to mean "it happened". The waits below
+    /// return as soon as the event arrives; the timeout only bounds
+    /// a test that would otherwise hang forever.
+    const WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Wait for the next event that satisfies `pred`.
+    ///
+    /// The event arrives in milliseconds; waiting for a fixed
+    /// window instead would make the test slow **and** fragile (a
+    /// loaded machine can miss the window).
+    fn wait_for_event<F>(rx: &Receiver<Event>, pred: F) -> Event
+    where
+        F: Fn(&Event) -> bool,
+    {
+        let deadline = std::time::Instant::now() + WAIT_LIMIT;
         loop {
-            match rx.recv_timeout(std::time::Duration::from_secs(10)) {
-                Ok(Event::NvencCapability(capability)) => return capability,
-                Ok(_) => continue,
-                Err(e) => panic!("no capability event: {e}"),
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .expect("timed out waiting for the event");
+            match rx.recv_timeout(remaining) {
+                Ok(event) => {
+                    if pred(&event) {
+                        return event;
+                    }
+                }
+                Err(e) => panic!("timed out waiting for the event: {e}"),
             }
         }
     }
 
-    /// Drain events until the batch's **terminal event**, the sender
-    /// drops, or the deadline expires.
+    /// Wait for the batch's **terminal** event and return everything
+    /// that arrived up to it.
     ///
-    /// The terminal event is the natural end of a batch's event
-    /// stream: after it, the batch is over and none of its events
-    /// arrive any more. Waiting for a wall-clock window instead
-    /// makes the test depend on how loaded the machine is -- the
-    /// batch's start waits for the published capability, so a fixed
-    /// two-second window is a coin flip on a busy machine (the
-    /// window is a safety net, not the thing being waited for).
-    fn collect_events(rx: &Receiver<Event>, timeout: std::time::Duration) -> Vec<Event> {
+    /// The terminal event *is* the "this batch is over" signal
+    /// (§3.11.4): one batch, one terminal event. So a test that
+    /// wants "what this batch did" waits for that -- not for a
+    /// window.
+    ///
+    /// This is the **barrier's release point** (design doc §3.11.3):
+    /// the stage publishes, the next stage starts. The tests wait
+    /// for the publication, exactly as the chain does.
+    fn batch_events_until_end(rx: &Receiver<Event>) -> Vec<Event> {
         let mut events = Vec::new();
-        let deadline = std::time::Instant::now() + timeout;
+        let deadline = std::time::Instant::now() + WAIT_LIMIT;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .expect("timed out waiting for the batch to end");
+            match rx.recv_timeout(remaining) {
+                Ok(event) => {
+                    let terminal = is_terminal_event(&event);
+                    events.push(event);
+                    if terminal {
+                        return events;
+                    }
+                }
+                Err(e) => panic!("timed out waiting for the batch to end: {e}"),
+            }
+        }
+    }
+
+    /// Assert that no event satisfying `pred` arrives within
+    /// `window`.
+    ///
+    /// A negative wait **is** a window -- there is nothing else to
+    /// wait for. It cannot produce a false failure (a late event only
+    /// makes the assertion weaker), so the window can be modest.
+    fn assert_no_event<F>(rx: &Receiver<Event>, pred: F, window: std::time::Duration)
+    where
+        F: Fn(&Event) -> bool,
+    {
+        let deadline = std::time::Instant::now() + window;
         while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
             match rx.recv_timeout(remaining) {
-                Ok(evt) => {
-                    let terminal = is_terminal_event(&evt);
-                    events.push(evt);
-                    if terminal {
-                        break;
-                    }
+                Ok(event) => {
+                    assert!(!pred(&event), "an unexpected event arrived: {event:?}");
                 }
                 Err(_) => break,
             }
         }
-        events
+    }
+
+    /// The next capability publication, skipping the other events.
+    fn next_capability_event(rx: &Receiver<Event>) -> Capability {
+        match wait_for_event(rx, |e| matches!(e, Event::NvencCapability(_))) {
+            Event::NvencCapability(capability) => capability,
+            other => unreachable!("the predicate matched: {other:?}"),
+        }
     }
 
     /// Is this event the end of a batch?
@@ -3188,7 +3258,8 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        let event = wait_for_event(&evt_rx, |e| matches!(e, Event::CommandRejected { .. }));
+        let events = [event];
         assert!(
             events
                 .iter()
@@ -3236,7 +3307,7 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        let events = batch_events(batch_events_until_end(&evt_rx));
         assert!(
             events
                 .iter()
@@ -3270,7 +3341,7 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = batch_events(collect_events(&evt_rx, std::time::Duration::from_secs(10)));
+        let events = batch_events(batch_events_until_end(&evt_rx));
         // Expected sequence: per-file events interleave (each
         // process_one_file emits FileStarted then FileCompleted
         // before moving to the next file).
@@ -3364,7 +3435,7 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = batch_events(collect_events(&evt_rx, std::time::Duration::from_secs(10)));
+        let events = batch_events(batch_events_until_end(&evt_rx));
         // Expected: CommandAccepted + BatchStarted
         //   + (FileStarted + Progress×2 + FileCompleted) × 2 + BatchCompleted
         assert_eq!(events.len(), 2 + (1 + 2 + 1) * 2 + 1);
@@ -3414,7 +3485,7 @@ mod mock_tests {
             ))
             .unwrap();
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        let events = batch_events(batch_events_until_end(&evt_rx));
         assert!(
             events.iter().any(|e| matches!(
                 e,
@@ -3472,7 +3543,7 @@ mod mock_tests {
             .send(Request::new(2, Command::Cancel { batch_id }))
             .unwrap();
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        let events = batch_events(batch_events_until_end(&evt_rx));
         let last = events.last().expect("expected a terminal event");
         match last {
             Event::BatchCancelled {
@@ -3524,7 +3595,7 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        let events = batch_events(batch_events_until_end(&evt_rx));
         // First file completes (FileStarted + FileCompleted) before
         // cancel propagates; then BatchCancelled with completed = 1.
         // (Mock cancels on file 1 itself, but the file's FileCompleted
@@ -3586,7 +3657,8 @@ mod mock_tests {
             ))
             .unwrap();
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        let event = wait_for_event(&evt_rx, |e| matches!(e, Event::CommandRejected { .. }));
+        let events = [event];
         assert!(
             events
                 .iter()
@@ -3636,7 +3708,8 @@ mod mock_tests {
             ))
             .unwrap();
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        let event = wait_for_event(&evt_rx, |e| matches!(e, Event::CommandRejected { .. }));
+        let events = [event];
         assert!(
             events
                 .iter()
@@ -3667,13 +3740,12 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = batch_events(collect_events(&evt_rx, std::time::Duration::from_secs(10)));
-        // The request is answered first (design doc §3.11.3), then
-        // the result.
-        assert_eq!(events.len(), 2);
-        match &events[1] {
+        // The history is not a batch: it waits for **its own**
+        // publication (the barrier's release point for that step).
+        let loaded = wait_for_event(&evt_rx, |e| matches!(e, Event::HistoryLoaded { .. }));
+        match loaded {
             Event::HistoryLoaded { records } => assert!(records.is_empty()),
-            _ => panic!("expected HistoryLoaded"),
+            other => panic!("expected HistoryLoaded, got {other:?}"),
         }
     }
 
@@ -3718,16 +3790,17 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = batch_events(collect_events(&evt_rx, std::time::Duration::from_secs(10)));
-        assert_eq!(events.len(), 2);
-        match &events[1] {
+        // The history is not a batch: it waits for **its own**
+        // publication (the barrier's release point for that step).
+        let loaded = wait_for_event(&evt_rx, |e| matches!(e, Event::HistoryLoaded { .. }));
+        match loaded {
             Event::HistoryLoaded { records: loaded } => {
                 assert_eq!(loaded.len(), 3);
                 // Newest-first ordering.
                 assert!(loaded[0].started_at >= loaded[1].started_at);
                 assert!(loaded[1].started_at >= loaded[2].started_at);
             }
-            _ => panic!("expected HistoryLoaded"),
+            other => panic!("expected HistoryLoaded, got {other:?}"),
         }
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -3757,7 +3830,7 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        let events = batch_events(batch_events_until_end(&evt_rx));
         assert!(
             events
                 .iter()
@@ -3813,7 +3886,8 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        let event = wait_for_event(&evt_rx, |e| matches!(e, Event::ConfigSaved { .. }));
+        let events = [event];
         assert!(
             events
                 .iter()
@@ -3842,7 +3916,8 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        let event = wait_for_event(&evt_rx, |e| matches!(e, Event::NvencCapability(_)));
+        let events = [event];
         assert!(
             events
                 .iter()
@@ -3876,7 +3951,8 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        let event = wait_for_event(&evt_rx, |e| matches!(e, Event::CapabilityChecked { .. }));
+        let events = [event];
         let report = events
             .iter()
             .find_map(|e| match e {
@@ -3935,7 +4011,7 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = batch_events(collect_events(&evt_rx, std::time::Duration::from_secs(10)));
+        let events = batch_events(batch_events_until_end(&evt_rx));
         // Expected: 1 CommandAccepted + 1 AnalyzeStarted
         //            + 3 AnalyzeProgress + 1 AnalyzeFinished.
         assert_eq!(events.len(), 6, "expected 6 events, got: {events:?}");
@@ -4016,7 +4092,7 @@ mod mock_tests {
         // publisher (design doc §3.10.6 step 5), so an actor that
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
-        let events = batch_events(collect_events(&evt_rx, std::time::Duration::from_secs(10)));
+        let events = batch_events(batch_events_until_end(&evt_rx));
         assert!(matches!(events[1], Event::AnalyzeStarted { .. }));
         assert!(matches!(
             events.last().unwrap(),
@@ -4047,7 +4123,7 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = batch_events(collect_events(&evt_rx, std::time::Duration::from_secs(10)));
+        let events = batch_events(batch_events_until_end(&evt_rx));
         assert_eq!(
             events.len(),
             3,
@@ -4105,8 +4181,9 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
-        match &events[1] {
+        let event = wait_for_event(&evt_rx, |e| matches!(e, Event::HistoryLoaded { .. }));
+        let events = [event];
+        match &events[0] {
             Event::HistoryLoaded { records: loaded } => {
                 assert_eq!(loaded.len(), 3);
                 // Newest-first: highest started_at first.
@@ -4156,8 +4233,9 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
-        match &events[1] {
+        let event = wait_for_event(&evt_rx, |e| matches!(e, Event::HistoryLoaded { .. }));
+        let events = [event];
+        match &events[0] {
             Event::HistoryLoaded { records: loaded } => {
                 // started_at values: 0, 100, 200, 300, 400 (seconds offset).
                 // after = 200 → keep records with started_at >= 200.
@@ -4202,7 +4280,11 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        // The batch's events -- up to its terminal event (the
+        // barrier's release point).
+        let events = batch_events(batch_events_until_end(&evt_rx));
+        // A per-file failure is **not** a fatal event (design doc
+        // §3.11.3): it travels in the record's `error` field.
         assert!(
             !events.iter().any(|e| matches!(e, Event::Error { .. })),
             "a file failure is not a fatal event: {events:?}"
@@ -4364,7 +4446,7 @@ mod mock_tests {
         // exited would never publish the startup capability and the
         // batch would wait for a state that never arrives.
 
-        let _events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        let _events = batch_events(batch_events_until_end(&evt_rx));
 
         assert!(
             !partial_check_b.exists(),
@@ -4416,7 +4498,7 @@ mod mock_tests {
             ))
             .unwrap();
 
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        let events = batch_events(batch_events_until_end(&evt_rx));
         assert!(
             events
                 .iter()
@@ -4426,7 +4508,7 @@ mod mock_tests {
         assert_eq!(
             saw_usable.load(AtomicOrdering::SeqCst),
             1,
-            "the batch must see the machine's capability"
+            "the batch must see the machine's capability; events: {events:?}"
         );
     }
 
@@ -4443,6 +4525,12 @@ mod mock_tests {
         }]);
         let saw_usable = Arc::new(AtomicUsize::new(0));
         let saw_usable_clone = saw_usable.clone();
+        // The probe fails -- but only from the **second** probe on: the
+        // first one is the startup, which must succeed (the scenario
+        // is "the machine is fine, the re-probe failed").
+        let probes = Arc::new(AtomicUsize::new(0));
+        let probes_for_runner = probes.clone();
+        let scripted = scripted_probe_runner(Some(&capability));
         let (cmd_tx, evt_rx) = run_test_controller_with_runner(
             move |task: &EncodeTask,
                   ctx: &mut BatchContext,
@@ -4455,20 +4543,30 @@ mod mock_tests {
             },
             None,
             Some(capability),
-            // The probe fails.
-            Arc::new(|_args: &[&str]| Err(EncodeError::Probe("probe failed".into()))),
+            Some(Arc::new(move |args: &[&str]| {
+                if args.contains(&"-encoders")
+                    && probes_for_runner.fetch_add(1, AtomicOrdering::SeqCst) > 0
+                {
+                    return Err(EncodeError::Probe("probe failed".into()));
+                }
+                scripted(args)
+            })),
         );
+
+        // The startup's publication comes first: the runner counts
+        // the probes, so the test has to know which probe is which
+        // before it sends the re-probe.
+        let startup = next_capability_event(&evt_rx);
+        assert_eq!(startup.generation(), 1, "the startup publishes first");
 
         // The forced re-probe: it fails.
         cmd_tx
             .send(Request::new(1, Command::Detect { force: true }))
             .unwrap();
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        let failure = wait_for_event(&evt_rx, |e| matches!(e, Event::OperationFailed { .. }));
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, Event::OperationFailed { .. })),
-            "the failed probe must be reported: {events:?}"
+            matches!(failure, Event::OperationFailed { .. }),
+            "the failed probe must be reported: {failure:?}"
         );
 
         // The next batch still sees the machine's capability.
@@ -4481,7 +4579,7 @@ mod mock_tests {
                 },
             ))
             .unwrap();
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        let events = batch_events(batch_events_until_end(&evt_rx));
         assert!(
             events
                 .iter()
@@ -4524,7 +4622,7 @@ mod mock_tests {
                 },
             ))
             .unwrap();
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        let events = batch_events(batch_events_until_end(&evt_rx));
         assert!(
             events
                 .iter()
@@ -4536,7 +4634,8 @@ mod mock_tests {
         cmd_tx
             .send(Request::new(2, Command::Detect { force: true }))
             .unwrap();
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        let event = wait_for_event(&evt_rx, |e| matches!(e, Event::NvencCapability(_)));
+        let events = [event];
         assert!(
             events
                 .iter()
@@ -4554,7 +4653,7 @@ mod mock_tests {
                 },
             ))
             .unwrap();
-        let events = collect_events(&evt_rx, std::time::Duration::from_secs(10));
+        let events = batch_events(batch_events_until_end(&evt_rx));
         assert!(
             events
                 .iter()
@@ -4589,16 +4688,18 @@ mod mock_tests {
         // for the announcement -- before sending the second Detect --
         // makes "the first probe is the older one" a fact instead of
         // an accident.
-        let (entered_tx, entered_rx) = crossbeam_channel::bounded::<()>(1);
-        let entered_for_runner = entered_tx.clone();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let calls_for_runner = Arc::clone(&calls);
-        let runner: crate::job::DetectRunner = Arc::new(move |_args: &[&str]| {
-            if calls_for_runner.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
-                // The **first** probe waits until the test lets it
-                // through. Only the first call blocks: a later probe
-                // that also blocked would never publish.
-                let _ = entered_for_runner.try_send(());
+        // The fixture blocks the probe that comes **after** the test
+        // arms the flag -- not "the n-th call": which thread reaches
+        // the runner first is a race (the system does not promise an
+        // order), so a count would block the wrong probe.
+        let block_next = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let block_next_for_runner = Arc::clone(&block_next);
+        let runner: crate::job::DetectRunner = Arc::new(move |args: &[&str]| {
+            if args.contains(&"-encoders")
+                && block_next_for_runner.swap(false, AtomicOrdering::SeqCst)
+            {
+                // This probe waits until the test lets it through --
+                // it is the probe whose result must arrive late.
                 while !release_for_runner.load(std::sync::atomic::Ordering::SeqCst) {
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
@@ -4612,28 +4713,21 @@ mod mock_tests {
              _: &mut dyn FnMut(FfmpegProgress)| Ok(fake_record(&task.input)),
             None,
             None,
-            runner,
+            Some(runner),
         );
 
-        // The startup's publication comes first, and it is
-        // **deterministic**: no probe has been sent yet, so nothing
-        // can supersede it. (Sending the probes first let the
-        // newer probe win, and the startup's result was then dropped
-        // by the sequence check -- the test's assumption, not the
-        // product's behaviour, was wrong.)
+        // The startup's publication comes first: the startup's probe
+        // is done, so the next probe to reach the runner is the one
+        // the test arms.
         let startup = next_capability_event(&evt_rx);
         assert_eq!(startup.generation(), 1, "the startup publishes first");
 
+        // Arm the fixture: the next probe blocks.
+        block_next.store(true, AtomicOrdering::SeqCst);
         // The first probe: it blocks.
         cmd_tx
             .send(Request::new(1, Command::Detect { force: true }))
             .unwrap();
-        // Wait until the first probe is inside the runner. Only then
-        // is it certain that the probe which blocks is the **first**
-        // one -- the older request.
-        entered_rx
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("the first probe must reach the runner");
         // The second probe: it runs through.
         cmd_tx
             .send(Request::new(2, Command::Detect { force: true }))
@@ -4651,15 +4745,12 @@ mod mock_tests {
         release.store(true, std::sync::atomic::Ordering::SeqCst);
 
         // It must not publish: the sequence check drops it.
-        let extra = collect_events(&evt_rx, std::time::Duration::from_secs(2));
-        let extra_publications = extra
-            .iter()
-            .filter(|e| matches!(e, Event::NvencCapability(_)))
-            .count();
-        assert_eq!(
-            extra_publications, 0,
-            "the older probe's result must not publish: {extra:?}"
+        assert_no_event(
+            &evt_rx,
+            |e| matches!(e, Event::NvencCapability(_)),
+            std::time::Duration::from_secs(2),
         );
+        // (the assertion is inside `assert_no_event`)
     }
 
     #[test]
@@ -4807,16 +4898,31 @@ mod mock_tests {
         let dir = unique_tmp("capability_event");
         std::fs::create_dir_all(&dir).expect("the temp dir must be created");
 
-        let capability = Capability::from_check(
-            Vec::new(),
-            Some(chrono::Utc::now() - chrono::Duration::days(40)),
-            true,
-        );
+        // The stored record is what makes the review advisory
+        // appear: the probe reuses it (it is not forced) and reports
+        // that it is past its review date.
+        let record = crate::encoder::nvenc::CapabilityRecord {
+            version: crate::encoder::nvenc::RECORD_VERSION,
+            ffmpeg_version: PROBE_VERSION.to_string(),
+            ffmpeg_fingerprint: crate::encoder::nvenc::fingerprint(PROBE_VERSION, ""),
+            probed_at: chrono::Utc::now() - chrono::Duration::days(40),
+            next_review_at: chrono::Utc::now() - chrono::Duration::days(10),
+            encoders: vec![],
+        };
+        std::fs::write(
+            dir.join("nvenc-capability.json"),
+            serde_json::to_string(&record).expect("the record must serialize"),
+        )
+        .expect("the record must be written");
 
         let (_cmd_tx, evt_rx) = run_test_controller_with_capability(
             make_succeeding_mock().0,
             Some(dir.clone()),
-            Some(capability),
+            Some(Capability::from_check(
+                Vec::new(),
+                Some(chrono::Utc::now() - chrono::Duration::days(40)),
+                true,
+            )),
         );
 
         let mut reported = None;

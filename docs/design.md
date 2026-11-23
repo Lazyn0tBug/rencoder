@@ -3729,8 +3729,8 @@ anyhow = "1"
 |---|---|---|---|
 | actor | `start_controller` | 处理 Command、发 Event、起 worker | 进程 |
 | 批次 worker | actor（`StartBatch` / `DryRun` / `Analyze`） | 跑一批文件（`TaskManager::run` 的同步循环） | 一批，结束即退 |
-| 缓存初始化 | `start_controller` | `ffmpeg -encoders` + NVENC 能力解析 → **结果交给 actor** | 一次，结束即退 |
-| NVENC 探测 | `Command::Detect` / nv 变化 | 能力实测 → **结果交给 actor**（落盘由 actor 安排） | 一次，结束即退 |
+| 能力检查（链的第一段） | `start_controller` | `ffmpeg -encoders` + NVENC 能力实测 → **结果交给 actor**（发布与落盘由 actor 安排 ✅ ✅） | 一次，结束即退 |
+| 能力刷新 | `Command::Detect` | 事实过期或构建变了才**再查一次** ✅ ✅ → 结果交给 actor ✅ ✅ | 一次，结束即退 |
 | stderr 读取 | 每次 ffmpeg | 收集 stderr 尾部（有上限） | 随 ffmpeg 子进程 |
 | signal 监听 | `install_handler` | 收 SIGINT/TERM/HUP → 清理半成品 | 进程 |
 | UI 事件泵 | `App()` 的 use_hook | 阻塞 `recv()` → `state.with_mut` | 进程 |
