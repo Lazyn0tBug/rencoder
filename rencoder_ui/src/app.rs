@@ -973,7 +973,15 @@ fn TaskPageButton(
         return rsx! { span {} };
     };
 
-    let kind = task_button_decision(phase, !history.is_empty(), input_dir.is_some());
+    // The batch id: a cancel names the batch (design doc §3.11.3),
+    // so the button can only offer a cancel once there is an id.
+    let has_batch_id = active.as_ref().is_some_and(|t| t.batch_id.is_some());
+    let kind = task_button_decision(
+        phase,
+        !history.is_empty(),
+        input_dir.is_some(),
+        has_batch_id,
+    );
     match kind {
         TaskButtonKind::Disabled { label } => rsx! {
             button {
@@ -999,7 +1007,9 @@ fn TaskPageButton(
             }
         }
         TaskButtonKind::EnabledSecondary { label } => {
-            // Cancel ✕: only fires during Encoding.
+            // Cancel ✕: fires during Encoding and during Starting
+            // (once the batch id is known -- the batch may still be
+            // waiting for the facts).
             let tx_c = tx.clone();
             rsx! {
                 button {
@@ -1030,6 +1040,7 @@ fn task_button_decision(
     phase: Option<BatchPhase>,
     has_history: bool,
     has_input_dir: bool,
+    has_batch_id: bool,
 ) -> TaskButtonKind {
     match phase {
         // Active task in flight: button reflects the phase.
@@ -1049,9 +1060,16 @@ fn task_button_decision(
         Some(BatchPhase::Encoding) => TaskButtonKind::EnabledSecondary {
             label: "Cancel ✕"
         },
-        // The batch is on its way: the lib has not answered yet, and
-        // the batch id (which a cancel must name -- design doc
-        // §3.11.3) is not known. Nothing to press.
+        // The batch is on its way. Two moments share this phase: the
+        // request is still in flight (no batch id yet -- a cancel
+        // could not name the batch, design doc §3.11.3), and the
+        // batch is admitted but waiting for the facts (the chain's
+        // barrier -- design doc §3.10.1.2). Once the id is known the
+        // cancel is offered: it interrupts the wait (the lib ends the
+        // batch where it stands).
+        Some(BatchPhase::Starting) if has_batch_id => TaskButtonKind::EnabledSecondary {
+            label: "Cancel ✕",
+        },
         Some(BatchPhase::Starting) => TaskButtonKind::Disabled {
             label: "Starting…"
         },
@@ -1366,7 +1384,7 @@ mod tests {
         // lib doesn't honor cancel_token in this phase, so we
         // disable the button. Locked by §3.8.7.1 limitations.
         assert_kind(
-            task_button_decision(Some(Analyzing), false, false),
+            task_button_decision(Some(Analyzing), false, false, false),
             TaskButtonKind::Disabled {
                 label: "Analyze…"
             },
@@ -1379,7 +1397,7 @@ mod tests {
         // label is plain "Encode" (no count suffix — we don't
         // design for encoding a subset; §3.8.7.1 decision 2).
         assert_kind(
-            task_button_decision(Some(AwaitingConfirm), false, false),
+            task_button_decision(Some(AwaitingConfirm), false, false, false),
             TaskButtonKind::EnabledPrimary { label: "Encode" },
         );
     }
@@ -1391,7 +1409,7 @@ mod tests {
         // so the label and click handler are identical. This
         // avoids a special-case in the reducer for Cancelled.
         assert_kind(
-            task_button_decision(Some(Cancelled), false, false),
+            task_button_decision(Some(Cancelled), false, false, false),
             TaskButtonKind::EnabledPrimary { label: "Encode" },
         );
     }
@@ -1402,7 +1420,29 @@ mod tests {
         // the lib's cancel_token (which the task manager polls
         // between ffmpeg frames).
         assert_kind(
-            task_button_decision(Some(Encoding), false, false),
+            task_button_decision(Some(Encoding), false, false, false),
+            TaskButtonKind::EnabledSecondary {
+                label: "Cancel ✕"
+            },
+        );
+    }
+
+    #[test]
+    fn task_button_starting_offers_a_cancel_once_the_batch_id_is_known() {
+        // `Starting` spans two moments: the request is still in
+        // flight (no batch id yet -- a cancel could not name the
+        // batch, design doc §3.11.3), and the batch is admitted but
+        // waiting for the facts (the chain's barrier, §3.10.1.2).
+        // Once the id is known the cancel is offered -- the lib ends
+        // the batch where it stands.
+        assert_kind(
+            task_button_decision(Some(Starting), false, false, false),
+            TaskButtonKind::Disabled {
+                label: "Starting…"
+            },
+        );
+        assert_kind(
+            task_button_decision(Some(Starting), false, false, true),
             TaskButtonKind::EnabledSecondary {
                 label: "Cancel ✕"
             },
@@ -1416,7 +1456,7 @@ mod tests {
         // — show a disabled placeholder rather than nothing so the
         // bottom bar is never empty.
         assert_kind(
-            task_button_decision(Some(Done), false, false),
+            task_button_decision(Some(Done), false, false, false),
             TaskButtonKind::Disabled { label: "Done" },
         );
     }
@@ -1426,13 +1466,13 @@ mod tests {
         // History present → user can re-run the dry-run flow.
         // history length > 0 wins over has_input_dir.
         assert_kind(
-            task_button_decision(None, true, true),
+            task_button_decision(None, true, true, false),
             TaskButtonKind::EnabledPrimary {
                 label: "Re-run ▸"
             },
         );
         assert_kind(
-            task_button_decision(None, true, false),
+            task_button_decision(None, true, false, false),
             TaskButtonKind::EnabledPrimary {
                 label: "Re-run ▸"
             },
@@ -1443,7 +1483,7 @@ mod tests {
     fn task_button_none_no_history_with_dir_analyzes() {
         // No history + dir picked = "Analyze ▸" — fresh first run.
         assert_kind(
-            task_button_decision(None, false, true),
+            task_button_decision(None, false, true, false),
             TaskButtonKind::EnabledPrimary {
                 label: "Analyze ▸"
             },
@@ -1456,7 +1496,7 @@ mod tests {
         // placeholder that tells the user what to do next (rather
         // than an empty button).
         assert_kind(
-            task_button_decision(None, false, false),
+            task_button_decision(None, false, false, false),
             TaskButtonKind::Disabled {
                 label: "Pick a directory first",
             },
@@ -1470,7 +1510,7 @@ mod tests {
         // precedence. Otherwise the bottom button would suddenly
         // flip from "Cancel ✕" to "Re-run ▸" mid-encode.
         assert_kind(
-            task_button_decision(Some(Encoding), true, true),
+            task_button_decision(Some(Encoding), true, true, false),
             TaskButtonKind::EnabledSecondary {
                 label: "Cancel ✕"
             },

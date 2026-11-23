@@ -2225,6 +2225,9 @@ pub enum Event {
     // Lifecycle topic（低频，批级 / 文件级）
     // 每个批次事件都带 `batch_id`（§3.11.3）：UI 靠它把事件对回批次，
     // 上一批的迟到事件不会污染现在这一批。
+    /// **worker 开跑**的时刻——不是"请求被接纳"的时刻。批次先被接纳，
+    /// 然后在链的第一段（等事实，§3.10.1.2）上等；`BatchStarted` 是
+    /// 等完、worker 真的起来了。UI 的 `Encoding` 相位由它推动。
     BatchStarted { id: u64, total_files: usize },
     FileStarted { batch_id: u64, index: usize, total: usize, source: PathBuf },
     FileCompleted { batch_id: u64, index: usize, record: EncodingRecord },
@@ -2943,10 +2946,11 @@ fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Command>, config: &App
             }
         }
         Msg::Lib(Event::BatchStarted { id, total_files }) => {
-            // Transition AwaitingConfirm → Encoding (lib accepted
-            // the StartBatch). Record lib's batch_id on the active
-            // task (id-as-mapping, **不**参与 gating 决策——per review
-            // feedback,避免 id-as-coincidence 反模式)。
+            // Transition Starting → Encoding (the worker started —
+            // after the facts landed, §3.10.1.2). Record lib's
+            // batch_id on the active task (id-as-mapping, **不**参与
+            // gating 决策——per review feedback,避免 id-as-coincidence
+            // 反模式)。
             if let Some(t) = state.tasks.active.as_mut() {
                 t.batch_id = Some(id);
                 t.total_files = total_files;
@@ -3057,15 +3061,17 @@ semantics):
       └───────────────────── UserSelectedDir / Re-pick ──────────────────────┘
 ```
 
-**Per-phase semantics** (v1.2 follow-up #2 — 6 states; 2-click
-Confirm restored; cancel is optimistic):
+**Per-phase semantics** (7 states; 2-click Confirm restored; cancel is
+optimistic):
 
 | Phase | 来源 | Dir picker | Button label | Button enabled | File list |
 |-------|------|-----------|--------------|----------------|-----------|
 | `None` + dir 未选 | initial | enabled | (placeholder) | **disabled** | empty |
 | `Analyzing` | `Command::DryRun` in flight | enabled (re-pick resets) | "Analyze…" | **disabled** | empty (dry-run results in toast, not list) |
 | `AwaitingConfirm` | `Event::DryRunFinished` (to_encode > 0) | enabled | **"Encode"** | **enabled** | empty (records → toast only) |
-| `Encoding` | `Event::BatchStarted` (lib accepted `Command::StartBatch`) | enabled (re-pick cancels + resets) | "Cancel ✕" | **enabled** (dispatches `Command::Cancel`) | records (Pending / Encoding / Succeeded / Failed) |
+| `Starting` | `Command::StartBatch` dispatched → the lib admitted it, the batch waits for the facts (§3.10.1.2) | enabled (re-pick cancels + resets) | "Cancel ✕"（批次号已知时）/ "Starting…"（还不知道批次号时） | **enabled**（`Command::Cancel` 点名批次 ✅ ✅——lib 就地结束这一批 ✅ ✅，等待被打断 ✅ ✅） | 预演记录（正在跑的计划） |
+| `Cancelling` | `Msg::UserClickedCancel` 已发出；批次的终态还没来 | enabled | "Cancelling…" | **disabled** | 取消那一刻的记录 |
+| `Encoding` | `Event::BatchStarted` (the worker started — after the facts landed, §3.10.1.2) | enabled (re-pick cancels + resets) | "Cancel ✕" | **enabled** (dispatches `Command::Cancel`) | records (Pending / Encoding / Succeeded / Failed) |
 | `Done` | `BatchCompleted` / late `BatchCancelled` (filtered to terminal) | enabled | (placeholder) | **disabled** (re-arm via dir re-pick) | records (final outcomes) |
 | `Cancelled` | `Msg::UserClickedCancel` 立即设;`Event::BatchCancelled` late events ignored | enabled | **"Encode"** | **enabled** (re-click re-dispatches `StartBatch`) | records at cancellation point (Succeeded up to cancel, in-flight record absent — deleted by lib cleanup) |
 
@@ -3888,6 +3894,11 @@ deadline 分支：超时就把这一批判失败（`BatchFailed`），闸门放�
 只有 actor（发布者），**读者从"worker 轮询"变成"actor 取一份快照交给 worker"**——worker
 拿到的是值（§3.10.1.1 的"不可变快照"），不是一个可以再去读的格子。
 
+**UI 的相位就是链的段**：`Starting` = 已接纳、在 barrier 上等事实；`Encoding` = worker 在
+跑。推动 `Starting → Encoding` 的是 `Event::BatchStarted`（worker 开跑的那一刻），**不是**
+`CommandAccepted`（接纳只是拿到批次号，好让取消能点名）。这样 UI 说的"在编码"就是真的
+在编码——之前它会在批次还没开工时就这么说。
+
 #### 3.10.2 参数流：一个字段只有一个转换入口
 
 **要求**：一个配置字段只能有**一个**地方把它变成运行时值。
@@ -4364,7 +4375,7 @@ worker 拿不到时**这一批开不了工** ✅ ✅ → 终态错误事件 ✅ 
 #### 3.11.3 交互：命令、事件和状态
 
 - GUI 命令提交方提供 `RequestId`。CLI 直接调用共享执行层。接纳和拒绝均回传该 ID，接纳时绑定 `BatchId`。所有批次事件带 `BatchId`，文件事件还带批次内稳定的文件索引。`Cancel { batch_id }` 只影响匹配的活动批次。
-- UI 在命令成功入队后进入 `Starting` 或 `Cancelling`。发送失败显示错误并保留原状态。启动拒绝恢复提交前状态。UI 以匹配批次的终态确认收尾。执行端释放运行名额后再发布终态，允许用户收到确认后直接重启。
+- UI 在命令成功入队后进入 `Starting` 或 `Cancelling`。发送失败显示错误并保留原状态。启动拒绝恢复提交前状态。UI 以匹配批次的终态确认收尾。执行端释放运行名额后再发布终态，允许用户收到确认后直接重启。`Starting` 到 `Encoding` 由 `BatchStarted` 推动（worker 开跑的那一刻，§3.10.1.2），不是由接纳推动——链的段与 UI 的相位是同一件事。
 - 生命周期、命令确认和结果可靠传递，进度可以合并或丢弃。进度背压不得阻塞取消入口或子进程监督。每批只有一个终态。
 - 文件失败进入文件记录，批次级失败进入匹配批次的终态，配置保存等非批次操作用带 `RequestId` 的独立失败事件。UI 根据事件类型和标识处理，无需解析错误文案。
 
@@ -4374,7 +4385,7 @@ worker 拿不到时**这一批开不了工** ✅ ✅ → 终态错误事件 ✅ 
 - **三种作用域，三种事件**：批次级失败走 `BatchFailed { batch_id }`（只终结那一批）；非批次操作失败走 `OperationFailed { request_id }`（什么都不终结）；actor 自己的 fatal 走 `Error`（无作用域）。per-file 失败**不是** fatal——它在记录的 `error` 字段里（§3.8.3）。
 - **批次号是事件的地址**：每个批次事件带 `batch_id`，UI 只把当前批次的号对上才动状态。上一批的迟到事件（它的文件序号在当前批次里另有所指）落到别的批次上，就是数据损坏。
 - **取消要点名**：取消请求带 `batch_id`；lib 只取消匹配的活动批次，点错批次（过期的一次取消）被当作良性拒绝——它绝不能停掉现在正在跑的那批。
-- **相位跟着答复走**：入队不是接纳。`Starting` 等 `CommandAccepted`（接纳 → `Encoding`；拒绝 → 恢复提交前的相位），`Cancelling` 等匹配批次的终态（`BatchCancelled` → `Cancelled`）。批次还没被接纳时没有批次号，取消无从点名——那扇门关着是对的。
+- **相位跟着链走**：入队不是接纳，接纳也不是开工。`CommandAccepted` 绑定批次号（取消要靠它点名），但相位不动——批次还在链的第一段（等事实，§3.10.1.2）。`BatchStarted`（worker 开跑）把 `Starting` 变成 `Encoding`；拒绝 → 恢复提交前的相位。`Cancelling` 等匹配批次的终态（`BatchCancelled` → `Cancelled`）。批次还没被接纳时没有批次号，取消无从点名——那扇门关着是对的；**接纳之后就有了**（§3.10.1.2 的取消能打断等待，从这里才够得着 ✅ ✅）。
 - **终态在释放名额之后发布**：worker 先交还运行名额，再发终态事件。UI 一收到确认就能直接重启；反过来（先发终态后放名额），UI 的"重启"会输给 actor 的闸门，被当成"已经有批在跑"拒掉。
 - **每批只有一个终态**：完成、取消、失败三选一，终态带批次号，UI 据此收尾。
 
@@ -4516,7 +4527,7 @@ future 待做 / ⚠️ 已作废），§8 就是当前的路线图。
 | 46 | `load_history(data_dir, limit, after)` 显式接受 data_dir 参数(不读 env var)——让 mock 测试 parallel-safe,env vars 是 process-global 会 race（v1.1 启用） | ✅ |
 | 47 | `rencoder_lib::job::EncodingRecord` 重新导出——UI 需要命名 `Event::FileCompleted` / `BatchCompleted` 携带的 record 类型 | ✅ |
 | 48 | `rencoder_ui` crate bootstrap(Dioxus desktop 0.6)：reducer + 9 个 unit test;App 在 `use_hook` 里 `std::thread::spawn` 做阻塞 `crossbeam::recv()` 循环,通过 `use_signal_sync` 的 SyncSignal 直接改 Dioxus state(详见 §3.9,不用 `use_coroutine` 因阻塞 recv 会 block executor);v1 三按钮 (Start/Cancel)+ 极简状态显示;Load History 按钮存在但 v1 不显示历史(v1.1 启用 HistoryPanel) | ✅ |
-| 49 | Actor 退出显式信号:`Event::ActorExited { reason: ExitReason }`——**未实现**(这个 variant 从不存在);UI 靠 evt_rx 收到 `Err` 察觉通道关闭 | ❌ 未实现 |
+| 49 | Actor 退出显式信号:`Event::ActorExited { reason: ExitReason }`——**已作废**（这个 variant 从不存在；UI 靠 evt_rx 收到 `Err` 察觉通道关闭，§3.11.3 的三级失败作用域里没有它） | ⚠️ 已作废 |
 | 50 | Preview / Dry Run (Tier 2 #6):`Command::DryRun { params, files }` 跑 `encode_prepare` 但**不调 ffmpeg**,emit `Event::DryRunFinished { records }`;`dry_run_batch` lib helper 复用 probe + partial + skip 逻辑。UI `Preview` 按钮 → reducer arm → DryRunPanel 渲染 planned outcomes。`encode.nv` 故意忽略——dry-run 不知道也不关心 GPU 是否启用 | ✅ |
 | 51 | Parallel analyze progress (Tier 3 #9):`Command::Analyze { files }` 走 `analyze_records_with_probe_and_progress_parallel` 闭包注入层(不是 c-probe FFI 回调层),emit `Event::AnalyzeStarted { total }` + N × `Event::AnalyzeProgress { done, total, failed, last: Option<AnalyzedFile> }` + `Event::AnalyzeFinished { records, failed_count }`;复合 A+B 显示(进度计数 + per-file log)、failure-only log、AnalyzedFile 新 type(不复用 AnalysisRecord 避免污染 success path)、v1 不响应 `Command::Cancel` 和 SIGINT、v1 走 busy-gate 不与 encode 并发。why 详见 §3.4 "分析进度上报" | ✅ |
 | 52 | UI 事件泵架构:UI 在 `use_hook` 里 `std::thread::spawn` 一个专用 OS 线程做阻塞 `crossbeam::Receiver::recv()`,通过 `use_signal_sync` 暴露的 `SyncSignal` 直接 `state.with_mut()` 改 Dioxus state。不用 `use_coroutine`(阻塞 recv() 会 block Dioxus executor,首帧不渲染);不桥接 `futures::mpsc`(冗余);lib API(`start_controller` 返回 crossbeam ControllerHandle)不动。详见 §3.9;bisect 历史见 `docs/debug-journal/event-pump-blocking.md` | ✅ |
@@ -4570,7 +4581,7 @@ future 待做 / ⚠️ 已作废），§8 就是当前的路线图。
 | 98 | **路径一处决定**（§3.6）：lib 的 `config::paths::Paths` 一次解析出全部路径，前端不再各自现算；操作目录里的应用文件（`cancel`、`capabilities.json`）按名字跳过，不被当成输入 | ✅ |
 | 99 | **单例守卫**（§3.11.1.1）：范围是一棵目录树（自己 ✅ ✅、祖先 ✅ ✅、后代 ✅ ✅）；互斥交给内核文件锁 ✅ ✅（进程死了内核放锁 ✅ ✅、取得占用是原子的 ✅ ✅、不需要 pid 判活 ✅ ✅）；标记只记 pid 与开始时刻 ✅ ✅，用完就删 ✅ ✅（先删名字后放锁 ✅ ✅）；冲突整趟拒绝 ✅ ✅，文件系统不支持锁则报错拒绝这一趟 ✅ ✅；GUI 空闲不占 ✅ ✅（只在会写产物的批次期间持有 ✅ ✅） | ✅ |
 | 105 | **GUI 两层草稿 + 保存回执**（§3.10.5 ✅ ✅）：文件层（`config_draft` = 磁盘上的配置 ✅ ✅）与入口层（`config_edits` = 用户未保存的逐字段编辑 ✅ ✅）分开 ✅ ✅——草稿的值表达文件层 ✅ ✅，"用户动过哪个字段"由入口层判定 ✅ ✅，不靠草稿字段有没有值推断 ✅ ✅；每个字段一个修订号 ✅ ✅，编辑时递增 ✅ ✅；保存请求带上修订号 ✅ ✅、回执带回它 ✅ ✅——回执**只**清除它覆盖的编辑 ✅ ✅，保存期间新敲的留在入口层 ✅ ✅；保存失败保留基线与草稿 ✅ ✅；有效配置 = 文件层 + 入口层 ✅ ✅（表单与运行参数都读它 ✅ ✅）| ✅ |
-| 104 | **GUI 命令协议**（§3.11.3）：通道上跑 `Request { id, command }` ✅ ✅（答复指名道姓 ✅ ✅）；`CommandAccepted` / `CommandRejected` 回传请求号 ✅ ✅，接纳时绑定批次号 ✅ ✅；所有批次事件带 `BatchId` ✅ ✅（上一批的迟到事件污染不到当前批 ✅ ✅）；`Cancel { batch_id }` 只影响匹配的活动批次 ✅ ✅（过期取消被拒 ✅ ✅）；三级失败作用域：批次级 `BatchFailed` ✅ ✅ / 非批次级 `OperationFailed` ✅ ✅ / 无作用域 `Error` ✅ ✅；per-file 失败**不再**发 fatal 事件 ✅ ✅（它在记录的 `error` 里 ✅ ✅）；UI 相位 `Starting` / `Cancelling` ✅ ✅（相位跟着答复走 ✅ ✅，拒绝恢复原状态 ✅ ✅）；终态在释放运行名额**之后**发布 ✅ ✅（UI 收到确认即可重启 ✅ ✅）| ✅ |
+| 104 | **GUI 命令协议**（§3.11.3）：通道上跑 `Request { id, command }` ✅ ✅（答复指名道姓 ✅ ✅）；`CommandAccepted` / `CommandRejected` 回传请求号 ✅ ✅，接纳时绑定批次号 ✅ ✅；所有批次事件带 `BatchId` ✅ ✅（上一批的迟到事件污染不到当前批 ✅ ✅）；`Cancel { batch_id }` 只影响匹配的活动批次 ✅ ✅（过期取消被拒 ✅ ✅）；三级失败作用域：批次级 `BatchFailed` ✅ ✅ / 非批次级 `OperationFailed` ✅ ✅ / 无作用域 `Error` ✅ ✅；per-file 失败**不再**发 fatal 事件 ✅ ✅（它在记录的 `error` 里 ✅ ✅）；UI 相位 `Starting` / `Cancelling` ✅ ✅（相位跟着**链**走 ✅ ✅——`BatchStarted` 推动 `Starting → Encoding` ✅ ✅，链的段与相位是同一件事 ✅ ✅；拒绝恢复原状态 ✅ ✅）；终态在释放运行名额**之后**发布 ✅ ✅（UI 收到确认即可重启 ✅ ✅）| ✅ |
 | 103 | **任务类型收紧 + 统一构造入口**（§3.11.1 ✅ ✅）：`EncodeTask` 的输出不再是可选项 ✅ ✅（`Option<PathBuf>` 让每个读者都问"这是不是分析？" ✅ ✅），分析有自己的 `AnalyzeTask` ✅ ✅；编码与预演共用 `pipeline::batch::encode_tasks` ✅ ✅（任务与输出名只有一处产生 ✅ ✅）；预演的记录说 `Ready` ✅ ✅，不说 `Succeeded` ✅ ✅ | ✅ |
 | 102 | **启动期可取消**（§3.11.2）：采集每 64 个条目查一次取消令牌 ✅ ✅；NVENC 探测走 ffmpeg 调用那道缝 ✅ ✅、每次调用前查一次 ✅ ✅；取消发生在开工前 ✅ ✅ → 不产出任何东西 ✅ ✅，退出码 130 ✅ ✅ | ✅ |
 | 101 | **批内输出规划**（§3.11.1）：两个输入指向同一输出时**改名**而不是整批终止 ✅ ✅ —— `<词干>_<输入扩展名>_<序号>.<目标扩展名>` ✅ ✅；序号按排序后的路径分配 ✅ ✅（名字不随采集顺序变 ✅ ✅）；输出不落在任何输入上 ✅ ✅ | ✅ |

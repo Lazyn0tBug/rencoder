@@ -266,8 +266,16 @@ pub enum Event {
     },
 
     // ---- Lifecycle topic (low frequency) ----
-    /// A batch has started. `id` is unique within the controller's
-    /// lifetime. `total_files` is the count after collection.
+    /// A batch's work has started. `id` is unique within the
+    /// controller's lifetime. `total_files` is the count after
+    /// collection.
+    ///
+    /// It fires when the **worker** starts -- not when the request is
+    /// accepted. The two are different moments: the batch is accepted
+    /// first and then waits for the facts (the chain's barrier,
+    /// design doc §3.10.1.2). The UI's `Encoding` phase follows
+    /// **this** event, so it means "the worker is running"
+    /// (design doc §3.11.3).
     BatchStarted { id: BatchId, total_files: usize },
     /// A single file is about to be encoded. `source` is the input
     /// path; the output path is computed by the lib and surfaced via
@@ -2390,14 +2398,6 @@ fn run_actor(cmd_rx: Receiver<Request>, evt_tx: Sender<Event>, env: ActorEnv) {
                     },
                     &dropped_counter,
                 );
-                send_evt_lossy(
-                    &evt_tx,
-                    Event::BatchStarted {
-                        id,
-                        total_files: files.len(),
-                    },
-                    &dropped_counter,
-                );
                 // One cache snapshot per batch (a batch is a unit —
                 // the encoder must not change under it).
                 //
@@ -2421,6 +2421,7 @@ fn run_actor(cmd_rx: Receiver<Request>, evt_tx: Sender<Event>, env: ActorEnv) {
                 // the same token (the `move` closure would otherwise
                 // take it).
                 let cancel_for_processor = cancel_for_worker.clone();
+                let total_files = files.len();
                 // The chain's barrier: the batch waits for the facts
                 // (the capability + the encoder cache). The actor
                 // holds it here and hands it over **frozen** -- the
@@ -2433,6 +2434,16 @@ fn run_actor(cmd_rx: Receiver<Request>, evt_tx: Sender<Event>, env: ActorEnv) {
                 // actor, and a cancel is a command the actor
                 // processes.
                 let start = Box::new(move |fact: PublishedState| {
+                    // The batch's work starts **now**: the facts are in
+                    // and the worker is about to run. The UI's phase
+                    // follows this event (design doc §3.11.3) -- so
+                    // "Encoding" means "the worker is running", not
+                    // "the lib took the request".
+                    send_evt_lossy(
+                        &evt_tx_for_worker,
+                        Event::BatchStarted { id, total_files },
+                        &dropped_for_worker,
+                    );
                     let cache = match cache_from_slot(fact.cache) {
                         Ok(cache) => cache,
                         Err((category, message)) => {
@@ -3777,6 +3788,60 @@ mod mock_tests {
             }
             _ => panic!("expected BatchCancelled, got {last:?}"),
         }
+    }
+
+    #[test]
+    fn the_batch_start_is_announced_when_the_worker_starts() {
+        // The chain's first stage is a barrier: the batch is admitted
+        // first and only then waits for the facts. `BatchStarted`
+        // says "the worker is running" -- so it must not fire before
+        // the facts land (design doc §3.10.1.2 / §3.11.3).
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release_for_runner = Arc::clone(&release);
+        let runner: crate::job::DetectRunner = Arc::new(move |_args: &[&str]| {
+            // The facts never land until the test lets them.
+            while !release_for_runner.load(AtomicOrdering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Ok(String::new())
+        });
+        let (cmd_tx, evt_rx) = run_test_controller_with_runner(
+            |task: &EncodeTask,
+             _: &mut BatchContext,
+             _: &CancelToken,
+             _: &mut dyn FnMut(FfmpegProgress)| Ok(fake_record(&task.input)),
+            None,
+            None,
+            Some(runner),
+        );
+
+        cmd_tx
+            .send(Request::new(
+                1,
+                Command::StartBatch {
+                    params: EncodeParams::default(),
+                    files: batch_files("start_announcement", 1),
+                },
+            ))
+            .unwrap();
+
+        // The batch is admitted -- but the facts have not landed, so
+        // the worker has not started: no announcement yet.
+        wait_for_event(&evt_rx, |e| matches!(e, Event::CommandAccepted { .. }));
+        assert_no_event(
+            &evt_rx,
+            |e| matches!(e, Event::BatchStarted { .. }),
+            std::time::Duration::from_millis(200),
+        );
+
+        // The facts land: the worker starts, and the batch is
+        // announced.
+        release.store(true, AtomicOrdering::SeqCst);
+        let started = wait_for_event(&evt_rx, |e| matches!(e, Event::BatchStarted { .. }));
+        assert!(
+            matches!(started, Event::BatchStarted { total_files: 1, .. }),
+            "the announcement names the batch's files: {started:?}"
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@
 //!                                            | (to_encode > 0)
 //!                                            | UserClickedStart
 //!                                            v
-//! [Starting] --CommandAccepted--> [Encoding]
+//! [Starting] --Event::BatchStarted--> [Encoding]
 //!      |                             |  UserClickedCancel
 //!      | CommandRejected             v
 //!      +--> [AwaitingConfirm]    [Cancelling] --BatchCancelled--> [Cancelled]
@@ -26,9 +26,11 @@
 //! ```
 //!
 //! The two new phases are the protocol's answer to "the command is
-//! on its way" (design doc §3.11.3): `Starting` waits for the lib to
-//! admit the batch, `Cancelling` waits for the batch's terminal
-//! event. A rejected request puts the phase back where it was.
+//! on its way" (design doc §3.11.3): `Starting` waits for the batch
+//! to actually start (the lib admits it, then the batch waits for
+//! the facts — the chain's barrier, §3.10.1.2), `Cancelling` waits
+//! for the batch's terminal event. A rejected request puts the phase
+//! back where it was.
 //!
 //! v1.2 user feedback (review #133 follow-up): removed the
 //! auto-encode on positive dry-run count. Encoding is a
@@ -68,9 +70,11 @@ pub enum BatchPhase {
     /// count — we don't design for encoding a subset; per
     /// §3.8.7.1 decision 2).
     AwaitingConfirm,
-    /// `Command::StartBatch` dispatched; the lib has not answered yet
-    /// (design doc §3.11.3). The button shows "Starting…" and the
-    /// cancel is not available -- the batch id is not known yet.
+    /// `Command::StartBatch` dispatched; the batch is admitted but not
+    /// working yet -- it is waiting for the facts (the chain's
+    /// barrier, design doc §3.10.1.2). The button shows "Starting…";
+    /// the batch id is known (the lib accepted it), but the cancel
+    /// button only appears once the work runs.
     Starting,
     /// The batch is admitted and running. Start button shows
     /// "Cancel ✕".
@@ -835,20 +839,29 @@ pub fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Request>) {
         Msg::UserClickedCancel => {
             let phase = state.tasks.active.as_ref().map(|t| t.phase);
             match phase {
-                Some(BatchPhase::Encoding) => {
+                Some(BatchPhase::Encoding) | Some(BatchPhase::Starting) => {
                     // The cancel names the batch (design doc §3.11.3):
                     // a cancel that names another batch is refused,
                     // so a stale cancel cannot stop the batch the
                     // user is watching.
+                    //
+                    // `Starting` belongs here too: the batch is
+                    // admitted but still waiting for the facts (the
+                    // chain's barrier, design doc §3.10.1.2). The id
+                    // is known -- the lib accepted it -- so the cancel
+                    // can name the batch, and the lib ends it where it
+                    // stands (the wait is interrupted).
                     let Some(batch_id) = state.tasks.active.as_ref().and_then(|t| t.batch_id)
                     else {
                         push_toast(state, "the batch has no id yet", ToastKind::Warning);
                         return;
                     };
+                    // Where a refusal puts the phase back to.
+                    let restore = phase.unwrap_or(BatchPhase::Encoding);
                     {
                         let t = state.tasks.active.as_mut().unwrap();
                         t.phase = BatchPhase::Cancelling;
-                        t.restore_phase = Some(BatchPhase::Encoding);
+                        t.restore_phase = Some(restore);
                     }
                     // The phase changes to `Cancelled` when the
                     // batch's terminal event arrives -- not when the
@@ -861,7 +874,7 @@ pub fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Request>) {
                         }
                         Err(e) => {
                             if let Some(t) = state.tasks.active.as_mut() {
-                                t.phase = BatchPhase::Encoding;
+                                t.phase = restore;
                                 t.restore_phase = None;
                             }
                             push_toast(state, e, ToastKind::Error);
@@ -871,12 +884,6 @@ pub fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Request>) {
                 Some(BatchPhase::Cancelling) => {
                     // The cancel is already on its way; the batch's
                     // terminal event will confirm it.
-                }
-                Some(BatchPhase::Starting) => {
-                    // The batch has not been admitted yet, so it has
-                    // no id to name (design doc §3.11.3). The window
-                    // is short: the answer arrives right after.
-                    push_toast(state, "the batch has not started yet", ToastKind::Warning);
                 }
                 Some(BatchPhase::Analyzing) => {
                     // Best-effort cancel during the dry run. The
@@ -977,8 +984,14 @@ fn apply_event(state: &mut AppState, evt: Event) {
             batch_id,
         } => {
             // The lib admitted the request (design doc §3.11.3).
-            // The batch id binds now, and the phase follows the
-            // answer -- not the enqueue.
+            // The batch id binds now -- so the UI can name the batch
+            // in a cancel.
+            //
+            // The **phase** does not move yet: the batch is admitted,
+            // but it may still be waiting for the facts (the chain's
+            // barrier, design doc §3.10.1.2). `Event::BatchStarted`
+            // is the moment the worker actually starts -- that is
+            // what "Encoding" means.
             let pending = state.tasks.active.as_ref().and_then(|t| t.pending_request);
             if pending != Some(request_id) {
                 // Not the request the UI is waiting for (a config
@@ -991,17 +1004,6 @@ fn apply_event(state: &mut AppState, evt: Event) {
             t.pending_request = None;
             if let Some(batch_id) = batch_id {
                 t.batch_id = Some(batch_id);
-            }
-            if t.phase == BatchPhase::Starting {
-                t.phase = BatchPhase::Encoding;
-                t.restore_phase = None;
-                // Clear dry_run_records so the file list switches
-                // from dry-run outcomes (Succeeded/Skipped/Failed
-                // from probe) to encoding outcomes (per-file
-                // FileCompleted events). Without this, the UI would
-                // keep showing the dry-run results during
-                // Encoding — misleading.
-                t.dry_run_records.clear();
             }
         }
         Event::CommandRejected { request_id, reason } => {
@@ -1057,6 +1059,22 @@ fn apply_event(state: &mut AppState, evt: Event) {
             t.batch_id = Some(id);
             t.total_files = total_files;
             t.records.clear();
+            if t.phase == BatchPhase::Starting {
+                // The worker is running: the phase says so (design
+                // doc §3.11.3). The chain's stages and the UI's
+                // phases are the same thing -- `Starting` is the
+                // barrier (admitted, waiting for the facts),
+                // `Encoding` is the work (§3.10.1.2).
+                t.phase = BatchPhase::Encoding;
+                t.restore_phase = None;
+                // Clear dry_run_records so the file list switches
+                // from dry-run outcomes (Succeeded/Skipped/Failed
+                // from probe) to encoding outcomes (per-file
+                // FileCompleted events). Without this, the UI would
+                // keep showing the dry-run results during
+                // Encoding — misleading.
+                t.dry_run_records.clear();
+            }
         }
         Event::FileStarted { .. } => {
             // Could update a "current file" display; v1 lets
@@ -2433,12 +2451,11 @@ mod tests {
 
     #[test]
     fn batch_started_records_batch_id_as_mapping() {
-        // review #133 part 3d: Event::BatchStarted now records the
-        // lib's batch_id on the active task but does NOT change
-        // phase. Phase is set to Encoding by Event::DryRunFinished
-        // (auto-encode path) before BatchStarted ever fires — the
-        // lib transitions Analyzing -> Encoding itself by emitting
-        // BatchStarted in response to Command::StartBatch.
+        // review #133 part 3d: Event::BatchStarted records the
+        // lib's batch_id on the active task. It also moves the phase
+        // from `Starting` to `Encoding` -- the batch's work has
+        // started (design doc §3.11.3, §3.10.1.2). Here the task is
+        // already in `Encoding`, so the phase does not change.
         let mut state = fresh_state();
         state.tasks.active = Some(TaskInfo {
             task_id: TaskId("20260101000000".into()),
@@ -2549,6 +2566,47 @@ mod tests {
     }
 
     #[test]
+    fn a_cancel_during_starting_names_the_batch() {
+        // The batch is admitted but still waiting for the facts (the
+        // chain's barrier, design doc §3.10.1.2). The id is known --
+        // the lib accepted it -- so the cancel can name the batch, and
+        // the lib ends it where it stands (the wait is interrupted).
+        let mut state = fresh_state();
+        let (tx, rx) = crossbeam_channel::unbounded::<Request>();
+        state.tasks.active = Some(TaskInfo {
+            task_id: TaskId("20260101000000".into()),
+            batch_id: Some(11),
+            pending_request: None,
+            restore_phase: None,
+            phase: BatchPhase::Starting,
+            dir: PathBuf::from("/x"),
+            total_files: 5,
+            to_encode: 5,
+            to_failed: 0,
+            encoded: 0,
+            cancelled: false,
+            finished: false,
+            records: vec![],
+            dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
+        });
+        reduce(&mut state, Msg::UserClickedCancel, &tx);
+
+        let t = state.tasks.active.as_ref().unwrap();
+        assert_eq!(
+            t.phase,
+            BatchPhase::Cancelling,
+            "the phase waits for the batch's terminal event"
+        );
+        match next_command(&rx) {
+            Command::Cancel { batch_id } => assert_eq!(batch_id, 11),
+            other => panic!("expected Command::Cancel, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn user_clicked_cancel_waits_for_the_batch_to_confirm() {
         // Design doc §3.11.3: the cancel names the batch, and the UI
         // waits for the batch's terminal event. The phase says
@@ -2608,9 +2666,10 @@ mod tests {
 
     #[test]
     fn the_accept_event_admits_the_batch() {
-        // Design doc §3.11.3: the phase follows the lib's answer,
-        // not the enqueue. `Starting` becomes `Encoding` when the
-        // answer arrives, and the answer binds the batch id.
+        // Design doc §3.11.3: the answer binds the batch id; the
+        // **phase** waits for the batch to actually start (the
+        // chain's barrier, §3.10.1.2). `Event::BatchStarted` is what
+        // moves it to `Encoding` -- see the test below.
         let mut state = fresh_state();
         let tx = cmd_tx();
         state.tasks.active = Some(TaskInfo {
@@ -2641,9 +2700,55 @@ mod tests {
             &tx,
         );
         let t = state.tasks.active.as_ref().unwrap();
-        assert_eq!(t.phase, BatchPhase::Encoding, "the batch is admitted");
+        assert_eq!(
+            t.phase,
+            BatchPhase::Starting,
+            "the batch is admitted but not working yet"
+        );
         assert_eq!(t.batch_id, Some(11), "the answer binds the batch id");
         assert_eq!(t.pending_request, None, "the request is answered");
+    }
+
+    #[test]
+    fn the_batch_start_moves_the_phase_to_encoding() {
+        // The chain's stages and the UI's phases are the same thing
+        // (design doc §3.10.1.2 / §3.11.3): `Starting` is the barrier
+        // (admitted, waiting for the facts), `Encoding` is the work.
+        // The event that says "the worker is running" is
+        // `Event::BatchStarted`.
+        let mut state = fresh_state();
+        let tx = cmd_tx();
+        state.tasks.active = Some(TaskInfo {
+            task_id: TaskId("20260101000000".into()),
+            batch_id: Some(11),
+            pending_request: None,
+            restore_phase: Some(BatchPhase::AwaitingConfirm),
+            phase: BatchPhase::Starting,
+            dir: std::path::PathBuf::from("/x"),
+            total_files: 0,
+            to_encode: 5,
+            to_failed: 0,
+            encoded: 0,
+            cancelled: false,
+            finished: false,
+            records: vec![],
+            dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
+        });
+        reduce(
+            &mut state,
+            Msg::Lib(Event::BatchStarted {
+                id: 11,
+                total_files: 5,
+            }),
+            &tx,
+        );
+        let t = state.tasks.active.as_ref().unwrap();
+        assert_eq!(t.phase, BatchPhase::Encoding, "the worker is running");
+        assert_eq!(t.total_files, 5);
+        assert_eq!(t.restore_phase, None, "the phase is committed");
     }
 
     #[test]
