@@ -106,7 +106,7 @@ pub enum Page {
 #[allow(dead_code)]
 // constructed by the Setup-page form (app.rs) on
 // every <input>/radio change; not constructed by the reducer itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ConfigFieldKind {
     Format,
     Crf,
@@ -185,12 +185,25 @@ pub struct AppState {
     /// Last fatal error (any source). UI renders it as the global
     /// status badge.
     pub last_error: Option<String>,
-    /// In-memory mirror of the on-disk `AppConfig` for the Setup
-    /// page's inline-edit form (review #133). Updated by every
-    /// `Msg::UserEditedConfigField` reducer arm and written to
-    /// TOML via `Command::SaveConfig`. Initialized at app start
-    /// from the loaded `AppConfig`.
+    /// The **file layer**: the `AppConfig` as it was loaded or last
+    /// saved successfully (design doc §3.10.5).
+    ///
+    /// The draft's values express this layer -- not "what the user
+    /// touched". The user's unsaved edits live in `config_edits`.
+    /// The draft only takes an edit over when the save that carried
+    /// it succeeded.
     pub config_draft: rencoder_lib::config::app::AppConfig,
+    /// The **entry layer**: the user's unsaved edits, per field, each
+    /// with the revision it carries (design doc §3.10.5).
+    ///
+    /// "The user touched this field" is tracked here, not inferred
+    /// from whether a draft field has a value: the draft expresses
+    /// the file layer, and the entry layer is a different thing.
+    pub config_edits: std::collections::BTreeMap<ConfigFieldKind, ConfigEdit>,
+    /// The revision counter. Every edit bumps it; a save carries
+    /// the counter's value at the time of the save, and the receipt
+    /// hands it back (design doc §3.10.5).
+    pub config_revision: u64,
     /// Display label for the Setup page's save-status indicator
     /// (`"Saved at HH:MM:SS"` / `"Saving…"` / `"Save failed: …"`).
     pub config_save_status: String,
@@ -219,7 +232,31 @@ pub struct AppState {
     next_request_id: u64,
 }
 
+/// One unsaved edit: the value and the revision it carries.
+#[derive(Debug, Clone)]
+pub struct ConfigEdit {
+    /// The value the user set.
+    pub value: ConfigFieldValue,
+    /// The revision this edit carries (the counter's value when the
+    /// user made it).
+    pub revision: u64,
+}
+
 impl AppState {
+    /// The effective config: the file layer with the entry layer on
+    /// top (design doc §3.10.5).
+    ///
+    /// This is what the run uses and what a save writes: the user's
+    /// unsaved edits count, and so does everything the file says
+    /// that the user did not touch.
+    pub fn effective_config(&self) -> rencoder_lib::config::app::AppConfig {
+        let mut config = self.config_draft.clone();
+        for (kind, edit) in &self.config_edits {
+            apply_field_edit(&mut config, *kind, edit.value.clone());
+        }
+        config
+    }
+
     /// Allocate the next request id.
     ///
     /// Monotonic per session. The ids are the UI's half of the
@@ -595,12 +632,32 @@ pub fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Request>) {
             // AppConfig to TOML atomically via `write_atomic`.
             // Each field change is one save — cheap for small
             // TOML, safe on every keystroke.
-            apply_config_field_edit(state, kind, value);
+            // The entry layer: the edit is recorded with a fresh
+            // revision (design doc §3.10.5). The draft -- the file
+            // layer -- does not change here; it takes the edit over
+            // when the save that carried it succeeds.
+            state.config_revision += 1;
+            let revision = state.config_revision;
+            state.config_edits.insert(
+                kind,
+                ConfigEdit {
+                    value: value.clone(),
+                    revision,
+                },
+            );
             state.config_save_status = "Saving…".into();
-            // The draft is the payload: the lib must persist what the
-            // user just edited, not the copy it loaded at startup.
-            let draft = Box::new(state.config_draft.clone());
-            if let Err(e) = dispatch(state, cmd_tx, Command::SaveConfig { config: draft }) {
+            // The effective config is the payload: the lib must
+            // persist what the user sees, not the copy it loaded at
+            // startup.
+            let effective = Box::new(state.effective_config());
+            if let Err(e) = dispatch(
+                state,
+                cmd_tx,
+                Command::SaveConfig {
+                    config: effective,
+                    revision,
+                },
+            ) {
                 state.config_save_status = format!("Save failed: {e}");
                 push_toast(state, e, ToastKind::Error);
             }
@@ -1083,14 +1140,25 @@ fn apply_event(state: &mut AppState, evt: Event) {
             // recomputes the check.
             state.capability_report = rencoder_lib::capability::read_report(&report);
         }
-        Event::ConfigSaved { .. } => {
-            // review-delta F1 (was empty): wire the lib's save
-            // success ack to the Setup-page save-status indicator.
-            // Command::SaveConfig (job.rs:1107) emits
-            // Event::ConfigSaved on success and Event::Error
-            // with a 'save failed:' prefix on failure. The
-            // Setup page reads state.config_save_status; the
-            // prior empty handler left it stuck at 'Saving…'.
+        Event::ConfigSaved { revision, .. } => {
+            // The receipt carries the revision it saved (design doc
+            // §3.10.5): the edits at or below it are on disk now and
+            // the file layer takes them over; the edits the user
+            // made while the save was in flight stay in the entry
+            // layer -- they are not on disk yet.
+            let saved: Vec<ConfigFieldKind> = state
+                .config_edits
+                .iter()
+                .filter(|(_, edit)| edit.revision <= revision)
+                .map(|(kind, _)| *kind)
+                .collect();
+            for kind in saved {
+                if let Some(edit) = state.config_edits.remove(&kind) {
+                    apply_field_edit(&mut state.config_draft, kind, edit.value);
+                }
+            }
+            // review-delta F1: the lib's save success ack drives the
+            // Setup-page save-status indicator.
             state.config_save_status = format!("Saved at {}", Local::now().format("%H:%M:%S"));
         }
         Event::FileCompleted {
@@ -1232,7 +1300,10 @@ fn apply_event(state: &mut AppState, evt: Event) {
 /// there's a single source of truth for "how a TOML `[encode]`
 /// block becomes an `EncodeParams`".
 fn build_encode_params_from_draft(state: &AppState) -> rencoder_lib::types::EncodeParams {
-    rencoder_lib::types::EncodeParams::from_app_config(state.config_draft.encode.as_ref())
+    // The effective config: the file layer with the user's unsaved
+    // edits on top (design doc §3.10.5).
+    let config = state.effective_config();
+    rencoder_lib::types::EncodeParams::from_app_config(config.encode.as_ref())
 }
 
 /// Errors that `collect_input_files` can return. Distinguishes
@@ -1274,7 +1345,10 @@ enum CollectError {
 fn collect_input_files(
     state: &AppState,
 ) -> Result<Vec<rencoder_lib::types::InputPath>, CollectError> {
-    let config = &state.config_draft;
+    // The effective config: the extensions the user set (even
+    // before the save lands) decide what is collected (design doc
+    // §3.10.5).
+    let config = state.effective_config();
     let Some(dir) = state.input_dir.as_ref() else {
         return Err(CollectError::NoInputDir);
     };
@@ -1473,20 +1547,21 @@ fn dispatch_dry_run_for_new_task(
     }
 }
 
-/// v1.2 review #133 part 2d: Setup-page real-time save helper.
-/// The reducer arm for `Msg::UserEditedConfigField` calls this
-/// to update the in-memory `config_draft`. The
-/// `Command::SaveConfig` dispatch (separate) atomically
-/// persists the full `AppConfig` to TOML via `write_atomic`.
+/// Apply one field edit to a config.
 ///
-/// Defensive: missing `encode` section in `config_draft` is
-/// populated with a default so the first edit doesn't crash.
-fn apply_config_field_edit(state: &mut AppState, kind: ConfigFieldKind, value: ConfigFieldValue) {
+/// The same shape for the file layer (the draft) and for the
+/// effective config -- one implementation, so the two layers cannot
+/// drift apart.
+fn apply_field_edit(
+    config: &mut rencoder_lib::config::app::AppConfig,
+    kind: ConfigFieldKind,
+    value: ConfigFieldValue,
+) {
     use rencoder_lib::config::app::EncodeConfig;
-    if state.config_draft.encode.is_none() {
-        state.config_draft.encode = Some(EncodeConfig::default());
+    if config.encode.is_none() {
+        config.encode = Some(EncodeConfig::default());
     }
-    let enc = state.config_draft.encode.as_mut().expect("just inserted");
+    let enc = config.encode.as_mut().expect("just inserted");
     match (kind, value) {
         (ConfigFieldKind::Format, ConfigFieldValue::Format(v)) => {
             enc.format = Some(v);
@@ -1676,7 +1751,11 @@ mod tests {
     }
 
     #[test]
-    fn editing_the_nv_field_updates_the_config_draft() {
+    fn editing_a_field_updates_the_entry_layer_not_the_draft() {
+        // Design doc §3.10.5: the draft's values express the **file
+        // layer**; the user's unsaved edits are the entry layer. The
+        // draft takes an edit over only when the save that carried
+        // it succeeds.
         use crossbeam_channel::unbounded;
         let (tx, _rx) = unbounded::<Request>();
         let mut state = fresh_state();
@@ -1690,8 +1769,115 @@ mod tests {
         );
         assert_eq!(
             state.config_draft.encode.as_ref().and_then(|e| e.nv),
+            None,
+            "the draft is the file layer: an unsaved edit does not touch it"
+        );
+        assert_eq!(
+            state
+                .config_edits
+                .get(&ConfigFieldKind::Nv)
+                .map(|edit| edit.revision),
+            Some(1),
+            "the edit is recorded with a fresh revision"
+        );
+        assert_eq!(
+            state.effective_config().encode.as_ref().and_then(|e| e.nv),
             Some(true),
-            "the draft should carry the nv switch"
+            "the effective config carries the edit"
+        );
+    }
+
+    #[test]
+    fn a_receipt_clears_only_the_edits_it_covered() {
+        // Design doc §3.10.5: the receipt carries the revision it
+        // saved; the edits at or below it are on disk now, the ones
+        // the user made while the save was in flight are not.
+        let mut state = fresh_state();
+        let tx = cmd_tx();
+        // The first edit: revision 1.
+        reduce(
+            &mut state,
+            Msg::UserEditedConfigField {
+                kind: ConfigFieldKind::Crf,
+                value: ConfigFieldValue::Crf(28),
+            },
+            &tx,
+        );
+        // The second edit (another field) while the first save is in
+        // flight: revision 2.
+        reduce(
+            &mut state,
+            Msg::UserEditedConfigField {
+                kind: ConfigFieldKind::Nv,
+                value: ConfigFieldValue::Nv(true),
+            },
+            &tx,
+        );
+        // The receipt for revision 1 arrives.
+        reduce(
+            &mut state,
+            Msg::Lib(Event::ConfigSaved {
+                path: PathBuf::from("/tmp/rencoder.toml"),
+                revision: 1,
+            }),
+            &tx,
+        );
+        assert!(
+            !state.config_edits.contains_key(&ConfigFieldKind::Crf),
+            "the covered edit is on disk now"
+        );
+        assert!(
+            state.config_edits.contains_key(&ConfigFieldKind::Nv),
+            "the newer edit is not on disk yet -- it stays"
+        );
+        assert_eq!(
+            state.config_draft.encode.as_ref().map(|e| e.crf),
+            Some(28),
+            "the file layer took the saved edit over"
+        );
+        assert_eq!(
+            state.effective_config().encode.as_ref().and_then(|e| e.nv),
+            Some(true),
+            "the newer edit is still in force"
+        );
+    }
+
+    #[test]
+    fn a_failed_save_keeps_the_baseline_and_the_edits() {
+        // Design doc §3.10.5: a failed save keeps the baseline and
+        // the draft; the edits stay in the entry layer.
+        let mut state = fresh_state();
+        let tx = cmd_tx();
+        reduce(
+            &mut state,
+            Msg::UserEditedConfigField {
+                kind: ConfigFieldKind::Crf,
+                value: ConfigFieldValue::Crf(28),
+            },
+            &tx,
+        );
+        reduce(
+            &mut state,
+            Msg::Lib(Event::OperationFailed {
+                request_id: 1,
+                category: rencoder_lib::types::ErrorCategory::ConfigError,
+                message: "save failed: permission denied".into(),
+            }),
+            &tx,
+        );
+        assert!(
+            state.config_edits.contains_key(&ConfigFieldKind::Crf),
+            "the edit stays: it was not saved"
+        );
+        assert_eq!(
+            state.config_draft.encode.as_ref().map(|e| e.crf),
+            None,
+            "the file layer is untouched"
+        );
+        assert_eq!(
+            state.effective_config().encode.as_ref().map(|e| e.crf),
+            Some(28),
+            "the edit is still in force"
         );
     }
 
@@ -2831,7 +3017,7 @@ mod tests {
     }
 
     #[test]
-    fn user_edited_config_field_updates_draft_and_saves() {
+    fn user_edited_config_field_updates_the_entry_layer_and_saves() {
         // review #133 part 2d/3d: each Setup-page field edit
         //   (a) updates state.config_draft (the Setup form reads
         //       it on next render),
@@ -2850,13 +3036,19 @@ mod tests {
             },
             &tx,
         );
-        // (a) config_draft updated.
-        let enc = state
-            .config_draft
+        // (a) the edit is in the entry layer, and the effective
+        // config carries it (design doc §3.10.5: the draft is the
+        // file layer; an unsaved edit does not touch it).
+        let effective = state.effective_config();
+        let enc = effective
             .encode
             .as_ref()
             .expect("encode section should be auto-populated");
         assert_eq!(enc.crf, 28);
+        assert!(
+            state.config_edits.contains_key(&ConfigFieldKind::Crf),
+            "the edit waits in the entry layer"
+        );
         // (b) save status set.
         assert_eq!(state.config_save_status, "Saving…");
         // (c) SaveConfig dispatched -- carrying the edited draft, not
@@ -2864,12 +3056,13 @@ mod tests {
         // write back the config it loaded and the edit would be lost.
         let cmd = next_command(&rx);
         match cmd {
-            Command::SaveConfig { config } => {
+            Command::SaveConfig { config, revision } => {
                 assert_eq!(
                     config.encode.as_ref().map(|e| e.crf),
                     Some(28),
                     "the payload must carry the edit"
                 );
+                assert_eq!(revision, 1, "the save carries the revision");
             }
             _ => panic!("expected SaveConfig"),
         }
@@ -2891,7 +3084,7 @@ mod tests {
             &tx,
         );
         match next_command(&rx) {
-            Command::SaveConfig { config } => {
+            Command::SaveConfig { config, .. } => {
                 assert_eq!(config.encode.as_ref().and_then(|e| e.nv), Some(true));
             }
             _ => panic!("expected SaveConfig"),
@@ -2914,7 +3107,7 @@ mod tests {
             },
             &tx,
         );
-        let enc = state.config_draft.encode.as_ref().unwrap();
+        let enc = state.effective_config().encode.clone().unwrap();
         assert_eq!(
             enc.extensions,
             Some(vec!["mp4".into(), "mkv".into(), "mov".into()])
@@ -2928,7 +3121,8 @@ mod tests {
             },
             &tx,
         );
-        let enc = state.config_draft.encode.as_ref().unwrap();
+        let effective = state.effective_config();
+        let enc = effective.encode.as_ref().unwrap();
         assert_eq!(enc.extensions, None, "empty csv should clear filter");
     }
 
@@ -2947,6 +3141,7 @@ mod tests {
             &mut state,
             Msg::Lib(Event::ConfigSaved {
                 path: std::path::PathBuf::from("/tmp/rencoder.toml"),
+                revision: 1,
             }),
             &tx,
         );

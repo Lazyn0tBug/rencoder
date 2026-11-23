@@ -2404,6 +2404,7 @@ UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `int
 | `job.rs` | `Command::Analyze { files }` arm | U22：调用 `analyze_records_with_probe_and_progress_parallel` with `probe = probe_video_metadata_auto`，`progress = |p| evt_tx.send(Event::AnalyzeProgress { ... })`。先发 `AnalyzeStarted { total }`，批结束发 `AnalyzeFinished`。**走** busy-gate（v1 限制——UI 不能同时跑 analyze + encode；analyze 是 read-only，理论上可与 encode 并存，但 v1 简化起见跟 DryRun 一致复用 busy-gate）|
 | `job.rs` | `Event::AnalyzeStarted` / `Event::AnalyzeProgress` / `Event::AnalyzeFinished` | U22：见 §3.8.3。`Event::AnalyzeProgress` 在 mock actor 里是 no-op（test seam，ref-count 即可）|
 | `job.rs` | `PublishedState` + `Capability::generation()` | actor 发布的"这一代答案"：编码器缓存与能力对象**一起**发布、一起被批次取用（§3.10.6 步骤 5）——批次等缓存落地，也就等到了已发布的能力，不会拿着空能力开跑 |
+| `job.rs` | `Command::SaveConfig { config, revision }` / `Event::ConfigSaved { path, revision }` | 保存带修订号、回执带回它——UI 据此只清除这次保存覆盖的编辑（§3.10.5）|
 | `job.rs` | `Event::CommandRejected { request_id, reason }` | 命令被拒（闸门拒绝等）——良性，**不是** fatal：UI 弹一条 toast 即可，正在跑的那批不受影响；`request_id` 说明是哪一个请求被拒，UI 据此恢复原状态（§3.11.3）|
 | `job.rs` | `Request { id, command }` + `RequestId` | 通道上跑的是"命令 + 提交方的号"——答复（接纳/拒绝）指名道姓，UI 才知道该恢复哪个状态（§3.11.3）|
 | `job.rs` | `Event::CommandAccepted { request_id, batch_id }` | 接纳的答复：请求号 + 它开启的批次号——UI 的 `Starting` 相位由它推动（§3.11.3）|
@@ -4476,7 +4477,7 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 83 | **运行时 `Config` 退役**：`encoders` 与 `ffmpeg_args` 进了 `EncodeParams` → 启动时算一次的 grab-bag 类型整体消失，"这次运行用了什么配置"只有一个答案 | ✅ |
 | 84 | 分层配置与一次解析（§3.10.5）：入口显式值 > 文件显式值 > 系统内建默认值，整批共用有效快照 | ✅ |
 | 85 | **编码器找不到 = 一个文件的失败**，不是 panic（§3.11.3）——`build_argv` 返回 `Result`，GUI 不再卡死在 Analyzing，CLI 不再 exit 101 丢光记录 | ✅ |
-| 86 | GUI 草稿覆盖、保存回执及预演失效（§3.10.5） | future |
+| 86 | **预演失效**（§3.10.5）：复用前比较任务清单、有效规划参数、能力代次、输入是否变化——预演依赖媒体探测时无法确认输入未变就重新规划 | future |
 | 87 | NVENC 夹具及真实 GPU 发布验收（§3.10.6） | future |
 | 88 | **能力判定分两级**（§3.10.5）：一级=构建带不带 NVENC，二级=机器能不能跑；记录存的是测试结果，一级失败是它的原因；每个候选都有一项，记录形状不随机器变化（磁盘格式升到 v2，旧记录作废重探） | ✅ |
 | 89 | **复审周期由 lib 掌管**（§2）：记录到期时解析把它推后 30 天并落盘，前端只负责显示提示；两个前端（及以后的前端）不必各自记着延期这件事 | ✅ |
@@ -4492,6 +4493,7 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 97 | **路径写进配置**（§3.6）：`[paths]` 段覆盖各路径，优先级 = 入口显式值（env / CLI）> 文件显式值 > 内建默认值；配置文件自身的位置仍由 `--config` / `$RENENCODER_CONFIG` 决定 | ✅ |
 | 98 | **路径一处决定**（§3.6）：lib 的 `config::paths::Paths` 一次解析出全部路径，前端不再各自现算；操作目录里的应用文件（`cancel`、`capabilities.json`）按名字跳过，不被当成输入 | ✅ |
 | 99 | **单例守卫**（§3.11.1.1）：范围是一棵目录树（自己 ✅ ✅、祖先 ✅ ✅、后代 ✅ ✅）；互斥交给内核文件锁 ✅ ✅（进程死了内核放锁 ✅ ✅、取得占用是原子的 ✅ ✅、不需要 pid 判活 ✅ ✅）；标记只记 pid 与开始时刻 ✅ ✅，用完就删 ✅ ✅（先删名字后放锁 ✅ ✅）；冲突整趟拒绝 ✅ ✅，文件系统不支持锁则报错拒绝这一趟 ✅ ✅；GUI 空闲不占 ✅ ✅（只在会写产物的批次期间持有 ✅ ✅） | ✅ |
+| 105 | **GUI 两层草稿 + 保存回执**（§3.10.5 ✅ ✅）：文件层（`config_draft` = 磁盘上的配置 ✅ ✅）与入口层（`config_edits` = 用户未保存的逐字段编辑 ✅ ✅）分开 ✅ ✅——草稿的值表达文件层 ✅ ✅，"用户动过哪个字段"由入口层判定 ✅ ✅，不靠草稿字段有没有值推断 ✅ ✅；每个字段一个修订号 ✅ ✅，编辑时递增 ✅ ✅；保存请求带上修订号 ✅ ✅、回执带回它 ✅ ✅——回执**只**清除它覆盖的编辑 ✅ ✅，保存期间新敲的留在入口层 ✅ ✅；保存失败保留基线与草稿 ✅ ✅；有效配置 = 文件层 + 入口层 ✅ ✅（表单与运行参数都读它 ✅ ✅）| ✅ |
 | 104 | **GUI 命令协议**（§3.11.3）：通道上跑 `Request { id, command }` ✅ ✅（答复指名道姓 ✅ ✅）；`CommandAccepted` / `CommandRejected` 回传请求号 ✅ ✅，接纳时绑定批次号 ✅ ✅；所有批次事件带 `BatchId` ✅ ✅（上一批的迟到事件污染不到当前批 ✅ ✅）；`Cancel { batch_id }` 只影响匹配的活动批次 ✅ ✅（过期取消被拒 ✅ ✅）；三级失败作用域：批次级 `BatchFailed` ✅ ✅ / 非批次级 `OperationFailed` ✅ ✅ / 无作用域 `Error` ✅ ✅；per-file 失败**不再**发 fatal 事件 ✅ ✅（它在记录的 `error` 里 ✅ ✅）；UI 相位 `Starting` / `Cancelling` ✅ ✅（相位跟着答复走 ✅ ✅，拒绝恢复原状态 ✅ ✅）；终态在释放运行名额**之后**发布 ✅ ✅（UI 收到确认即可重启 ✅ ✅）| ✅ |
 | 103 | **任务类型收紧 + 统一构造入口**（§3.11.1 ✅ ✅）：`EncodeTask` 的输出不再是可选项 ✅ ✅（`Option<PathBuf>` 让每个读者都问"这是不是分析？" ✅ ✅），分析有自己的 `AnalyzeTask` ✅ ✅；编码与预演共用 `pipeline::batch::encode_tasks` ✅ ✅（任务与输出名只有一处产生 ✅ ✅）；预演的记录说 `Ready` ✅ ✅，不说 `Succeeded` ✅ ✅ | ✅ |
 | 102 | **启动期可取消**（§3.11.2）：采集每 64 个条目查一次取消令牌 ✅ ✅；NVENC 探测走 ffmpeg 调用那道缝 ✅ ✅、每次调用前查一次 ✅ ✅；取消发生在开工前 ✅ ✅ → 不产出任何东西 ✅ ✅，退出码 130 ✅ ✅ | ✅ |

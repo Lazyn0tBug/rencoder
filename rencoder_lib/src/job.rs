@@ -148,7 +148,16 @@ pub enum Command {
     /// failure. A change to `[encode].nv` also refreshes the encoder
     /// cache, so the switch takes effect for the next batch instead
     /// of the next application start.
-    SaveConfig { config: Box<AppConfig> },
+    ///
+    /// `revision` is the submitter's revision of the edit this save
+    /// carries. The lib treats it as an opaque number and hands it
+    /// back in the receipt: the UI needs it to know **which** of its
+    /// edits are on disk now (design doc §3.10.5 -- the receipt
+    /// clears only the edits it saved, later edits stay).
+    SaveConfig {
+        config: Box<AppConfig>,
+        revision: u64,
+    },
     /// Detect this machine's NVENC capability and report it back.
     ///
     /// Same logic as the CLI's `rencoder detect`: the result is stored
@@ -329,7 +338,11 @@ pub enum Event {
     /// Result of a `Command::SaveConfig` — the config was written
     /// to disk. The path is included so the UI can show feedback
     /// like "saved to /path/to/rencoder.toml".
-    ConfigSaved { path: PathBuf },
+    ///
+    /// `revision` is the revision the save carried (design doc
+    /// §3.10.5): the UI clears the edits at or below it, and keeps
+    /// the ones the user made while the save was in flight.
+    ConfigSaved { path: PathBuf, revision: u64 },
 
     /// The NVENC capability of this machine (after a `Command::Detect`
     /// or the startup resolve). The UI shows it next to the NVENC
@@ -2154,7 +2167,7 @@ fn run_actor(
                 send_evt_lossy(&evt_tx, Event::HistoryLoaded { records }, &dropped_counter);
             }
 
-            Command::SaveConfig { config } => {
+            Command::SaveConfig { config, revision } => {
                 send_evt_lossy(
                     &evt_tx,
                     Event::CommandAccepted {
@@ -2173,6 +2186,7 @@ fn run_actor(
                             &evt_tx,
                             Event::ConfigSaved {
                                 path: config_path.clone(),
+                                revision,
                             },
                             &dropped_counter,
                         );
@@ -3464,6 +3478,7 @@ mod mock_tests {
                 1,
                 Command::SaveConfig {
                     config: Box::new(edited),
+                    revision: 7,
                 },
             ))
             .unwrap();
@@ -3477,8 +3492,8 @@ mod mock_tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, Event::ConfigSaved { .. })),
-            "expected a ConfigSaved event, got {events:?}"
+                .any(|e| matches!(e, Event::ConfigSaved { revision: 7, .. })),
+            "the receipt must carry the revision it saved, got {events:?}"
         );
 
         let written = std::fs::read_to_string(dir.join("saved-config.toml")).unwrap();

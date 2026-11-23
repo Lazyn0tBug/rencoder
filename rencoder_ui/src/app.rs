@@ -393,7 +393,15 @@ fn SetupPage(
     // Snapshot the values needed to render the form. The form
     // is fully controlled — every input reads from `draft` and
     // every change dispatches a Msg.
-    let draft = state.read().config_draft.encode.clone().unwrap_or_default();
+    // The effective config: the file layer with the user's unsaved
+    // edits on top (design doc §3.10.5). The form shows what the
+    // run will use.
+    let draft = state
+        .read()
+        .effective_config()
+        .encode
+        .clone()
+        .unwrap_or_default();
     let save_status = state.read().config_save_status.clone();
     let tx_opt = cmd_tx.read().clone();
 
