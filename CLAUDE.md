@@ -143,6 +143,30 @@ saying a change is done.
 
 - (none open)
 
+## Batch check, batch fix, batch verify
+
+A change that spans several files is one change, not several. One round trip:
+
+1. **Batch check.** One command that surfaces every error at once:
+   `cargo check --workspace --all-targets` (not `cargo check -p <crate>`,
+   which hides the errors in the crates you did not name, and not a
+   per-file loop). Collect the whole error list with its locations.
+2. **Batch fix.** Apply every fix in one pass, then compile once. A
+   systematic mistake (a renamed field, a changed signature) shows up as
+   N errors at N sites; fixing them one at a time costs N compiles, and
+   each compile reveals only the next error, never the shape of the
+   change.
+3. **Batch verify.** Run the gate once at the end (`cargo clippy
+   --workspace --all-targets -- -D warnings`, `cargo test --workspace`,
+   `cargo fmt --check`) and say what it proved.
+
+Do not interleave edit -> compile -> edit -> compile. Each round trip is
+a full compile, and the interleaving hides the fact that the errors share
+one cause.
+
+State the batch before running it: what this round checks, what it fixes,
+what proves it.
+
 ## Refactor / rename methodology
 
 When a refactor or rename touches more than one file, the wrong pattern is
@@ -166,8 +190,8 @@ call sites. Use this workflow instead:
      many files.
    - `Edit` only when the file has unique context that sed can't handle.
      Read the file first; verify the path is right.
-   - `cargo check` once at the END of the change set, not after each
-     file. One iteration goal.
+   - One compile at the END of the change set, not after each file (see
+     **Batch check, batch fix, batch verify**). One iteration goal.
 
 4. **Verify before each commit:**
    - `git status --short` — what actually changed?
