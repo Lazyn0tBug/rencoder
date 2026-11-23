@@ -1163,6 +1163,89 @@ struct Publication {
     failure: Option<(ErrorCategory, String)>,
 }
 
+/// What a batch takes when it is admitted.
+struct BatchAdmission {
+    /// The batch's id.
+    id: BatchId,
+    /// The batch's cancel token -- **its own**.
+    ///
+    /// A batch never inherits the previous batch's token: the token
+    /// is shared with `Command::Cancel` (which cancels whatever is
+    /// current), so an inherited one would still be cancelled -- the
+    /// next dry run would abort before it started (design doc
+    /// §3.11.2).
+    token: CancelToken,
+}
+
+/// The actor's own state: the batch gate, the active batch, the
+/// cancel token and the capability publication.
+///
+/// The admission lives here as **one operation**: every batch kind
+/// takes its gate, its id and its cancel token from it, so none of
+/// them can inherit the previous batch's, and none of them has to
+/// remember to reset anything (design doc §3.11.2).
+struct ActorState {
+    /// The busy gate: one batch at a time (§3.4).
+    batch_running: bool,
+    /// The batch the UI may cancel (design doc §3.11.3).
+    active_batch_id: Option<BatchId>,
+    /// The cancel token of the current batch.
+    cancel_token: CancelToken,
+    /// The next batch id.
+    next_batch_id: BatchId,
+    /// The capability publication (design doc §3.10.6 step 5).
+    publisher: CapabilityPublisher,
+}
+
+impl ActorState {
+    /// Admit a batch.
+    ///
+    /// Takes the gate, hands out the id and gives the batch a cancel
+    /// token of its own. `cancel_file` is the state file a batch
+    /// watches for an external cancel request (`None` for the kinds
+    /// that do not watch one).
+    ///
+    /// A leftover cancel file is removed first: it belongs to the
+    /// previous run, and it would cancel this batch on its first
+    /// poll.
+    fn admit_batch(&mut self, cancel_file: Option<&std::path::Path>) -> BatchAdmission {
+        let id = self.next_batch_id;
+        self.next_batch_id += 1;
+        self.batch_running = true;
+        self.active_batch_id = Some(id);
+        self.cancel_token = match cancel_file {
+            Some(path) => {
+                let _ = std::fs::remove_file(path);
+                CancelToken::watching(path.to_path_buf())
+            }
+            None => CancelToken::new(),
+        };
+        BatchAdmission {
+            id,
+            token: self.cancel_token.clone(),
+        }
+    }
+
+    /// The batch ended: open the gate and forget the active batch.
+    fn finish_batch(&mut self) {
+        self.batch_running = false;
+        self.active_batch_id = None;
+    }
+
+    /// Cancel the active batch -- if the request names it.
+    ///
+    /// A cancel that names another batch is refused: a stale cancel
+    /// (the user cancelled, then a new batch started) must not stop
+    /// the batch that is running now (design doc §3.11.3).
+    fn cancel(&mut self, batch_id: BatchId) -> bool {
+        if self.active_batch_id != Some(batch_id) {
+            return false;
+        }
+        self.cancel_token.cancel();
+        true
+    }
+}
+
 /// The actor's capability publication state.
 ///
 /// One object owns the rules that used to be spread across the
@@ -1932,7 +2015,15 @@ fn run_actor(
     // The newest published probe request. A result older than this
     // is dropped -- it cannot overwrite a newer snapshot.
     // The generation the next published capability carries.
-    let mut publisher = CapabilityPublisher::new(published_cell.clone());
+    // The actor's state: the gate, the active batch, the cancel
+    // token and the capability publication (design doc §3.11.2).
+    let mut state = ActorState {
+        batch_running: false,
+        active_batch_id: None,
+        cancel_token: CancelToken::new(),
+        next_batch_id: 0,
+        publisher: CapabilityPublisher::new(published_cell.clone()),
+    };
     // The background init thread hands its result to the actor.
     let probe_tx_for_init = probe_tx.clone();
     std::thread::spawn(move || {
@@ -1971,22 +2062,11 @@ fn run_actor(
     // `app_config` is still held (referenced by `config_path`
     // for the SaveConfig handler). Don't drop yet.
 
-    let mut next_batch_id: BatchId = 0;
     // Busy gate: one batch in flight at a time (§3.4 / §3.8.1).
     //
     // A plain `bool` in the actor — no lock, no atomic. The batch
     // itself runs on a worker thread (§3.10.1.1), so the actor is the
     // only reader and the only writer.
-    let mut batch_running = false;
-    // The batch the UI may cancel (design doc §3.11.3): `Cancel`
-    // names a batch, and only the active one may be cancelled. A
-    // stale cancel -- the user cancelled and started a new batch
-    // before the cancel was processed -- must not stop the new one.
-    let mut active_batch_id: Option<BatchId> = None;
-    // Per-batch cancel token. Reset between batches. Shared with the
-    // worker: the actor sets it on `Command::Cancel`, the worker polls
-    // it (between files, and inside the ffmpeg progress loop).
-    let mut cancel_token = CancelToken::new();
     // "This batch is done" signals. The worker sends one when it
     // finishes; the actor reopens the busy gate when it reads one.
     let (done_tx, done_rx) = bounded::<BatchDone>(1);
@@ -2001,9 +2081,8 @@ fn run_actor(
             recv(cmd_rx) -> req => req,
             recv(done_rx) -> done => {
                 if let Ok(BatchDone { updates }) = done {
-                    publisher.merge_verdicts(updates);
-                    batch_running = false;
-                    active_batch_id = None;
+                    state.publisher.merge_verdicts(updates);
+                    state.finish_batch();
                 }
                 continue;
             }
@@ -2018,7 +2097,7 @@ fn run_actor(
                         outcome,
                         ..
                     } = probed;
-                    if let Some(publication) = publisher.publish(
+                    if let Some(publication) = state.publisher.publish(
                         probed.seq,
                         outcome,
                         nvenc_cache_path.as_path(),
@@ -2107,12 +2186,11 @@ fn run_actor(
             Command::StartBatch { .. } | Command::DryRun { .. } | Command::Analyze { .. }
         ) {
             let (finished, updates) = drain_batch_done(&done_rx);
-            publisher.merge_verdicts(updates);
+            state.publisher.merge_verdicts(updates);
             if finished {
-                batch_running = false;
-                active_batch_id = None;
+                state.finish_batch();
             }
-            if batch_running {
+            if state.batch_running {
                 // Benign rejection: the command is dropped, the running
                 // batch continues. `Event::Error` would be fatal-only
                 // and the UI would finalize the running batch.
@@ -2135,14 +2213,16 @@ fn run_actor(
                 // protocol (FileStarted / FileCompleted / Progress);
                 // TaskManager owns batch/task scaffold logs +
                 // partial_output::Guard registration.
-                let id = next_batch_id;
-                next_batch_id += 1;
                 // The operation directory: the directory this batch
                 // acts on (design doc §3.6). The GUI's working
                 // directory can change between batches, so the
                 // run-level paths follow it.
                 let batch_paths =
                     paths.with_op_dir(&crate::pipeline::batch::batch_target_path_for_files(&files));
+                // The admission: the gate, the id and a cancel token
+                // of this batch's own (design doc §3.11.2).
+                let admission = state.admit_batch(Some(&batch_paths.cancel_file));
+                let id = admission.id;
                 // The single-instance guard's cheap probe (design doc
                 // §3.11.1.1): the ancestors and the target itself. A
                 // conflict is a **benign rejection** -- the running
@@ -2167,10 +2247,6 @@ fn run_actor(
                     );
                     continue;
                 }
-                // A leftover request would cancel this batch as well.
-                let _ = std::fs::remove_file(&batch_paths.cancel_file);
-                cancel_token = CancelToken::watching(batch_paths.cancel_file.clone());
-
                 // The batch is admitted: the request gets its answer
                 // and the batch its id (design doc §3.11.3). The UI
                 // moves from `Starting` to `Encoding` on this event.
@@ -2190,9 +2266,6 @@ fn run_actor(
                     },
                     &dropped_counter,
                 );
-                // The batch the UI may cancel (design doc §3.11.3).
-                active_batch_id = Some(id);
-
                 // One cache snapshot per batch (a batch is a unit —
                 // the encoder must not change under it). The cache is
                 // resolved *in the worker*: the one-time init may
@@ -2211,7 +2284,7 @@ fn run_actor(
 
                 let published_cell_for_worker = Arc::clone(&published_cell);
                 let params_for_worker = params.clone();
-                let cancel_for_worker = cancel_token.clone();
+                let cancel_for_worker = admission.token.clone();
                 let evt_tx_for_worker = evt_tx.clone();
                 let dropped_for_worker = DropCounter::default();
                 let file_encoder_for_worker = Arc::clone(&file_encoder);
@@ -2253,7 +2326,6 @@ fn run_actor(
                 // The batch runs on its own thread: the actor stays
                 // responsive, so `Command::Cancel` reaches the
                 // in-flight ffmpeg.
-                batch_running = true;
                 spawn_task_batch(
                     id,
                     tasks,
@@ -2279,18 +2351,17 @@ fn run_actor(
                 // capability -- it only reads it. It reads the
                 // published one, like every other batch.
                 //
-                // A dry run is a batch of its own: it takes a
-                // **fresh** cancel token. The token is shared with
-                // `Command::Cancel` (which cancels whatever is
-                // current), so inheriting the previous batch's
-                // token would let an old cancel abort this dry run
-                // before it started.
-                cancel_token = CancelToken::new();
-                let cancel_for_worker = cancel_token.clone();
+                // The dry run is a batch of its own: the admission
+                // gives it a fresh cancel token (the token is shared
+                // with `Command::Cancel`, so an inherited one would
+                // still be cancelled -- design doc §3.11.2). It does
+                // not watch the cancel file: only the encode batch
+                // answers an external cancel request.
+                let admission = state.admit_batch(None);
+                let cancel_for_worker = admission.token.clone();
                 // The dry run is a batch too: it gets a batch id, so
                 // its events can be matched (design doc §3.11.3).
-                let id = next_batch_id;
-                next_batch_id += 1;
+                let id = admission.id;
                 send_evt_lossy(
                     &evt_tx,
                     Event::CommandAccepted {
@@ -2299,8 +2370,6 @@ fn run_actor(
                     },
                     &dropped_counter,
                 );
-                active_batch_id = Some(id);
-                batch_running = true;
                 spawn_batch_job(
                     move || {
                         // The cache is resolved here, in the worker: the
@@ -2355,7 +2424,7 @@ fn run_actor(
                 // §3.11.3): a cancel that names another batch -- a
                 // stale one, or a batch that already ended -- is
                 // refused. It must not stop whatever runs now.
-                if active_batch_id != Some(batch_id) {
+                if !state.cancel(batch_id) {
                     send_evt_lossy(
                         &evt_tx,
                         Event::CommandRejected {
@@ -2374,11 +2443,10 @@ fn run_actor(
                     },
                     &dropped_counter,
                 );
-                // Marks the per-batch token. The worker polls it: the
-                // in-flight ffmpeg is killed (and its partial output
-                // removed), and the batch stops at the next file
-                // boundary.
-                cancel_token.cancel();
+                // The token is marked (by `state.cancel`): the worker
+                // polls it -- the in-flight ffmpeg is killed (and its
+                // partial output removed), and the batch stops at the
+                // next file boundary.
             }
 
             Command::LoadHistory { limit, after } => {
@@ -2461,7 +2529,7 @@ fn run_actor(
                 // The probe request takes the next sequence number:
                 // the actor publishes the result only if it is the
                 // newest one (design doc §3.10.6 step 5).
-                let seq = publisher.request();
+                let seq = state.publisher.request();
                 let probe_tx = probe_tx.clone();
                 std::thread::Builder::new()
                     .name("renencoder-detect".into())
@@ -2542,8 +2610,7 @@ fn run_actor(
                 let total = files.len();
                 // The analyze run is a batch too: it gets a batch id
                 // (design doc §3.11.3).
-                let id = next_batch_id;
-                next_batch_id += 1;
+                let id = state.admit_batch(None).id;
                 send_evt_lossy(
                     &evt_tx,
                     Event::CommandAccepted {
@@ -2560,11 +2627,8 @@ fn run_actor(
                     },
                     &dropped_counter,
                 );
-                active_batch_id = Some(id);
-
                 let evt_tx_for_worker = evt_tx.clone();
                 let dropped_for_worker = DropCounter::default();
-                batch_running = true;
                 spawn_batch_job(
                     move || {
                         // Progress closure: convert each rayon worker
