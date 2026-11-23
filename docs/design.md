@@ -3706,8 +3706,8 @@ anyhow = "1"
 | `CancelToken` | actor（`Command::Cancel`） | worker（在飞行的 ffmpeg 上轮询） | `Arc<AtomicBool>`——**唯一正当的跨线程 bit**（§3.10.1.1） |
 | busy 闸门（单批次） | actor | actor | **无锁**——actor 本地 `bool`（批次在 worker 上跑之后，闸门只有 actor 读写） |
 | 批次完成信号 | worker | actor | 通道 `bounded(1)`——回话走通道，不共享可变状态 |
-| 降级回报通道 | worker（发现降级时） | worker 自己收，批次结束时并进 done 信号 | 通道（无界） |
-| 已发布状态（编码器缓存 + 能力对象，**可替换**） | actor（唯一的发布者） | worker（等发布落地后取一份快照） | `Arc<Mutex<Option<PublishedState>>>`——两者是**同一次探测的答案**，一起发布、一起被取用（§3.10.6 步骤 5） |
+| 降级回报通道 | worker（发现降级时） | worker 自己收，批次结束时并进 done 信号 | 通道（无界）——**回报带代次**，actor 只合并当前代的（§3.10.6 步骤 5） |
+| 已发布状态（编码器缓存 + 能力对象，**可替换**） | actor（唯一的发布者；运行期修正也由它合并回来） | worker（等发布落地后取一份快照） | `Arc<Mutex<Option<PublishedState>>>`——两者是**同一次探测的答案**，一起发布、一起被取用（§3.10.6 步骤 5） |
 | NVENC 能力对象（检查结论 + 本次运行内的修正） | actor（发布）/ worker（发现降级时，经 done 通道回报） | `select_encoder`（选编码器时） | **无锁**——持有者独占：actor 持权威副本（带代次），每批给 worker 一份快照 |
 | 丢弃事件计数 | 各发送方自己 | 只有它自己 | 每个发送方一个 `DropCounter`——不再跨发送方共享 |
 | 日志文件写入 | tracing sink | 各线程的日志 | `Mutex<Inner>`（`std::sync`）——**序列化 IO 的例外**，见规则 2 |
@@ -4467,7 +4467,7 @@ CLI 前端使用 `anyhow::Result` 包裹，在 `main` 中打印错误链。
 | 74 | 缝 = 单方法 trait `FileEncoder`（`&self`，可跨批共享）+ 注入的 `ActorEnv`；测试替身驱动**同一个** actor，协议只有一份实现（mock actor 删除，-280 行） | ✅ |
 | 75 | `nvenc::resolve_and_store_with`：探测与落盘一起换掉 runner——否则测试会把 NVENC 记录写进开发者的真实 app 目录 | ✅ |
 | 76 | 闸门拒绝走 `Event::CommandRejected`（良性），不再复用 fatal-only 的 `Event::Error`——否则 UI 会把正在跑的那批 finalize 成 Done | ✅ |
-| 77 | 任务模型与执行契约（§3.11）——剩**能力代次**（§3.10.6 步骤 5 ✅ ✅）：探测请求序号 ✅ ✅、已发布代次 ✅ ✅、批次冻结代次 ✅ ✅、旧代次的运行时修正不再继承 ✅ ✅ | future |
+| 77 | 任务模型与执行契约（§3.11）——含**能力代次**（§3.10.6 步骤 5 ✅ ✅）：探测请求序号 ✅ ✅、已发布代次 ✅ ✅、批次冻结代次 ✅ ✅、旧代次的运行时修正不再继承 ✅ ✅ | ✅ |
 | 78 | per-file 失败走 `EncodingRecord.error`，**不再**发 fatal-only 的 `Event::Error`（协议 §3.8.3 早就这么写，代码违反了两轮） | ✅ |
 | 79 | 编码器找不到 = 一个文件的失败（`Failed` record），不是 panic——GUI 不再卡死在 Analyzing，CLI 不再 exit 101 丢光记录 | ✅ |
 | 80 | partial-output 只在真的要写输出时登记——信号处理器不会删掉上一轮已完成的文件 | ✅ |

@@ -1008,6 +1008,22 @@ type PublishedCell = Arc<Mutex<Option<PublishedState>>>;
 
 /// The machine facts, gathered once and shared (design doc §3.10.7).
 ///
+/// Put the actor's authoritative capability into the published state.
+///
+/// The runtime corrections land in the actor's copy (the merge is
+/// generation-scoped, see [`apply_verdict_updates`]), and the next
+/// batch must inherit them -- so the published state carries the
+/// actor's copy, not the probe's original.
+///
+/// The lock is held only for the swap -- no IO inside (§3.10.1
+/// rule 2).
+fn update_published_capability(cell: &PublishedCell, capability: &Capability) {
+    let mut guard = cell.lock();
+    if let Some(state) = guard.as_mut() {
+        state.capability = capability.clone();
+    }
+}
+
 /// Publish a probe's answer: the encoder cache and the capability.
 ///
 /// Only the **actor** calls this -- the actor is the publisher (design
@@ -1067,6 +1083,17 @@ struct ProbeOutcome {
 // Batch workers — the actor never runs a batch itself (§3.10.1.1)
 // =====================================================================
 
+/// A runtime correction the worker found, with the generation it was
+/// found under.
+///
+/// The generation is what makes the report scoped: a batch that ran
+/// under an older publication reports its corrections against **that**
+/// publication, and the actor merges only the reports of the
+/// generation it currently holds (design doc §3.10.6 step 5). A late
+/// report from an old batch therefore cannot disable an encoder the
+/// new generation found usable.
+type VerdictUpdate = (u64, String, bool);
+
 /// "This batch is done" signal, sent by a worker to the actor.
 ///
 /// The actor reopens the busy gate when it reads the signal. A channel
@@ -1076,8 +1103,8 @@ struct ProbeOutcome {
 /// that failed at runtime). The actor merges them into its authoritative
 /// copy, so the next batch inherits them.
 struct BatchDone {
-    /// Encoder name → usable?
-    updates: Vec<(String, bool)>,
+    /// The runtime corrections, each with its generation.
+    updates: Vec<VerdictUpdate>,
 }
 
 /// Drain the pending "batch done" signals.
@@ -1087,7 +1114,7 @@ struct BatchDone {
 /// gate: a worker can report "done" while the actor is handling a
 /// command, and a batch that has finished must not be mistaken for a
 /// running one.
-fn drain_batch_done(done_rx: &Receiver<BatchDone>) -> (bool, Vec<(String, bool)>) {
+fn drain_batch_done(done_rx: &Receiver<BatchDone>) -> (bool, Vec<VerdictUpdate>) {
     let mut finished = false;
     let mut updates = Vec::new();
     while let Ok(BatchDone { updates: u }) = done_rx.try_recv() {
@@ -1106,7 +1133,7 @@ fn drain_batch_done(done_rx: &Receiver<BatchDone>) -> (bool, Vec<(String, bool)>
 struct DoneGuard {
     done_tx: Sender<BatchDone>,
     /// Verdict updates the worker reported (drained on drop).
-    updates: Option<Receiver<(String, bool)>>,
+    updates: Option<Receiver<VerdictUpdate>>,
 }
 
 impl Drop for DoneGuard {
@@ -1139,7 +1166,7 @@ impl Drop for DoneGuard {
 fn spawn_batch_job<F>(
     body: F,
     done_tx: Sender<BatchDone>,
-    updates: Option<Receiver<(String, bool)>>,
+    updates: Option<Receiver<VerdictUpdate>>,
     evt_tx: Sender<Event>,
     dropped_counter: DropCounter,
 ) where
@@ -1167,8 +1194,8 @@ fn spawn_batch_job<F>(
 /// (which writes into its verdict snapshot), the receiver is drained
 /// when the batch ends and handed to the actor with the done signal.
 struct BatchUpdates {
-    tx: Sender<(String, bool)>,
-    rx: Receiver<(String, bool)>,
+    tx: Sender<VerdictUpdate>,
+    rx: Receiver<VerdictUpdate>,
 }
 
 impl BatchUpdates {
@@ -1214,7 +1241,7 @@ fn spawn_task_batch<P, F>(
         ) -> Result<EncodingRecord, EncodeError>
         + Send
         + 'static,
-    F: FnOnce(Sender<(String, bool)>) -> Result<P, (ErrorCategory, String)> + Send + 'static,
+    F: FnOnce(Sender<VerdictUpdate>) -> Result<P, (ErrorCategory, String)> + Send + 'static,
 {
     let BatchUpdates { tx, rx } = updates;
     std::thread::Builder::new()
@@ -1354,7 +1381,7 @@ fn make_encode_processor(
     cancel: CancelToken,
     evt_tx: Sender<Event>,
     dropped_counter: DropCounter,
-    update_tx: Sender<(String, bool)>,
+    update_tx: Sender<VerdictUpdate>,
     encoder: Arc<dyn FileEncoder>,
 ) -> impl FnMut(
     &EncodeTask,
@@ -1415,9 +1442,13 @@ fn make_encode_processor(
         // Report the verdicts this file changed (rare: only when an
         // NVENC encode failed and the encoder turned out to be
         // unusable). The actor merges them into its authoritative copy
-        // so the next batch inherits them.
-        for change in batch_ctx.capability().verdicts().changes_since(&reported) {
-            let _ = update_tx.send(change);
+        // so the next batch inherits them -- but only the ones that
+        // belong to the generation the actor still holds (design doc
+        // §3.10.6 step 5): this batch ran under the generation it
+        // froze, and a newer publication has already superseded it.
+        let generation = batch_ctx.capability().generation();
+        for (encoder, usable) in batch_ctx.capability().verdicts().changes_since(&reported) {
+            let _ = update_tx.send((generation, encoder, usable));
         }
         reported.clone_from(batch_ctx.capability().verdicts());
 
@@ -1507,8 +1538,34 @@ fn take_published(cell: &PublishedCell, timeout: std::time::Duration) -> Option<
 }
 
 /// Fold the verdicts a worker reported into the actor's copy.
-fn apply_verdict_updates(verdicts: &mut CapabilityVerdicts, updates: Vec<(String, bool)>) {
-    for (encoder, usable) in updates {
+///
+/// **Only the current generation's reports are folded in.** A batch
+/// that ran under an older publication reported against that
+/// publication: its conclusion ("this NVENC encoder is broken") is
+/// about a machine state the current generation has already replaced
+/// (design doc §3.10.6 step 5). Folding it in would carry a stale
+/// hardware failure into the next batch forever.
+///
+/// The known cost: after a re-probe publishes a new generation, the
+/// old generation's runtime corrections are not inherited -- the next
+/// batch may try an encoder that just fell back, and fall back again
+/// (harmless: the product is still correct, one file is encoded
+/// twice).
+fn apply_verdict_updates(
+    verdicts: &mut CapabilityVerdicts,
+    generation: u64,
+    updates: Vec<VerdictUpdate>,
+) {
+    for (reported_generation, encoder, usable) in updates {
+        if reported_generation != generation {
+            tracing::debug!(
+                encoder = %encoder,
+                reported_generation,
+                generation,
+                "dropping a verdict from an older generation"
+            );
+            continue;
+        }
         verdicts.set(&encoder, usable);
     }
 }
@@ -1654,7 +1711,10 @@ fn run_actor(
             recv(cmd_rx) -> req => req,
             recv(done_rx) -> done => {
                 if let Ok(BatchDone { updates }) = done {
-                    apply_verdict_updates(capability.verdicts_mut(), updates);
+                    let generation = capability.generation();
+                    apply_verdict_updates(capability.verdicts_mut(), generation, updates);
+                    // The next batch inherits the corrections.
+                    update_published_capability(&published_cell, &capability);
                     batch_running = false;
                     active_batch_id = None;
                 }
@@ -1805,7 +1865,10 @@ fn run_actor(
             Command::StartBatch { .. } | Command::DryRun { .. } | Command::Analyze { .. }
         ) {
             let (finished, updates) = drain_batch_done(&done_rx);
-            apply_verdict_updates(capability.verdicts_mut(), updates);
+            let generation = capability.generation();
+            apply_verdict_updates(capability.verdicts_mut(), generation, updates);
+            // The next batch inherits the corrections.
+            update_published_capability(&published_cell, &capability);
             if finished {
                 batch_running = false;
                 active_batch_id = None;
@@ -1917,7 +1980,7 @@ fn run_actor(
                 // the same token (the `move` closure would otherwise
                 // take it).
                 let cancel_for_processor = cancel_for_worker.clone();
-                let make_processor = move |update_tx: Sender<(String, bool)>| {
+                let make_processor = move |update_tx: Sender<VerdictUpdate>| {
                     // The context is built here, in the worker: the
                     // cache may still be initializing, and waiting for
                     // it must not block the actor (§3.10.1.1 rule 5).
@@ -2457,7 +2520,7 @@ mod mock_tests {
     where
         F: Fn(
                 &EncodeTask,
-                &BatchContext,
+                &mut BatchContext,
                 &CancelToken,
                 &mut dyn FnMut(FfmpegProgress),
             ) -> Result<EncodingRecord, EncodeError>
@@ -2484,7 +2547,7 @@ mod mock_tests {
     where
         F: Fn(
                 &EncodeTask,
-                &BatchContext,
+                &mut BatchContext,
                 &CancelToken,
                 &mut dyn FnMut(FfmpegProgress),
             ) -> Result<EncodingRecord, EncodeError>
@@ -2517,7 +2580,7 @@ mod mock_tests {
     where
         F: Fn(
                 &EncodeTask,
-                &BatchContext,
+                &mut BatchContext,
                 &CancelToken,
                 &mut dyn FnMut(FfmpegProgress),
             ) -> Result<EncodingRecord, EncodeError>
@@ -2596,7 +2659,7 @@ mod mock_tests {
     where
         F: Fn(
                 &EncodeTask,
-                &BatchContext,
+                &mut BatchContext,
                 &CancelToken,
                 &mut dyn FnMut(FfmpegProgress),
             ) -> Result<EncodingRecord, EncodeError>
@@ -2651,7 +2714,7 @@ mod mock_tests {
     fn make_succeeding_mock() -> (
         impl Fn(
                 &EncodeTask,
-                &BatchContext,
+                &mut BatchContext,
                 &CancelToken,
                 &mut dyn FnMut(FfmpegProgress),
             ) -> Result<EncodingRecord, EncodeError>
@@ -2663,7 +2726,7 @@ mod mock_tests {
         let count = Arc::new(AtomicUsize::new(0));
         let count_clone = count.clone();
         let f = move |task: &EncodeTask,
-                      _: &BatchContext,
+                      _: &mut BatchContext,
                       _: &CancelToken,
                       _: &mut dyn FnMut(FfmpegProgress)|
               -> Result<EncodingRecord, EncodeError> {
@@ -2677,7 +2740,7 @@ mod mock_tests {
     /// returns Succeeded. Used to verify Event::Progress flow.
     fn make_progress_mock() -> impl Fn(
         &EncodeTask,
-        &BatchContext,
+        &mut BatchContext,
         &CancelToken,
         &mut dyn FnMut(FfmpegProgress),
     ) -> Result<EncodingRecord, EncodeError>
@@ -2686,7 +2749,7 @@ mod mock_tests {
            + 'static {
         fn f(
             task: &EncodeTask,
-            _: &BatchContext,
+            _: &mut BatchContext,
             _: &CancelToken,
             on_progress: &mut dyn FnMut(FfmpegProgress),
         ) -> Result<EncodingRecord, EncodeError> {
@@ -3867,7 +3930,7 @@ mod mock_tests {
 
         let (cmd_tx, evt_rx) = run_test_controller(
             move |task: &EncodeTask,
-                  _ctx: &BatchContext,
+                  _ctx: &mut BatchContext,
                   cancel: &CancelToken,
                   on_progress: &mut dyn FnMut(FfmpegProgress)| {
                 let output = task.output.to_string_lossy().into_owned();
@@ -3978,7 +4041,7 @@ mod mock_tests {
         let saw_usable_clone = saw_usable.clone();
         let (cmd_tx, evt_rx) = run_test_controller_with_capability(
             move |task: &EncodeTask,
-                  ctx: &BatchContext,
+                  ctx: &mut BatchContext,
                   _: &CancelToken,
                   _: &mut dyn FnMut(FfmpegProgress)| {
                 if ctx.capability().any_usable() {
@@ -4023,7 +4086,7 @@ mod mock_tests {
         let generations_clone = Arc::clone(&generations);
         let (cmd_tx, evt_rx) = run_test_controller_with_capability(
             move |task: &EncodeTask,
-                  ctx: &BatchContext,
+                  ctx: &mut BatchContext,
                   _: &CancelToken,
                   _: &mut dyn FnMut(FfmpegProgress)| {
                 generations_clone.lock().push(ctx.capability().generation());
@@ -4115,7 +4178,7 @@ mod mock_tests {
         });
         let (cmd_tx, evt_rx) = run_test_controller_with_runner(
             |task: &EncodeTask,
-             _: &BatchContext,
+             _: &mut BatchContext,
              _: &CancelToken,
              _: &mut dyn FnMut(FfmpegProgress)| Ok(fake_record(&task.input)),
             None,
@@ -4163,6 +4226,135 @@ mod mock_tests {
             published,
             vec![1, 2],
             "exactly two publications: the startup one and the newer probe"
+        );
+    }
+
+    #[test]
+    fn a_verdict_from_an_older_generation_does_not_land() {
+        // Design doc §3.10.6 step 5: only the current generation's
+        // runtime corrections are merged. A batch that ran under an
+        // older publication reported against that publication -- its
+        // conclusion is about a machine state the current generation
+        // has already replaced.
+        let mut verdicts = CapabilityVerdicts::default();
+
+        // A report from generation 1, while generation 2 is current.
+        apply_verdict_updates(&mut verdicts, 2, vec![(1, "h264_nvenc".to_string(), false)]);
+        assert!(
+            !verdicts.is_disabled("h264_nvenc"),
+            "a stale report must not disable the encoder"
+        );
+
+        // A report from the current generation lands.
+        apply_verdict_updates(&mut verdicts, 2, vec![(2, "h264_nvenc".to_string(), false)]);
+        assert!(
+            verdicts.is_disabled("h264_nvenc"),
+            "the current generation's report must land"
+        );
+    }
+
+    #[test]
+    fn a_late_verdict_from_an_old_batch_does_not_disable_the_new_generation() {
+        // The scenario: a batch runs under generation 1 and finds an
+        // NVENC encoder unusable; while it is still running, a forced
+        // re-probe publishes generation 2; the batch's late report
+        // must not disable the encoder for the next batch (design doc
+        // §3.10.6 step 5).
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release_for_mock = Arc::clone(&release);
+        let recorded = Arc::new(Mutex::new(Vec::<bool>::new()));
+        let recorded_for_mock = Arc::clone(&recorded);
+        let (cmd_tx, evt_rx) = run_test_controller(
+            move |task: &EncodeTask,
+                  ctx: &mut BatchContext,
+                  _: &CancelToken,
+                  _: &mut dyn FnMut(FfmpegProgress)| {
+                // The batch blocks here until the re-probe has
+                // published the new generation.
+                while !release_for_mock.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                // What this batch was admitted with.
+                recorded_for_mock
+                    .lock()
+                    .push(ctx.capability().verdicts().is_disabled("h264_nvenc"));
+                // The runtime correction: the encoder turned out to
+                // be unusable.
+                ctx.capability_mut().verdicts_mut().set("h264_nvenc", false);
+                Ok(fake_record(&task.input))
+            },
+            None,
+        );
+
+        // The first batch: it blocks inside the encoder.
+        cmd_tx
+            .send(Request::new(
+                1,
+                Command::StartBatch {
+                    params: EncodeParams::default(),
+                    files: batch_files("late_verdict", 1),
+                },
+            ))
+            .unwrap();
+        // Wait until the batch is really inside the encoder.
+        loop {
+            match evt_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(Event::FileStarted { .. }) => break,
+                Ok(_) => continue,
+                Err(e) => panic!("the batch must start: {e}"),
+            }
+        }
+
+        // The forced re-probe: it publishes a new generation while the
+        // first batch is still running.
+        cmd_tx
+            .send(Request::new(2, Command::Detect { force: true }))
+            .unwrap();
+        loop {
+            match evt_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(Event::NvencCapability(capability)) => {
+                    if capability.generation() > 1 {
+                        break;
+                    }
+                }
+                Ok(_) => continue,
+                Err(e) => panic!("no capability event: {e}"),
+            }
+        }
+
+        // Let the first batch finish: its verdict report is late now.
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+        loop {
+            match evt_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(Event::BatchCompleted { .. }) => break,
+                Ok(_) => continue,
+                Err(e) => panic!("the first batch must finish: {e}"),
+            }
+        }
+
+        // The second batch: it must not inherit the old conclusion.
+        cmd_tx
+            .send(Request::new(
+                3,
+                Command::StartBatch {
+                    params: EncodeParams::default(),
+                    files: batch_files("late_verdict_second", 1),
+                },
+            ))
+            .unwrap();
+        loop {
+            match evt_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(Event::BatchCompleted { .. }) => break,
+                Ok(_) => continue,
+                Err(e) => panic!("the second batch must finish: {e}"),
+            }
+        }
+
+        let seen = recorded.lock().clone();
+        assert_eq!(seen.len(), 2, "two batches: {seen:?}");
+        assert!(
+            !seen[1],
+            "the new generation must not inherit the old batch's verdict: {seen:?}"
         );
     }
 
