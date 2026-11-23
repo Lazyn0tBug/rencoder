@@ -66,9 +66,9 @@ pub fn App() -> Element {
         // v1.2 review #133: seed the Setup-page editor's
         // in-memory draft from the loaded config so the form
         // shows the user's actual values, not `AppConfig::default()`.
-        // `apply_config_field_edit` (msg.rs) mutates `config_draft`
-        // on every edit; the form dispatches `UserEditedConfigField`
-        // which fires `Command::SaveConfig` for atomic TOML write.
+        // The form dispatches `UserEditedConfigField`, which the
+        // reducer records in the entry layer and fires
+        // `Command::SaveConfig` for (design doc §3.10.5).
         let mut state_thread = state;
         state_thread.with_mut(|s| s.config_draft = (*cfg).clone());
         // v1.2 (review #133 follow-up): seed the log with a
@@ -377,10 +377,11 @@ fn tab_button(
 // SetupPage — pure config editor (review #133 part 3b).
 //
 // No [SETUP] header, no DirPicker, no Start button — those moved
-// to the Task tab. This page is a form that mirrors
-// `state.config_draft`; every input/radio change dispatches
-// `Msg::UserEditedConfigField`, which the reducer applies via
-// `apply_config_field_edit` + fires `Command::SaveConfig` for
+// to the Task tab. This page is a form that mirrors the **effective
+// config** (the file layer `config_draft` plus the entry layer
+// `config_edits`, design doc §3.10.5); every input/radio change
+// dispatches `Msg::UserEditedConfigField`, which the reducer
+// records in the entry layer + fires `Command::SaveConfig` for
 // atomic TOML write. The save status line reads
 // `state.config_save_status` ("Saving…" / "Saved at HH:MM:SS").
 // ============================================================================

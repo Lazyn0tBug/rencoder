@@ -540,9 +540,10 @@ pub enum Msg {
     // (review #133 part 3c, follows in the next commit).
     UserSelectedDir(PathBuf),
     /// Setup-page live edit (review #133). The Setup page's
-    /// `<input>` and radio handlers fire this on every change;
-    /// the reducer updates `state.config_draft` AND fires
-    /// `Command::SaveConfig` so each keystroke persists atomically.
+    /// `<input>` and radio handlers fire this on every change; the
+    /// reducer records the edit in the **entry layer**
+    /// (`state.config_edits`) AND fires `Command::SaveConfig` so each
+    /// keystroke persists atomically (design doc §3.10.5).
     #[allow(dead_code)] // constructed by the Setup-page form (app.rs).
     UserEditedConfigField {
         kind: ConfigFieldKind,
@@ -1559,8 +1560,10 @@ fn dispatch_dry_run_for_new_task(
         }
     };
     if files.is_empty() {
+        // The effective config: the extensions the user set (even
+        // before the save lands) decide what was collected.
         let extensions = state
-            .config_draft
+            .effective_config()
             .encode
             .as_ref()
             .and_then(|e| e.extensions.clone())
@@ -3391,8 +3394,9 @@ mod tests {
     #[test]
     fn user_edited_config_field_updates_the_entry_layer_and_saves() {
         // review #133 part 2d/3d: each Setup-page field edit
-        //   (a) updates state.config_draft (the Setup form reads
-        //       it on next render),
+        //   (a) records the edit in the entry layer -- the effective
+        //       config (what the Setup form reads on next render)
+        //       carries it,
         //   (b) sets config_save_status to "Saving…",
         //   (c) fires Command::SaveConfig for atomic TOML write.
         // The receiver side is tested separately by the lib;
