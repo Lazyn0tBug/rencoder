@@ -156,6 +156,11 @@ impl TaskId {
 /// Top-level UI state — single source of truth for all views.
 #[derive(Debug, Default)]
 pub struct AppState {
+    /// The capability **details** are open (the popup).
+    ///
+    /// The page shows one compact line -- what is available (design
+    /// doc §3.8.7.2); the per-check detail is here, on demand.
+    pub show_capability_details: bool,
     /// The user asked to quit (Ctrl-D in the CLI, **Ctrl-Q** here).
     ///
     /// The window closes **after** the batch has stopped — that is what
@@ -583,6 +588,11 @@ pub enum Msg {
     /// User clicked a top-bar tab. Reducer writes
     /// `state.active_page`. No lib command.
     UserClickedTab(Page),
+    /// The user opened (or closed) the capability details.
+    ///
+    /// The page shows the compact summary; this opens the popup with
+    /// the per-check detail (design doc §3.8.7.2).
+    UserToggledCapabilityDetails,
     /// The user pressed the quit key (**Ctrl-Q**).
     ///
     /// The graceful quit (design doc §3.8.7.4): the batch is cancelled
@@ -875,6 +885,12 @@ pub fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Request>) {
                     push_toast(state, "task in progress", ToastKind::Warning);
                 }
             }
+        }
+        Msg::UserToggledCapabilityDetails => {
+            // The popup is the only place the per-check detail shows
+            // up (design doc §3.8.7.2): the page carries one compact
+            // line -- what is available -- and the rest is on demand.
+            state.show_capability_details = !state.show_capability_details;
         }
         Msg::UserPressedQuit => {
             // The graceful quit (design doc §3.8.7.4). The batch is
@@ -2668,6 +2684,19 @@ mod tests {
     }
 
     // ---- the graceful quit (Ctrl-Q) ----
+
+    #[test]
+    fn the_capability_details_open_and_close() {
+        // The page shows one compact line; the detail is behind a
+        // button (design doc §3.8.7.2).
+        let mut state = fresh_state();
+        let (tx, _rx) = crossbeam_channel::unbounded::<Request>();
+        assert!(!state.show_capability_details, "the detail starts closed");
+        reduce(&mut state, Msg::UserToggledCapabilityDetails, &tx);
+        assert!(state.show_capability_details);
+        reduce(&mut state, Msg::UserToggledCapabilityDetails, &tx);
+        assert!(!state.show_capability_details, "the button toggles it");
+    }
 
     #[test]
     fn ctrl_q_is_the_quit_key() {

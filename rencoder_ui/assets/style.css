@@ -782,3 +782,79 @@ html, body {
     background: var(--bg-elev);
     color: var(--text);
 }
+/* ---- The capability details popup (design doc §3.8.7.x) ----
+ *
+ * The page carries one compact line -- what is available. The
+ * per-check detail lives here, behind a "details" button. A fixed
+ * overlay, like the toaster, so it floats above the page.
+ */
+.popup-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 30;              /* above the toaster (20) */
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.55);
+}
+
+.popup-card {
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    max-width: 640px;
+    max-height: 70vh;
+    overflow-y: auto;
+    padding: var(--space-4);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+}
+
+.popup-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+}
+
+.popup-title {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    color: var(--text-mute);
+}
+
+.popup-close {
+    background: none;
+    border: none;
+    color: var(--text-mute);
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.popup-close:hover {
+    color: var(--text);
+}
+
+.popup-section-label {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    color: var(--text-mute);
+}
+
+.popup-line {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text);
+    white-space: pre-wrap;
+}
+
+/* The ✓ / ✗ marker in the capability popup. */
+.popup-mark {
+    display: inline-block;
+    width: 1.4em;
+    color: var(--text-mute);
+}

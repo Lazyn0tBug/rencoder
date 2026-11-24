@@ -314,6 +314,19 @@ impl Capability {
             .collect()
     }
 
+    /// Every encoder and whether it can run here.
+    ///
+    /// The **compact** answer to "what can this machine do" -- the
+    /// names and a yes/no. The *why* (ffmpeg's stderr, which can be
+    /// a paragraph per encoder) is [`Capability::lines`] -- and the
+    /// user does not need it (design doc §3.10.7).
+    pub fn availability(&self) -> Vec<(String, bool)> {
+        self.support
+            .iter()
+            .map(|entry| (entry.encoder.clone(), entry.usable))
+            .collect()
+    }
+
     /// The advisory shown when the stored result is past its review
     /// date. `None` when it is still fresh.
     ///
@@ -879,6 +892,29 @@ fn failure_reason(err: &EncodeError) -> String {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn the_availability_lists_every_encoder_with_yes_or_no() {
+        let cap = Capability::from_support(vec![
+            crate::types::NvencSupport {
+                encoder: "h264_nvenc".into(),
+                usable: true,
+                reason: None,
+            },
+            crate::types::NvencSupport {
+                encoder: "av1_nvenc".into(),
+                usable: false,
+                reason: Some("no capable devices".into()),
+            },
+        ]);
+        assert_eq!(
+            cap.availability(),
+            vec![
+                ("h264_nvenc".to_string(), true),
+                ("av1_nvenc".to_string(), false),
+            ]
+        );
+    }
 
     fn temp_path(label: &str) -> PathBuf {
         let dir =

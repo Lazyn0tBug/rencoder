@@ -370,8 +370,15 @@ rencoder --detect encode ... # 作为命令行选项：本次忽略记录，检�
 
 GUI 走同一条路：`Command::CheckCapability { ignore_record }` → lib 用同一个记录
 文件解析 → 发 `Event::NvencCapability` 回报。UI 的 Setup 页在 NVENC 开关旁显示
-能力清单（每个编码器能不能用、不能用是什么原因），并提供"check now"按钮；启动
-时 lib 也会检查一次并回报，所以用户不点按钮也知道这台机器支持什么。
+**一行摘要**（这台机器能用哪些编码器 ✅ ✅——`Capability::usable_summary()` ✅ ✅），
+旁边是"details"和"check now"两个按钮 ✅ ✅；启动时 lib 也会检查一次并回报，所以
+用户不点按钮也知道这台机器支持什么。
+
+**明细不直接摊在页面上** ✅ ✅（§3.8.7.2 ✅ ✅）：每个编码器能不能用、不能用是什
+么原因、运行检查（目录可写 ✅ ✅、ffmpeg ✅ ✅……）——这些**进弹窗** ✅ ✅，按钮点开
+✅ ✅。理由：页面是干活的 ✅ ✅，能力清单是**参考** ✅ ✅；摊开会让 Setup 页变成一
+张报告 ✅ ✅，而用户真正要的只是"哪些能用" ✅ ✅。摘要的**措辞在 lib** ✅ ✅（`Capability::usable_summary()`
+✅ ✅ / `Capabilities::summary()` ✅ ✅），CLI 与 GUI 说法一致 ✅ ✅。
 
 `--detect` 是全局选项，出现在子命令前后都认。`detect` 的报告本身就是这项设计的
 主要价值——把"这台机器能用哪些硬件编码器"变成用户能主动查的事实：
@@ -3218,10 +3225,12 @@ been recorded; lib cleanup happens silently in the background.
 
 | Page | Body | 按钮位置 | 按钮 states |
 |------|------|----------|-------------|
-| `[SETUP]` | live-edit form(format radios / crf / max fps / extensions) + save-status 行 | (无 contextual button;setup page 是配置编辑页,不是 action 页) | — |
+| `[SETUP]` | live-edit form(format radios / crf / max fps / extensions) + save-status 行 + **capability 一行摘要** ✅ ✅（这台机器哪些编码器可用 ✅ ✅） | (无 contextual button;setup page 是配置编辑页,不是 action 页) | — |
 | `[TASK]` | DirPicker + count summary + `[● phase] badge` + scrollable file list + ProgressPanel | **底部 sticky**(随 task phase 动态 show / hide) | `Analyze ▸`(dir 选了无 history) / `Re-run ▸`(history 非空) / 禁用 `Analyze…`(Analyzing 中) / `Cancel ✕`(Encoding 中) |
 | `[HISTORY]` | history table(source / outcome / size) | body 顶部 inline(无 page header 占用 row) | `[ Refresh ⟳ ]`(per v1.1 deferred——见 §3.8.7.4) |
 | `[LOG]` | 完整 log scrollback(全 1000 行) | body 顶部 inline | `[ Clear ]` |
+
+- **能力信息不进页面** ✅ ✅（§3.10.7 ✅ ✅）：Setup 页的 capability 行 ✅ ✅ 与 Task 页的 CAPABILITY 块 ✅ ✅ 都**只有按钮** ✅ ✅（"details" ✅ ✅）——一个字都不直接显示 ✅ ✅；点开弹窗 ✅ ✅ 才看到**是否可用** ✅ ✅（每个编码器 ✅ ✅、每项检查 ✅ ✅，一个 ✓/✗ ✅ ✅），**不含** ffmpeg 的输出 ✅ ✅。
 
 **Why drop the page headers**: `[TASK]` / `[HISTORY]` / `[LOG]` 文字标签与 TopBar 的同名 tab 重复。原 layout 把 `[NAME]────` 放在 page header 是为了给 top-right button 找一个 row;但 button 完全可以放到 page 底部(随 phase 动态 show / hide)。这样省 ~50px 垂直空间,且按钮位置贴近用户的视线终点(file list 看完即按按钮,不需要回头找)。`[SETUP]` 已经在 v1.2 早期工作里去掉 header(review #133 part 3b)——这次扩展到剩余 3 页保持一致。
 
@@ -4713,6 +4722,7 @@ future 待做 / ⚠️ 已作废），§8 就是当前的路线图。
 | 110 | **主动退出键 Ctrl-D**（§3.11.2 ✅ ✅）：键盘的中断（Ctrl-C ✅ ✅）退出码 130 ✅ ✅，主动退出退出码 0 ✅ ✅——**同样的停止路径** ✅ ✅（取消请求 ✅ ✅ → 文件边界停下 ✅ ✅ → 删半成品 ✅ ✅ → 记录落盘 ✅ ✅），差别只在退出码 ✅ ✅；只在批次进行中生效 ✅ ✅（提问时读整行 stdin ✅ ✅，抢同一个输入会互相吃字符 ✅ ✅）；键的读法是平台差异 ✅ ✅（Unix 切非规范模式 ✅ ✅，保留 ISIG ✅ ✅；Windows `ReadConsoleInput` ✅ ✅），关在 `rencoder_cli::keys` ✅ ✅；终端模式在批次结束 ✅ ✅ / `process::exit` ✅ ✅ / panic ✅ ✅ 三条路都还原 ✅ ✅ | ✅ |
 | 111 | **交互向导（`--interactive`）未实现** ✅ ✅：设计文档 §"交互模式" ✅ ✅ 列了它 ✅ ✅，但 `interact.rs` 从头到尾**只有一行注释** ✅ ✅——flag 收下了 ✅ ✅，然后什么也不做 ✅ ✅，用户只看到"要么 --file 要么 --dir" ✅ ✅（还提示"或者用 --interactive" ✅ ✅——指向一个不存在的东西 ✅ ✅）。现在传 `--interactive` **明确报错** ✅ ✅，占位文件删掉 ✅ ✅，`dialoguer` 依赖也去掉 ✅ ✅（向导真做的时候再加回来 ✅ ✅）| ❌ 未实现 |
 | 112 | **actor 的形状**（§3.10.1.2 ✅ ✅）：`run_actor` 767 行装下整个状态机 ✅ ✅（第 1 未测热点 ✅ ✅、第 2 桥节点 ✅ ✅）——文档描述的"每段一个 barrier 的链"在代码形状里看不见 ✅ ✅，审阅者没法对着文档核对 ✅ ✅。现在：**上下文对象** `Ctx` ✅ ✅（状态 ✅ ✅、路径 ✅ ✅、通道 ✅ ✅、seam ✅ ✅ 一起走 ✅ ✅——按 §3.10.4 ✅ ✅，超过 5 个参数就该问"这是不是一个上下文对象" ✅ ✅，答案是 ✅ ✅）+ **每个命令一个 handler** ✅ ✅（`on_start_batch` ✅ ✅ / `on_dry_run` ✅ ✅ / `on_cancel` ✅ ✅ / `on_load_history` ✅ ✅ / `on_save_config` ✅ ✅ / `on_check_capability` ✅ ✅ / `on_set_working_dir` ✅ ✅ / `on_analyze` ✅ ✅），`run_actor` 277 行 ✅ ✅，只做**分发** ✅ ✅。| ✅ |
+| 113 | **能力信息不进页面** ✅ ✅：Setup 页 ✅ ✅ 与 Task 页 ✅ ✅ 都**只有按钮** ✅ ✅（"details" ✅ ✅）——一个字都不直接显示 ✅ ✅；点开弹窗 ✅ ✅ 才看到**是否可用** ✅ ✅（`Capability::availability()` ✅ ✅，每个编码器 ✅ ✅ / 每项检查 ✅ ✅ 一个 ✓/✗ ✅ ✅），**不含** ffmpeg 的输出 ✅ ✅（那是每编码器一段 stderr ✅ ✅，用户不需要 ✅ ✅，它在日志里 ✅ ✅）——页面是干活的 ✅ ✅，能力清单是参考 ✅ ✅ | ✅ |
 
 ---
 

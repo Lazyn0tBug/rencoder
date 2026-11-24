@@ -232,6 +232,141 @@ pub fn App() -> Element {
             // transient user-action feedback toasts (review
             // #133 v1.2). See design.md §3.8.7.2.
             Toaster { state: state }
+            // The capability details — a popup, because the page
+            // carries only the compact line (design doc §3.8.7.2).
+            CapabilityPopup { state: state, cmd_tx: cmd_tx }
+        }
+    }
+}
+
+// ============================================================================
+// Capability details — the popup (design doc §3.8.7.2)
+// ============================================================================
+
+/// The capability **details**, on demand.
+///
+/// The page carries one compact line -- *what is available* (design
+/// doc §3.8.7.2). The per-check detail -- which encoder, why one does
+/// not work, what the run checks said -- is here, behind a button.
+#[component]
+fn CapabilityPopup(
+    state: Signal<AppState, SyncStorage>,
+    cmd_tx: Signal<Option<Sender<Request>>, SyncStorage>,
+) -> Element {
+    if !state.read().show_capability_details {
+        return rsx! {};
+    }
+    // **Availability only**: which encoder, which check -- and yes or
+    // no. The reasons (ffmpeg's stderr, a paragraph per encoder) are
+    // what the user does NOT need (design doc §3.8.7.2); they stay in
+    // the log.
+    let (encoders, encoder_note): (Vec<(String, bool)>, Option<String>) =
+        match state.read().nvenc_capability.as_ref() {
+            Some(cap) => {
+                let list = cap.availability();
+                // An empty list means one thing: the ffmpeg build has no
+                // NVENC encoders at all. Say so -- an empty section would
+                // look like "we did not check".
+                let note = if list.is_empty() {
+                    Some(cap.lines().join("; "))
+                } else {
+                    None
+                };
+                (list, note)
+            }
+            None => (Vec::new(), None),
+        };
+    let advisory = state
+        .read()
+        .nvenc_capability
+        .as_ref()
+        .and_then(|cap| cap.review_advisory());
+    let checks: Vec<(String, bool)> = state
+        .read()
+        .capability_report
+        .as_ref()
+        .map(|report| {
+            report
+                .checks
+                .iter()
+                .map(|c| {
+                    (
+                        c.name.clone(),
+                        c.status == rencoder_lib::capability::CheckStatus::Ok,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut state_c = state;
+    let tx = cmd_tx.read().clone();
+    rsx! {
+        div { class: "popup-overlay",
+            div { class: "popup-card",
+                header { class: "popup-header",
+                    span { class: "popup-title", "CAPABILITY" }
+                    button {
+                        class: "popup-close",
+                        onclick: move |_| {
+                            if let Some(tx) = tx.clone() {
+                                state_c.with_mut(|s| {
+                                    reduce(s, Msg::UserToggledCapabilityDetails, &tx)
+                                });
+                            }
+                        },
+                        "×"
+                    }
+                }
+                {
+                    if !encoders.is_empty() || encoder_note.is_some() {
+                        rsx! {
+                            span { class: "popup-section-label", "ENCODERS" }
+                            for (name, usable) in encoders.iter() {
+                                div { class: "popup-line",
+                                    span { class: "popup-mark", if *usable { "✓" } else { "✗" } }
+                                    span { "{name}" }
+                                }
+                            }
+                            {
+                                if let Some(note) = encoder_note.as_ref() {
+                                    rsx! {
+                                        div { class: "popup-line muted", "{note}" }
+                                    }
+                                } else {
+                                    rsx! {}
+                                }
+                            }
+                        }
+                    } else {
+                        rsx! {}
+                    }
+                }
+                {
+                    if let Some(advisory) = advisory {
+                        rsx! {
+                            div { class: "popup-line muted", "{advisory}" }
+                        }
+                    } else {
+                        rsx! {}
+                    }
+                }
+                {
+                    if !checks.is_empty() {
+                        rsx! {
+                            span { class: "popup-section-label", "RUN CHECKS" }
+                            for (name, ok) in checks.iter() {
+                                div { class: "popup-line",
+                                    span { class: "popup-mark", if *ok { "✓" } else { "✗" } }
+                                    span { "{name}" }
+                                }
+                            }
+                        }
+                    } else {
+                        rsx! {}
+                    }
+                }
+            }
         }
     }
 }
@@ -620,43 +755,36 @@ fn SetupPage(
                 }
 
                 // ---- NVENC capability (what this machine can run) ----
+                //
+                // **Nothing about the capability is shown here**
+                // (design doc §3.8.7.2): not the summary, not the
+                // detail. The page is for working; "which encoders
+                // can this machine run" is a question the user asks
+                // by clicking -- and the answer is a yes/no per
+                // encoder (the popup), never ffmpeg's output.
                 {
-                    let capability = state.read().nvenc_capability.clone();
-                    // Rendered as plain lines: rsx! has no `match` arm
-                    // with a block in child position.
-                    // The wording comes from the lib so the UI and the
-                    // CLI describe the same capability the same way.
-                    let lines: Vec<String> = match &capability {
-                        None => vec!["not detected yet".to_string()],
-                        Some(cap) => cap.lines(),
-                    };
-                    let review_advisory = capability
-                        .as_ref()
-                        .and_then(|cap| cap.review_advisory());
                     let mut state_c = state;
                     let tx_c = tx_opt.clone();
+                    let tx_c2 = tx_opt.clone();
                     rsx! {
                         div { class: "form-row",
                             label { class: "form-label", "capability" }
                             div {
-                                for line in lines.iter() {
-                                    div { class: "plan-row",
-                                        span { class: "code", "{line}" }
-                                    }
-                                }
-                                {
-                                    if let Some(advisory) = review_advisory {
-                                        rsx! {
-                                            span { class: "muted", "{advisory}" }
-                                        }
-                                    } else {
-                                        rsx! {}
-                                    }
-                                }
                                 button {
                                     class: "secondary-btn",
                                     onclick: move |_| {
                                         if let Some(tx) = tx_c.clone() {
+                                            state_c.with_mut(|s| {
+                                                reduce(s, Msg::UserToggledCapabilityDetails, &tx)
+                                            });
+                                        }
+                                    },
+                                    "details"
+                                }
+                                button {
+                                    class: "secondary-btn",
+                                    onclick: move |_| {
+                                        if let Some(tx) = tx_c2.clone() {
                                             state_c.with_mut(|s| {
                                                 reduce(s, Msg::UserClickedCheckCapability, &tx)
                                             });
@@ -810,12 +938,11 @@ fn TaskPage(
     // The capability report for the current working directory (design
     // doc §3.10.7): the lib checked and wrote the file, the UI reads
     // it — nobody recomputes the check.
-    let capability_lines = state
-        .read()
-        .capability_report
-        .as_ref()
-        .map(|report| report.lines())
-        .unwrap_or_default();
+    // Is there a report at all? The page shows a button; the popup
+    // shows the yes/no per check (design doc §3.8.7.2).
+    let capability_known = state.read().capability_report.is_some();
+    let mut state2 = state;
+    let tx_opt2 = cmd_tx.read().clone();
 
     // Pick the source of records to show in the file list. Active task
     // wins (its dry-run records during Analyzing, its records during
@@ -897,14 +1024,27 @@ fn TaskPage(
 
             DirPicker { state: state, cmd_tx: cmd_tx }
 
-            // The capability report — one line per check, written by
-            // the lib into the operation directory (design doc
-            // §3.10.7). It answers "can this directory be worked in".
-            if !capability_lines.is_empty() {
+            // The capability report — written by the lib into the
+            // operation directory (design doc §3.10.7). It answers
+            // "can this directory be worked in".
+            //
+            // **Nothing about it is shown here** (design doc
+            // §3.8.7.2): the page carries a button, and the answer
+            // (a yes/no per check) is in the popup.
+            if capability_known {
                 div { class: "capability-report",
                     span { class: "section-label", "CAPABILITY" }
-                    for line in capability_lines.iter() {
-                        div { class: "capability-line", "{line}" }
+                    button {
+                        class: "secondary-btn",
+                        onclick: move |_| {
+                            let tx = tx_opt2.clone();
+                            if let Some(tx) = tx {
+                                state2.with_mut(|s| {
+                                    reduce(s, Msg::UserToggledCapabilityDetails, &tx)
+                                });
+                            }
+                        },
+                        "details"
                     }
                 }
             }
