@@ -25,9 +25,49 @@
 //! This mirrors `encode.zsh`'s `trap _cleanup INT TERM HUP`.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-/// Where the cancel request goes.
+use parking_lot::Mutex;
+
+/// Why the run is stopping.
+///
+/// The cancel **file** only says "stop": it is the portable channel,
+/// and anyone who can write it can stop a batch. *Why* the run stops is
+/// local to this process -- the CLI knows whether the user pressed
+/// Ctrl-C (an interrupt) or Ctrl-D (a deliberate quit), and the two
+/// leave with different exit codes (design doc §3.11.2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Reason {
+    /// An interrupt: Ctrl-C, SIGTERM, SIGHUP or a console control event.
+    Interrupt,
+    /// A deliberate quit: the user asked the app to stop.
+    Quit,
+}
+
+/// The exit code a stop leaves behind.
+///
+/// - An **interrupt** is not a success: 130 (128 + SIGINT, the shell
+///   convention) -- the shell should know the run did not finish.
+/// - A **deliberate quit** is: 0. The user asked for it; the records
+///   are on disk and the run ended the way they wanted.
+pub fn exit_code(reason: Reason) -> i32 {
+    match reason {
+        Reason::Interrupt => 130,
+        Reason::Quit => 0,
+    }
+}
+
+/// The cancel channel's state.
+#[derive(Default)]
+pub struct CancelState {
+    /// Where the cancel request goes -- filled in once the paths
+    /// resolve (design doc §3.6).
+    path: Option<PathBuf>,
+    /// Why the run is stopping -- set by whoever asked.
+    reason: Option<Reason>,
+}
+
+/// Where the cancel request goes, and why the run is stopping.
 ///
 /// The handler is installed as the process's **first** thing (design
 /// doc §3.11.2): before it is installed, a signal takes the default
@@ -35,18 +75,21 @@ use std::sync::{Arc, Mutex};
 /// output stays. The path itself comes from the operation directory
 /// (§3.6), which the arguments decide; the config can still point it
 /// elsewhere, so the slot is filled in again once the paths resolve.
-pub type CancelSlot = Arc<Mutex<Option<PathBuf>>>;
+pub type CancelSlot = Arc<Mutex<CancelState>>;
 
 /// A fresh, empty cancel slot.
 pub fn new_cancel_slot() -> CancelSlot {
-    Arc::new(Mutex::new(None))
+    Arc::new(Mutex::new(CancelState::default()))
 }
 
 /// Point the handler at the cancel request file.
 pub fn set_cancel_path(slot: &CancelSlot, path: &Path) {
-    if let Ok(mut slot) = slot.lock() {
-        *slot = Some(path.to_path_buf());
-    }
+    slot.lock().path = Some(path.to_path_buf());
+}
+
+/// Why the run is stopping, if it is.
+pub fn reason(slot: &CancelSlot) -> Option<Reason> {
+    slot.lock().reason
 }
 
 /// Install the interrupt handler.
@@ -62,29 +105,43 @@ pub fn install_handler(slot: &CancelSlot) {
     register_handler(Arc::clone(slot));
 }
 
+/// The user asked to quit (Ctrl-D).
+///
+/// The **same** stop path as an interrupt -- the cancel request is
+/// written, the batch stops at the next file boundary, the records are
+/// written -- but the reason is [`Reason::Quit`], so the process exits
+/// with 0 instead of 130 (design doc §3.11.2).
+pub fn request_quit(slot: &CancelSlot) {
+    tracing::warn!("quit requested; asking the batch to stop");
+    write_request(slot, Reason::Quit);
+}
+
 /// Record the interrupt and ask the batch to stop.
 ///
 /// The signal arrives on a dedicated thread (`signal-hook`'s iterator
-/// loop) or on a console-control thread (Windows), so setting an
-/// atomic flag is safe here. Everything else -- killing the child,
-/// removing the partial output, writing the records, exiting -- happens
-/// on the batch's own thread.
+/// loop) or on a console-control thread (Windows), so setting the
+/// reason is safe here. Everything else -- killing the child, removing
+/// the partial output, writing the records, exiting -- happens on the
+/// batch's own thread.
 fn request_cancel(slot: &CancelSlot, signal: &str) {
     tracing::warn!("received {signal}; asking the batch to stop");
-    let cancel_file = match slot.lock() {
-        Ok(slot) => slot.clone(),
-        Err(_) => {
-            tracing::warn!("the cancel path lock is poisoned; the request is dropped");
-            return;
-        }
+    write_request(slot, Reason::Interrupt);
+}
+
+/// Write the cancel request, and record why.
+fn write_request(slot: &CancelSlot, reason: Reason) {
+    let cancel_file = {
+        let mut slot = slot.lock();
+        slot.reason = Some(reason);
+        slot.path.clone()
     };
     let Some(cancel_file) = cancel_file else {
         // The paths are not resolved yet (design doc §3.6): no batch
         // has started, so there is nothing to cancel -- but the
         // process must still stop, the way it would without the
         // handler. No records exist yet, so nothing is lost.
-        tracing::warn!("received {signal} before the paths resolved; stopping the process");
-        std::process::exit(130);
+        tracing::warn!("stop requested before the paths resolved; stopping the process");
+        std::process::exit(exit_code(reason));
     };
     // The file *is* the request -- its content does not matter, so
     // creating it needs no atomic write.

@@ -12,6 +12,7 @@
 mod args;
 mod file_sink;
 mod interact;
+mod keys;
 mod signal;
 mod tracing_init;
 
@@ -35,6 +36,15 @@ use tracing::{info, instrument, warn};
 fn main() -> Result<()> {
     let cli = args::Cli::parse();
 
+    // A panic must not leave the terminal in the mode the key reader
+    // put it in -- the user's shell would lose its line editing
+    // (design doc §3.11.2).
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        keys::restore_terminal();
+        default_hook(info);
+    }));
+
     // The signal handler comes **first** (design doc §3.11.2): before
     // the handler is installed, a signal takes the default action --
     // the process dies, the records are lost, the partial output stays.
@@ -48,6 +58,35 @@ fn main() -> Result<()> {
         args::Command::Encode(encode_args) => encode_cmd(encode_args, cli.detect, &cancel_slot),
         args::Command::Analyze(analyze_args) => analyze_cmd(analyze_args, &cancel_slot),
         args::Command::Detect(_) => detect_cmd(&cancel_slot),
+    }
+}
+
+/// Leave the terminal as we found it, then leave with `code`.
+///
+/// `process::exit` skips the destructors, so the key reader's guard
+/// never runs on this path -- the terminal is restored explicitly
+/// (design doc §3.11.2).
+fn exit_with(code: i32) -> ! {
+    keys::restore_terminal();
+    std::process::exit(code);
+}
+
+/// The exit code of a finished run.
+///
+/// - **Not cancelled** → 0.
+/// - **Cancelled by an interrupt** → 130 (128 + SIGINT): the run did
+///   not finish, and the shell should know.
+/// - **Cancelled by a deliberate quit** (Ctrl-D) → 0: the user asked
+///   for it, the records are on disk, the run ended the way they
+///   wanted.
+/// - Cancelled by *someone else* (the cancel file was written by a
+///   script) → 130: we cannot tell what was meant, so the
+///   conservative code stands.
+fn exit_code_for(cancelled: bool, reason: Option<signal::Reason>) -> i32 {
+    match (cancelled, reason) {
+        (false, _) => 0,
+        (true, Some(reason)) => signal::exit_code(reason),
+        (true, None) => 130,
     }
 }
 
@@ -133,7 +172,7 @@ fn detect_cmd(cancel_slot: &signal::CancelSlot) -> Result<()> {
         }) {
             Ok(resolution) => resolution,
             Err(rencoder_lib::error::EncodeError::UserCancel) => {
-                std::process::exit(130);
+                exit_with(130);
             }
             Err(e) => return Err(e).context("NVENC detection failed"),
         };
@@ -257,7 +296,7 @@ fn encode_cmd(
             // The run never started: release the target and leave
             // with the cancel exit code (130).
             drop(target_guard.take());
-            std::process::exit(130);
+            exit_with(130);
         }
         Err(e) => {
             return Err(e).with_context(|| {
@@ -337,7 +376,7 @@ fn encode_cmd(
             Err(rencoder_lib::error::EncodeError::UserCancel) => {
                 // Cancelled before the batch started.
                 drop(target_guard.take());
-                std::process::exit(130);
+                exit_with(130);
             }
             Err(e) => {
                 // ffmpeg does not run. The check still reports what it
@@ -394,7 +433,14 @@ fn encode_cmd(
     // fails at runtime is not tried again for the rest of the command).
     let mut ctx = BatchContext::new(params, std::sync::Arc::new(cache), resolution.capability());
 
+    // Ctrl-D: the user asks to quit (design doc §3.11.2). The reader
+    // is installed **around the batch** -- the interactive prompt
+    // earlier reads whole lines from the same stdin, and two readers
+    // on one stdin eat each other's characters.
+    let key_reader = keys::install(cancel_slot);
     let report = transcode_batch(&files, &mut ctx, ProcessOutput::Inherit, &cancel, None);
+    // The batch is over: the terminal belongs to the user again.
+    drop(key_reader);
     let records = report.records;
 
     // Default output: timestamped Parquet in <app_dir>/data/ (U18; honors
@@ -420,12 +466,13 @@ fn encode_cmd(
 
     // An interrupted run is not a successful one: the records are on
     // disk, but the exit code says the batch did not finish (130 =
-    // 128 + SIGINT, the shell convention).
+    // 128 + SIGINT, the shell convention). A deliberate quit (Ctrl-D)
+    // is the exception: the user asked for it, so it leaves with 0.
     if matches!(
         report.termination,
         rencoder_lib::pipeline::task::Termination::Cancelled { .. }
     ) {
-        std::process::exit(130);
+        exit_with(exit_code_for(true, signal::reason(cancel_slot)));
     }
 
     Ok(())
@@ -467,7 +514,7 @@ fn analyze_cmd(args: args::AnalyzeArgs, cancel_slot: &signal::CancelSlot) -> Res
         Ok(files) => files,
         Err(rencoder_lib::error::EncodeError::UserCancel) => {
             // Cancelled before the analysis started.
-            std::process::exit(130);
+            exit_with(130);
         }
         Err(e) => {
             return Err(e).with_context(|| {
@@ -492,6 +539,9 @@ fn analyze_cmd(args: args::AnalyzeArgs, cancel_slot: &signal::CancelSlot) -> Res
     let parallel = an.and_then(|a| a.parallel).unwrap_or(false);
     tracing::Span::current().record("parallel", parallel);
 
+    // Ctrl-D: the user asks to quit (design doc §3.11.2) -- the same
+    // reader as the encode path, installed around the analysis.
+    let key_reader = keys::install(cancel_slot);
     let report = if parallel {
         // The parallel analyzer takes `&[PathBuf]` and bypasses the
         // `InputPath` boundary (probe-only, no argv injection risk).
@@ -540,16 +590,19 @@ fn analyze_cmd(args: args::AnalyzeArgs, cancel_slot: &signal::CancelSlot) -> Res
             },
         )
     };
+    // The analysis is over: the terminal belongs to the user again.
+    drop(key_reader);
     let records = &report.records;
     let stats = rencoder_lib::analyzer::records::aggregate_records(records);
 
     // An interrupted analysis says so with its exit code, like the
-    // encode path (design doc §3.11.2).
+    // encode path (design doc §3.11.2). A deliberate quit (Ctrl-D)
+    // leaves with 0.
     if matches!(
         report.termination,
         rencoder_lib::pipeline::task::Termination::Cancelled { .. }
     ) {
-        std::process::exit(130);
+        exit_with(exit_code_for(true, signal::reason(cancel_slot)));
     }
 
     // One-line summary to stderr regardless of output format.
@@ -667,6 +720,31 @@ mod tests {
     use super::*;
     use rencoder_lib::config::{AnalyzeConfig, EncodeConfig, EncodersConfig, FormatArg};
     use std::path::PathBuf;
+
+    #[test]
+    fn an_interrupted_run_leaves_with_130() {
+        assert_eq!(exit_code_for(true, Some(signal::Reason::Interrupt)), 130);
+    }
+
+    #[test]
+    fn a_deliberate_quit_leaves_with_zero() {
+        // The user asked for it: the records are on disk, the run
+        // ended the way they wanted. The shell sees a success.
+        assert_eq!(exit_code_for(true, Some(signal::Reason::Quit)), 0);
+    }
+
+    #[test]
+    fn a_finished_run_leaves_with_zero() {
+        assert_eq!(exit_code_for(false, None), 0);
+        assert_eq!(exit_code_for(false, Some(signal::Reason::Quit)), 0);
+    }
+
+    #[test]
+    fn a_cancel_from_someone_else_keeps_the_conservative_code() {
+        // The cancel file was written by a script, not by us: we
+        // cannot tell what was meant, so 130 stands.
+        assert_eq!(exit_code_for(true, None), 130);
+    }
 
     #[test]
     fn the_jsonl_output_survives_a_windows_path() {

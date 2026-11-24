@@ -84,6 +84,14 @@ Unix uses `signal-hook` (SIGINT/SIGTERM/SIGHUP), Windows uses
 one file; `install_handler()` keeps one signature everywhere. The
 Windows path is compiled and tested by the CI's Windows job.
 
+`rencoder_cli::keys` is the same kind of exception: the **quit key**
+(Ctrl-D, a deliberate quit -- exit code 0, unlike Ctrl-C's
+interrupt -- exit code 130). Unix reads the terminal in non-canonical
+mode (`libc` termios), Windows reads console key events
+(`ReadConsoleInput`). It is installed around the batch only, and the
+terminal is put back when the batch ends, on `process::exit` and on a
+panic.
+
 ## Build
 
 ```bash
