@@ -85,7 +85,10 @@ jobs:
           set -euo pipefail
           cargo fmt --check
           cargo clippy -p rencoder_lib -p rencoder_cli --all-targets -- -D warnings
-          cargo test -p rencoder_lib -p rencoder_cli
+          # --no-fail-fast: cargo stops at the first failing target, so a
+          # later failure hides behind an earlier one. The guard's Windows
+          # failure stayed hidden behind the CLI's that way.
+          cargo test -p rencoder_lib -p rencoder_cli --no-fail-fast
 
   ui:
     name: ui (${{ matrix.os }})
@@ -136,4 +139,4 @@ jobs:
           set -euo pipefail
           cargo fmt --check
           cargo clippy --workspace --all-targets -- -D warnings
-          cargo test --workspace
+          cargo test --workspace --no-fail-fast
