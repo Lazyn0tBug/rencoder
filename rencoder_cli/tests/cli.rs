@@ -87,6 +87,14 @@ fn write_config(dir: &Path, contents: &str) -> PathBuf {
     path
 }
 
+/// The CSV carries the **OS-native** path (`C:\...\a.mp4` on Windows,
+/// `/tmp/.../a.mp4` on Unix). The assertions below are written with
+/// one separator, so normalize before matching -- otherwise the path
+/// assertions only hold on Unix.
+fn with_slashes(s: &str) -> String {
+    s.replace('\\', "/")
+}
+
 fn make_video(dir: &Path, name: &str, fps: u32) -> PathBuf {
     let path = dir.join(name);
     let status = Command::new("ffmpeg")
@@ -224,7 +232,7 @@ fn analyze_subcommand_produces_csv_for_real_videos() {
         String::from_utf8_lossy(&out.stderr)
     );
     // Default output is per-file CSV to stdout.
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stdout = with_slashes(&String::from_utf8_lossy(&out.stdout));
     assert!(stdout.starts_with("path,fps,codec,duration_secs,file_bytes\n"));
     assert!(stdout.contains("/a.mp4,24,"));
     assert!(stdout.contains("/b.mp4,30,"));
@@ -266,7 +274,7 @@ fn analyze_subcommand_writes_csv_to_file() {
         "expected CSV at {}",
         stats_path.display()
     );
-    let content = std::fs::read_to_string(&stats_path).unwrap();
+    let content = with_slashes(&std::fs::read_to_string(&stats_path).unwrap());
     assert!(content.starts_with("path,fps,codec,duration_secs,file_bytes\n"));
     assert!(content.contains("/x.mp4,30,"));
 }
