@@ -152,6 +152,25 @@ pub fn App() -> Element {
         }
     });
 
+    // The graceful quit: the window closes **once the batch has
+    // stopped** (design doc §3.8.7.4). Until then the batch is still
+    // finishing — the lib writes the records at its terminal state and
+    // removes the partial output, and only then is it safe to go.
+    //
+    // **Above** the early return below, on purpose: Dioxus's rules of
+    // hooks say the hooks must run in the same order every render, and
+    // a hook behind a conditional return breaks that the day the
+    // branch becomes reachable ("your app may panic").
+    use_effect(move || {
+        let (quitting, phase) = {
+            let s = state.read();
+            (s.quitting, s.tasks.active.as_ref().map(|t| t.phase))
+        };
+        if quitting && crate::msg::quit_can_close_now(phase) {
+            desktop::window().close();
+        }
+    });
+
     // If cmd_tx isn't set yet (use_hook hasn't run), show
     // "Initializing actor..." placeholder. Otherwise render the
     // top-bar + active page.
@@ -173,20 +192,6 @@ pub fn App() -> Element {
     // Page routing — read active_page, render the right page.
     let active_page = state.read().active_page;
     let last_error = state.read().last_error.clone();
-
-    // The graceful quit: the window closes **once the batch has
-    // stopped** (design doc §3.8.7.4). Until then the batch is still
-    // finishing — the lib writes the records at its terminal state and
-    // removes the partial output, and only then is it safe to go.
-    use_effect(move || {
-        let (quitting, phase) = {
-            let s = state.read();
-            (s.quitting, s.tasks.active.as_ref().map(|t| t.phase))
-        };
-        if quitting && crate::msg::quit_can_close_now(phase) {
-            desktop::window().close();
-        }
-    });
 
     rsx! {
         style { dangerous_inner_html: "{CSS}" }
