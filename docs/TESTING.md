@@ -46,6 +46,8 @@ CI 的 job 是分开的 ✅：`core`（lib + CLI，三台宿主机 ✓）、`c-p
   （规范模式下 Ctrl-D 是行规程的 EOF ✅ ✅，应用收不到 ✅ ✅）；Windows 上它不是控制台
   事件 ✅ ✅，靠 `ReadConsoleInput` 读按键事件 ✅ ✅。所以这个键**没法在 CI 里端到端测**
   ✅ ✅——决策逻辑（哪些键算退出 ✅ ✅）有单元测试 ✅ ✅，读键的那一段靠人手验证 ✅ ✅。
+- **GUI 的 Ctrl-Q** ✅ ✅：webview 的按键 ✅ ✅，**三个平台一样** ✅ ✅，**不碰终端** ✅ ✅
+  ——所以它跟 CLI 的 Ctrl-D（§3.11.2 ✅ ✅）互不干扰 ✅ ✅：两个程序各认各的键 ✅ ✅。
 - **控制台事件只到 app，不到编码器**：Windows 的控制台事件发给整个**进程组** ✅ ✅，
   Unix 的信号只发给一个进程 ✅ ✅。所以 lib 启动 ffmpeg 时在 Windows 上给它单独建组
   （`CREATE_NEW_PROCESS_GROUP` ✅ ✅，关在 `rencoder_lib::platform::process` ✅ ✅）——

@@ -32,6 +32,7 @@
 //! pages — user navigates manually.
 
 use dioxus::desktop;
+use dioxus::html::prelude::{Key, Modifiers};
 use dioxus::prelude::*;
 
 use crossbeam_channel::Sender;
@@ -52,7 +53,7 @@ const CSS: &str = include_str!("../assets/style.css");
 
 #[component]
 pub fn App() -> Element {
-    let state: Signal<AppState, SyncStorage> = use_signal_sync(AppState::default);
+    let mut state: Signal<AppState, SyncStorage> = use_signal_sync(AppState::default);
     let mut cmd_tx: Signal<Option<Sender<Request>>, SyncStorage> = use_signal_sync(|| None);
 
     // One-shot setup: start the controller, wire the channels,
@@ -173,9 +174,42 @@ pub fn App() -> Element {
     let active_page = state.read().active_page;
     let last_error = state.read().last_error.clone();
 
+    // The graceful quit: the window closes **once the batch has
+    // stopped** (design doc §3.8.7.4). Until then the batch is still
+    // finishing — the lib writes the records at its terminal state and
+    // removes the partial output, and only then is it safe to go.
+    use_effect(move || {
+        let (quitting, phase) = {
+            let s = state.read();
+            (s.quitting, s.tasks.active.as_ref().map(|t| t.phase))
+        };
+        if quitting && crate::msg::quit_can_close_now(phase) {
+            desktop::window().close();
+        }
+    });
+
     rsx! {
         style { dangerous_inner_html: "{CSS}" }
         div { class: "app",
+            // **Ctrl-Q**: the graceful quit (design doc §3.8.7.4).
+            // The webview delivers the key the same way on every
+            // platform, and the GUI has no terminal to disturb — the
+            // CLI's Ctrl-Q (which changes the terminal's mode) is a
+            // different program.
+            onkeydown: move |e: KeyboardEvent| {
+                let character = match e.key() {
+                    Key::Character(c) => c,
+                    _ => String::new(),
+                };
+                if !crate::msg::is_quit_key(&character, e.modifiers().contains(Modifiers::CONTROL)) {
+                    return;
+                }
+                e.stop_propagation();
+                let tx = cmd_tx.read().clone();
+                if let Some(tx) = tx {
+                    state.with_mut(|s| reduce(s, Msg::UserPressedQuit, &tx));
+                }
+            },
             TopBar { state: state, cmd_tx: cmd_tx }
             if let Some(ref err) = last_error {
                 div { class: "global-error", "{err}" }
@@ -328,18 +362,17 @@ fn TopBar(
                     button {
                         class: "exit-btn",
                         onclick: move |_| {
-                            // v1 Exit semantics (per §3.8.7.4):
-                            // an active batch -> cancel it, then
-                            // window().close() (after BatchCancelled
-                            // in v1.1; v1 closes immediately after
-                            // the dispatch).
-                            // None/Done -> close immediately.
+                            // The graceful quit (design doc §3.8.7.4):
+                            // an active batch -> cancel it, and the
+                            // window closes **after** the batch has
+                            // stopped -- the lib writes the records at
+                            // its terminal state, and the partial
+                            // output is gone before the process goes.
+                            // Nothing running -> close right away.
                             //
-                            // The cancel goes through the reducer:
-                            // it names the batch (design doc
-                            // §3.11.3) and carries the request id.
-                            state.with_mut(|s| reduce(s, Msg::UserClickedCancel, &tx));
-                            desktop::window().close();
+                            // The same path as Ctrl-Q: one way to
+                            // leave, one behaviour.
+                            state.with_mut(|s| reduce(s, Msg::UserPressedQuit, &tx));
                         },
                         "Exit"
                     }

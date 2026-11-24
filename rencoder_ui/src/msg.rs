@@ -156,6 +156,13 @@ impl TaskId {
 /// Top-level UI state — single source of truth for all views.
 #[derive(Debug, Default)]
 pub struct AppState {
+    /// The user asked to quit (Ctrl-D in the CLI, **Ctrl-Q** here).
+    ///
+    /// The window closes **after** the batch has stopped — that is what
+    /// makes the quit graceful: the lib writes the records at the
+    /// batch's terminal state, and the partial output is gone before
+    /// the process goes (design doc §3.8.7.4).
+    pub quitting: bool,
     /// Task queue (v1: capacity = 1). All tasks share the lib
     /// actor via busy-gate. Guard on `tasks.active.is_some()` —
     /// task is the gating unit, not batch id.
@@ -576,6 +583,16 @@ pub enum Msg {
     /// User clicked a top-bar tab. Reducer writes
     /// `state.active_page`. No lib command.
     UserClickedTab(Page),
+    /// The user pressed the quit key (**Ctrl-Q**).
+    ///
+    /// The graceful quit (design doc §3.8.7.4): the batch is cancelled
+    /// and the window closes once the batch has stopped.
+    ///
+    /// The key is **Ctrl-Q on every OS** — the webview delivers it the
+    /// same way everywhere, and the GUI has no terminal to disturb.
+    /// (The CLI takes **Ctrl-D** for the same thing, design doc
+    /// §3.11.2 — a different program, a different key.)
+    UserPressedQuit,
     /// Wrapper for lib -> UI events. All lib events flow
     /// through here; reducer routes them in `apply_event`.
     Lib(Event),
@@ -583,6 +600,29 @@ pub enum Msg {
     /// pushed through a crossbeam channel from the log drain
     /// thread). Source field is fixed to `LogSource::LibInternal`.
     LibLogLine(String),
+}
+
+/// Is this key press the quit key?
+///
+/// **Ctrl-Q, on every OS.** The webview delivers it the same way
+/// everywhere, and the GUI has no terminal to disturb — so unlike the
+/// CLI's Ctrl-D (design doc §3.11.2), this key needs no terminal
+/// mode change and cannot collide with a terminal shortcut.
+pub fn is_quit_key(character: &str, ctrl: bool) -> bool {
+    ctrl && character.eq_ignore_ascii_case("q")
+}
+
+/// Can the window close right now?
+///
+/// The graceful quit waits for the batch to stop — but only while
+/// something is actually running. A dry run, a plan waiting for the
+/// user, or no task at all: nothing is at risk, so the window closes
+/// at once.
+pub fn quit_can_close_now(phase: Option<BatchPhase>) -> bool {
+    !matches!(
+        phase,
+        Some(BatchPhase::Encoding) | Some(BatchPhase::Starting) | Some(BatchPhase::Cancelling)
+    )
 }
 
 /// Send a command to the lib actor, with a fresh request id.
@@ -833,6 +873,27 @@ pub fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Request>) {
                     // a last-resort signal for keyboard /
                     // programmatic dispatch.
                     push_toast(state, "task in progress", ToastKind::Warning);
+                }
+            }
+        }
+        Msg::UserPressedQuit => {
+            // The graceful quit (design doc §3.8.7.4). The batch is
+            // cancelled first; the window closes when the batch's
+            // terminal event arrives (the view's effect watches
+            // `quitting`). That order is the whole point: the lib
+            // writes the records at the terminal state, and the
+            // partial output is removed before the process goes.
+            state.quitting = true;
+            match state.tasks.active.as_ref().map(|t| t.phase) {
+                Some(BatchPhase::Encoding) | Some(BatchPhase::Starting) => {
+                    // The same cancel the Cancel button sends (design
+                    // doc §3.11.3): it names the batch, so a stale
+                    // quit cannot stop another batch.
+                    reduce(state, Msg::UserClickedCancel, cmd_tx);
+                }
+                _ => {
+                    // Nothing is running: the view closes the window
+                    // right away (`quit_can_close_now`).
                 }
             }
         }
@@ -2604,6 +2665,87 @@ mod tests {
             Command::Cancel { batch_id } => assert_eq!(batch_id, 11),
             other => panic!("expected Command::Cancel, got {other:?}"),
         }
+    }
+
+    // ---- the graceful quit (Ctrl-Q) ----
+
+    #[test]
+    fn ctrl_q_is_the_quit_key() {
+        // Ctrl-Q, on every platform (design doc §3.8.7.4): the same
+        // key the CLI takes (§3.11.2).
+        assert!(is_quit_key("q", true));
+        assert!(is_quit_key("Q", true), "shift does not change it");
+        assert!(!is_quit_key("q", false), "a bare q is a character");
+        assert!(!is_quit_key("c", true), "Ctrl-C is the interrupt");
+    }
+
+    #[test]
+    fn the_window_waits_for_the_batch_before_closing() {
+        // The quit is graceful: the window closes **after** the batch
+        // has stopped (the lib writes the records at its terminal
+        // state, and the partial output is gone before the process
+        // goes).
+        assert!(!quit_can_close_now(Some(BatchPhase::Encoding)));
+        assert!(!quit_can_close_now(Some(BatchPhase::Starting)));
+        assert!(!quit_can_close_now(Some(BatchPhase::Cancelling)));
+        assert!(quit_can_close_now(Some(BatchPhase::Done)));
+        assert!(quit_can_close_now(Some(BatchPhase::Cancelled)));
+        assert!(
+            quit_can_close_now(Some(BatchPhase::Analyzing)),
+            "a dry run has nothing at risk"
+        );
+        assert!(quit_can_close_now(None));
+    }
+
+    #[test]
+    fn the_quit_cancels_the_batch_and_waits_for_it() {
+        let mut state = fresh_state();
+        let (tx, rx) = crossbeam_channel::unbounded::<Request>();
+        state.tasks.active = Some(TaskInfo {
+            task_id: TaskId("20260101000000".into()),
+            batch_id: Some(11),
+            pending_request: None,
+            restore_phase: None,
+            phase: BatchPhase::Encoding,
+            dir: PathBuf::from("/x"),
+            total_files: 5,
+            to_encode: 5,
+            to_failed: 0,
+            encoded: 0,
+            cancelled: false,
+            finished: false,
+            records: vec![],
+            dry_run_records: vec![],
+            dry_run_generation: None,
+            dry_run_params: None,
+            dry_run_inputs: Vec::new(),
+        });
+        reduce(&mut state, Msg::UserPressedQuit, &tx);
+
+        assert!(state.quitting, "the quit is remembered");
+        let t = state.tasks.active.as_ref().unwrap();
+        assert_eq!(
+            t.phase,
+            BatchPhase::Cancelling,
+            "the batch is cancelled first; the window waits for it"
+        );
+        match next_command(&rx) {
+            Command::Cancel { batch_id } => assert_eq!(batch_id, 11),
+            other => panic!("expected Command::Cancel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_quit_with_no_batch_closes_at_once() {
+        let mut state = fresh_state();
+        let (tx, rx) = crossbeam_channel::unbounded::<Request>();
+        reduce(&mut state, Msg::UserPressedQuit, &tx);
+
+        assert!(state.quitting);
+        assert!(rx.try_recv().is_err(), "there is nothing to cancel");
+        assert!(quit_can_close_now(
+            state.tasks.active.as_ref().map(|t| t.phase)
+        ));
     }
 
     #[test]

@@ -3449,7 +3449,8 @@ fn push_toast(state: &mut AppState, msg: impl Into<String>, kind: ToastKind) {
 | 项 | 实现 |
 |----|------|
 | UI drain thread panic recovery | `use_hook` 里 `std::thread::spawn` 的 drain loop 用 `std::panic::catch_unwind` 包裹(per §3.9.4);panic → 设 `state.last_error = "drain thread panicked"` + 暴露 `controller_alive: false` 在 v2 才需要, v1 只设 last_error |
-| Exit button 先 Cancel | Exit button onclick 分两阶段:active phase → 先 `cmd_tx.send(Command::Cancel)`,等 `Event::BatchCancelled`,再 `window().close()`;None/Done → 直接 `window().close()` |
+| Exit button 先 Cancel | Exit button onclick 分两阶段:active phase → 先 `cmd_tx.send(Command::Cancel)`,等 `Event::BatchCancelled`,再 `window().close()`;None/Done → 直接 `window().close()`。**代码已实现** ✅ ✅（`Msg::UserPressedQuit` ✅ ✅：设 `state.quitting` ✅ ✅ + 派 Cancel ✅ ✅，窗口在**批次停下之后**才关 ✅ ✅——这才是“优雅” ✅ ✅：记录在终态落盘 ✅ ✅，半成品先删 ✅ ✅） |
+| **Ctrl-Q 优雅退出**（新 ✅ ✅） | **Ctrl-Q** ✅ ✅——**每个 OS 都一样** ✅ ✅（webview 的按键 ✅ ✅，不经过终端 ✅ ✅，所以既没有终端模式要改 ✅ ✅，也不会撞上终端的快捷键 ✅ ✅）。语义与 Exit 按钮**同一条路** ✅ ✅：取消批次 ✅ ✅ → 等它停下 ✅ ✅ → 关窗 ✅ ✅。（CLI 那边是 **Ctrl-D** ✅ ✅，§3.11.2 ✅ ✅——两个程序各认各的键 ✅ ✅）|
 
 这些限制不影响协议契约（Command/Event 已端到端测试通过 mock_tests），只是 UI 渲染层不完整。
 
