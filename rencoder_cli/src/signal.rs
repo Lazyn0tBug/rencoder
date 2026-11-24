@@ -16,7 +16,9 @@
 //!   removes its half-written output (design doc §3.11.2);
 //! - the batch stops at the next file boundary and the records of the
 //!   files that finished are written out;
-//! - only then does the process exit, with a non-zero status.
+//! - only then does the process exit -- with a non-zero status for an
+//!   interrupt (130), and with 0 for a deliberate quit (Ctrl-D, see
+//!   [`Reason`]).
 //!
 //! An interrupt used to cost the whole run: the handler removed the
 //! partial file and called `process::exit(1)` right there, so the
@@ -55,6 +57,14 @@ pub fn exit_code(reason: Reason) -> i32 {
         Reason::Interrupt => 130,
         Reason::Quit => 0,
     }
+}
+
+/// Record why the run is stopping -- the first reason wins.
+///
+/// Returns the reason that is now on record.
+pub fn record_reason(slot: &CancelSlot, reason: Reason) -> Reason {
+    let mut slot = slot.lock();
+    *slot.reason.get_or_insert(reason)
 }
 
 /// The cancel channel's state.
@@ -129,12 +139,15 @@ fn request_cancel(slot: &CancelSlot, signal: &str) {
 }
 
 /// Write the cancel request, and record why.
+///
+/// The reason is **first-writer-wins**: it records *why the run
+/// stopped*, and the first request is the one the batch answered. A
+/// second request (the user hits Ctrl-C because the quit seems to
+/// take long) must not rewrite the story -- otherwise a deliberate
+/// quit would leave with 130 again.
 fn write_request(slot: &CancelSlot, reason: Reason) {
-    let cancel_file = {
-        let mut slot = slot.lock();
-        slot.reason = Some(reason);
-        slot.path.clone()
-    };
+    record_reason(slot, reason);
+    let cancel_file = slot.lock().path.clone();
     let Some(cancel_file) = cancel_file else {
         // The paths are not resolved yet (design doc §3.6): no batch
         // has started, so there is nothing to cancel -- but the
@@ -245,5 +258,34 @@ mod windows {
             "failed to register console handler: {}",
             std::io::Error::last_os_error()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_first_reason_is_the_one_that_stops_the_run() {
+        // The user asks to quit (Ctrl-D), then gets impatient and
+        // hits Ctrl-C. The quit is what the batch answered, so the
+        // run leaves with 0 -- not 130.
+        let slot = new_cancel_slot();
+        assert_eq!(record_reason(&slot, Reason::Quit), Reason::Quit);
+        assert_eq!(record_reason(&slot, Reason::Interrupt), Reason::Quit);
+        assert_eq!(reason(&slot), Some(Reason::Quit));
+    }
+
+    #[test]
+    fn an_interrupt_is_not_rewritten_by_a_later_quit() {
+        let slot = new_cancel_slot();
+        assert_eq!(record_reason(&slot, Reason::Interrupt), Reason::Interrupt);
+        assert_eq!(record_reason(&slot, Reason::Quit), Reason::Interrupt);
+    }
+
+    #[test]
+    fn the_exit_codes_follow_the_reason() {
+        assert_eq!(exit_code(Reason::Interrupt), 130);
+        assert_eq!(exit_code(Reason::Quit), 0);
     }
 }
