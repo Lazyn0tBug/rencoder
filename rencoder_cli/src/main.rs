@@ -603,26 +603,24 @@ fn analyze_cmd(args: args::AnalyzeArgs, cancel_slot: &signal::CancelSlot) -> Res
 }
 
 /// Render records as JSON Lines: one `AnalysisRecord` per line.
+///
+/// The escaping is serde's, not a hand-written `"{}"`: a Windows path
+/// contains backslashes (`C:\Users\me\a.mp4`), and interpolating it
+/// raw produces **invalid JSON** -- every line with a Windows path in
+/// it would fail to parse. The output must be the same on every
+/// platform (design doc §1.3).
 fn records_to_jsonl(records: &[rencoder_lib::analyzer::records::AnalysisRecord]) -> String {
     let mut out = String::new();
     for r in records {
-        let fps = r
-            .fps
-            .map(|f| f.to_string())
-            .unwrap_or_else(|| "null".into());
-        let codec = r.codec.clone().unwrap_or_else(|| "null".into());
-        let dur = r
-            .duration_secs
-            .map(|d| d.to_string())
-            .unwrap_or_else(|| "null".into());
-        out.push_str(&format!(
-            "{{\"path\":\"{}\",\"fps\":{},\"codec\":\"{}\",\"duration_secs\":{},\"file_bytes\":{}}}\n",
-            r.path.display(),
-            fps,
-            codec,
-            dur,
-            r.file_bytes,
-        ));
+        let line = serde_json::json!({
+            "path": r.path.to_string_lossy(),
+            "fps": r.fps,
+            "codec": r.codec.clone(),
+            "duration_secs": r.duration_secs,
+            "file_bytes": r.file_bytes,
+        });
+        out.push_str(&line.to_string());
+        out.push('\n');
     }
     out
 }
@@ -669,6 +667,44 @@ mod tests {
     use super::*;
     use rencoder_lib::config::{AnalyzeConfig, EncodeConfig, EncodersConfig, FormatArg};
     use std::path::PathBuf;
+
+    #[test]
+    fn the_jsonl_output_survives_a_windows_path() {
+        // The path is escaped, so the line is valid JSON on every
+        // platform. Interpolating it raw produced `C:\Users\...`,
+        // which is not JSON (a backslash starts an escape).
+        let record = rencoder_lib::analyzer::records::AnalysisRecord::new(
+            PathBuf::from(r"C:\Users\me\my videos\a.mp4"),
+            Some(30),
+            Some("h264".into()),
+            Some(1.5),
+            42,
+        );
+        let line = records_to_jsonl(std::slice::from_ref(&record));
+        let parsed: serde_json::Value =
+            serde_json::from_str(line.trim()).expect("the line must be valid JSON");
+        assert_eq!(parsed["path"], r"C:\Users\me\my videos\a.mp4");
+        assert_eq!(parsed["fps"], 30);
+        assert_eq!(parsed["codec"], "h264");
+        assert_eq!(parsed["file_bytes"], 42);
+    }
+
+    #[test]
+    fn the_jsonl_output_marks_a_failed_probe_as_null() {
+        let record = rencoder_lib::analyzer::records::AnalysisRecord::new(
+            PathBuf::from("/videos/broken.mp4"),
+            None,
+            None,
+            None,
+            0,
+        );
+        let line = records_to_jsonl(std::slice::from_ref(&record));
+        let parsed: serde_json::Value =
+            serde_json::from_str(line.trim()).expect("the line must be valid JSON");
+        assert!(parsed["fps"].is_null());
+        assert!(parsed["codec"].is_null());
+        assert!(parsed["duration_secs"].is_null());
+    }
 
     #[test]
     fn params_have_no_encoder_override_without_an_encode_section() {

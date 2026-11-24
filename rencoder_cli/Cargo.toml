@@ -18,6 +18,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 anyhow = "1"
+# The JSONL output escapes the paths -- a Windows path contains
+# backslashes, and a hand-written `"{}"` would produce invalid JSON.
+serde_json = "1"
 
 [target.'cfg(unix)'.dependencies]
 # SIGINT / SIGTERM / SIGHUP (encode.zsh's `trap _cleanup INT TERM HUP`).
