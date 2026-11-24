@@ -51,6 +51,27 @@ use crate::tracing_init;
 /// doesn't need a separate file lookup at runtime.
 const CSS: &str = include_str!("../assets/style.css");
 
+/// The JavaScript that gives the app root the keyboard focus.
+///
+/// The webview dispatches key events only *inside* its own root
+/// (`#main`). A key pressed while nothing in the app has the focus
+/// targets `<body>` -- outside `#main` -- so the event never reaches
+/// Rust and the shortcuts are dead (design doc §3.8.7.4).
+///
+/// The script retries: the DOM update and this call race, and the
+/// first attempts may find no `.app` yet.
+const FOCUS_APP_JS: &str = r#"
+(function () {
+    let tries = 0;
+    const focus = function () {
+        const app = document.querySelector('.app');
+        if (app) { app.focus(); return; }
+        if (tries++ < 120) { requestAnimationFrame(focus); }
+    };
+    focus();
+})();
+"#;
+
 #[component]
 pub fn App() -> Element {
     let mut state: Signal<AppState, SyncStorage> = use_signal_sync(AppState::default);
@@ -152,6 +173,25 @@ pub fn App() -> Element {
         }
     });
 
+    // The app root takes the keyboard focus (design doc §3.8.7.4).
+    //
+    // The webview dispatches key events only inside its own root
+    // (`#main`). With nothing focused inside the app, a key press
+    // targets `<body>` -- outside `#main` -- and never reaches Rust:
+    // the shortcuts are dead on a freshly opened window.
+    //
+    // The effect reads no signal, so it runs once, after the first
+    // render. The JS retries until the app root is in the DOM: the
+    // DOM update and this call race.
+    use_effect(move || {
+        spawn(async move {
+            match dioxus::document::eval(FOCUS_APP_JS).await {
+                Ok(_) => tracing::debug!("the app root was asked for the focus"),
+                Err(e) => tracing::warn!(error = %e, "the focus request did not go through"),
+            }
+        });
+    });
+
     // The graceful quit: the window closes **once the batch has
     // stopped** (design doc §3.8.7.4). Until then the batch is still
     // finishing — the lib writes the records at its terminal state and
@@ -179,6 +219,11 @@ pub fn App() -> Element {
         return rsx! {
             style { dangerous_inner_html: "{CSS}" }
             div { class: "app",
+                // The same focus contract as the real root below
+                // (design doc §3.8.7.4): this div may be the one the
+                // webview mounts first.
+                tabindex: 0,
+                autofocus: true,
                 header { class: "app-header",
                     span { class: "brand", "RENENCODER" }
                 }
@@ -196,6 +241,21 @@ pub fn App() -> Element {
     rsx! {
         style { dangerous_inner_html: "{CSS}" }
         div { class: "app",
+            // **The focus contract** (design doc §3.8.7.4): the
+            // webview only dispatches key events *inside* its own
+            // root (`#main`). A key pressed while nothing in the app
+            // has the focus targets `<body>`, which is not inside
+            // `#main` -- the event never reaches Rust. That is why
+            // Ctrl-Q did nothing on a freshly opened window.
+            //
+            // So the app root is focusable, and it **takes** the
+            // focus: `autofocus` asks the browser to do it, and the
+            // effect above makes sure it happened (the browser only
+            // honours `autofocus` on insertion, and the desktop's
+            // `onmounted` never fires -- no shipped JS dispatches
+            // it).
+            tabindex: 0,
+            autofocus: true,
             // **Ctrl-Q**: the graceful quit (design doc §3.8.7.4).
             // The webview delivers the key the same way on every
             // platform, and the GUI has no terminal to disturb — the
@@ -206,13 +266,27 @@ pub fn App() -> Element {
                     Key::Character(c) => c,
                     _ => String::new(),
                 };
-                if !crate::msg::is_quit_key(&character, e.modifiers().contains(Modifiers::CONTROL)) {
+                let ctrl = e.modifiers().contains(Modifiers::CONTROL);
+                // The keybinding is invisible when it does not fire --
+                // and a webview has a dozen ways to swallow a key
+                // (focus, the engine's own shortcuts). Say what came
+                // in, so the log can answer "did the key arrive?".
+                tracing::debug!(
+                    key = %character,
+                    ctrl,
+                    "the app got a key"
+                );
+                if !crate::msg::is_quit_key(&character, ctrl) {
                     return;
                 }
                 e.stop_propagation();
                 let tx = cmd_tx.read().clone();
-                if let Some(tx) = tx {
-                    state.with_mut(|s| reduce(s, Msg::UserPressedQuit, &tx));
+                match tx {
+                    Some(tx) => {
+                        tracing::debug!("the quit key: asking the batch to stop");
+                        state.with_mut(|s| reduce(s, Msg::UserPressedQuit, &tx));
+                    }
+                    None => tracing::warn!("the quit key: the actor is not reachable"),
                 }
             },
             TopBar { state: state, cmd_tx: cmd_tx }

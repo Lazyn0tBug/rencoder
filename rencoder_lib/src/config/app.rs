@@ -28,6 +28,11 @@
 //! format = "table"
 //! parallel = true
 //! output = "video_stats.csv"
+//!
+//! [log]
+//! level = "info"
+//! max_bytes = 10485760
+//! max_days = 7
 //! ```
 
 use std::io::Write;
@@ -126,6 +131,22 @@ parallel = true
 # Optional: write the analyze output to this path instead of stdout.
 # The CLI `-o` flag overrides this per-run; `-` means stdout (default).
 # output = "video_stats.csv"
+
+[log]
+# How much the app says. One of: off | error | warn | info | debug | trace.
+# Default: info.
+#
+# This is a RUNTIME setting: a release build logs exactly as much as a
+# debug build when this says "debug". Set it to "debug" to see what the
+# app is doing, then put it back.
+level = "info"
+
+# Roll the log file over to the next one when it grows past this size
+# (bytes). Default: 10485760 (10 MB).
+# max_bytes = 10485760
+
+# Delete log files older than this many days. Default: 7.
+# max_days = 7
 "#;
 
 /// Top-level user-facing config. Both sections are optional; missing
@@ -143,6 +164,81 @@ pub struct AppConfig {
     /// directory.
     #[serde(default)]
     pub paths: Option<PathsConfig>,
+    /// How much the app says, and how it keeps the log (design doc
+    /// §3.10.5).
+    #[serde(default)]
+    pub log: Option<LogConfig>,
+}
+
+/// Read a config file **leniently**: a missing or broken file yields
+/// the built-in defaults.
+///
+/// For the frontend that has to know its settings *before* the
+/// subscriber is up — the GUI's log level and log directory (§3.10.5).
+/// The authoritative load stays with whoever runs the app: the CLI
+/// loads the config for the run, the actor loads it for the GUI, and
+/// that load reports a broken config to the user.
+///
+/// This function never creates the file either — creating it is the
+/// authoritative loader's business.
+pub fn read_config_lenient(path: &Path) -> AppConfig {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return AppConfig::default();
+    };
+    // A parse error means the file is broken; the authoritative load
+    // will say so. Here it just means "no settings".
+    toml::from_str(&raw).unwrap_or_default()
+}
+
+/// The `[log]` section: the app's verbosity and its log-file policy.
+///
+/// Logging is **configuration**, not an environment variable: the
+/// level lives in the config file next to the app (design doc §3.6),
+/// so a release build can be made as talkative as a debug build by
+/// editing one line — the level is a runtime setting, not a compile
+/// time one.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LogConfig {
+    /// The verbosity. `None` = the built-in default (info).
+    pub level: Option<LogLevel>,
+    /// Roll the log file over at this size (bytes). `None` = 10 MB.
+    pub max_bytes: Option<u64>,
+    /// Delete log files older than this many days. `None` = 7.
+    pub max_days: Option<u32>,
+}
+
+/// The log levels the app understands.
+///
+/// The vocabulary is the lib's on purpose: an unknown level fails
+/// the **parse** (a typo surfaces immediately) instead of silently
+/// degrading into "nothing is logged".
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Off,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevel {
+    /// The filter directive this level means.
+    ///
+    /// `EnvFilter` understands exactly these words, so the config
+    /// value and the filter speak the same language.
+    pub fn as_directive(&self) -> &'static str {
+        match self {
+            LogLevel::Off => "off",
+            LogLevel::Error => "error",
+            LogLevel::Warn => "warn",
+            LogLevel::Info => "info",
+            LogLevel::Debug => "debug",
+            LogLevel::Trace => "trace",
+        }
+    }
 }
 
 /// The `[paths]` section: where the app's files live.
@@ -384,7 +480,8 @@ impl AppConfig {
             write_atomic(path, content.as_bytes())?;
             // Surface auto-create via the project's log infrastructure
             // v1.2 follow-up #4: lib uses `tracing` directly (was `log`).
-            // User can silence via RUST_LOG.
+            // The user can lower the level via `[log] level` in the
+            // config file (design doc §3.10.5).
             tracing::info!(
                 config_path = %path.display(),
                 "{CREATED_CONFIG_NOTICE}"
@@ -454,6 +551,18 @@ impl AppConfig {
             if enc.max_batch_size == 0 {
                 return Err(ConfigError::InvalidValue {
                     field: "encode.max_batch_size".into(),
+                    value: "0".into(),
+                });
+            }
+        }
+        if let Some(log) = &self.log {
+            // `0` would roll the log file over after every single
+            // write -- one file per event. `max_days = 0` is
+            // different: it means "keep the files forever" (the
+            // sink's own contract), so it stays legal.
+            if log.max_bytes == Some(0) {
+                return Err(ConfigError::InvalidValue {
+                    field: "log.max_bytes".into(),
                     value: "0".into(),
                 });
             }
@@ -743,6 +852,71 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    // ---- the [log] section (design doc §3.10.5) ----
+
+    #[test]
+    fn the_log_section_parses() {
+        let path = crate::test_support::unique_temp_file("log_ok");
+        std::fs::write(
+            &path,
+            "[log]\nlevel = \"debug\"\nmax_bytes = 2048\nmax_days = 3\n",
+        )
+        .unwrap();
+        let cfg = AppConfig::load(&path).expect("load should succeed");
+        let log = cfg.log.as_ref().expect("log section");
+        assert_eq!(log.level, Some(LogLevel::Debug));
+        assert_eq!(log.max_bytes, Some(2048));
+        assert_eq!(log.max_days, Some(3));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn an_unknown_log_level_is_rejected() {
+        // A typo must fail the parse, not silently mean "log nothing".
+        let path = crate::test_support::unique_temp_file("log_bad_level");
+        std::fs::write(&path, "[log]\nlevel = \"verbos\"\n").unwrap();
+        assert!(AppConfig::load(&path).is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn unknown_keys_in_the_log_section_are_rejected() {
+        let path = crate::test_support::unique_temp_file("log_unknown_key");
+        std::fs::write(&path, "[log]\nlvl = \"debug\"\n").unwrap();
+        assert!(AppConfig::load(&path).is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_zero_max_bytes_is_rejected() {
+        // 0 would roll the log file over after every write.
+        let path = crate::test_support::unique_temp_file("log_zero_bytes");
+        std::fs::write(&path, "[log]\nmax_bytes = 0\n").unwrap();
+        let err = AppConfig::load(&path).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue { .. }));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn zero_max_days_means_keep_the_files() {
+        // `max_days = 0` is the sink's own "no cleanup" value, not a
+        // typo -- it must load.
+        let path = crate::test_support::unique_temp_file("log_zero_days");
+        std::fs::write(&path, "[log]\nmax_days = 0\n").unwrap();
+        let cfg = AppConfig::load(&path).expect("load should succeed");
+        assert_eq!(cfg.log.unwrap().max_days, Some(0));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn the_generated_template_documents_the_log_section() {
+        // A first-run user has to be able to find the knob.
+        assert!(
+            DEFAULT_CONFIG_TOML.contains("[log]"),
+            "the generated config must carry a [log] section"
+        );
+    }
+
     #[test]
     fn crf_defaults_to_45_when_field_missing() {
         // U18 step 6: `crf: u32` with serde default = 45 (libsvtav1 medium).
@@ -815,6 +989,7 @@ mod tests {
                 }),
                 analyze: None,
                 paths: None,
+                log: None,
             };
             let err = cfg.validate().unwrap_err();
             assert!(
@@ -845,6 +1020,7 @@ mod tests {
                 }),
                 analyze: None,
                 paths: None,
+                log: None,
             };
             cfg.validate()
                 .unwrap_or_else(|e| panic!("max_fps={good} should validate, got {e:?}"));
@@ -870,6 +1046,7 @@ mod tests {
             }),
             analyze: None,
             paths: None,
+            log: None,
         };
         let err = cfg.validate().unwrap_err();
         assert!(
@@ -897,6 +1074,7 @@ mod tests {
             }),
             analyze: None,
             paths: None,
+            log: None,
         };
         cfg.validate().expect("bitrate=5000 should validate");
     }
@@ -910,6 +1088,7 @@ mod tests {
             encode: None,
             analyze: Some(AnalyzeConfig::default()),
             paths: None,
+            log: None,
         };
         cfg.validate().expect("analyze-only config should validate");
     }

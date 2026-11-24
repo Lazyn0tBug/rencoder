@@ -45,6 +45,13 @@ rejected so typos surface immediately.
 CRF is a `u32` (default 45, sentinel 0 = bitrate mode), not a bool — this
 aligns 1:1 with ffmpeg's `-crf N`.
 
+**Logging is configuration too**: the `[log]` section of `rencoder.toml`
+(`level` / `max_bytes` / `max_days`) — **no `RUST_LOG` environment
+variable**. The level is a *runtime* setting, so a release build logs
+exactly as much as a debug build when the config says so (design doc
+§3.10.5). Both frontends write the same log file (`<app_dir>/log/`);
+the file sink lives in the lib (`rencoder_lib::logging::file_sink`).
+
 ## Cross-platform encapsulation (U18)
 
 Platform-specific behavior follows the **"cfg at definition, uniform

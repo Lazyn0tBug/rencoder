@@ -31,7 +31,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # events — single subscriber, no bridge layer. Custom MakeWriter
 # pushes lines into `state.log` via crossbeam channel.
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# The subscriber's fmt layer + the registry. The *filter* is built by
+# the lib (`rencoder_lib::logging::level_filter`), so the env-filter
+# feature is not needed here.
+tracing-subscriber = "0.3"
 # Toaster's auto-dismiss loop uses tokio::time::sleep inside
 # a `use_future` block. Dioxus 0.6 already pulls tokio in as a
 # transitive dep, but doesn't re-export it; we add it here for

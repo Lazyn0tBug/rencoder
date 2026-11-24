@@ -414,14 +414,16 @@ NVENC 用的是恒定质量（`-cq N -b:v 0`），不是 x265 的 CRF（`-crf N`
 - `rencoder_lib` 是 `publish = false`（U18，internal lib）—— 没有外部消费者，不再受 "API surface 不应依赖 tracing" 这条约束限制。
 - 关键收益：日志**结构化字段**（`output = %path`, `source_fps = f`, `batch_id = id`）—— 替代之前 `log::info!("...{} {}", a, b)` 这种把字段名丢进字符串拼接的做法。`tracing-subscriber` 的 `fmt::Layer().json()` 输出可以按字段聚合 / 检索。
 - 关键收益：`#[instrument]` 自动给函数挂 span context —— `run_ffmpeg_with_progress` 加 instrument 后，子事件（progress / stderr / cancel）自动继承函数名 + 参数作为字段。
-- 统一栈：`RUST_LOG` 一套规则控制 lib + CLI + UI，不需要 `tracing-log::LogTracer` 桥接。
+- 统一栈：**日志级别由配置文件决定**（`[log] level`，§3.10.5）——lib + CLI + UI 用同一套级别，不需要 `tracing-log::LogTracer` 桥接，也**不用 `RUST_LOG` 环境变量**：本应用是小工具，配置跟着应用走（§3.6），诊断不能只靠"开发机上记得设个环境变量"才开得了。
+- **级别对 debug / release 一视同仁**：`tracing` 的级别是**运行时**的，不是编译期的——release build 也能靠配置打开 `debug` 日志。诊断能力不能随构建类型消失。
 - 旧方案 `log` + 桥接的唯一好处是"库可被不依赖 tracing 的项目使用" —— 我们没有这种外部消费者，桥接是 dead weight。
 
 **CLI / UI 用 `tracing-subscriber`**：
 
 - `Registry` + 多 `Layer` 模式天然支持双 sink（stdout + 文件）。
-- CLI: stdout + 自写 file sink（§"文件 sink" 段）。
-- UI: stdout（debug 时）+ `crossbeam_channel::Sender<LogLine>` 桥到 `state.log`，由专用 drain thread 推给 footer / `[LOG]` 页（§3.8.7.5）。
+- CLI: stderr + 自写 file sink（§"文件 sink" 段）。
+- UI: `crossbeam_channel::Sender<LogLine>` 桥到 `state.log`，由专用 drain thread 推给 footer / `[LOG]` 页（§3.8.7.5）+ **同一个 file sink**（§3.10.5：日志文件在应用目录，GUI 退出后仍然查得到）。
+- **file sink 归 lib**（`rencoder_lib::logging::file_sink`）：两个前端都要它，一份实现。
 
 **文件 sink 用自写 `MakeWriter` 而非 `tracing_appender`**：
 
@@ -3460,12 +3462,13 @@ fn push_toast(state: &mut AppState, msg: impl Into<String>, kind: ToastKind) {
 | UI drain thread panic recovery | `use_hook` 里 `std::thread::spawn` 的 drain loop 用 `std::panic::catch_unwind` 包裹(per §3.9.4);panic → 设 `state.last_error = "drain thread panicked"` + 暴露 `controller_alive: false` 在 v2 才需要, v1 只设 last_error |
 | Exit button 先 Cancel | Exit button onclick 分两阶段:active phase → 先 `cmd_tx.send(Command::Cancel)`,等 `Event::BatchCancelled`,再 `window().close()`;None/Done → 直接 `window().close()`。**代码已实现** ✅ ✅（`Msg::UserPressedQuit` ✅ ✅：设 `state.quitting` ✅ ✅ + 派 Cancel ✅ ✅，窗口在**批次停下之后**才关 ✅ ✅——这才是“优雅” ✅ ✅：记录在终态落盘 ✅ ✅，半成品先删 ✅ ✅） |
 | **Ctrl-Q 优雅退出**（新 ✅ ✅） | **Ctrl-Q** ✅ ✅——**每个 OS 都一样** ✅ ✅（webview 的按键 ✅ ✅，不经过终端 ✅ ✅，所以既没有终端模式要改 ✅ ✅，也不会撞上终端的快捷键 ✅ ✅）。语义与 Exit 按钮**同一条路** ✅ ✅：取消批次 ✅ ✅ → 等它停下 ✅ ✅ → 关窗 ✅ ✅。（CLI 那边是 **Ctrl-D** ✅ ✅，§3.11.2 ✅ ✅——两个程序各认各的键 ✅ ✅）|
+| **Ctrl-Q 需要焦点在应用里** ✅ ✅ | webview 的 `keydown` 只在**解释器根节点 `#main`** 上派发 ✅ ✅——焦点不在应用里时（刚打开、什么都没点）按键事件的 target 是 `<body>` ✅ ✅，它不在 `#main` 里面 ✅ ✅，事件**到不了 Rust** ✅ ✅。所以应用根元素必须**可聚焦**（`tabindex="0"` ✅ ✅）并**真的拿到焦点** ✅ ✅——一次**带重试的 JS 求值** ✅ ✅（`document.querySelector('.app').focus()` ✅ ✅，`autofocus` 兜底 ✅ ✅）：desktop 的 `onmounted` **不触发** ✅ ✅（没有随包的 JS 派发这个事件 ✅ ✅），焦点不能指望它 ✅ ✅——否则就是"刚打开完全无反应" ✅ ✅ |
 
 这些限制不影响协议契约（Command/Event 已端到端测试通过 mock_tests），只是 UI 渲染层不完整。
 
 #### 3.8.7.5 Unified log pipeline (UI side)
 
-> **TL;DR** — lib 与两个 binary 都用 `tracing`(v1.2 follow-up #4 替代之前的 `log` + `tracing-log` 桥接)。CLI 写到 stderr + 文件;UI 写到 `crossbeam_channel::Sender<LogLine>` → 专用 drain thread → `state.log`,footer / `[LOG]` 页统一显示。`RUST_LOG` 一套规则同时控制两层。
+> **TL;DR** — lib 与两个 binary 都用 `tracing`(v1.2 follow-up #4 替代之前的 `log` + `tracing-log` 桥接)。CLI 写到 stderr + 文件;UI 写到 `crossbeam_channel::Sender<LogLine>` → 专用 drain thread → `state.log`,footer / `[LOG]` 页统一显示,**外加同一个日志文件** ✅ ✅。级别由**配置文件**决定(§3.10.5 `[log] level`),**不用 `RUST_LOG`** ✅ ✅——一套规则同时控制两层 ✅ ✅。
 
 **Why this architecture**: lib 现在与 binary 用同一套 logging API,不再需要 `tracing-log` 桥接。`rencoder_lib` 是 `publish = false`,没有外部消费者依赖 `log` 兼容性,所以可以安全地让 lib 直接 emit `tracing` 事件。`tracing` 的结构化字段(`output = %path`, `source_fps = f`, `batch_id = id`)把 `log::info!("...{}...", arg)` 这种把字段名丢进字符串拼接的做法替代掉 —— `tracing-subscriber` 的 `fmt::Layer().json()` 输出可以按字段聚合 / 检索。`#[instrument]` 自动给函数挂 span context,子事件自动继承。
 
@@ -3524,8 +3527,7 @@ fn push_toast(state: &mut AppState, msg: impl Into<String>, kind: ToastKind) {
 - Visual 区分 ffmpeg stderr vs lib internal(都用同一灰底色)
   —— v1.2 加 color / icon
 - Filter controls(hide lib events / only show errors)—— v1.2
-- Persist log to disk on UI side(CLI 的 file sink 不覆盖 UI;
-  UI session 退出即丢;CLI 不受影响)—— v1.2 if needed
+- ~~Persist log to disk on UI side~~ ✅ ✅：**已做** ✅ ✅（§3.10.5 ✅ ✅）——GUI 与 CLI 写**同一个日志文件** ✅ ✅（应用目录的 `log/` ✅ ✅，同一个 sink 实现 ✅ ✅），UI 退出后日志仍在 ✅ ✅
 
 **Why not just write tracing events to stderr from the UI?** —
 stderr 不适合 desktop app(GUI 程序没控制台)。Sink 必须接到 UI
@@ -4158,6 +4160,25 @@ schema 层仅对需要区分缺省的字段保留存在性：只有「缺省」�
 
 验收覆盖三层优先级、显式 0 / false、等效 CLI 和 GUI 参数产生相同计划、同一批次快照稳定、透传冲突及回退参数一致性。
 
+##### 日志配置：级别与文件都在配置文件里
+
+日志是**配置**，不是环境变量。`rencoder.toml`（应用目录里，与应用同在，§3.6）多一段：
+
+```toml
+[log]
+level = "info"        # off | error | warn | info | debug | trace
+max_bytes = 10485760  # 日志文件滚到这么大就换一份
+max_days = 7          # 超过这么多天的日志文件启动时删掉
+```
+
+三条规则：
+
+1. **级别只有一处定义**：lib 的 `LogLevel` 是词表——拼错直接**解析失败**，不静默降级成"什么都看不见"；两个前端只负责把它翻成各自的 subscriber 过滤器。级别对 **debug 与 release 一视同仁**（`tracing` 的级别是运行时的）：release build 也能靠配置打开 `debug` 日志，诊断能力不随构建类型消失。
+2. **文件参数同一份**：日志文件在**应用目录**（`log/`，§3.6），CLI 与 GUI 共用同一个 sink 实现（`rencoder_lib::logging::file_sink`）——GUI 退出后日志仍在，不必靠截图或翻内存。
+3. **读取顺序**：CLI 在解析配置**之后**才开日志（日志目录本身来自配置，§3.6）；GUI 在 `main` 里先读配置再开日志（actor 那次加载是给运行用的，日志要更早）。**日志设置读不出来不是致命的**：配置坏了由运行路径报错，日志退回默认级别。
+
+日志级别是 §3.10.5 分层的一个普通实例：文件里的显式值 > 内建默认值；**没有**环境变量这一层——路径的 env 覆盖（§3.6）是"入口显式值"，日志级别没有入口参数，因此只有文件层与默认层。
+
 
 ##### NVENC 与配置解析的接口
 
@@ -4723,6 +4744,8 @@ future 待做 / ⚠️ 已作废），§8 就是当前的路线图。
 | 111 | **交互向导（`--interactive`）未实现** ✅ ✅：设计文档 §"交互模式" ✅ ✅ 列了它 ✅ ✅，但 `interact.rs` 从头到尾**只有一行注释** ✅ ✅——flag 收下了 ✅ ✅，然后什么也不做 ✅ ✅，用户只看到"要么 --file 要么 --dir" ✅ ✅（还提示"或者用 --interactive" ✅ ✅——指向一个不存在的东西 ✅ ✅）。现在传 `--interactive` **明确报错** ✅ ✅，占位文件删掉 ✅ ✅，`dialoguer` 依赖也去掉 ✅ ✅（向导真做的时候再加回来 ✅ ✅）| ❌ 未实现 |
 | 112 | **actor 的形状**（§3.10.1.2 ✅ ✅）：`run_actor` 767 行装下整个状态机 ✅ ✅（第 1 未测热点 ✅ ✅、第 2 桥节点 ✅ ✅）——文档描述的"每段一个 barrier 的链"在代码形状里看不见 ✅ ✅，审阅者没法对着文档核对 ✅ ✅。现在：**上下文对象** `Ctx` ✅ ✅（状态 ✅ ✅、路径 ✅ ✅、通道 ✅ ✅、seam ✅ ✅ 一起走 ✅ ✅——按 §3.10.4 ✅ ✅，超过 5 个参数就该问"这是不是一个上下文对象" ✅ ✅，答案是 ✅ ✅）+ **每个命令一个 handler** ✅ ✅（`on_start_batch` ✅ ✅ / `on_dry_run` ✅ ✅ / `on_cancel` ✅ ✅ / `on_load_history` ✅ ✅ / `on_save_config` ✅ ✅ / `on_check_capability` ✅ ✅ / `on_set_working_dir` ✅ ✅ / `on_analyze` ✅ ✅），`run_actor` 277 行 ✅ ✅，只做**分发** ✅ ✅。| ✅ |
 | 113 | **能力信息不进页面** ✅ ✅：Setup 页 ✅ ✅ 与 Task 页 ✅ ✅ 都**只有按钮** ✅ ✅（"details" ✅ ✅）——一个字都不直接显示 ✅ ✅；点开弹窗 ✅ ✅ 才看到**是否可用** ✅ ✅（`Capability::availability()` ✅ ✅，每个编码器 ✅ ✅ / 每项检查 ✅ ✅ 一个 ✓/✗ ✅ ✅），**不含** ffmpeg 的输出 ✅ ✅（那是每编码器一段 stderr ✅ ✅，用户不需要 ✅ ✅，它在日志里 ✅ ✅）——页面是干活的 ✅ ✅，能力清单是参考 ✅ ✅ | ✅ |
+| 114 | **日志配置在配置文件里** ✅ ✅（§3.10.5 ✅ ✅）：`[log] level / max_bytes / max_days` ✅ ✅——**不用 `RUST_LOG`** ✅ ✅（本应用是小工具 ✅ ✅，配置跟着应用走 ✅ ✅，§3.6 ✅ ✅）；级别是**运行时**的 ✅ ✅，**debug 与 release 一视同仁** ✅ ✅（release build 也能靠配置打开 `debug` ✅ ✅，诊断能力不随构建类型消失 ✅ ✅）；词表在 lib ✅ ✅（拼错直接解析失败 ✅ ✅，不静默降级 ✅ ✅）；file sink 归 lib ✅ ✅（`rencoder_lib::logging::file_sink` ✅ ✅），CLI 与 GUI 写**同一个日志文件** ✅ ✅（应用目录的 `log/` ✅ ✅）——GUI 退出后日志仍在 ✅ ✅ | ✅ |
+| 115 | **Ctrl-Q 的焦点契约** ✅ ✅（§3.8.7.4 ✅ ✅）：webview 的 `keydown` 只在 `#main` 上派发 ✅ ✅——焦点不在应用里时 target 是 `<body>` ✅ ✅，事件到不了 Rust ✅ ✅。应用根元素**可聚焦** ✅ ✅（`tabindex="0"` ✅ ✅）+ **真的拿到焦点** ✅ ✅（一次带重试的 JS 求值 ✅ ✅，`autofocus` 兜底 ✅ ✅；desktop 的 `onmounted` 不触发 ✅ ✅，指望它就是指望一个不会发生的事件 ✅ ✅）——"刚打开完全无反应"不再是未解释的现象 ✅ ✅ | ✅ |
 
 ---
 

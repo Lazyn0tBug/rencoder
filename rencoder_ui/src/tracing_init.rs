@@ -5,9 +5,11 @@
 //! UI consumes lib events the same way it consumes its own
 //! tracing events — single channel, single subscriber.
 //!
-//! Sink: UI doesn't have a console (desktop app), so events
-//! flow into a `crossbeam_channel::Sender<String>` drained by
-//! a dedicated thread that pushes into `state.log` via the reducer.
+//! Sinks: the UI has no console, so events flow into a
+//! `crossbeam_channel::Sender<String>` drained by a dedicated thread
+//! that pushes into `state.log` via the reducer — **plus** the same
+//! rotating log file the CLI writes (application dir, design doc
+//! §3.10.5): the GUI's logs have to outlive the session.
 //!
 //! Flow:
 //!
@@ -23,12 +25,23 @@
 //! and spawns the drain thread. We use a `OnceLock` rather than
 //! plumbing the receiver through main.rs → App() because the
 //! Dioxus launch path doesn't take constructor args.
+//!
+//! The **level** comes from the config file (`[log] level`), not
+//! from an environment variable: it is a runtime setting, so a
+//! release build logs exactly as much as a debug build when the
+//! config says so (design doc §3.10.5).
 
 use std::io;
+use std::path::Path;
 use std::sync::OnceLock;
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+use rencoder_lib::config::app::AppConfig;
+use rencoder_lib::logging::file_sink::FileSink;
+use rencoder_lib::logging::{level_filter, LogSettings};
 
 /// The receiver side of the log channel, populated by `init()` and
 /// taken (cloned) by App's `use_hook` for the drain thread.
@@ -39,28 +52,61 @@ use tracing_subscriber::fmt::MakeWriter;
 /// `set` happens after `get`.
 pub static LOG_RECEIVER: OnceLock<Receiver<String>> = OnceLock::new();
 
-/// Initialize the global tracing subscriber.
+/// Initialize the global tracing subscriber: the log pane + the log
+/// file.
 ///
 /// Idempotent: subsequent calls are no-ops (subscriber init
 /// returns `Err` and is swallowed). The receiver becomes
 /// available via `LOG_RECEIVER.get()`.
-pub fn init() {
+pub fn init(log_dir: &Path, config: &AppConfig) {
+    let settings = LogSettings::from_config(config);
+
     let (tx, rx) = unbounded::<String>();
     LOG_RECEIVER
         .set(rx)
         .expect("tracing_init::init called twice");
 
-    let writer = ChannelWriter { tx };
+    let writer = ChannelWriter { tx: tx.clone() };
 
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-
-    let _ = tracing_subscriber::fmt()
+    let pane_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
         .with_thread_ids(false)
-        .with_writer(writer)
-        .with_env_filter(filter)
+        .with_writer(writer);
+
+    // The log file is the same one the CLI writes (application dir,
+    // §3.10.5). A failure here is not fatal: the pane still works,
+    // and the reason goes to the pane too -- a GUI app has no
+    // console to complain on.
+    let file_layer = match open_file_sink(log_dir, &settings) {
+        Ok(sink) => Some(
+            tracing_subscriber::fmt::layer()
+                .compact()
+                .with_ansi(false)
+                .with_target(true)
+                .with_thread_ids(false)
+                .with_writer(sink),
+        ),
+        Err(e) => {
+            let _ = tx.send(format!("rencoder: cannot open the log file: {e}"));
+            None
+        }
+    };
+
+    let _ = tracing_subscriber::registry()
+        .with(level_filter(settings.level))
+        .with(pane_layer)
+        .with(file_layer)
         .try_init();
+}
+
+/// Open the rotating log-file sink, creating the log directory if it
+/// is not there yet.
+fn open_file_sink(log_dir: &Path, settings: &LogSettings) -> io::Result<FileSink> {
+    std::fs::create_dir_all(log_dir)?;
+    // The mode bits are the lib's business (they are a no-op where
+    // the ACL already says the same thing).
+    let _ = rencoder_lib::platform::perms::set_app_dir_mode(log_dir);
+    FileSink::new(log_dir, settings.max_bytes, settings.max_days)
 }
 
 /// `MakeWriter` impl that pushes formatted log lines into a

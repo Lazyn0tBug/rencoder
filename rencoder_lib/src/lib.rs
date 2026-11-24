@@ -14,6 +14,7 @@ pub mod encoder;
 pub mod error;
 pub mod guard;
 pub mod job;
+pub mod logging;
 pub mod pipeline;
 pub mod platform;
 pub mod test_support;

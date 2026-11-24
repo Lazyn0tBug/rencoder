@@ -1,7 +1,7 @@
 //! Tracing initialization.
 //!
 //! Two output sinks:
-//! - stdout via `fmt` (RUST_LOG / default info)
+//! - stderr via `fmt` (the level comes from the config file)
 //! - rotating file under `<app_dir>/log/` (U18; `$RENENCODER_LOG_DIR` overrides)
 //!   default 10 MB, 7 days
 //!
@@ -11,12 +11,19 @@
 //! Span events are enabled so each `info!` / `warn!` carries the span
 //! context (function name + entered spans). `#[instrument]` annotations
 //! on `encode_cmd` / `analyze_cmd` propagate the span hierarchy.
+//!
+//! **The level is configuration, not an environment variable** (design
+//! doc §3.10.5): `[log] level` in `rencoder.toml`, next to the app.
+//! A release build logs exactly as much as a debug build when the
+//! config says `debug` -- the level is a runtime setting.
 
 use std::path::Path;
 
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::file_sink::FileSink;
+use rencoder_lib::config::app::AppConfig;
+use rencoder_lib::logging::file_sink::FileSink;
+use rencoder_lib::logging::{level_filter, LogSettings};
 
 /// Initialize the global tracing subscriber with stdout + file sinks.
 ///
@@ -24,10 +31,11 @@ use crate::file_sink::FileSink;
 /// `Err` and we swallow it). Filesystem errors (log dir creation /
 /// mode-bit set) propagate via `Result` so the binary exits with a
 /// clean error message instead of panicking.
-pub fn init(log_dir: &Path) -> anyhow::Result<()> {
+pub fn init(log_dir: &Path, config: &AppConfig) -> anyhow::Result<()> {
     use anyhow::Context;
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let settings = LogSettings::from_config(config);
+    let filter = level_filter(settings.level);
 
     let stdout_layer = fmt::layer()
         .with_target(false)
@@ -38,12 +46,12 @@ pub fn init(log_dir: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(log_dir).context("create log dir")?;
     rencoder_lib::platform::perms::set_app_dir_mode(log_dir).context("set log dir mode bits")?;
 
-    let file_sink =
-        FileSink::new(log_dir, 10 * 1024 * 1024, 7).context("failed to open log file sink")?;
+    let file_sink = FileSink::new(log_dir, settings.max_bytes, settings.max_days)
+        .context("failed to open log file sink")?;
     // File layer is for post-mortem analysis: keep it scannable.
     // - `.compact()` produces Format::Compact, which renders span
     //   fields inline without the Pretty field formatter's ANSI
-    //   styling. (`with_ansi(false)` alone is not enough — the
+    //   styling. (`with_ansi(false)` alone is not enough -- the
     //   default `Format::Full` uses `Pretty` for span-field display,
     //   which emits escape codes regardless of the layer-level
     //   ANSI flag. Confirmed via `xxd` on a sample run.)
@@ -56,9 +64,9 @@ pub fn init(log_dir: &Path) -> anyhow::Result<()> {
         .with_ansi(false)
         .with_target(true)
         .with_thread_ids(false)
-        .with_writer(file_sink)
-        .with_filter(EnvFilter::new("info"));
+        .with_writer(file_sink);
 
+    // One filter for both sinks: the level the config asked for.
     let _ = tracing_subscriber::registry()
         .with(filter)
         .with(stdout_layer)
@@ -74,7 +82,8 @@ mod tests {
     #[test]
     fn init_is_idempotent() {
         let dir = std::env::temp_dir().join(format!("rencoder_log_init_{}", std::process::id()));
-        init(&dir).expect("first init");
-        init(&dir).expect("second init (idempotent)");
+        let config = AppConfig::default();
+        init(&dir, &config).expect("first init");
+        init(&dir, &config).expect("second init (idempotent)");
     }
 }

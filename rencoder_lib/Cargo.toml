@@ -22,6 +22,11 @@ toml = "0.8"
 # win we wanted. CLI / UI keep their `tracing-log` bridge
 # until commit 3 drops it.
 tracing = "0.1"
+# The logging setup both frontends share: the level vocabulary
+# (`LogLevel` -> a subscriber filter) and the rotating file sink
+# (§2.3 / §3.10.5). `publish = false` -- internal lib, so the
+# subscriber dependency does not leak into a public API surface.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "1"
 num_cpus = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

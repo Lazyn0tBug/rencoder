@@ -20,6 +20,6 @@ pub mod paths;
 // instead of `rencoder_lib::config::app::AppConfig`.
 pub use app::{
     AnalyzeConfig, AnalyzeFormatArg, AppConfig, EncodeConfig, EncodersConfig, FfmpegArgsConfig,
-    FormatArg, PathsConfig,
+    FormatArg, LogConfig, LogLevel, PathsConfig,
 };
 pub use paths::Paths;

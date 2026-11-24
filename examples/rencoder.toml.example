@@ -85,3 +85,19 @@ parallel = true
 # cancel_file = "cancel"
 # Run capability check report -- relative to the operation directory.
 # capability_report = "capabilities.json"
+
+[log]
+# How much the app says. One of: off | error | warn | info | debug | trace.
+# Default: info.
+#
+# This is a RUNTIME setting: a release build logs exactly as much as a
+# debug build when this says "debug". Set it to "debug" to see what the
+# app is doing, then put it back.
+level = "info"
+
+# Roll the log file over to the next one when it grows past this size
+# (bytes). Default: 10485760 (10 MB).
+# max_bytes = 10485760
+
+# Delete log files older than this many days. Default: 7.
+# max_days = 7

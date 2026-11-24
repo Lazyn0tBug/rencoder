@@ -317,16 +317,17 @@ rencoder encode -d ./input/ -- -tune film -preset slow
 
 Rencoder emits structured tracing events with span context. Two sinks:
 
-1. **stdout** — formatted per `tracing-subscriber` defaults; `RUST_LOG`
-   controls the level (default `info`).
+1. **stderr** — formatted per `tracing-subscriber` defaults.
 2. **Rolling file** — `<app_dir>/log/rencoder.YYYY-MM-DD.NN.log`:
    - Daily rollover (NN resets at midnight).
    - Size rollover when the current file reaches 10 MB (NN increments).
    - Files older than 7 days deleted at startup.
 
 Each event carries span context (function name + entered spans) because
-`encode_cmd` / `analyze_cmd` use `#[instrument]`. The library's `log`
-calls feed the same subscriber via `tracing-log`.
+`encode_cmd` / `analyze_cmd` use `#[instrument]`.
+
+The GUI writes the same log file (its own log pane shows the same
+events while the app is open).
 
 Override the log directory via `RENENCODER_LOG_DIR`:
 
@@ -336,15 +337,25 @@ RENENCODER_LOG_DIR=/tmp/rencoder-debug ./rencoder encode -d ~/Movies
 
 ### 5.1 Verbosity control
 
+The level is **configuration**, not an environment variable — it lives
+in the config file next to the app (`<app_dir>/rencoder.toml`):
+
+```toml
+[log]
+level = "debug"       # off | error | warn | info | debug | trace
+max_bytes = 10485760  # roll the log file at 10 MB
+max_days = 7          # keep a week of log files
+```
+
+The level is a *runtime* setting: a release build logs exactly as much
+as a debug build when the config says so. Change it, restart the app,
+read the log — no rebuild, no environment variable.
+
 ```sh
-# All debug events
-RUST_LOG=debug rencoder encode -d ./input/
-
-# Only rencoder's debug events, deps at warn
-RUST_LOG=rencoder=debug,info rencoder encode -d ./input/
-
-# Trace level (extremely verbose; useful for ffmpeg issue debugging)
-RUST_LOG=trace,rencoder_ffmpeg=trace rencoder encode -d ./input/
+# what the app just did
+$EDITOR <app_dir>/rencoder.toml   # set level = "debug"
+rencoder encode -d ./input/
+tail -f <app_dir>/log/rencoder.*.log
 ```
 
 ---

@@ -10,7 +10,6 @@
 //! encoder overrides) come from the TOML config file.
 
 mod args;
-mod file_sink;
 mod keys;
 mod signal;
 mod tracing_init;
@@ -109,7 +108,7 @@ fn prepare(
         .unwrap_or_else(|| app_dir.clone());
     let paths = Paths::resolve(config_path, app_dir, op_dir, &app_config);
 
-    tracing_init::init(&paths.log_dir).context("initialize tracing")?;
+    tracing_init::init(&paths.log_dir, &app_config).context("initialize tracing")?;
     if !config_existed {
         info!(
             config_path = %paths.config_file.display(),
