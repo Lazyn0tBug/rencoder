@@ -235,10 +235,33 @@ pub fn check_run_capabilities(paths: &Paths, facts: &MachineFacts) -> Capabiliti
 
 /// Can a file be created in this directory?
 fn writable(name: &str, dir: &Path) -> Check {
-    match crate::config::fs_perms::ensure_dir_writable(dir) {
+    match ensure_dir_writable(dir) {
         Ok(()) => Check::ok(name),
         Err(e) => Check::failed(name, e.to_string()),
     }
+}
+
+/// Check that a file can be created in `dir`, leaving nothing behind.
+///
+/// The **filesystem** part of the run capability check (design doc
+/// §3.10.7): the app directory holds the config, the records and the
+/// cancel request, so a directory that cannot be written means the run
+/// cannot finish. That is a precondition, checked before the work
+/// starts -- not something to discover when the run is over, or when a
+/// signal arrives.
+///
+/// The probe file's name starts with a dash so the input collector
+/// skips it even if this process dies between the write and the
+/// delete.
+///
+/// This is plain `std` -- it is not an OS difference, so it does not
+/// belong in the platform layer (design doc §1.3).
+fn ensure_dir_writable(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let probe = dir.join(format!("-rencoder-write-probe.{}", std::process::id()));
+    std::fs::write(&probe, b"")?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
 }
 
 /// Can ffmpeg run? The probe the check runs when nobody asked before.

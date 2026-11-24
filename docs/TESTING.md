@@ -38,13 +38,20 @@ macOS + Linux ✅）。分开是因为 webview 依赖比核心重得多 ✅ —�
 - **Windows 的信号处理**：`rencoder_cli::signal` 的 Windows 分支用
   `SetConsoleCtrlHandler` ✅（Unix 用 `signal-hook` ✅）。这个分支以前**从未被编译过**
   ✅（写的时候手边没有 Windows 工具链 ✅）——CI 的 Windows job 现在会编它 ✅ ✅。
+- **控制台事件只到 app，不到编码器**：Windows 的控制台事件发给整个**进程组** ✅ ✅，
+  Unix 的信号只发给一个进程 ✅ ✅。所以 lib 启动 ffmpeg 时在 Windows 上给它单独建组
+  （`CREATE_NEW_PROCESS_GROUP` ✅ ✅，关在 `rencoder_lib::platform::process` ✅ ✅）——
+  否则 Ctrl-C 会把 ffmpeg 一起杀掉 ✅ ✅，那个文件会被记成 failed ✅ ✅ 而不是整批
+  cancelled ✅ ✅，退出码也不是 130 ✅ ✅。
 - **文件系统大小写**：Linux 区分大小写 ✅，macOS/Windows 不区分 ✅。代码里一律按
-  **不区分大小写**比较 ✅（`utils::fs::is_same_file` ✅）——在 Linux 上偏保守 ✅
-  （把两个不同的文件当成同一个 ✅），不会出错 ✅ ✅。
+  **不区分大小写**比较 ✅（`platform::fs_semantics` ✅，`utils::fs::is_same_file` ✅ 用它）
+  ——在 Linux 上偏保守 ✅（把两个不同的文件当成同一个 ✅），不会出错 ✅ ✅。
 - **mtime 粒度**：预演失效要比较输入的"大小 + mtime" ✅（§3.10.5 ✅）。某些文件系统
   的 mtime 精度只到秒 ✅ ——同秒内改内容且大小不变时可能漏判 ✅，大小变了就能抓住 ✅ ✅。
-- **文件锁**：守卫用的是内核文件锁 ✅（Unix 上是 `flock` ✅）——内核在进程死时释放 ✅，
-  所以"进程被 kill"不会留下死锁 ✅ ✅。macOS 与 Linux 的 `flock` 语义一致 ✅ ✅。
+- **文件锁**：守卫用的是内核文件锁 ✅（Unix 上是 `flock` ✅，Windows 上是打开时的共享模式
+  ✅ ✅）——内核在进程死时释放 ✅，所以"进程被 kill"不会留下死锁 ✅ ✅。机制不同 ✅ ✅，
+  契约相同 ✅ ✅：五条性质 ✅ ✅（原子抢占 / 死亡自动释放 / 可探测不干扰 / 不挡读 / 按路径
+  定位 ✅ ✅）由**同一份**契约测试在两个平台上断言 ✅ ✅（`platform::lock` ✅ ✅）。
 
 ## 手动在别的机器上跑
 

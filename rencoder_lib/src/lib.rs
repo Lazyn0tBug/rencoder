@@ -15,6 +15,7 @@ pub mod error;
 pub mod guard;
 pub mod job;
 pub mod pipeline;
+pub mod platform;
 pub mod test_support;
 pub mod types;
 pub mod utils;

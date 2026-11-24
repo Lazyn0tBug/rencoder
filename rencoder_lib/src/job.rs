@@ -4634,13 +4634,12 @@ mod mock_tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn cancel_during_encode_removes_partial_output() {
         // v1.2 follow-up #2: end-to-end test through the actor's
         // full StartBatch path. The mock calls the REAL
-        // run_ffmpeg_with_progress with `argv[0] = "sh"` — a
-        // shell script acts as fake-ffmpeg, writes to a real
-        // partial output file, and emits `progress=continue`
+        // run_ffmpeg_with_progress with this test binary as the
+        // fake-ffmpeg (test_support::fake_ffmpeg_argv): it writes to
+        // a real partial output file, and emits `progress=continue`
         // blocks like real ffmpeg.
         //
         // On the first progress block, the mock cancels the
@@ -4673,34 +4672,13 @@ mod mock_tests {
         let partial_check_b = partial.clone();
         std::fs::write(&partial, b"garbage").unwrap();
 
-        // Fake-ffmpeg script: emits progress blocks + writes more
-        // garbage to the output. Loops ~forever; we kill it via
-        // cancel.
-        let script = format!(
-            r#"
-            i=0
-            while [ $i -lt 200 ]; do
-                printf 'frame=%d\nfps=30\nspeed=1.0x\nout_time_us=1000000\nprogress=continue\n' $i
-                echo garbage >> {}
-                sleep 0.05
-                i=$((i+1))
-            done
-            "#,
-            partial.display()
-        );
-
         let (cmd_tx, evt_rx) = run_test_controller(
             move |task: &EncodeTask,
                   _ctx: &mut BatchContext,
                   cancel: &CancelToken,
                   on_progress: &mut dyn FnMut(FfmpegProgress)| {
                 let output = task.output.to_string_lossy().into_owned();
-                let argv = vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    script.clone(),
-                    output.clone(),
-                ];
+                let argv = crate::test_support::fake_ffmpeg_argv(&task.output);
                 assert_eq!(
                     argv.last().unwrap(),
                     &output,

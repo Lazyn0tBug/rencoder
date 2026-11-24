@@ -66,25 +66,57 @@ Rencoder 是一个独立的第三方应用，不是发布到 crates.io 的通用
 
 ### 1.3 跨平台代码封装约定（U18）
 
-涉及平台特定行为的代码（file mode bits 等）遵循"**定义处条件编译，使用处统一接口**"原则：
+涉及平台特定行为的代码（file mode bits、文件锁、文件名大小写等）遵循"**定义处条件编译，使用处统一接口**"原则：
 
 - **cfg 只出现在定义处**——写出平台特定逻辑的函数内部。
 - **调用处只看到 uniform signature**——一个名字、一个签名，跨平台一致。
+- **统一的是功能语义，不是机制**——OS 的机制差异（Unix 的 `flock` vs Windows 的共享模式）
+  是事实，不去动它；统一的是**应用能依赖的契约**：同样的输入得到同样的行为，
+  同一份断言在两个平台都成立 ✅。
 - **当前实现：GUI 是 Unix only**（§8 row 35 ✅）；lib 与 CLI 在 macOS、
   Linux、Windows 三台宿主机上构建并测试 ✅ ——CI（`.github/workflows/ci.yml` ✅）
-  在三台上跑闸门 ✅。非 Unix 平台的等价行为**尚未实现**（future work ✅）。
-- **新增平台行为只改一个文件**——后续要落非 Unix 平台特定特性时，只改
-  定义处的实现，调用方零改动。
+  在三台上跑闸门 ✅。
+- **新增平台行为只改一个文件**——所有 OS 差异集中在 `rencoder_lib::platform`
+  （+ CLI 私有的 `rencoder_cli::signal`），调用方零改动 ✅。
 
-#### 当前实现（Unix：macOS 已验证 ✅，Linux 由 CI 覆盖 ✅）
+#### 封装层：`rencoder_lib::platform`
 
-| 操作 | Unix (macOS / Linux) | 非 Unix | 模块 |
-|------|----------------------|---------|------|
-| config 文件 mode bits | `0o644` | no-op（TBD future work） | `rencoder_lib::config::fs_perms::set_config_file_mode` |
-| log / data 目录 mode bits | `0o755` | no-op（TBD future work） | `rencoder_lib::config::fs_perms::set_app_dir_mode` |
-| SIGINT/TERM/HUP → 清理半成品文件（§3.4.5） | `signal-hook`（INT / TERM / HUP） | console event（`SetConsoleCtrlHandler`，本仓实现） | `rencoder_cli::signal` + `rencoder_lib::pipeline::partial_output` |
+产品代码里的 OS 差异只在这个文件（+ CLI 私有的 `rencoder_cli::signal` ✅ —— 已登记的例外 ✅）；
+测试里另有几个 Unix-only 用例 ✅ ✅（符号链接 ✅ ✅、POSIX 权限位 ✅ ✅——它们测的是**机制** ✅ ✅，
+不是**行为** ✅ ✅）。它把四类 OS 差异各收成一个契约 ✅ ✅：
 
-**信号处理的 platform divergence 在定义处**：本节列出的 fs_perms 调用的是 Unix-only Rust stdlib
+| 契约 | 应用可以依赖什么 | Unix (macOS / Linux) 怎么做到 | Windows 怎么做到 | 模块 |
+|------|----------------|-----------------------------|-----------------|------|
+| config 文件权限 | 用户能改、别人能读 | `0o644` | ACL 继承（no-op 即等价） | `platform::perms::set_config_file_mode` |
+| log / data 目录权限 | 能进、能写 | `0o755` | ACL 继承（no-op 即等价） | `platform::perms::set_app_dir_mode` |
+| 目标抢占（§3.11.1.1） | 五条性质：原子抢占 / 死亡自动释放 / 可探测且不干扰 / **不挡读** / 按路径定位 | std 的 `flock`（建议锁） | 打开时的**共享模式**（拒写不拒读） | `platform::lock` |
+| 文件名折叠 | "输出永远不等于输入"在所有平台成立（§3.11.2） | 唯一折叠口径（小写折叠，保守方向） | 同左（不按平台分叉） | `platform::fs_semantics` |
+| 子进程隔离 | "停止一切"的事件只到 app，不到它启动的编码器（§3.11.2） | 信号发给一个进程，天然隔离 | 控制台事件发给进程组 → 子进程单独建组 | `platform::process` |
+| SIGINT/TERM/HUP → 清理半成品文件（§3.4.5） | 收到中断就清半成品、停整批 | `signal-hook`（INT / TERM / HUP） | console event（`SetConsoleCtrlHandler`，本仓实现） | `rencoder_cli::signal` + `rencoder_lib::pipeline::partial_output` |
+
+**锁：统一契约，不统一机制**。两个平台的抢占原语不同，而且**必须**不同：std 的
+`LockFileEx` 是**强制锁**、锁住整个文件，持有期间别的句柄连读都读不到，
+契约第 4 条"不挡读"会被直接破坏 → Windows 用**打开时的共享模式**（持有者以写权限打开、
+共享模式允许别人读和删、拒绝别人写）；Unix 侧用 std 的 `flock`（建议锁，不挡读），
+并额外复核"名字是否仍指向自己锁住的 inode"（`flock` 锁的是 inode，打开与上锁之间有窗口）。
+两套机制各自实现，**应用看到的只有 `claim` / `probe` 与 `Busy` / `Unreadable` / `Unsupported`
+三种结果**。第三档平台（既非 Unix 也非 Windows）返回 `Unsupported` → 守卫**拒绝这一趟**
+（安全默认），而不是假装抢占成功。
+
+**契约测试两边同跑**：`platform::lock` 里有**一份**平台无关的契约测试，逐条断言上面五条性质——
+两个平台跑的是**同一份断言**，这就是"功能语义统一"的落地形式 ✅。
+Unix 特有的**机制**细节（inode 复核）另有一条 `#[cfg(unix)]` 的机制测试。
+
+**权限：no-op 是等价实现，不是 TODO**。Windows 没有 POSIX mode bits，
+但文件与目录的 ACL 默认从父目录继承：用户可写、他人可读——正是契约要的效果，
+所以非 Unix 分支是 no-op 而不是"未实现"。
+
+**文件名折叠：唯一口径，保守方向**。`file_key` 与 `is_same_file` 过去各用一套
+（Unicode `to_lowercase` vs ASCII `eq_ignore_ascii_case`）。现在统一到
+`platform::fs_semantics`：小写折叠后比较，**永远视作不区分大小写**。
+保守方向是有意的：宁可多改一个名，也不覆盖源文件——"输出 ≠ 输入"是结构性要求。
+
+**信号处理的 platform divergence 在定义处**：mode bits 调用的是 Unix-only Rust stdlib
 API（`PermissionsExt::from_mode`），所以需要 `#[cfg(unix)]` 切到 no-op 分支。信号处理同样有
 platform divergence，但**只存在于 `rencoder_cli::signal` 一个文件里**：Unix 侧用 `signal-hook`
 收 SIGINT / SIGTERM / SIGHUP，Windows 侧用 `windows-sys` 的 `SetConsoleCtrlHandler` 收 console
@@ -104,12 +136,13 @@ event。调用方（`main.rs`）看到的签名不变——`install_handler() ->
 
 ```rust
 // 跨平台统一调用，调用方零 cfg
-fs_perms::set_config_file_mode(&tmp)?;
+platform::perms::set_config_file_mode(&tmp)?;
+let claim = platform::lock::claim(&marker)?;
 ```
 
 非 Unix 分支显式写 `let _ = path; Ok(())` 而非省略——让"该平台未实现"
-成为**编译期事实**，而不是运行期才发现调用缺失。落地非 Unix 平台
-行为时只改 `fs_perms.rs` 一个文件，调用方零改动。
+成为**编译期事实**，而不是运行期才发现调用缺失。落地新平台行为时
+只改 `rencoder_lib::platform`（+ `rencoder_cli::signal`），调用方零改动。
 
 ---
 
@@ -148,9 +181,9 @@ fs_perms::set_config_file_mode(&tmp)?;
 | 单目录应用部署 | `scripts/dist.sh` 把 target 产物 + LICENSE + README + 配置种子装配成单目录应用（U18） | 跨平台一致；解压即用；放弃 `cargo install` 的共享 `~/.cargo/bin/` 模式 |
 | `rencoder_lib` publish 策略 | `publish = false`（U18） | 内部 lib，不发布到 crates.io；防止内部 API 泄露锁死 schema |
 | 配置路径解析 | `$RENENCODER_CONFIG` > `<app_dir>/rencoder.toml`（U18） | 二级解析；env 覆盖用于 read-only fs / 调试 |
-| 跨平台代码封装 | cfg 只在定义处（`fs_perms.rs`），调用处 uniform signature（U18） | 平台差异集中单文件维护；非 Unix 平台尚未实现（future work） |
+| 跨平台代码封装 | cfg 只在定义处（`rencoder_lib::platform`），调用处 uniform signature（U18） | 平台差异集中单文件维护；统一功能语义（契约 + 两平台同跑的契约测试），不统一机制 |
 | Rust 版本 | 2021 Edition | 稳定 |
-| 目标平台 | Linux / macOS（Windows 后续） | 跨平台 |
+| 目标平台 | Linux / macOS / Windows（lib + CLI，CI 三平台跑闸门）；GUI 仍 Unix only | 跨平台 |
 
 ### 2.1 关于 `ffmpeg-next` crate 的决策
 
@@ -506,6 +539,7 @@ ffmpeg 不带 `-r` 时并不等于"不干预帧率"——默认 vsync 行为会�
 - `encoder/{command,select}.rs` 拥有 `build_ffmpeg_command` + `select_encoder`
 - `pipeline/{batch,cancel,cache}.rs` 拥有 `transcode_batch` + `CancelToken` + 从已解析能力构造编码器缓存（`cache_from_resolution`）
 - `utils/{fs,time}.rs` 拥有 `output_path_for` + `is_same_file` + `utc_timestamp_filename`
+- `platform.rs` 拥有全部 OS 差异（`lock` 抢占契约 / `perms` 权限契约 / `fs_semantics` 文件名折叠契约）——全仓唯一的 `#[cfg]` 所在（§1.3）
 - `config/mod.rs` 拥有配置的重导出（运行时 `Config` 已退役 —— §8 item 83）
 - `config/app.rs` 拥有 user-facing `AppConfig`（U18 重命名自 `project.rs`；TOML 加载在 U17 新增）
 
@@ -530,6 +564,7 @@ rencoder_lib/
 │   └── select.rs                # select_encoder（cache + Config → 编码器名）
 ├── error.rs                     # EncodeError（thiserror）
 ├── job.rs                       # GUI actor 入口（§3.8）：Command/Event + start_controller()
+├── platform.rs                  # 唯一的 OS 差异文件：lock / perms / fs_semantics（§1.3）
 ├── pipeline/
 │   ├── mod.rs
 │   ├── batch.rs                 # 编排：collect_files → transcode_batch（按文件循环，写记录+日志）
@@ -4412,6 +4447,14 @@ worker 拿不到时**这一批开不了工** ✅ ✅ → 终态错误事件 ✅ 
     进程。所以回调里只做"置位 + 返回"，不做可能阻塞的事——半成品删除与记录落盘
     都在批自己的线程上做 ✅。（回调跑在系统创建的独立线程上，不在信号处理器
     上下文里，所以一行日志是安全的 ✅；要避免的是会等很久的 IO ✅。）
+- **编码器不接收"停止一切"的事件**（把 Windows 的行为对齐到 Unix ✅ ✅）：Unix 的信号发给
+  **一个进程** ✅ ✅，所以 CLI 收到的 SIGINT 不会波及 ffmpeg ✅ ✅——是 lib 自己杀掉子进程
+  ✅ ✅、删半成品 ✅ ✅、写记录 ✅ ✅。Windows 的控制台事件发给整个**进程组** ✅ ✅，ffmpeg
+  继承了 CLI 的组 ✅ ✅，事件会把它一起杀掉 ✅ ✅ → 那个文件会被记成 **failed** ✅ ✅ 而不是
+  整批 **cancelled** ✅ ✅，退出码也不是 130 ✅ ✅，半成品还留在盘上 ✅ ✅。
+  所以 lib 启动 ffmpeg 时给它**单独一个进程组**（`CREATE_NEW_PROCESS_GROUP` ✅ ✅），
+  恢复"一个进程一个事件"的语义 ✅ ✅。这条差异关在 `rencoder_lib::platform::process`
+  ✅ ✅（§1.3 ✅ ✅）——调用处零 cfg ✅ ✅。
 - **半成品只有一个地方删**：取消时由 lib 的执行路径删（按 argv 找到那个输出文件），
   信号处理器不再自己删。于是 CLI 不再需要"当前输出路径"那个注册表
   （`PartialOutputHandle`）——它曾经存在的唯一理由就是让信号处理器去删文件。
@@ -4637,6 +4680,8 @@ future 待做 / ⚠️ 已作废），§8 就是当前的路线图。
 | 108 | **预演失效的比较放在点击时**（§3.10.5 ✅ ✅）：预演冻结的代次与当前代次都是 lib 给的事实 ✅ ✅，UI 比的是这两个 ✅ ✅；代次只有一处会动——**用户请求的那次检查** ✅ ✅（UI 自己发起 ✅ ✅、结论回到 UI ✅ ✅）；批次的第一段**不再自己探** ✅ ✅（它取已发布的事实 ✅ ✅，§3.10.1.2 ✅ ✅），所以"点击之后事实被刷新"不存在 ✅ ✅——actor 不重复这次比较 ✅ ✅（剩下的窗口 = 能力事件在路上的一拍 ✅ ✅，毫秒级 ✅ ✅）| ✅ |
 | 107 | **链在 actor 里，每段一个 barrier**（§3.10.1.2）：接纳 → 事实成立 → 执行 → 终态 ✅ ✅；**等待归 actor** ✅ ✅（事实的发布落地 = 第一道 barrier 的释放点 ✅ ✅），worker **不再轮询**已发布状态 ✅ ✅（它拿到的是冻结的事实快照 ✅ ✅）；**取消能打断 barrier** ✅ ✅——批次停在第一段时取消就地结束 ✅ ✅（`BatchCancelled { completed: 0 }` ✅ ✅，worker 根本不起 ✅ ✅）；事实迟迟不落地 → actor 的 deadline 分支判失败 ✅ ✅（闸门不会永远关着 ✅ ✅）| ✅ |
 | 106 | **必要时的一次检查**（§3.10.7）：能力是**机器的事实**，成立一次就沿用 ✅ ✅——没有例行的"重检" ✅ ✅；检查只发生在两种必要时 ✅ ✅：记录不成立（没有 / 指纹对不上）✅ ✅，或用户说机器变了 ✅ ✅（GUI 的 "check now" ✅ ✅、CLI 的 `--detect` ✅ ✅）；一次请求最多一次检查 ✅ ✅；**批次不发起检查** ✅ ✅——它取已发布的事实 ✅ ✅（链的第一段 = "确保事实成立" ✅ ✅）；检查的结论发布一代，整体共享 ✅ ✅（§3.10.6 步骤 5 ✅ ✅）| ✅ |
+
+| 109 | **跨平台封装层**（§1.3 ✅ ✅）：OS 差异集中在 `rencoder_lib::platform` 一个文件 ✅ ✅——锁（抢占契约 ✅ ✅）/ 权限 ✅ ✅ / 文件名折叠 ✅ ✅ / 子进程隔离 ✅ ✅；**统一的是功能语义，不是机制** ✅ ✅（机制是 OS 的事实 ✅ ✅，契约是应用的依赖 ✅ ✅）；契约由**同一份**测试在两个平台上断言 ✅ ✅；产品代码里 `#[cfg]` 只出现在这个文件 ✅ ✅（+ CLI 私有的 `rencoder_cli::signal` ✅ ✅），测试里另有几个 Unix-only 用例 ✅ ✅（符号链接 ✅ ✅、POSIX 权限位 ✅ ✅——测的是机制 ✅ ✅，不是行为 ✅ ✅）| ✅ |
 
 ---
 

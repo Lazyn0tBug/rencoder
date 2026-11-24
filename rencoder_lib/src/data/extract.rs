@@ -33,20 +33,25 @@ use crate::types::VideoMetadata;
 /// Spawns one `ffprobe` process with `-show_entries` filtered to the three
 /// fields we need.
 pub fn probe_video_metadata(input: &Path) -> Result<VideoMetadata, EncodeError> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=codec_name,avg_frame_rate,r_frame_rate",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "json",
-        ])
-        .arg(input)
+    let mut cmd = Command::new("ffprobe");
+    cmd.args([
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=codec_name,avg_frame_rate,r_frame_rate",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "json",
+    ])
+    .arg(input);
+    // The probe must not die from the platform's "stop everything"
+    // event: a killed probe would record a *failed* file instead of
+    // cancelling the run (platform::process).
+    crate::platform::process::isolate_from_console_events(&mut cmd);
+    let output = cmd
         .output()
         .map_err(|e| EncodeError::Probe(format!("ffprobe spawn: {e}")))?;
 

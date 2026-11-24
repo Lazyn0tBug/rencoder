@@ -155,7 +155,7 @@ fn matches_extension(path: &Path, extensions: &[String]) -> bool {
     match path.extension().and_then(|e| e.to_str()) {
         Some(ext) => extensions
             .iter()
-            .any(|allowed| allowed.eq_ignore_ascii_case(ext)),
+            .any(|allowed| crate::platform::fs_semantics::same_name(allowed, ext)),
         None => false,
     }
 }

@@ -412,6 +412,14 @@ fn encode_rejects_missing_target() {
 /// signal it. The output is discarded: ffmpeg writes a lot of it, and
 /// a pipe nobody reads would fill up and block the child.
 fn spawn(args: &[&str], logs: Option<(&Path, &Path)>) -> std::process::Child {
+    command(args, logs).spawn().expect("the binary must start")
+}
+
+/// The command the binary is spawned with, before it is started.
+///
+/// Split out of [`spawn`] so a platform can add its own flags (the
+/// Windows interrupt test needs its own process group).
+fn command(args: &[&str], logs: Option<(&Path, &Path)>) -> Command {
     let scratch = scratch_dir();
     let mut cmd = Command::new(bin());
     cmd.args(args)
@@ -435,6 +443,24 @@ fn spawn(args: &[&str], logs: Option<(&Path, &Path)>) -> std::process::Child {
             cmd.stdout(Stdio::null()).stderr(Stdio::null());
         }
     }
+    cmd
+}
+
+/// Windows: spawn the child in its **own process group**.
+///
+/// A console control event can only be delivered to a process group,
+/// and `CTRL_C_EVENT` cannot be targeted at one at all -- only
+/// `CTRL_BREAK_EVENT` can (design doc §3.11.2). The child's group id
+/// is then its own pid, which is what the event is sent to.
+#[cfg(windows)]
+fn spawn_in_own_process_group(args: &[&str], logs: Option<(&Path, &Path)>) -> std::process::Child {
+    use std::os::windows::process::CommandExt;
+
+    /// CREATE_NEW_PROCESS_GROUP
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+    let mut cmd = command(args, logs);
+    cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
     cmd.spawn().expect("the binary must start")
 }
 
@@ -537,6 +563,24 @@ impl InterruptFixture {
         )
     }
 
+    /// Windows: spawn the encoder in its own process group, so a
+    /// console control event can be sent to it.
+    #[cfg(windows)]
+    fn spawn_in_own_process_group(&self) -> std::process::Child {
+        spawn_in_own_process_group(
+            &[
+                "encode",
+                "-d",
+                self.inputs.to_str().unwrap(),
+                "--config",
+                self.config.to_str().unwrap(),
+                "-o",
+                self.out.to_str().unwrap(),
+            ],
+            Some((&self.dir.join("stdout.log"), &self.err_log)),
+        )
+    }
+
     /// Wait until the second file is really being encoded: the first
     /// one is done by then, and the batch is busy -- so the request
     /// has something to interrupt.
@@ -619,6 +663,49 @@ fn an_interrupt_keeps_the_records_of_the_files_that_finished() {
         .status()
         .expect("kill must run");
     assert!(status.success(), "the signal must be delivered");
+
+    let status = child.wait().expect("the child must exit");
+    fixture.assert_interrupted(&status);
+
+    let _ = std::fs::remove_dir_all(&fixture.dir);
+}
+
+/// Ctrl-Break takes the same route on Windows: the console handler
+/// writes the cancel file, the batch polls for it.
+///
+/// `CTRL_C_EVENT` cannot be delivered to a specific process group (a
+/// Windows limitation), so the test sends `CTRL_BREAK_EVENT` to a
+/// child that was started with `CREATE_NEW_PROCESS_GROUP` -- the
+/// child's own group id is its pid (design doc §3.11.2). Both sides
+/// of the contract are the same as on Unix: exit code 130, the
+/// records on disk, the file that finished before the request among
+/// them.
+#[cfg(windows)]
+#[test]
+fn an_interrupt_keeps_the_records_of_the_files_that_finished() {
+    use windows_sys::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
+
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+    let fixture = interrupt_fixture("interrupt");
+    let mut child = fixture.spawn_in_own_process_group();
+
+    fixture.wait_until_encoding();
+
+    // SAFETY: the group id is the child's own pid, which was created
+    // with CREATE_NEW_PROCESS_GROUP.
+    let delivered = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, child.id()) };
+    if delivered == 0 {
+        // No console to send to (a service, a detached session):
+        // the environment cannot deliver the event at all.
+        eprintln!("skipping: this environment cannot deliver console control events");
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&fixture.dir);
+        return;
+    }
 
     let status = child.wait().expect("the child must exit");
     fixture.assert_interrupted(&status);

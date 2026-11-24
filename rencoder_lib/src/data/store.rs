@@ -486,7 +486,7 @@ pub fn write_records(records: &[EncodingRecord], path: &Path) -> Result<(), Enco
 /// recognises.
 pub fn default_encoding_path_in(dir: &Path) -> Result<std::path::PathBuf, EncodeError> {
     std::fs::create_dir_all(dir)?;
-    crate::config::fs_perms::set_app_dir_mode(dir)?;
+    crate::platform::perms::set_app_dir_mode(dir)?;
     Ok(dir.join(format!(
         "encoding-{}.parquet",
         crate::utils::time::utc_timestamp()

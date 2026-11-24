@@ -12,7 +12,9 @@
 //! primitive has to satisfy five properties (design doc §3.11.1.1) --
 //! atomic takeover, release on process death, probeable without
 //! interfering, **does not block reads**, located by path -- and the
-//! two platforms reach them differently:
+//! two platforms reach them differently. The mechanism lives in
+//! [`crate::platform::lock`]; this module only sees the contract:
+//! `claim` / `probe` and `Busy` / `Unreadable` / `Unsupported`:
 //!
 //! - Unix: std's `flock`, an *advisory* lock. It does not block
 //!   reads, so the record stays readable while the target is held.
@@ -44,12 +46,13 @@
 //! first, the lock is released after): the application leaves no litter
 //! in the user's directory.
 
-use std::fs::File;
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
+
+use crate::platform::lock::{self, Claim};
 
 /// The marker file's name inside the target directory.
 pub const OWNER_FILE_NAME: &str = ".rencoder-owner";
@@ -119,24 +122,6 @@ impl std::fmt::Display for GuardError {
 
 impl std::error::Error for GuardError {}
 
-/// Why a claim (taking or probing the target) did not produce a handle.
-///
-/// The platform part ([`sys`]) turns its own failure modes into these
-/// three, so the rest of the module does not branch on the platform.
-#[derive(Debug)]
-enum ClaimError {
-    /// Somebody else holds the target: a benign refusal.
-    Busy,
-    /// The marker could not be opened at all -- a permission problem,
-    /// a path that is not a directory, and so on.
-    Unreadable(io::Error),
-    /// The filesystem cannot provide the lock at all. On Unix that is
-    /// `ENOLCK` / `EOPNOTSUPP` / `ENOSYS`; on Windows the share mode
-    /// is always available, so this never happens there.
-    #[cfg_attr(windows, allow(dead_code))]
-    Unsupported(io::Error),
-}
-
 /// The marker file's path in `dir`.
 pub fn marker_path(dir: &Path) -> PathBuf {
     dir.join(OWNER_FILE_NAME)
@@ -193,18 +178,14 @@ pub fn common_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
 /// ✓ (that would block the directory for everyone, forever ✓).
 pub fn occupancy(dir: &Path) -> Result<Occupancy, GuardError> {
     let path = marker_path(dir);
-    match sys::probe(&path) {
-        // We got the claim: nobody holds it exclusively. Give it back.
-        Ok(_file) => Ok(Occupancy::Free),
-        // No marker: nobody holds this directory.
-        Err(ClaimError::Unreadable(e)) if e.kind() == io::ErrorKind::NotFound => {
-            Ok(Occupancy::Free)
-        }
+    match lock::probe(&path) {
+        // Nobody holds it: no marker, or the marker is not claimed.
+        Ok(()) => Ok(Occupancy::Free),
         // We cannot even read it: we cannot tell, and refusing is
         // safer than racing.
-        Err(ClaimError::Unreadable(_)) => Ok(Occupancy::Held(None)),
-        Err(ClaimError::Busy) => Ok(Occupancy::Held(read_holder(&path))),
-        Err(ClaimError::Unsupported(e)) => Err(GuardError::Unsupported { path, source: e }),
+        Err(lock::Error::Unreadable(_)) => Ok(Occupancy::Held(None)),
+        Err(lock::Error::Busy) => Ok(Occupancy::Held(read_holder(&path))),
+        Err(lock::Error::Unsupported(e)) => Err(GuardError::Unsupported { path, source: e }),
     }
 }
 
@@ -235,10 +216,10 @@ pub fn probe(dir: &Path) -> Result<(), GuardError> {
 /// A held target: this object owns the lock.
 #[derive(Debug)]
 pub struct TargetGuard {
-    /// The locked marker file. Dropping it releases the lock -- it is
-    /// held here for exactly that reason.
+    /// The claim on the marker. Dropping it releases the claim -- it
+    /// is held here for exactly that reason.
     #[allow(dead_code)]
-    file: File,
+    claim: Claim,
     /// The marker path -- removed on release.
     marker: Option<PathBuf>,
     /// The directory this guard holds.
@@ -266,21 +247,21 @@ impl TargetGuard {
 
         // The target itself: the atomic part.
         let marker = marker_path(&target);
-        let mut file = match sys::take(&marker) {
-            Ok(file) => file,
-            Err(ClaimError::Busy) => {
+        let mut claim = match lock::claim(&marker) {
+            Ok(claim) => claim,
+            Err(lock::Error::Busy) => {
                 return Err(GuardError::Busy {
                     path: target,
                     holder: read_holder(&marker),
                 });
             }
-            Err(ClaimError::Unreadable(e)) => {
+            Err(lock::Error::Unreadable(e)) => {
                 return Err(GuardError::Io {
                     path: marker,
                     source: e,
                 })
             }
-            Err(ClaimError::Unsupported(e)) => {
+            Err(lock::Error::Unsupported(e)) => {
                 return Err(GuardError::Unsupported {
                     path: marker,
                     source: e,
@@ -294,18 +275,18 @@ impl TargetGuard {
             pid: std::process::id(),
             since: chrono::Utc::now().to_rfc3339(),
         };
-        let _ = write_holder(&mut file, &record);
+        let _ = write_holder(&mut claim, &record);
 
         // Descendants: this run collects them.
         if let Some((dir, holder)) = held_descendant(&target)? {
             // Give the target back before refusing.
             let _ = std::fs::remove_file(&marker);
-            drop(file);
+            drop(claim);
             return Err(GuardError::Busy { path: dir, holder });
         }
 
         Ok(TargetGuard {
-            file,
+            claim,
             marker: Some(marker),
             target,
         })
@@ -343,187 +324,6 @@ impl TargetGuard {
 impl Drop for TargetGuard {
     fn drop(&mut self) {
         self.release_inner();
-    }
-}
-
-/// Unix: the claim is std's `flock` -- an **advisory** lock.
-///
-/// It does not block reads, so the record stays readable while the
-/// target is held (design doc §3.11.1.1, property 4).
-#[cfg(unix)]
-mod sys {
-    use std::fs::{File, OpenOptions, TryLockError};
-    use std::io;
-    use std::os::unix::fs::MetadataExt;
-    use std::path::Path;
-
-    use super::ClaimError;
-
-    /// How many times we retry when the marker moved under us.
-    const MAX_ATTEMPTS: usize = 8;
-
-    /// Take the target: open the marker, lock it, and make sure the
-    /// name still points at the file we locked.
-    pub fn take(marker: &Path) -> Result<File, ClaimError> {
-        for _ in 0..MAX_ATTEMPTS {
-            let file = match open_for_claim(marker) {
-                Ok(file) => file,
-                Err(e) => return Err(ClaimError::Unreadable(e)),
-            };
-            match file.try_lock() {
-                Ok(()) => {}
-                Err(TryLockError::WouldBlock) => return Err(ClaimError::Busy),
-                // Any lock error is "this filesystem cannot do it" --
-                // the class the design doc calls out (ENOLCK /
-                // EOPNOTSUPP / ENOSYS).
-                Err(TryLockError::Error(e)) => return Err(ClaimError::Unsupported(e)),
-            }
-            // `flock` locks the *inode*, so the open and the lock are
-            // two steps with a window between them: if the previous
-            // holder deleted the name and released in that window, we
-            // would lock an unlinked inode while a later instance
-            // locks a fresh file under the same name -- two holders.
-            // The device and inode numbers tell the two apart.
-            match still_named(&file, marker) {
-                Ok(true) => return Ok(file),
-                // The name moved on: dropping the file releases the
-                // lock, and we start over on the file that is there now.
-                Ok(false) => continue,
-                Err(e) => return Err(ClaimError::Unreadable(e)),
-            }
-        }
-        Err(ClaimError::Unreadable(io::Error::new(
-            io::ErrorKind::Other,
-            "the target marker kept changing hands",
-        )))
-    }
-
-    /// Probe: is somebody holding the target?
-    ///
-    /// Read-only, and it does not create the marker -- no marker means
-    /// nobody holds the directory.
-    pub fn probe(marker: &Path) -> Result<File, ClaimError> {
-        let file = match File::open(marker) {
-            Ok(file) => file,
-            Err(e) => return Err(ClaimError::Unreadable(e)),
-        };
-        match file.try_lock_shared() {
-            Ok(()) => Ok(file),
-            Err(TryLockError::WouldBlock) => Err(ClaimError::Busy),
-            Err(TryLockError::Error(e)) => Err(ClaimError::Unsupported(e)),
-        }
-    }
-
-    /// Open the marker for the claim.
-    ///
-    /// Write access is preferred (the record goes in there), but it is
-    /// not required: a marker left behind by **another user** cannot be
-    /// written, and it must not block this directory forever -- we take
-    /// it over (the lock is the state, the record is only for the
-    /// message).
-    fn open_for_claim(marker: &Path) -> io::Result<File> {
-        match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(marker)
-        {
-            Ok(file) => Ok(file),
-            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                // Another user's marker: read it and lock it. The
-                // record stays theirs (we cannot write it) -- it is
-                // best-effort.
-                File::open(marker)
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Is the name still pointing at the file we hold?
-    pub(super) fn still_named(file: &File, marker: &Path) -> io::Result<bool> {
-        let mine = file.metadata()?;
-        match std::fs::metadata(marker) {
-            Ok(current) => Ok(current.dev() == mine.dev() && current.ino() == mine.ino()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(e),
-        }
-    }
-}
-
-/// Windows: the claim is the **share mode** of the open.
-///
-/// std's `LockFileEx` is a *mandatory* lock over the whole file: while
-/// it is held, no other handle can read the file either, so the record
-/// would be unreadable and the refusal message would lose the pid.
-/// The share mode denies *writers* instead: the holder opens for
-/// writing and lets others read and delete.
-#[cfg(windows)]
-mod sys {
-    use std::fs::{File, OpenOptions};
-    use std::io;
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::path::Path;
-
-    use super::ClaimError;
-
-    /// Others may read the marker.
-    const FILE_SHARE_READ: u32 = 0x0000_0001;
-    /// Others may delete the marker (the holder deletes its own).
-    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
-    /// Others may read and delete; nobody else may write.
-    const DENY_WRITE: u32 = FILE_SHARE_READ | FILE_SHARE_DELETE;
-    /// The file is open by somebody else in a way that conflicts.
-    const ERROR_SHARING_VIOLATION: i32 = 32;
-
-    /// Take the target.
-    ///
-    /// The claim *is* the open: it succeeds only when nobody else
-    /// holds the marker for writing, so it is atomic by construction
-    /// (no open/lock window to close, unlike the Unix inode case).
-    pub fn take(marker: &Path) -> Result<File, ClaimError> {
-        match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .share_mode(DENY_WRITE)
-            .open(marker)
-        {
-            Ok(file) => Ok(file),
-            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                // Another user's marker: read-only, but still deny the
-                // writes -- the claim is the share mode, not the access.
-                OpenOptions::new()
-                    .read(true)
-                    .share_mode(DENY_WRITE)
-                    .open(marker)
-                    .map_err(map_open_error)
-            }
-            Err(e) => Err(map_open_error(e)),
-        }
-    }
-
-    /// Probe: is somebody holding the target?
-    ///
-    /// Read-only, and it does not create the marker. It denies writers
-    /// too -- that is what makes it conflict with a holder, which is
-    /// open for writing.
-    pub fn probe(marker: &Path) -> Result<File, ClaimError> {
-        OpenOptions::new()
-            .read(true)
-            .share_mode(DENY_WRITE)
-            .open(marker)
-            .map_err(map_open_error)
-    }
-
-    /// A share mode conflict means "somebody else holds it".
-    fn map_open_error(e: io::Error) -> ClaimError {
-        if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) {
-            ClaimError::Busy
-        } else {
-            ClaimError::Unreadable(e)
-        }
     }
 }
 
@@ -568,15 +368,10 @@ fn read_holder(path: &Path) -> Option<Holder> {
 }
 
 /// Write the holder record into the marker.
-fn write_holder(file: &mut File, holder: &Holder) -> io::Result<()> {
+fn write_holder(claim: &mut Claim, holder: &Holder) -> io::Result<()> {
     let json =
         serde_json::to_vec(holder).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    file.set_len(0)?;
-    // From the start: the marker may be a leftover, and the position
-    // is not ours to assume.
-    file.seek(SeekFrom::Start(0))?;
-    file.write_all(&json)?;
-    file.flush()
+    claim.write_record(&json)
 }
 
 #[cfg(test)]
@@ -644,42 +439,6 @@ mod tests {
         }
 
         drop(guard);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_marker_that_moved_under_us_is_not_ours() {
-        // `flock` locks the inode, so the open and the lock are two
-        // steps: the previous holder can delete the name and release
-        // in between, and we would then hold a lock on an unlinked
-        // file while a later instance locks a fresh file under the
-        // same name -- two holders. The guard checks that the name
-        // still points at the file it locked.
-        let dir = scratch("moved");
-        let marker = dir.join("marker");
-        std::fs::write(&marker, "x").unwrap();
-
-        let file = std::fs::File::open(&marker).unwrap();
-        assert!(
-            sys::still_named(&file, &marker).expect("the check must work"),
-            "the name still points at our file"
-        );
-
-        // The name goes away ...
-        std::fs::remove_file(&marker).unwrap();
-        assert!(
-            !sys::still_named(&file, &marker).expect("the check must work"),
-            "an unlinked file is not ours"
-        );
-
-        // ... and a new file takes its place.
-        std::fs::write(&marker, "y").unwrap();
-        assert!(
-            !sys::still_named(&file, &marker).expect("the check must work"),
-            "a different inode is not ours"
-        );
-
         let _ = std::fs::remove_dir_all(&dir);
     }
 

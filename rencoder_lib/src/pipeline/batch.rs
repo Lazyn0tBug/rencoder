@@ -987,6 +987,10 @@ fn run_ffmpeg_with_stderr(
     let args = &argv[1..];
     let mut cmd = Command::new(program);
     cmd.args(args);
+    // The encoder must not receive the platform's "stop everything"
+    // event: the app stops it itself, so the batch is *cancelled*
+    // rather than the file being *failed* (platform::process).
+    crate::platform::process::isolate_from_console_events(&mut cmd);
     match output {
         ProcessOutput::Inherit => {
             cmd.stdout(Stdio::inherit());
@@ -1253,6 +1257,10 @@ pub fn run_ffmpeg_with_progress(
     cmd.args(&args);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    // The encoder must not receive the platform's "stop everything"
+    // event: the app stops it itself, so the batch is *cancelled*
+    // rather than the file being *failed* (platform::process).
+    crate::platform::process::isolate_from_console_events(&mut cmd);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -2222,16 +2230,15 @@ Encoders:
     }
 
     #[test]
-    #[cfg(unix)]
     fn cleanup_partial_output_after_kill_removes_partial() {
-        // Integration test: spawn a shell process that mimics
-        // ffmpeg's `-progress pipe:1` stream — emits
-        // `progress=continue` blocks every 100ms, and writes some
-        // garbage to the output path so we have a partial file to
-        // clean up. On the first progress block, the test cancels
-        // the token; on the next block (within ~100ms), the cancel
-        // poll at the top of the run loop fires, the child is
-        // killed, the partial is cleaned up, and Err is returned.
+        // Integration test: spawn a child that mimics ffmpeg's
+        // `-progress pipe:1` stream — emits `progress=continue` blocks
+        // every 50ms, and writes some garbage to the output path so we
+        // have a partial file to clean up. On the first progress block,
+        // the test cancels the token; on the next block (within
+        // ~50ms), the cancel poll at the top of the run loop fires, the
+        // child is killed, the partial is cleaned up, and Err is
+        // returned.
         //
         // Why not just emit ONE progress block and sleep? Because
         // `BufReader::lines()` blocks waiting for the next line —
@@ -2240,6 +2247,12 @@ Encoders:
         // per progress line" (not "once per X ms"), so we need
         // the fake-ffmpeg to keep emitting lines for the cancel
         // branch to actually be reached.
+        //
+        // The child is this test binary, re-entered as the fake
+        // (test_support::fake_ffmpeg_argv) — so the test runs on
+        // Unix and on Windows alike. It used to be a `sh` script,
+        // which is why it was `#[cfg(unix)]` and never ran on
+        // Windows.
         let tmp = cleanup_tmp("kill");
         let partial = tmp.join("partial.mkv");
         std::fs::write(&partial, b"x").unwrap(); // pre-create so output path exists
@@ -2247,28 +2260,7 @@ Encoders:
         let cancel = CancelToken::new();
         let cancel_for_signal = cancel.clone();
 
-        // Script: emit a progress block, write garbage, loop
-        // ~forever. The shell's `printf` flushes per-call so lines
-        // arrive promptly at the parent's BufReader.
-        let script = format!(
-            r#"
-            i=0
-            while [ $i -lt 200 ]; do
-                printf 'frame=%d\nfps=30\nspeed=1.0x\nout_time_us=1000000\nprogress=continue\n' $i
-                echo garbage >> {}
-                sleep 0.1
-                i=$((i+1))
-            done
-            "#,
-            partial.display()
-        );
-
-        let argv = vec![
-            "sh".into(),
-            "-c".into(),
-            script.clone(),
-            partial.to_string_lossy().into_owned(),
-        ];
+        let argv = crate::test_support::fake_ffmpeg_argv(&partial);
 
         let mut progress = |p: FfmpegProgress| {
             // On the FIRST progress block, signal cancel. The

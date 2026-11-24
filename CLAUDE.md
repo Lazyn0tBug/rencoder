@@ -51,15 +51,32 @@ signature at call"** principle:
 - `#[cfg(...)]` lives only inside the function body that does the
   platform-specific work.
 - Callers see one stable signature; no cfg at the call site.
+- **Unify the functional semantics, not the mechanism.** The OS
+  mechanism differs (Unix `flock` vs Windows share mode) and must not
+  be "unified"; what is unified is the *contract* the application
+  depends on — same behavior, same assertions on both platforms.
 - **Current implementation is Unix only** for the GUI (design doc
   §8 row 35); the library and the CLI build and test on macOS,
   Linux and Windows. The CI (`.github/workflows/ci.yml`) runs the
   gate on all three hosts — see `docs/TESTING.md`.
 - Adding a new platform later = edit one file (the definition site).
 
-Concrete: `rencoder_lib::config::fs_perms` exposes
-`set_config_file_mode` (Unix: `0o644`) and `set_app_dir_mode` (Unix:
-`0o755`); non-Unix is a no-op placeholder.
+Concrete: `rencoder_lib::platform` is the **only** file in the repo
+with `#[cfg]` in product code (plus `rencoder_cli::signal`, the
+registered CLI exception). It holds four contracts:
+
+| Contract | Unix | Windows |
+|----------|------|---------|
+| `perms::set_config_file_mode` / `set_app_dir_mode` | `0o644` / `0o755` | no-op — ACL inheritance is equivalent |
+| `lock::claim` / `lock::probe` (the single-instance guard) | std `flock` (advisory) | open share mode (deny writers, allow readers) |
+| `fs_semantics::fold_name` / `same_name` | one folding rule (case-insensitive) | same rule — not split per platform |
+| `process::isolate_from_console_events` | no-op (a signal hits one process) | `CREATE_NEW_PROCESS_GROUP` for the encoder |
+
+The lock's contract is the five properties of design doc §3.11.1.1
+(atomic takeover, release on process death, probeable without
+interfering, **does not block reads**, located by path). `platform::lock`
+holds **one platform-agnostic contract test** for them, so both CI
+hosts assert the same behavior.
 
 Exception (CLI only): `rencoder_cli::signal` has a Windows branch --
 Unix uses `signal-hook` (SIGINT/SIGTERM/SIGHUP), Windows uses

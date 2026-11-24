@@ -36,7 +36,7 @@ pub fn init(log_dir: &Path) -> anyhow::Result<()> {
         .with_writer(std::io::stderr);
 
     std::fs::create_dir_all(log_dir).context("create log dir")?;
-    rencoder_lib::config::fs_perms::set_app_dir_mode(log_dir).context("set log dir mode bits")?;
+    rencoder_lib::platform::perms::set_app_dir_mode(log_dir).context("set log dir mode bits")?;
 
     let file_sink =
         FileSink::new(log_dir, 10 * 1024 * 1024, 7).context("failed to open log file sink")?;

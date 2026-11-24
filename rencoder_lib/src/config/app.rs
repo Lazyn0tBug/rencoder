@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::fs_perms;
+use crate::platform::perms;
 use crate::types::VideoFormat;
 
 /// The notice the app logs when it creates the default config file.
@@ -514,7 +514,7 @@ pub enum ConfigError {
 /// Windows via `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`).
 ///
 /// On any error during the write sequence (File::create, write_all,
-/// sync_all, fs_perms::set_config_file_mode, rename), the tmp file is
+/// sync_all, perms::set_config_file_mode, rename), the tmp file is
 /// cleaned up so it doesn't leak. A successful `rename` atomically
 /// removes the tmp, so cleanup is only needed on the error path.
 fn write_atomic(path: &Path, content: &[u8]) -> Result<(), ConfigError> {
@@ -530,7 +530,7 @@ fn write_atomic(path: &Path, content: &[u8]) -> Result<(), ConfigError> {
             f.write_all(content)?;
             f.sync_all()?;
         }
-        fs_perms::set_config_file_mode(&tmp)?;
+        perms::set_config_file_mode(&tmp)?;
         std::fs::rename(&tmp, path).map_err(ConfigError::Io)?;
         Ok(())
     })();

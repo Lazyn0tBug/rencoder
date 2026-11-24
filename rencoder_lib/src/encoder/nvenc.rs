@@ -823,8 +823,13 @@ pub fn report(resolution: &Resolution) -> String {
 /// drives the real actor (only the *paths* are redirected then -- see
 /// [`crate::job::ActorEnv`]).
 pub fn run_ffmpeg(args: &[&str]) -> Result<String, EncodeError> {
-    let output = std::process::Command::new("ffmpeg")
-        .args(args)
+    let mut cmd = std::process::Command::new("ffmpeg");
+    cmd.args(args);
+    // The probe must not die from the platform's "stop everything"
+    // event: a killed probe would record "NVENC unavailable" instead
+    // of cancelling the run (platform::process).
+    crate::platform::process::isolate_from_console_events(&mut cmd);
+    let output = cmd
         .output()
         .map_err(|e| EncodeError::Probe(format!("ffmpeg spawn: {e}")))?;
     if !output.status.success() {

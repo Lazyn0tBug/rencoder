@@ -297,6 +297,52 @@ pub fn unique_temp_file(label: &str) -> PathBuf {
     unique_temp_dir(label).join("config.toml")
 }
 
+/// The portable fake ffmpeg: this test binary, re-entered as a child.
+///
+/// The cancel tests need a child process that looks like ffmpeg -- it
+/// writes a partial output, emits `-progress pipe:1` blocks on stdout
+/// and runs until it is killed. A shell script filled that role on
+/// Unix, which is why those tests were `#[cfg(unix)]` and never ran on
+/// Windows.
+///
+/// The child is **this very test binary**, re-entered with `--exact
+/// <the fake test> --nocapture` plus a marker argument that says where
+/// the partial output goes. So there is no second binary to find, no
+/// shell to depend on, and **the same test runs on every platform**.
+///
+/// The output path is **last** in the argv, because that is what the
+/// cancel cleanup deletes (design doc §3.11.2).
+///
+/// # Panics
+///
+/// Never in a normal test run: without the marker the fake does
+/// nothing.
+pub fn fake_ffmpeg_argv(output: &Path) -> Vec<String> {
+    let exe = std::env::current_exe().expect("the test binary's own path");
+    vec![
+        exe.to_string_lossy().into_owned(),
+        "--exact".into(),
+        FAKE_FFMPEG_TEST_NAME.into(),
+        "--nocapture".into(),
+        // Everything after this is a free argument: libtest stops
+        // parsing options there, so the fake's own arguments (and the
+        // `-progress pipe:1` the production code appends) do not have
+        // to look like options.
+        "--".into(),
+        FAKE_FFMPEG_MARKER.into(),
+        output.to_string_lossy().into_owned(),
+    ]
+}
+
+/// The marker that tells the fake child where the partial output goes.
+///
+/// A marker rather than "the last argument": in a normal test run the
+/// arguments belong to cargo, and the fake must stay a no-op.
+pub const FAKE_FFMPEG_MARKER: &str = "--rencoder-fake-ffmpeg";
+
+/// The full name of the test that acts as the fake ffmpeg child.
+pub const FAKE_FFMPEG_TEST_NAME: &str = "test_support::tests::fake_ffmpeg_child";
+
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
@@ -411,5 +457,51 @@ mod tests {
         assert_eq!(clock.now(), start);
         clock.advance(Duration::days(31));
         assert_eq!(clock.now(), start + Duration::days(31));
+    }
+
+    /// The fake ffmpeg, as a child process.
+    ///
+    /// The cancel tests spawn this test binary as the fake (see
+    /// [`fake_ffmpeg_argv`]): it writes garbage to the partial output,
+    /// emits ffmpeg's `-progress pipe:1` blocks on stdout, and runs
+    /// until it is killed.
+    ///
+    /// In a normal test run there is no marker in the arguments, so
+    /// this test does nothing -- it is a no-op, not a fake ffmpeg that
+    /// runs for ten seconds.
+    #[test]
+    fn fake_ffmpeg_child() {
+        use std::io::Write;
+        use std::time::Duration;
+
+        /// How many progress blocks before the fake gives up on its own.
+        const BLOCKS: usize = 200;
+        /// The gap between two blocks -- the cadence the cancel poll
+        /// sees.
+        const INTERVAL: Duration = Duration::from_millis(50);
+
+        let args: Vec<String> = std::env::args().collect();
+        let Some(marker) = args.iter().position(|a| a == FAKE_FFMPEG_MARKER) else {
+            // Not spawned as the fake: nothing to do.
+            return;
+        };
+        let Some(output) = args.get(marker + 1) else {
+            return;
+        };
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(output)
+            .expect("the fake ffmpeg writes to the output path");
+
+        for frame in 0..BLOCKS {
+            // The shape real ffmpeg prints with `-progress pipe:1`.
+            print!("frame={frame}\nfps=30\nspeed=1.0x\nout_time_us=1000000\nprogress=continue\n");
+            std::io::stdout().flush().expect("flush stdout");
+            let _ = writeln!(file, "garbage");
+            let _ = file.flush();
+            std::thread::sleep(INTERVAL);
+        }
     }
 }

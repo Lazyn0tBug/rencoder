@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::platform::fs_semantics;
 use crate::types::VideoFormat;
 
 /// Canonicalize a path; fall back to the input verbatim on error.
@@ -165,14 +166,14 @@ fn disambiguated_output(output: &Path, input: &Path, number: usize) -> PathBuf {
 }
 
 /// The identity of a file: the same directory (canonicalized) and the
-/// same name (case-insensitively -- macOS and Windows filesystems are
-/// case-insensitive by default).
+/// same name (folded -- one rule everywhere, see
+/// [`crate::platform::fs_semantics`]).
 fn file_key(path: &Path) -> String {
     let parent = path.parent().unwrap_or_else(|| Path::new(""));
     let dir = normalize(parent);
     let name = path
         .file_name()
-        .map(|name| name.to_string_lossy().to_lowercase())
+        .map(|name| fs_semantics::fold_name(&name.to_string_lossy()))
         .unwrap_or_default();
     format!("{}|{}", dir.display(), name)
 }
@@ -180,16 +181,19 @@ fn file_key(path: &Path) -> String {
 /// Do two paths point at the same file?
 ///
 /// Compares the **canonicalized parent directories** and the **file
-/// names case-insensitively**:
+/// names folded** (one rule on every platform, see
+/// [`crate::platform::fs_semantics`]):
 ///
 /// - canonicalizing the parents resolves `.` / `..` segments and
 ///   symlinked directories, so `/d/./movie.mkv` and `/d/movie.mkv`
 ///   compare equal;
-/// - the file name comparison ignores ASCII case, because macOS and
-///   Windows filesystems are case-insensitive by default. `movie.MKV`
-///   and `movie.mkv` are the same file there, and ffmpeg's own
+/// - the file name comparison ignores case, because macOS and Windows
+///   filesystems are case-insensitive by default. `movie.MKV` and
+///   `movie.mkv` are the same file there, and ffmpeg's own
 ///   "input and output are the same file" check compares the strings,
-///   so it does not catch this either.
+///   so it does not catch this either. On a case-sensitive filesystem
+///   the comparison is conservative -- it may treat two different
+///   files as one, which costs a rename, never a source file.
 ///
 /// The file name itself is not canonicalized: the output usually does
 /// not exist yet, and canonicalizing it would fail anyway.
@@ -199,10 +203,7 @@ pub fn is_same_file(input: &Path, other: &Path) -> bool {
         // can be the same file.
         return input == other;
     };
-    if !input_name
-        .to_string_lossy()
-        .eq_ignore_ascii_case(&other_name.to_string_lossy())
-    {
+    if !fs_semantics::same_name(&input_name.to_string_lossy(), &other_name.to_string_lossy()) {
         return false;
     }
     let empty = Path::new("");
@@ -414,11 +415,13 @@ mod tests {
 
     // ---- the temp file and the commit (design doc §3.11.2) ----
 
-    #[cfg(unix)]
     // v1.2 follow-up #3: collision guard matrix — every
     // (format, input ext) pair where the format's default
     // extension matches the input's extension MUST trip the
     // `_encoded` suffix so output != input structurally.
+    //
+    // Platform-independent on purpose: the naming rule is the same
+    // everywhere, so the matrix runs on every host.
     #[test]
     fn output_path_for_collision_guard_always_distinguishes() {
         let cases = [

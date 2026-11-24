@@ -14,7 +14,6 @@
 //! configured with" has exactly one answer.
 
 pub mod app;
-pub mod fs_perms;
 pub mod paths;
 
 // Re-exports for ergonomics: callers can write `rencoder_lib::config::AppConfig`
