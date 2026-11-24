@@ -89,7 +89,7 @@ pub fn transcode_single(
     let prepare = encode_prepare(task, ctx, started_at_meta, started_at_instant);
     match prepare {
         EncodePrepareResult::Failed(r) => Ok(*r),
-        EncodePrepareResult::Ready(plan) => transcode_with_argv(task, plan, ctx, output, cancel),
+        EncodePrepareResult::Ready(plan) => transcode_with_argv(task, *plan, ctx, output, cancel),
     }
 }
 
@@ -158,7 +158,7 @@ pub fn transcode_single_with_progress(
     match prepare {
         EncodePrepareResult::Failed(r) => Ok(*r),
         EncodePrepareResult::Ready(plan) => {
-            transcode_with_progress(task, plan, ctx, cancel, on_progress)
+            transcode_with_progress(task, *plan, ctx, cancel, on_progress)
         }
     }
 }
@@ -172,10 +172,12 @@ pub fn transcode_single_with_progress(
 enum EncodePrepareResult {
     /// Ready to encode: the plan carries the probe result, the argv,
     /// the output path and the start times.
-    Ready(FilePlan),
+    ///
+    /// Boxed: a plan is ~200 bytes (it holds the probe result by
+    /// value), so both arms are one pointer and the enum stays small.
+    Ready(Box<FilePlan>),
     /// The file cannot be encoded (probe failed, no usable encoder).
-    /// Boxed: a record is much bigger than a plan, and this arm is
-    /// the rare one.
+    /// Boxed for the same reason.
     Failed(Box<EncodingRecord>),
 }
 
@@ -262,13 +264,13 @@ fn encode_prepare(
             )));
         }
     };
-    EncodePrepareResult::Ready(FilePlan::new(
+    EncodePrepareResult::Ready(Box::new(FilePlan::new(
         metadata,
         argv,
         output_path,
         started_at_meta,
         started_at_instant,
-    ))
+    )))
 }
 
 /// Shared body for the CLI + GUI transcode inner helpers (review #119).

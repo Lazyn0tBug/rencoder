@@ -2885,7 +2885,7 @@ fn load_history(
 
     // Newest first; chronological reverse lets truncate() pick the
     // most recent N after the time filter.
-    all.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    all.sort_by_key(|r| std::cmp::Reverse(r.started_at));
 
     if let Some(t) = after {
         all.retain(|r| r.started_at >= t);

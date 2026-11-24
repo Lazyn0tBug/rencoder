@@ -413,6 +413,10 @@ mod tests {
         assert_eq!(files.len(), 2);
     }
 
+    // Unix only: creating a symlink needs privileges the Windows CI
+    // runner doesn't have. The production code path is the same
+    // there -- walkdir never follows links on any platform.
+    #[cfg(unix)]
     #[test]
     fn dir_skips_symlinks_to_files() {
         // Symlinks are never followed (follow_links(false)). Even if a
@@ -421,14 +425,7 @@ mod tests {
         let dir = fixture_dir("dir_symlink");
         let real = touch(&dir, "real.mp4");
         let link = dir.join("alias.mp4");
-        #[cfg(unix)]
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        #[cfg(not(unix))]
-        {
-            // Skip on non-Unix; the production code path is the same.
-            let _ = link;
-            return;
-        }
         let files = collect_files(
             &Target::Dir(dir.clone()),
             &["mp4".into()],
@@ -441,6 +438,10 @@ mod tests {
         assert!(!files.iter().any(|ip| ip.as_path() == link));
     }
 
+    // Unix only: same reason as `dir_skips_symlinks_to_files` --
+    // creating a symlink needs privileges the Windows CI runner
+    // doesn't have.
+    #[cfg(unix)]
     #[test]
     fn dir_does_not_recurse_through_loop_symlink() {
         // Create dir/sub/ with a symlink sub/loop pointing back to dir.
@@ -452,13 +453,7 @@ mod tests {
         touch(&dir, "outer.mp4");
         touch(&sub, "inner.mp4");
         let link = sub.join("loop");
-        #[cfg(unix)]
         std::os::unix::fs::symlink(&dir, &link).unwrap();
-        #[cfg(not(unix))]
-        {
-            let _ = link;
-            return;
-        }
         let files = collect_files(
             &Target::Dir(dir.clone()),
             &["mp4".into()],
