@@ -2080,20 +2080,585 @@ fn cache_from_slot(slot: CacheSlot) -> Result<Arc<EncoderCache>, (ErrorCategory,
     }
 }
 
+/// The actor's context: everything the command handlers share.
+///
+/// One owner -- the actor thread -- so a plain struct, no lock
+/// (design doc §3.10.1 rule 1). The published cell inside the
+/// publisher is the one exception: the publisher thread writes it,
+/// the actor reads a snapshot per batch.
+///
+/// The context exists so the handlers do not need a parameter bag
+/// (design doc §3.10.4): the state, the paths, the channels and
+/// the seams travel together.
+struct Ctx {
+    /// The actor's own state: the gate, the batch ids, the
+    /// publication (design doc §3.11.2).
+    state: ActorState,
+    /// The paths: the app-level ones never move, the run-level ones
+    /// follow the working directory (design doc §3.6).
+    paths: Paths,
+    /// The machine facts, gathered once by the capability check
+    /// (design doc §3.10.7).
+    machine_facts: Option<crate::capability::MachineFacts>,
+    /// The batch that is admitted but waits for the facts (the
+    /// chain's barrier).
+    pending: Option<PendingBatch>,
+    /// Where `Command::SaveConfig` writes.
+    config_path: PathBuf,
+    /// The records directory (the history comes from it).
+    records_dir: PathBuf,
+    /// The NVENC capability record on disk.
+    nvenc_cache_path: PathBuf,
+    /// The encoder seam (a test replaces it -- design doc §3.10.4).
+    file_encoder: Arc<dyn FileEncoder>,
+    /// The capability probe seam.
+    detect_runner: DetectRunner,
+    /// Where the events go.
+    evt_tx: Sender<Event>,
+    /// The dropped-event counter (diagnostics only).
+    dropped_counter: DropCounter,
+    /// The probe channel: the probe threads hand their result back
+    /// here, and the actor publishes it.
+    probe_tx: Sender<ProbeResult>,
+    /// The "batch finished" channel: the worker reports back.
+    done_tx: Sender<BatchDone>,
+}
+
+impl Ctx {
+    /// Admit an encode batch, hand it the facts, and let it
+    /// run on a worker thread.
+    fn on_start_batch(
+        &mut self,
+        request_id: RequestId,
+        params: EncodeParams,
+        files: Vec<crate::types::InputPath>,
+    ) {
+        // Review #120: delegate per-file iteration to
+        // TaskManager::run. The processor closure owns the UI
+        // protocol (FileStarted / FileCompleted / Progress);
+        // TaskManager owns batch/task scaffold logs +
+        // partial_output::Guard registration.
+        // The operation directory: the directory this batch
+        // acts on (design doc §3.6). The GUI's working
+        // directory can change between batches, so the
+        // run-level paths follow it.
+        let batch_paths = self
+            .paths
+            .with_op_dir(&crate::pipeline::batch::batch_target_path_for_files(&files));
+        // The admission: the gate, the id and a cancel token
+        // of this batch's own (design doc §3.11.2).
+        let admission = self.state.admit_batch(Some(&batch_paths.cancel_file));
+        let id = admission.id;
+        // The single-instance guard's cheap probe (design doc
+        // §3.11.1.1): the ancestors and the target itself. A
+        // conflict is a **benign rejection** -- the running
+        // batch is untouched, and this one never starts.
+        // (The full take -- including the descendant scan --
+        // happens in the worker, off the actor thread.)
+        let batch_scope = crate::guard::common_ancestor(
+            &files
+                .iter()
+                .map(|file| file.as_path().to_path_buf())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_else(|| batch_paths.op_dir.clone());
+        if let Err(e) = crate::guard::probe(&batch_scope) {
+            send_evt_lossy(
+                &self.evt_tx,
+                Event::CommandRejected {
+                    request_id,
+                    reason: e.to_string(),
+                },
+                &self.dropped_counter,
+            );
+            return;
+        }
+        // The batch is admitted: the request gets its answer
+        // and the batch its id (design doc §3.11.3). The UI
+        // moves from `Starting` to `Encoding` on this event.
+        send_evt_lossy(
+            &self.evt_tx,
+            Event::CommandAccepted {
+                request_id,
+                batch_id: Some(id),
+            },
+            &self.dropped_counter,
+        );
+        // One cache snapshot per batch (a batch is a unit —
+        // the encoder must not change under it).
+        //
+        // Review #122: extension still hoisted (unused now — kept for
+        // the hoist comment / future use).
+        let _ext = params.format.default_extension();
+        // The tasks come from the shared construction entry
+        // (design doc §3.11.1): the same names the encode
+        // path and the dry run use.
+        let tasks = crate::pipeline::batch::encode_tasks(&files, params.format);
+
+        let batch_path = crate::pipeline::batch::batch_target_path_for_files(&files);
+
+        let cancel_for_worker = admission.token.clone();
+        let evt_tx_for_worker = self.evt_tx.clone();
+        let dropped_for_worker = DropCounter::default();
+        let file_encoder_for_worker = Arc::clone(&self.file_encoder);
+        let records_dir_for_worker = self.records_dir.clone();
+        let done_tx_for_worker = self.done_tx.clone();
+        // The processor and the worker each hold a handle on
+        // the same token (the `move` closure would otherwise
+        // take it).
+        let cancel_for_processor = cancel_for_worker.clone();
+        let total_files = files.len();
+        // The chain's barrier: the batch waits for the facts
+        // (the capability + the encoder cache). The actor
+        // holds it here and hands it over **frozen** -- the
+        // generation the batch runs under (design doc §3.10.6
+        // step 5).
+        //
+        // The worker does not wait for the facts: it is
+        // started **with** them. That is what lets a cancel
+        // interrupt the wait: the waiting belongs to the
+        // actor, and a cancel is a command the actor
+        // processes.
+        let start = Box::new(move |fact: PublishedState| {
+            // The batch's work starts **now**: the facts are in
+            // and the worker is about to run. The UI's phase
+            // follows this event (design doc §3.11.3) -- so
+            // "Encoding" means "the worker is running", not
+            // "the lib took the request".
+            send_evt_lossy(
+                &evt_tx_for_worker,
+                Event::BatchStarted { id, total_files },
+                &dropped_for_worker,
+            );
+            let cache = match cache_from_slot(fact.cache) {
+                Ok(cache) => cache,
+                Err((category, message)) => {
+                    // The encoder cache is unusable: this
+                    // batch cannot run (design doc §3.11.3 --
+                    // a batch-scoped failure).
+                    send_evt_lossy(
+                        &evt_tx_for_worker,
+                        Event::BatchFailed {
+                            batch_id: id,
+                            category,
+                            message,
+                        },
+                        &dropped_for_worker,
+                    );
+                    return;
+                }
+            };
+            let evt_tx_for_processor = evt_tx_for_worker.clone();
+            let make_processor = move |update_tx: Sender<VerdictUpdate>| {
+                // The capability of **this** publication: the
+                // batch freezes the generation it was admitted
+                // with (design doc §3.10.6 step 5).
+                let batch_ctx = BatchContext::new(params, cache, fact.capability.clone());
+                make_encode_processor(
+                    batch_ctx,
+                    id,
+                    cancel_for_processor,
+                    evt_tx_for_processor.clone(),
+                    dropped_for_worker,
+                    update_tx,
+                    file_encoder_for_worker.clone(),
+                )
+            };
+
+            // The batch runs on its own thread: the actor stays
+            // responsive, so `Command::Cancel` reaches the
+            // in-flight ffmpeg.
+            spawn_task_batch(
+                id,
+                tasks,
+                "encoding",
+                batch_path,
+                Some(records_dir_for_worker.clone()),
+                cancel_for_worker.clone(),
+                make_processor,
+                BatchUpdates::new(),
+                evt_tx_for_worker.clone(),
+                DropCounter::default(),
+                done_tx_for_worker.clone(),
+            );
+        });
+        self.pending = Some(PendingBatch {
+            id,
+            total: files.len(),
+            deadline: std::time::Instant::now() + FACTS_DEADLINE,
+            start,
+        });
+        // The facts may already be there (every batch but the
+        // first): then the barrier is already released.
+        advance_pending(&mut self.pending, &mut self.state);
+    }
+
+    /// A dry run: the same prepare + skip as the encode path,
+    /// but no ffmpeg invocation.
+    fn on_dry_run(
+        &mut self,
+        request_id: RequestId,
+        params: EncodeParams,
+        files: Vec<crate::types::InputPath>,
+    ) {
+        // Dry-run: same per-file probe + partial + skip as
+        // StartBatch, but no ffmpeg invocation. The busy gate
+        // (checked above) applies so a real batch can't sneak
+        // in during dry-run.
+        // A dry run never encodes, so it cannot change the
+        // capability -- it only reads it. It reads the
+        // published one, like every other batch.
+        //
+        // The dry run is a batch of its own: the admission
+        // gives it a fresh cancel token (the token is shared
+        // with `Command::Cancel`, so an inherited one would
+        // still be cancelled -- design doc §3.11.2). It does
+        // not watch the cancel file: only the encode batch
+        // answers an external cancel request.
+        let admission = self.state.admit_batch(None);
+        let cancel_for_worker = admission.token.clone();
+        // The dry run is a batch too: it gets a batch id, so
+        // its events can be matched (design doc §3.11.3).
+        let id = admission.id;
+        let total = files.len();
+        send_evt_lossy(
+            &self.evt_tx,
+            Event::CommandAccepted {
+                request_id,
+                batch_id: Some(id),
+            },
+            &self.dropped_counter,
+        );
+        let evt_tx_for_worker = self.evt_tx.clone();
+        let done_tx_for_worker = self.done_tx.clone();
+        let dropped_for_worker = DropCounter::default();
+        // The chain's barrier -- the same one the encode batch
+        // waits at (the facts are the facts).
+        let start = Box::new(move |fact: PublishedState| {
+            let cache = match cache_from_slot(fact.cache) {
+                Ok(cache) => cache,
+                Err((category, message)) => {
+                    send_evt_lossy(
+                        &evt_tx_for_worker,
+                        Event::BatchFailed {
+                            batch_id: id,
+                            category,
+                            message,
+                        },
+                        &dropped_for_worker,
+                    );
+                    return;
+                }
+            };
+            // The capability of this publication: the
+            // dry run freezes the generation too.
+            // The generation this dry run froze: the
+            // plan is only valid for it (design doc
+            // §3.10.5).
+            let generation = fact.capability.generation();
+            let batch_ctx = BatchContext::new(params, cache, fact.capability.clone());
+            spawn_batch_job(
+                move || {
+                    let report = crate::pipeline::batch::dry_run_batch(
+                        &batch_ctx,
+                        files.iter(),
+                        &cancel_for_worker,
+                    );
+                    Some(Event::DryRunFinished {
+                        batch_id: id,
+                        generation,
+                        records: report.records,
+                    })
+                },
+                done_tx_for_worker.clone(),
+                None,
+                evt_tx_for_worker.clone(),
+                DropCounter::default(),
+            );
+        });
+        self.pending = Some(PendingBatch {
+            id,
+            total,
+            deadline: std::time::Instant::now() + FACTS_DEADLINE,
+            start,
+        });
+        advance_pending(&mut self.pending, &mut self.state);
+    }
+
+    /// Cancel the active batch. Only the active one: a cancel
+    /// that names another batch is refused.
+    fn on_cancel(&mut self, request_id: RequestId, batch_id: BatchId) {
+        // Only the active batch may be cancelled (design doc
+        // §3.11.3): a cancel that names another batch -- a
+        // stale one, or a batch that already ended -- is
+        // refused. It must not stop whatever runs now.
+        if !self.state.cancel(batch_id) {
+            send_evt_lossy(
+                &self.evt_tx,
+                Event::CommandRejected {
+                    request_id,
+                    reason: format!("no active batch {batch_id} to cancel"),
+                },
+                &self.dropped_counter,
+            );
+            return;
+        }
+        send_evt_lossy(
+            &self.evt_tx,
+            Event::CommandAccepted {
+                request_id,
+                batch_id: Some(batch_id),
+            },
+            &self.dropped_counter,
+        );
+        // The token is marked (by `state.cancel`): the worker
+        // polls it -- the in-flight ffmpeg is killed (and its
+        // partial output removed), and the batch stops at the
+        // next file boundary.
+        //
+        // **Unless** the batch has not started yet: then it is
+        // waiting at the chain's barrier (the facts), and the
+        // wait ends here -- the worker is never started. That
+        // is the whole point of the waiting belonging to the
+        // actor: a cancel is a command, and the actor is the
+        // one who processes it.
+        if self.state.stage() == Some(Stage::Facts) {
+            if let Some(p) = self.pending.take() {
+                self.state.finish_batch();
+                send_evt_lossy(
+                    &self.evt_tx,
+                    Event::BatchCancelled {
+                        batch_id: p.id,
+                        completed: 0,
+                        total: p.total,
+                    },
+                    &self.dropped_counter,
+                );
+            }
+        }
+    }
+
+    /// Read the records the earlier runs wrote.
+    fn on_load_history(
+        &mut self,
+        request_id: RequestId,
+        limit: Option<usize>,
+        after: Option<DateTime<Utc>>,
+    ) {
+        send_evt_lossy(
+            &self.evt_tx,
+            Event::CommandAccepted {
+                request_id,
+                batch_id: None,
+            },
+            &self.dropped_counter,
+        );
+        let records = load_history(Some(self.records_dir.clone()), limit, after);
+        send_evt_lossy(
+            &self.evt_tx,
+            Event::HistoryLoaded { records },
+            &self.dropped_counter,
+        );
+    }
+
+    /// Persist the UI's edited draft.
+    fn on_save_config(&mut self, request_id: RequestId, config: Box<AppConfig>, revision: u64) {
+        send_evt_lossy(
+            &self.evt_tx,
+            Event::CommandAccepted {
+                request_id,
+                batch_id: None,
+            },
+            &self.dropped_counter,
+        );
+        // The payload is the UI's edited draft. Persisting our
+        // own copy would silently drop the edit: the file
+        // would be rewritten with the original values while
+        // the UI showed "Saved".
+        match config.save(&self.config_path) {
+            Ok(()) => {
+                send_evt_lossy(
+                    &self.evt_tx,
+                    Event::ConfigSaved {
+                        path: self.config_path.clone(),
+                        revision,
+                    },
+                    &self.dropped_counter,
+                );
+            }
+            Err(e) => {
+                // A failed save is a **non-batch** failure: it
+                // finalizes nothing (design doc §3.11.3).
+                send_evt_lossy(
+                    &self.evt_tx,
+                    Event::OperationFailed {
+                        request_id,
+                        category: ErrorCategory::ConfigError,
+                        message: format!("save failed: {e}"),
+                    },
+                    &self.dropped_counter,
+                );
+            }
+        }
+        // The `nv` switch may have changed -- and that is all
+        // that changes: the capability is a fact about the
+        // machine, so the cache stays as it is. The next batch
+        // picks the new `nv` up from the run parameters (design
+        // doc §3.10.5).
+    }
+
+    /// One capability check, and only when it is needed
+    /// (design doc §3.10.7).
+    fn on_check_capability(&mut self, request_id: RequestId, ignore_record: bool) {
+        send_evt_lossy(
+            &self.evt_tx,
+            Event::CommandAccepted {
+                request_id,
+                batch_id: None,
+            },
+            &self.dropped_counter,
+        );
+        // One check, and only when it is needed (design doc
+        // §3.10.7). Same path as the CLI's `rencoder detect`:
+        // resolve through the on-disk record, store the
+        // fresh result, and report what this machine can
+        // actually run.
+        //
+        // The probe spawns ffmpeg subprocesses (up to ~1.5s),
+        // so it runs on its own thread: doing it here would
+        // stall every other command -- `Command::Cancel`
+        // included -- for the duration.
+        let cache_path = self.nvenc_cache_path.clone();
+        let detect_runner = Arc::clone(&self.detect_runner);
+        // The probe request takes the next sequence number:
+        // the actor publishes the result only if it is the
+        // newest one (design doc §3.10.6 step 5).
+        let seq = self.state.publisher.request();
+        spawn_probe(
+            seq,
+            Some(request_id),
+            ignore_record,
+            cache_path.clone(),
+            move |args| detect_runner(args),
+            self.probe_tx.clone(),
+        );
+    }
+
+    /// Move the operation directory (design doc §3.6) and
+    /// re-check the filesystem.
+    fn on_set_working_dir(&mut self, request_id: RequestId, dir: PathBuf) {
+        send_evt_lossy(
+            &self.evt_tx,
+            Event::CommandAccepted {
+                request_id,
+                batch_id: None,
+            },
+            &self.dropped_counter,
+        );
+        // The operation directory follows the working
+        // directory (design doc §3.6): the run-level paths
+        // move with it.
+        self.paths = self.paths.with_op_dir(&dir);
+        // Re-check (design doc §3.10.7): the directory
+        // changed, the machine did not -- so the machine's
+        // facts are reused and only the filesystem is checked
+        // anew. The report lands in the new operation
+        // directory.
+        let facts = self.machine_facts.clone().unwrap_or_default();
+        crate::capability::check_run_capabilities(&self.paths, &facts);
+        send_evt_lossy(
+            &self.evt_tx,
+            Event::CapabilityChecked {
+                report: self.paths.capability_report.clone(),
+            },
+            &self.dropped_counter,
+        );
+    }
+
+    /// Analyze the files: a batch like the others, but it does
+    /// not wait for the facts -- it probes the media.
+    fn on_analyze(&mut self, request_id: RequestId, files: Vec<crate::types::InputPath>) {
+        // U22 / Tier 3 #9: parallel analyze with per-file
+        // progress events. The busy gate (checked above) keeps
+        // it from overlapping with StartBatch / DryRun — the
+        // operator can only have one kind of batch in flight.
+        // v1 doesn't support Command::Cancel abort; the rayon
+        // par_iter runs to completion and AnalyzeFinished fires
+        // cleanly.
+        let total = files.len();
+        // The analyze run is a batch too: it gets a batch id
+        // (design doc §3.11.3).
+        let id = self.state.admit_batch(None).id;
+        // The analyze batch does not wait for the facts: it
+        // probes the media, it does not encode with them. So
+        // its chain has no barrier -- it starts right away.
+        self.state.set_stage(id, Stage::Work);
+        send_evt_lossy(
+            &self.evt_tx,
+            Event::CommandAccepted {
+                request_id,
+                batch_id: Some(id),
+            },
+            &self.dropped_counter,
+        );
+        send_evt_lossy(
+            &self.evt_tx,
+            Event::AnalyzeStarted {
+                batch_id: id,
+                total,
+            },
+            &self.dropped_counter,
+        );
+        let evt_tx_for_worker = self.evt_tx.clone();
+        let dropped_for_worker = DropCounter::default();
+        spawn_batch_job(
+            move || {
+                // Progress closure: convert each rayon worker
+                // tick into an Event on the lib→UI channel.
+                // `Sender<Event>` is Sync, so the `Fn + Sync +
+                // Send` bound required by rayon is satisfied.
+                let progress = |p: AnalyzeProgress| {
+                    send_evt_lossy(
+                        &evt_tx_for_worker,
+                        Event::AnalyzeProgress {
+                            batch_id: id,
+                            done: p.done,
+                            total: p.total,
+                            failed: p.failed,
+                            last: p.last,
+                        },
+                        &dropped_for_worker,
+                    );
+                };
+
+                let records = analyze_records_with_probe_and_progress_parallel(
+                    &files,
+                    probe_video_metadata_auto,
+                    progress,
+                );
+
+                // failed_count invariant: equals
+                // records.iter().filter(|r| r.fps.is_none()).count().
+                // The probe-progress closure already counted
+                // failures (atomic increment), so we re-derive from
+                // the final records to keep the contract testable.
+                let failed_count = records.iter().filter(|r| r.fps.is_none()).count();
+
+                Some(Event::AnalyzeFinished {
+                    batch_id: id,
+                    records,
+                    failed_count,
+                })
+            },
+            self.done_tx.clone(),
+            None,
+            self.evt_tx.clone(),
+            DropCounter::default(),
+        );
+    }
+}
+
 fn run_actor(cmd_rx: Receiver<Request>, evt_tx: Sender<Event>, env: ActorEnv) {
-    // The injected dependencies, unpacked for the arms below.
-    let config_path = env.config_path.clone();
-    // The paths: the app-level ones never move, the run-level ones
-    // follow the working directory (design doc §3.6). The actor owns
-    // the current value -- `Command::SetWorkingDir` moves it.
-    let mut paths = env.paths.clone();
-    let records_dir = env.paths.records_dir.clone();
-    let nvenc_cache_path = env.paths.capability_record.clone();
-    let file_encoder = Arc::clone(&env.file_encoder);
-    let detect_runner = Arc::clone(&env.detect_runner);
-    // Review #111: dropped-event counter for diagnostics. Each sender
-    // owns one (it is never read by anyone but its own thread).
-    let dropped_counter = DropCounter::default();
     // The published state: the encoder cache and the capability, as
     // one answer (design doc §3.10.6 step 5). The publisher writes
     // it; the actor reads one snapshot per batch and hands it to the
@@ -2114,27 +2679,52 @@ fn run_actor(cmd_rx: Receiver<Request>, evt_tx: Sender<Event>, env: ActorEnv) {
     // one writer (the publisher), so a read/write split would buy
     // nothing.
     let published_cell: PublishedCell = Arc::new(Mutex::new(None));
-    // The machine facts, gathered once by the capability check
-    // (design doc §3.10.7). The actor adopts them: a check after a
-    // working directory change reuses them instead of probing the
-    // machine again.
-    //
-    // A plain local, not a cell: the actor is the only reader *and*
-    // the only writer (the probes hand their result to the actor,
-    // which publishes it) -- one owner, so no lock (§3.10.1 rule 1).
-    let mut machine_facts: Option<crate::capability::MachineFacts> = None;
     // The probe channel: the probe threads hand their result back
     // here, and the actor publishes it (design doc §3.10.6 step 5).
     let (probe_tx, probe_rx) = unbounded::<ProbeResult>();
-    // The newest published probe request. A result older than this
-    // is dropped -- it cannot overwrite a newer snapshot.
-    // The generation the next published capability carries.
-    // The actor's state: the gate, the active batch and the capability
-    // publication (design doc §3.11.2).
-    let mut state = ActorState {
-        active: None,
-        next_batch_id: 0,
-        publisher: CapabilityPublisher::new(published_cell.clone()),
+    // Busy gate: one batch in flight at a time (§3.4 / §3.8.1).
+    //
+    // A plain `bool` in the actor - no lock, no atomic. The batch
+    // itself runs on a worker thread (§3.10.1.1), so the actor is the
+    // only reader and the only writer.
+    // "This batch is done" signals. The worker sends one when it
+    // finishes; the actor reopens the busy gate when it reads one.
+    let (done_tx, done_rx) = bounded::<BatchDone>(1);
+    // The actor's context: its state, its paths, its channels and
+    // its seams. One owner (the actor thread) -- no lock (design doc
+    // §3.10.1 rule 1).
+    let mut ctx = Ctx {
+        state: ActorState {
+            active: None,
+            next_batch_id: 0,
+            publisher: CapabilityPublisher::new(published_cell.clone()),
+        },
+        // The paths: the app-level ones never move, the run-level
+        // ones follow the working directory (design doc §3.6).
+        paths: env.paths.clone(),
+        // The machine facts, gathered once by the capability check
+        // (design doc §3.10.7). The actor adopts them: a check after
+        // a working directory change reuses them instead of
+        // probing the machine again.
+        //
+        // A plain field, not a cell: the actor is the only reader
+        // *and* the only writer (the probes hand their result to
+        // the actor, which publishes it) -- one owner, so no lock
+        // (§3.10.1 rule 1).
+        machine_facts: None,
+        pending: None,
+        config_path: env.config_path.clone(),
+        records_dir: env.paths.records_dir.clone(),
+        nvenc_cache_path: env.paths.capability_record.clone(),
+        file_encoder: Arc::clone(&env.file_encoder),
+        detect_runner: Arc::clone(&env.detect_runner),
+        evt_tx,
+        // Review #111: dropped-event counter for diagnostics. Each
+        // sender owns one (it is never read by anyone but its own
+        // thread).
+        dropped_counter: DropCounter::default(),
+        probe_tx: probe_tx.clone(),
+        done_tx,
     };
     // The chain's **first stage**: "ensure the fact holds". It runs on
     // a worker (it spawns ffmpeg) and the actor publishes its result
@@ -2145,40 +2735,23 @@ fn run_actor(cmd_rx: Receiver<Request>, evt_tx: Sender<Event>, env: ActorEnv) {
     // missing or mismatched one is checked once. The path is the same
     // one a user-requested check takes -- only `ignore_record` differs.
     {
-        let seq = state.publisher.request();
+        let seq = ctx.state.publisher.request();
         // The **injected** runner: a test must never touch the real
         // machine (design doc §3.10.4), and the production runner is
         // the same seam (the actor's environment carries it).
-        let detect_runner_for_startup = Arc::clone(&detect_runner);
+        let detect_runner_for_startup = Arc::clone(&ctx.detect_runner);
         spawn_probe(
             seq,
             None,
             false,
-            nvenc_cache_path.clone(),
+            ctx.nvenc_cache_path.clone(),
             move |args| detect_runner_for_startup(args),
             probe_tx.clone(),
         );
     }
-
     // `app_config` is still held (referenced by `config_path`
     // for the SaveConfig handler). Don't drop yet.
-
-    // Busy gate: one batch in flight at a time (§3.4 / §3.8.1).
     //
-    // A plain `bool` in the actor — no lock, no atomic. The batch
-    // itself runs on a worker thread (§3.10.1.1), so the actor is the
-    // only reader and the only writer.
-    // "This batch is done" signals. The worker sends one when it
-    // finishes; the actor reopens the busy gate when it reads one.
-    let (done_tx, done_rx) = bounded::<BatchDone>(1);
-    // The authoritative capability: this machine's NVENC capability as
-    // the session knows it. Each batch worker gets a snapshot and
-    // reports its changes back (the done signal carries them).
-
-    // The batch that is admitted but has not started yet: it waits for
-    // the facts (the chain's barrier). The publisher releases it.
-    let mut pending: Option<PendingBatch> = None;
-
     // The "no deadline" case: created once, not per iteration (the
     // actor's loop is hot).
     let no_deadline: Receiver<std::time::Instant> = never();
@@ -2187,7 +2760,7 @@ fn run_actor(cmd_rx: Receiver<Request>, evt_tx: Sender<Event>, env: ActorEnv) {
         // The pending batch's deadline: the facts must land in time.
         // Without it, a probe that never answers would hold the gate
         // forever.
-        let deadline_rx = match &pending {
+        let deadline_rx = match &ctx.pending {
             Some(p) => after(
                 p.deadline
                     .saturating_duration_since(std::time::Instant::now()),
@@ -2200,24 +2773,24 @@ fn run_actor(cmd_rx: Receiver<Request>, evt_tx: Sender<Event>, env: ActorEnv) {
             recv(cmd_rx) -> req => req,
             recv(done_rx) -> done => {
                 if let Ok(BatchDone { updates }) = done {
-                    state.publisher.merge_verdicts(updates);
-                    state.finish_batch();
+                    ctx.state.publisher.merge_verdicts(updates);
+                    ctx.state.finish_batch();
                 }
                 continue;
             }
             recv(deadline_rx) -> _ => {
                 // The facts did not land in time: the batch fails
                 // instead of hanging.
-                if let Some(p) = pending.take() {
-                    state.finish_batch();
+                if let Some(p) = ctx.pending.take() {
+                    ctx.state.finish_batch();
                     send_evt_lossy(
-                        &evt_tx,
+                        &ctx.evt_tx,
                         Event::BatchFailed {
                             batch_id: p.id,
                             category: ErrorCategory::ConfigError,
                             message: "the capability check timed out".into(),
                         },
-                        &dropped_counter,
+                        &ctx.dropped_counter,
                     );
                 }
                 continue;
@@ -2233,10 +2806,10 @@ fn run_actor(cmd_rx: Receiver<Request>, evt_tx: Sender<Event>, env: ActorEnv) {
                         outcome,
                         ..
                     } = probed;
-                    if let Some(publication) = state.publisher.publish(
+                    if let Some(publication) = ctx.state.publisher.publish(
                         probed.seq,
                         outcome,
-                        nvenc_cache_path.as_path(),
+                        ctx.nvenc_cache_path.as_path(),
                     ) {
                         match publication.failure {
                             Some((category, message)) => {
@@ -2246,35 +2819,35 @@ fn run_actor(cmd_rx: Receiver<Request>, evt_tx: Sender<Event>, env: ActorEnv) {
                                 // for it.
                                 match request_id {
                                     Some(request_id) => send_evt_lossy(
-                                        &evt_tx,
+                                        &ctx.evt_tx,
                                         Event::OperationFailed {
                                             request_id,
                                             category,
                                             message,
                                         },
-                                        &dropped_counter,
+                                        &ctx.dropped_counter,
                                     ),
                                     None => send_evt_lossy(
-                                        &evt_tx,
+                                        &ctx.evt_tx,
                                         Event::Error { category, message },
-                                        &dropped_counter,
+                                        &ctx.dropped_counter,
                                     ),
                                 }
                             }
                             None => {
-                                machine_facts = Some(publication.facts.clone());
+                                ctx.machine_facts = Some(publication.facts.clone());
                                 // The run capability report for the
                                 // current operation directory.
                                 crate::capability::check_run_capabilities(
-                                    &paths,
+                                    &ctx.paths,
                                     &publication.facts,
                                 );
                                 send_evt_lossy(
-                                    &evt_tx,
+                                    &ctx.evt_tx,
                                     Event::CapabilityChecked {
-                                        report: paths.capability_report.clone(),
+                                        report: ctx.paths.capability_report.clone(),
                                     },
-                                    &dropped_counter,
+                                    &ctx.dropped_counter,
                                 );
                                 // The UI hears about the capability
                                 // from here -- one publisher, one
@@ -2285,9 +2858,9 @@ fn run_actor(cmd_rx: Receiver<Request>, evt_tx: Sender<Event>, env: ActorEnv) {
                                 // capability is in force", which is
                                 // what a caller waits for.
                                 send_evt_lossy(
-                                    &evt_tx,
+                                    &ctx.evt_tx,
                                     Event::NvencCapability(publication.capability),
-                                    &dropped_counter,
+                                    &ctx.dropped_counter,
                                 );
                             }
                         }
@@ -2296,7 +2869,7 @@ fn run_actor(cmd_rx: Receiver<Request>, evt_tx: Sender<Event>, env: ActorEnv) {
                 // The publication released the chain's barrier: the
                 // waiting batch starts, with this version of the
                 // facts frozen into it.
-                advance_pending(&mut pending, &mut state);
+                advance_pending(&mut ctx.pending, &mut ctx.state);
                 continue;
             }
         };
@@ -2326,524 +2899,39 @@ fn run_actor(cmd_rx: Receiver<Request>, evt_tx: Sender<Event>, env: ActorEnv) {
             Command::StartBatch { .. } | Command::DryRun { .. } | Command::Analyze { .. }
         ) {
             let (finished, updates) = drain_batch_done(&done_rx);
-            state.publisher.merge_verdicts(updates);
+            ctx.state.publisher.merge_verdicts(updates);
             if finished {
-                state.finish_batch();
+                ctx.state.finish_batch();
             }
-            if state.is_running() {
+            if ctx.state.is_running() {
                 // Benign rejection: the command is dropped, the running
                 // batch continues. `Event::Error` would be fatal-only
                 // and the UI would finalize the running batch.
                 send_evt_lossy(
-                    &evt_tx,
+                    &ctx.evt_tx,
                     Event::CommandRejected {
                         request_id,
                         reason: "another batch is already running".into(),
                     },
-                    &dropped_counter,
+                    &ctx.dropped_counter,
                 );
                 continue;
             }
         }
 
         match command {
-            Command::StartBatch { params, files } => {
-                // Review #120: delegate per-file iteration to
-                // TaskManager::run. The processor closure owns the UI
-                // protocol (FileStarted / FileCompleted / Progress);
-                // TaskManager owns batch/task scaffold logs +
-                // partial_output::Guard registration.
-                // The operation directory: the directory this batch
-                // acts on (design doc §3.6). The GUI's working
-                // directory can change between batches, so the
-                // run-level paths follow it.
-                let batch_paths =
-                    paths.with_op_dir(&crate::pipeline::batch::batch_target_path_for_files(&files));
-                // The admission: the gate, the id and a cancel token
-                // of this batch's own (design doc §3.11.2).
-                let admission = state.admit_batch(Some(&batch_paths.cancel_file));
-                let id = admission.id;
-                // The single-instance guard's cheap probe (design doc
-                // §3.11.1.1): the ancestors and the target itself. A
-                // conflict is a **benign rejection** -- the running
-                // batch is untouched, and this one never starts.
-                // (The full take -- including the descendant scan --
-                // happens in the worker, off the actor thread.)
-                let batch_scope = crate::guard::common_ancestor(
-                    &files
-                        .iter()
-                        .map(|file| file.as_path().to_path_buf())
-                        .collect::<Vec<_>>(),
-                )
-                .unwrap_or_else(|| batch_paths.op_dir.clone());
-                if let Err(e) = crate::guard::probe(&batch_scope) {
-                    send_evt_lossy(
-                        &evt_tx,
-                        Event::CommandRejected {
-                            request_id,
-                            reason: e.to_string(),
-                        },
-                        &dropped_counter,
-                    );
-                    continue;
-                }
-                // The batch is admitted: the request gets its answer
-                // and the batch its id (design doc §3.11.3). The UI
-                // moves from `Starting` to `Encoding` on this event.
-                send_evt_lossy(
-                    &evt_tx,
-                    Event::CommandAccepted {
-                        request_id,
-                        batch_id: Some(id),
-                    },
-                    &dropped_counter,
-                );
-                // One cache snapshot per batch (a batch is a unit —
-                // the encoder must not change under it).
-                //
-                // Review #122: extension still hoisted (unused now — kept for
-                // the hoist comment / future use).
-                let _ext = params.format.default_extension();
-                // The tasks come from the shared construction entry
-                // (design doc §3.11.1): the same names the encode
-                // path and the dry run use.
-                let tasks = crate::pipeline::batch::encode_tasks(&files, params.format);
-
-                let batch_path = crate::pipeline::batch::batch_target_path_for_files(&files);
-
-                let cancel_for_worker = admission.token.clone();
-                let evt_tx_for_worker = evt_tx.clone();
-                let dropped_for_worker = DropCounter::default();
-                let file_encoder_for_worker = Arc::clone(&file_encoder);
-                let records_dir_for_worker = records_dir.clone();
-                let done_tx_for_worker = done_tx.clone();
-                // The processor and the worker each hold a handle on
-                // the same token (the `move` closure would otherwise
-                // take it).
-                let cancel_for_processor = cancel_for_worker.clone();
-                let total_files = files.len();
-                // The chain's barrier: the batch waits for the facts
-                // (the capability + the encoder cache). The actor
-                // holds it here and hands it over **frozen** -- the
-                // generation the batch runs under (design doc §3.10.6
-                // step 5).
-                //
-                // The worker does not wait for the facts: it is
-                // started **with** them. That is what lets a cancel
-                // interrupt the wait: the waiting belongs to the
-                // actor, and a cancel is a command the actor
-                // processes.
-                let start = Box::new(move |fact: PublishedState| {
-                    // The batch's work starts **now**: the facts are in
-                    // and the worker is about to run. The UI's phase
-                    // follows this event (design doc §3.11.3) -- so
-                    // "Encoding" means "the worker is running", not
-                    // "the lib took the request".
-                    send_evt_lossy(
-                        &evt_tx_for_worker,
-                        Event::BatchStarted { id, total_files },
-                        &dropped_for_worker,
-                    );
-                    let cache = match cache_from_slot(fact.cache) {
-                        Ok(cache) => cache,
-                        Err((category, message)) => {
-                            // The encoder cache is unusable: this
-                            // batch cannot run (design doc §3.11.3 --
-                            // a batch-scoped failure).
-                            send_evt_lossy(
-                                &evt_tx_for_worker,
-                                Event::BatchFailed {
-                                    batch_id: id,
-                                    category,
-                                    message,
-                                },
-                                &dropped_for_worker,
-                            );
-                            return;
-                        }
-                    };
-                    let evt_tx_for_processor = evt_tx_for_worker.clone();
-                    let make_processor = move |update_tx: Sender<VerdictUpdate>| {
-                        // The capability of **this** publication: the
-                        // batch freezes the generation it was admitted
-                        // with (design doc §3.10.6 step 5).
-                        let batch_ctx = BatchContext::new(params, cache, fact.capability.clone());
-                        make_encode_processor(
-                            batch_ctx,
-                            id,
-                            cancel_for_processor,
-                            evt_tx_for_processor.clone(),
-                            dropped_for_worker,
-                            update_tx,
-                            file_encoder_for_worker.clone(),
-                        )
-                    };
-
-                    // The batch runs on its own thread: the actor stays
-                    // responsive, so `Command::Cancel` reaches the
-                    // in-flight ffmpeg.
-                    spawn_task_batch(
-                        id,
-                        tasks,
-                        "encoding",
-                        batch_path,
-                        Some(records_dir_for_worker.clone()),
-                        cancel_for_worker.clone(),
-                        make_processor,
-                        BatchUpdates::new(),
-                        evt_tx_for_worker.clone(),
-                        DropCounter::default(),
-                        done_tx_for_worker.clone(),
-                    );
-                });
-                pending = Some(PendingBatch {
-                    id,
-                    total: files.len(),
-                    deadline: std::time::Instant::now() + FACTS_DEADLINE,
-                    start,
-                });
-                // The facts may already be there (every batch but the
-                // first): then the barrier is already released.
-                advance_pending(&mut pending, &mut state);
-            }
-
-            Command::DryRun { params, files } => {
-                // Dry-run: same per-file probe + partial + skip as
-                // StartBatch, but no ffmpeg invocation. The busy gate
-                // (checked above) applies so a real batch can't sneak
-                // in during dry-run.
-                // A dry run never encodes, so it cannot change the
-                // capability -- it only reads it. It reads the
-                // published one, like every other batch.
-                //
-                // The dry run is a batch of its own: the admission
-                // gives it a fresh cancel token (the token is shared
-                // with `Command::Cancel`, so an inherited one would
-                // still be cancelled -- design doc §3.11.2). It does
-                // not watch the cancel file: only the encode batch
-                // answers an external cancel request.
-                let admission = state.admit_batch(None);
-                let cancel_for_worker = admission.token.clone();
-                // The dry run is a batch too: it gets a batch id, so
-                // its events can be matched (design doc §3.11.3).
-                let id = admission.id;
-                let total = files.len();
-                send_evt_lossy(
-                    &evt_tx,
-                    Event::CommandAccepted {
-                        request_id,
-                        batch_id: Some(id),
-                    },
-                    &dropped_counter,
-                );
-                let evt_tx_for_worker = evt_tx.clone();
-                let done_tx_for_worker = done_tx.clone();
-                let dropped_for_worker = DropCounter::default();
-                // The chain's barrier -- the same one the encode batch
-                // waits at (the facts are the facts).
-                let start = Box::new(move |fact: PublishedState| {
-                    let cache = match cache_from_slot(fact.cache) {
-                        Ok(cache) => cache,
-                        Err((category, message)) => {
-                            send_evt_lossy(
-                                &evt_tx_for_worker,
-                                Event::BatchFailed {
-                                    batch_id: id,
-                                    category,
-                                    message,
-                                },
-                                &dropped_for_worker,
-                            );
-                            return;
-                        }
-                    };
-                    // The capability of this publication: the
-                    // dry run freezes the generation too.
-                    // The generation this dry run froze: the
-                    // plan is only valid for it (design doc
-                    // §3.10.5).
-                    let generation = fact.capability.generation();
-                    let batch_ctx = BatchContext::new(params, cache, fact.capability.clone());
-                    spawn_batch_job(
-                        move || {
-                            let report = crate::pipeline::batch::dry_run_batch(
-                                &batch_ctx,
-                                files.iter(),
-                                &cancel_for_worker,
-                            );
-                            Some(Event::DryRunFinished {
-                                batch_id: id,
-                                generation,
-                                records: report.records,
-                            })
-                        },
-                        done_tx_for_worker.clone(),
-                        None,
-                        evt_tx_for_worker.clone(),
-                        DropCounter::default(),
-                    );
-                });
-                pending = Some(PendingBatch {
-                    id,
-                    total,
-                    deadline: std::time::Instant::now() + FACTS_DEADLINE,
-                    start,
-                });
-                advance_pending(&mut pending, &mut state);
-            }
-
-            Command::Cancel { batch_id } => {
-                // Only the active batch may be cancelled (design doc
-                // §3.11.3): a cancel that names another batch -- a
-                // stale one, or a batch that already ended -- is
-                // refused. It must not stop whatever runs now.
-                if !state.cancel(batch_id) {
-                    send_evt_lossy(
-                        &evt_tx,
-                        Event::CommandRejected {
-                            request_id,
-                            reason: format!("no active batch {batch_id} to cancel"),
-                        },
-                        &dropped_counter,
-                    );
-                    continue;
-                }
-                send_evt_lossy(
-                    &evt_tx,
-                    Event::CommandAccepted {
-                        request_id,
-                        batch_id: Some(batch_id),
-                    },
-                    &dropped_counter,
-                );
-                // The token is marked (by `state.cancel`): the worker
-                // polls it -- the in-flight ffmpeg is killed (and its
-                // partial output removed), and the batch stops at the
-                // next file boundary.
-                //
-                // **Unless** the batch has not started yet: then it is
-                // waiting at the chain's barrier (the facts), and the
-                // wait ends here -- the worker is never started. That
-                // is the whole point of the waiting belonging to the
-                // actor: a cancel is a command, and the actor is the
-                // one who processes it.
-                if state.stage() == Some(Stage::Facts) {
-                    if let Some(p) = pending.take() {
-                        state.finish_batch();
-                        send_evt_lossy(
-                            &evt_tx,
-                            Event::BatchCancelled {
-                                batch_id: p.id,
-                                completed: 0,
-                                total: p.total,
-                            },
-                            &dropped_counter,
-                        );
-                    }
-                }
-            }
-
-            Command::LoadHistory { limit, after } => {
-                send_evt_lossy(
-                    &evt_tx,
-                    Event::CommandAccepted {
-                        request_id,
-                        batch_id: None,
-                    },
-                    &dropped_counter,
-                );
-                let records = load_history(Some(records_dir.clone()), limit, after);
-                send_evt_lossy(&evt_tx, Event::HistoryLoaded { records }, &dropped_counter);
-            }
-
+            Command::StartBatch { params, files } => ctx.on_start_batch(request_id, params, files),
+            Command::DryRun { params, files } => ctx.on_dry_run(request_id, params, files),
+            Command::Cancel { batch_id } => ctx.on_cancel(request_id, batch_id),
+            Command::LoadHistory { limit, after } => ctx.on_load_history(request_id, limit, after),
             Command::SaveConfig { config, revision } => {
-                send_evt_lossy(
-                    &evt_tx,
-                    Event::CommandAccepted {
-                        request_id,
-                        batch_id: None,
-                    },
-                    &dropped_counter,
-                );
-                // The payload is the UI's edited draft. Persisting our
-                // own copy would silently drop the edit: the file
-                // would be rewritten with the original values while
-                // the UI showed "Saved".
-                match config.save(&config_path) {
-                    Ok(()) => {
-                        send_evt_lossy(
-                            &evt_tx,
-                            Event::ConfigSaved {
-                                path: config_path.clone(),
-                                revision,
-                            },
-                            &dropped_counter,
-                        );
-                    }
-                    Err(e) => {
-                        // A failed save is a **non-batch** failure: it
-                        // finalizes nothing (design doc §3.11.3).
-                        send_evt_lossy(
-                            &evt_tx,
-                            Event::OperationFailed {
-                                request_id,
-                                category: ErrorCategory::ConfigError,
-                                message: format!("save failed: {e}"),
-                            },
-                            &dropped_counter,
-                        );
-                    }
-                }
-                // The `nv` switch may have changed -- and that is all
-                // that changes: the capability is a fact about the
-                // machine, so the cache stays as it is. The next batch
-                // picks the new `nv` up from the run parameters (design
-                // doc §3.10.5).
+                ctx.on_save_config(request_id, config, revision)
             }
-
             Command::CheckCapability { ignore_record } => {
-                send_evt_lossy(
-                    &evt_tx,
-                    Event::CommandAccepted {
-                        request_id,
-                        batch_id: None,
-                    },
-                    &dropped_counter,
-                );
-                // One check, and only when it is needed (design doc
-                // §3.10.7). Same path as the CLI's `rencoder detect`:
-                // resolve through the on-disk record, store the
-                // fresh result, and report what this machine can
-                // actually run.
-                //
-                // The probe spawns ffmpeg subprocesses (up to ~1.5s),
-                // so it runs on its own thread: doing it here would
-                // stall every other command -- `Command::Cancel`
-                // included -- for the duration.
-                let cache_path = nvenc_cache_path.clone();
-                let detect_runner = Arc::clone(&detect_runner);
-                // The probe request takes the next sequence number:
-                // the actor publishes the result only if it is the
-                // newest one (design doc §3.10.6 step 5).
-                let seq = state.publisher.request();
-                spawn_probe(
-                    seq,
-                    Some(request_id),
-                    ignore_record,
-                    cache_path.clone(),
-                    move |args| detect_runner(args),
-                    probe_tx.clone(),
-                );
+                ctx.on_check_capability(request_id, ignore_record)
             }
-
-            Command::SetWorkingDir { dir } => {
-                send_evt_lossy(
-                    &evt_tx,
-                    Event::CommandAccepted {
-                        request_id,
-                        batch_id: None,
-                    },
-                    &dropped_counter,
-                );
-                // The operation directory follows the working
-                // directory (design doc §3.6): the run-level paths
-                // move with it.
-                paths = paths.with_op_dir(&dir);
-                // Re-check (design doc §3.10.7): the directory
-                // changed, the machine did not -- so the machine's
-                // facts are reused and only the filesystem is checked
-                // anew. The report lands in the new operation
-                // directory.
-                let facts = machine_facts.clone().unwrap_or_default();
-                crate::capability::check_run_capabilities(&paths, &facts);
-                send_evt_lossy(
-                    &evt_tx,
-                    Event::CapabilityChecked {
-                        report: paths.capability_report.clone(),
-                    },
-                    &dropped_counter,
-                );
-            }
-
-            Command::Analyze { files } => {
-                // U22 / Tier 3 #9: parallel analyze with per-file
-                // progress events. The busy gate (checked above) keeps
-                // it from overlapping with StartBatch / DryRun — the
-                // operator can only have one kind of batch in flight.
-                // v1 doesn't support Command::Cancel abort; the rayon
-                // par_iter runs to completion and AnalyzeFinished fires
-                // cleanly.
-                let total = files.len();
-                // The analyze run is a batch too: it gets a batch id
-                // (design doc §3.11.3).
-                let id = state.admit_batch(None).id;
-                // The analyze batch does not wait for the facts: it
-                // probes the media, it does not encode with them. So
-                // its chain has no barrier -- it starts right away.
-                state.set_stage(id, Stage::Work);
-                send_evt_lossy(
-                    &evt_tx,
-                    Event::CommandAccepted {
-                        request_id,
-                        batch_id: Some(id),
-                    },
-                    &dropped_counter,
-                );
-                send_evt_lossy(
-                    &evt_tx,
-                    Event::AnalyzeStarted {
-                        batch_id: id,
-                        total,
-                    },
-                    &dropped_counter,
-                );
-                let evt_tx_for_worker = evt_tx.clone();
-                let dropped_for_worker = DropCounter::default();
-                spawn_batch_job(
-                    move || {
-                        // Progress closure: convert each rayon worker
-                        // tick into an Event on the lib→UI channel.
-                        // `Sender<Event>` is Sync, so the `Fn + Sync +
-                        // Send` bound required by rayon is satisfied.
-                        let progress = |p: AnalyzeProgress| {
-                            send_evt_lossy(
-                                &evt_tx_for_worker,
-                                Event::AnalyzeProgress {
-                                    batch_id: id,
-                                    done: p.done,
-                                    total: p.total,
-                                    failed: p.failed,
-                                    last: p.last,
-                                },
-                                &dropped_for_worker,
-                            );
-                        };
-
-                        let records = analyze_records_with_probe_and_progress_parallel(
-                            &files,
-                            probe_video_metadata_auto,
-                            progress,
-                        );
-
-                        // failed_count invariant: equals
-                        // records.iter().filter(|r| r.fps.is_none()).count().
-                        // The probe-progress closure already counted
-                        // failures (atomic increment), so we re-derive from
-                        // the final records to keep the contract testable.
-                        let failed_count = records.iter().filter(|r| r.fps.is_none()).count();
-
-                        Some(Event::AnalyzeFinished {
-                            batch_id: id,
-                            records,
-                            failed_count,
-                        })
-                    },
-                    done_tx.clone(),
-                    None,
-                    evt_tx.clone(),
-                    DropCounter::default(),
-                );
-            }
+            Command::SetWorkingDir { dir } => ctx.on_set_working_dir(request_id, dir),
+            Command::Analyze { files } => ctx.on_analyze(request_id, files),
         }
     }
 }
