@@ -57,10 +57,14 @@ signature at call"** principle:
   mechanism differs (Unix `flock` vs Windows share mode) and must not
   be "unified"; what is unified is the *contract* the application
   depends on — same behavior, same assertions on both platforms.
-- **Current implementation is Unix only** for the GUI (design doc
-  §8 row 35); the library and the CLI build and test on macOS,
+- The library, the CLI **and the GUI** build and test on macOS,
   Linux and Windows. The CI (`.github/workflows/ci.yml`) runs the
-  gate on all three hosts — see `docs/TESTING.md`.
+  `core` and `ui` gates on all three hosts — see `docs/TESTING.md`.
+  The GUI's tests are headless, so CI proves "it compiles and the
+  tests pass", not "the window opens" (that one is manual).
+- **WebView2 is the system's job**: Windows 11 ships it, Windows 10
+  pulls wry's Evergreen bootstrapper once. Shipping a fixed-version
+  runtime would add 150MB to every archive.
 - Adding a new platform later = edit one file (the definition site).
 
 Concrete: `rencoder_lib::platform` is the **only** file in the repo

@@ -31,7 +31,7 @@ cargo test --workspace
 |--------|------|------|
 | macOS | 本地开发 + CI | 全部（lib + CLI + GUI）✅ |
 | Linux | CI | 全部（lib + CLI + GUI）✅ |
-| Windows | CI | lib + CLI ✅（**GUI 不在范围内** ✅ —— 设计如此 ✅，§8 row 35 ✅） |
+| Windows | CI | 全部（lib + CLI + GUI ✅ ✅——GUI 没有 Unix 专属代码 ✅ ✅，§8 row 35 ✅ ✅） |
 
 CI 的 job 是分开的 ✅：`core`（lib + CLI，三台宿主机 ✓）、`c-probe`（可选 FFI ✅，Linux ✅）与
 `ui`（整个 workspace ✅，macOS + Linux ✅）。分开是因为 webview 依赖比核心重得多 ✅ ——
@@ -88,4 +88,4 @@ cargo test -p rencoder_lib -p rencoder_cli
 
 - **真实 GPU 的 NVENC 验收**（§8 row 87 ✅）——需要一台带 NVIDIA 显卡的机器 ✅，
   CI 跑不了 ✅（GitHub 的 runner 没有 GPU ✅）✅。
-- **Windows 的 GUI** ——设计如此 ✅（Unix-only ✅）✅。
+- **Windows 的 GUI 能不能真的开窗** ✅ ❌——CI 只能证"编得过、测试过" ✅ ✅（测试无头的 ✅ ✅），"窗口开得起来"要人在 Windows 上跑一遍 ✅ ✅。

@@ -10,12 +10,17 @@
 #   * `core` -- the library and the CLI, on all three hosts. This is
 #     the gate: it has no system dependencies beyond a Rust toolchain,
 #     so it cannot go red for an unrelated reason.
-#   * `ui`   -- the whole workspace including the Dioxus desktop GUI,
-#     on the two hosts it supports. The GUI is Unix-only by design
-#     (design doc §8 row 35), so Windows is out; the Linux job needs
-#     the webview stack, which is a heavier dependency than the core
-#     and therefore its own job (a broken webview package must not
-#     take the core gate with it).
+#   * `ui`   -- the whole workspace including the Dioxus desktop GUI.
+#     The GUI has no Unix-only code (design doc §3.8), so it builds
+#     wherever the webview stack exists: macOS (WKWebView), Linux
+#     (WebKitGTK) and Windows (WebView2 -- preinstalled on the
+#     runner). The Linux job needs the webview packages, which is a
+#     heavier dependency than the core and therefore its own job (a
+#     broken webview package must not take the core gate with it).
+#
+# The GUI's *tests* are headless (they never open a window), so the
+# Windows job proves "it compiles and the tests pass" -- not "the
+# window opens". That last one is a manual check (design doc §3.8).
 #
 # ffmpeg/ffprobe are installed so the integration tests actually run
 # instead of skipping (they skip when the binaries are missing).
@@ -129,6 +134,7 @@ jobs:
         include:
           - os: macos-14
           - os: ubuntu-22.04
+          - os: windows-2022
     steps:
       - uses: actions/checkout@v4
         with:
@@ -142,6 +148,10 @@ jobs:
       - name: Install ffmpeg (macOS)
         if: runner.os == 'macOS'
         run: brew install ffmpeg
+
+      - name: Install ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg --no-progress -y
 
       - name: Install ffmpeg and the webview stack (Linux)
         if: runner.os == 'Linux'
