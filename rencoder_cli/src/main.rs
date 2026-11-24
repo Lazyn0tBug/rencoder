@@ -47,7 +47,7 @@ fn main() -> Result<()> {
     match cli.command {
         args::Command::Encode(encode_args) => encode_cmd(encode_args, cli.detect, &cancel_slot),
         args::Command::Analyze(analyze_args) => analyze_cmd(analyze_args, &cancel_slot),
-        args::Command::Detect(_) => detect_cmd(),
+        args::Command::Detect(_) => detect_cmd(&cancel_slot),
     }
 }
 
@@ -113,10 +113,15 @@ fn prepare(
 /// The report is the point: "which hardware encoders can this machine
 /// actually run" becomes something the user can ask, instead of
 /// something they only learn from a fallback warning.
-fn detect_cmd() -> Result<()> {
-    let slot = signal::new_cancel_slot();
-    signal::install_handler(&slot);
-    let (_config, paths, cancel) = prepare(None, None, &slot)?;
+fn detect_cmd(cancel_slot: &signal::CancelSlot) -> Result<()> {
+    // The handler is already installed -- `main` does it for every
+    // command (design doc §3.11.2). Installing a second one is not
+    // just redundant: the handler is global (one per process), so a
+    // second registration is an error on Windows (the console
+    // handler slot is a `OnceLock`) and a second signal thread on
+    // Unix. The slot `main` installed is the one `prepare` points at
+    // the cancel file, so the graceful cancel path works here too.
+    let (_config, paths, cancel) = prepare(None, None, cancel_slot)?;
     // The probe is part of the startup phase: a cancel must not wait
     // for it (design doc §3.11.2).
     let resolution =
