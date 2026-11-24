@@ -250,9 +250,19 @@ impl TargetGuard {
         let mut claim = match lock::claim(&marker) {
             Ok(claim) => claim,
             Err(lock::Error::Busy) => {
+                let holder = read_holder(&marker);
+                // The refusal is the app's answer to the user; the log
+                // is the answer to "why did it refuse" -- the holder's
+                // pid and when it took the target.
+                tracing::warn!(
+                    target = %target.display(),
+                    holder_pid = holder.as_ref().map(|h| h.pid),
+                    holder_since = holder.as_ref().map(|h| h.since.as_str()),
+                    "the target is held by another instance"
+                );
                 return Err(GuardError::Busy {
                     path: target,
-                    holder: read_holder(&marker),
+                    holder,
                 });
             }
             Err(lock::Error::Unreadable(e)) => {
@@ -284,6 +294,12 @@ impl TargetGuard {
             drop(claim);
             return Err(GuardError::Busy { path: dir, holder });
         }
+
+        tracing::debug!(
+            target = %target.display(),
+            pid = record.pid,
+            "the target is taken"
+        );
 
         Ok(TargetGuard {
             claim,

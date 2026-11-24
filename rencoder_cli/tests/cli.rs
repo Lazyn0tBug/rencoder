@@ -508,6 +508,54 @@ fn wait_for(file: &Path, marker: &str, timeout: std::time::Duration) {
     }
 }
 
+/// Wait for the spawned CLI, but not forever.
+///
+/// A hung child hangs the test suite with it -- and the failure says
+/// nothing ("the child must exit" after four minutes). The timeout
+/// says what was going on when it hit: the CLI's own log is the only
+/// evidence of what it was doing, so the last lines of it are part of
+/// the failure message.
+fn wait_for_child(
+    child: &mut std::process::Child,
+    err_log: &Path,
+    timeout: std::time::Duration,
+) -> std::process::ExitStatus {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status,
+            Ok(None) => {}
+            Err(e) => panic!("could not wait for the child: {e}"),
+        }
+        if std::time::Instant::now() >= deadline {
+            // Stop the child before the panic: an orphaned encoder
+            // would keep running (and keep writing) after the test
+            // is over.
+            let _ = child.kill();
+            let log = std::fs::read_to_string(err_log).unwrap_or_default();
+            let tail: String = log
+                .lines()
+                .rev()
+                .take(20)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join(
+                    "
+",
+                );
+            panic!(
+                "the child did not exit within {timeout:?}
+                 --- the CLI's stderr (last 20 lines) ---
+{tail}
+---"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 /// An interrupt must not cost the run: the files that were already
 /// encoded stay in the records, and the process says it was
 /// interrupted (130 = 128 + SIGINT).
@@ -637,7 +685,11 @@ fn the_cancel_file_stops_the_batch_and_the_records_survive() {
     let cancel_file = scratch_dir().join("cancel");
     std::fs::write(&cancel_file, b"").expect("the cancel file must be writable");
 
-    let status = child.wait().expect("the child must exit");
+    let status = wait_for_child(
+        &mut child,
+        &fixture.err_log,
+        std::time::Duration::from_secs(60),
+    );
     fixture.assert_interrupted(&status);
 
     let _ = std::fs::remove_dir_all(&fixture.dir);
@@ -664,7 +716,11 @@ fn an_interrupt_keeps_the_records_of_the_files_that_finished() {
         .expect("kill must run");
     assert!(status.success(), "the signal must be delivered");
 
-    let status = child.wait().expect("the child must exit");
+    let status = wait_for_child(
+        &mut child,
+        &fixture.err_log,
+        std::time::Duration::from_secs(60),
+    );
     fixture.assert_interrupted(&status);
 
     let _ = std::fs::remove_dir_all(&fixture.dir);
@@ -707,7 +763,11 @@ fn an_interrupt_keeps_the_records_of_the_files_that_finished() {
         return;
     }
 
-    let status = child.wait().expect("the child must exit");
+    let status = wait_for_child(
+        &mut child,
+        &fixture.err_log,
+        std::time::Duration::from_secs(60),
+    );
     fixture.assert_interrupted(&status);
 
     let _ = std::fs::remove_dir_all(&fixture.dir);

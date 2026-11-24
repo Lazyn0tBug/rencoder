@@ -491,14 +491,29 @@ pub fn write_records(records: &[EncodingRecord], path: &Path) -> Result<(), Enco
 /// as a run of its own.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), EncodeError> {
     let tmp = tmp_path_for(path);
+    tracing::debug!(
+        path = %path.display(),
+        bytes = bytes.len(),
+        "writing the records (atomic: temporary file, then rename)"
+    );
     if let Err(e) = std::fs::write(&tmp, bytes) {
         let _ = std::fs::remove_file(&tmp);
+        tracing::warn!(
+            error = %e,
+            path = %path.display(),
+            "could not write the temporary records file"
+        );
         return Err(EncodeError::Io(e));
     }
     if let Err(e) = std::fs::rename(&tmp, path) {
         // The target keeps its old contents; the temporary does not
         // linger.
         let _ = std::fs::remove_file(&tmp);
+        tracing::warn!(
+            error = %e,
+            path = %path.display(),
+            "could not move the records into place"
+        );
         return Err(EncodeError::Io(e));
     }
     Ok(())

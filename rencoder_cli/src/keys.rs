@@ -125,10 +125,25 @@ impl KeyReader {
     /// only way to stop it.
     pub fn install(slot: &CancelSlot) -> Option<Self> {
         if !io::stdin().is_terminal() {
+            // No keyboard: the run behaves as if the key did not
+            // exist. Say so -- "Ctrl-D does nothing" is otherwise a
+            // mystery.
+            tracing::debug!(
+                "stdin is not a terminal: there is no keyboard to watch, \
+                 the quit key (Ctrl-D) does nothing"
+            );
             return None;
         }
         #[cfg(unix)]
-        unix::enter().ok()?;
+        if let Err(e) = unix::enter() {
+            tracing::warn!(
+                error = %e,
+                "could not put the terminal in non-canonical mode: \
+                 the quit key (Ctrl-D) does nothing"
+            );
+            return None;
+        }
+        tracing::debug!("watching the keyboard for the quit key (Ctrl-D)");
 
         #[cfg(windows)]
         let console = windows::Console::open();

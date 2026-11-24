@@ -2330,18 +2330,34 @@ fn the_capability_reaches_the_ui_at_startup() {
         )),
     );
 
+    // Wait for the event -- but not for five seconds: the suite runs
+    // the tests in parallel, and a loaded machine needs longer than a
+    // quiet one. The wait remembers what it saw, so a timeout says
+    // *where* the chain stopped instead of just "it did not arrive".
     let mut reported = None;
-    for _ in 0..50 {
+    let mut seen: Vec<String> = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
         match evt_rx.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok(Event::NvencCapability(capability)) => {
                 reported = Some(capability);
                 break;
             }
-            Ok(_) => {}
-            Err(_) => break,
+            Ok(other) => {
+                if seen.len() < 20 {
+                    seen.push(format!("{other:?}"));
+                }
+            }
+            Err(_) => {}
         }
     }
-    let capability = reported.expect("the capability must reach the UI");
+    let capability = reported.unwrap_or_else(|| {
+        panic!(
+            "the capability never reached the UI within 15s\n\
+             --- the events that did arrive ---\n{}\n---",
+            seen.join("\n")
+        )
+    });
     assert!(
         capability.review_due(),
         "the UI needs the advisory flag to show the advisory"

@@ -2920,18 +2920,38 @@ fn run_actor(cmd_rx: Receiver<Request>, evt_tx: Sender<Event>, env: ActorEnv) {
         }
 
         match command {
-            Command::StartBatch { params, files } => ctx.on_start_batch(request_id, params, files),
-            Command::DryRun { params, files } => ctx.on_dry_run(request_id, params, files),
-            Command::Cancel { batch_id } => ctx.on_cancel(request_id, batch_id),
-            Command::LoadHistory { limit, after } => ctx.on_load_history(request_id, limit, after),
+            Command::StartBatch { params, files } => {
+                tracing::debug!(request_id, files = files.len(), "the actor: StartBatch");
+                ctx.on_start_batch(request_id, params, files)
+            }
+            Command::DryRun { params, files } => {
+                tracing::debug!(request_id, files = files.len(), "the actor: DryRun");
+                ctx.on_dry_run(request_id, params, files)
+            }
+            Command::Cancel { batch_id } => {
+                tracing::debug!(request_id, batch_id, "the actor: Cancel");
+                ctx.on_cancel(request_id, batch_id)
+            }
+            Command::LoadHistory { limit, after } => {
+                tracing::debug!(request_id, "the actor: LoadHistory");
+                ctx.on_load_history(request_id, limit, after)
+            }
             Command::SaveConfig { config, revision } => {
+                tracing::debug!(request_id, revision, "the actor: SaveConfig");
                 ctx.on_save_config(request_id, config, revision)
             }
             Command::CheckCapability { ignore_record } => {
+                tracing::debug!(request_id, ignore_record, "the actor: CheckCapability");
                 ctx.on_check_capability(request_id, ignore_record)
             }
-            Command::SetWorkingDir { dir } => ctx.on_set_working_dir(request_id, dir),
-            Command::Analyze { files } => ctx.on_analyze(request_id, files),
+            Command::SetWorkingDir { dir } => {
+                tracing::debug!(request_id, dir = %dir.display(), "the actor: SetWorkingDir");
+                ctx.on_set_working_dir(request_id, dir)
+            }
+            Command::Analyze { files } => {
+                tracing::debug!(request_id, files = files.len(), "the actor: Analyze");
+                ctx.on_analyze(request_id, files)
+            }
         }
     }
 }
@@ -2985,6 +3005,7 @@ fn load_history(
     // Newest first; chronological reverse lets truncate() pick the
     // most recent N after the time filter.
     all.sort_by_key(|r| std::cmp::Reverse(r.started_at));
+    tracing::debug!(records = all.len(), "the history was read");
 
     if let Some(t) = after {
         all.retain(|r| r.started_at >= t);
