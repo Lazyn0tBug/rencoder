@@ -12,7 +12,10 @@
 | NVIDIA GPU | 不要 | NVENC 的实机验收（§8 row 87）跑不了，其余不受影响 |
 
 `c-probe`（原生 libavformat 探测）是**可选特性** ✅ —— 默认走 `ffprobe` 子进程 ✅。
-CI 不开它 ✅，所以 CI 验的正是用户实际会跑的那条路径 ✅。
+核心闸门不开它 ✅，所以核心闸门验的正是用户实际会跑的那条路径 ✅。
+但它**不是没人编** ✅ ✅：另有一个 `c-probe (ubuntu)` 的 job ✅ ✅，每次 push 都编一遍 ✅ ✅
+（装 `pkg-config` + `libavformat-dev` ✅ ✅）——没人编的 feature 会静默腐烂 ✅ ✅，
+一个改错的 C 签名要等到某人在本地开 feature 才发现 ✅ ✅。
 
 ## 闸门
 
@@ -30,8 +33,9 @@ cargo test --workspace
 | Linux | CI | 全部（lib + CLI + GUI）✅ |
 | Windows | CI | lib + CLI ✅（**GUI 不在范围内** ✅ —— 设计如此 ✅，§8 row 35 ✅） |
 
-CI 的两个 job 是分开的 ✅：`core`（lib + CLI，三台宿主机 ✓）与 `ui`（整个 workspace ✅，
-macOS + Linux ✅）。分开是因为 webview 依赖比核心重得多 ✅ —— 它坏了不该把核心闸门一起带下水 ✅。
+CI 的 job 是分开的 ✅：`core`（lib + CLI，三台宿主机 ✓）、`c-probe`（可选 FFI ✅，Linux ✅）与
+`ui`（整个 workspace ✅，macOS + Linux ✅）。分开是因为 webview 依赖比核心重得多 ✅ ——
+它坏了不该把核心闸门一起带下水 ✅；`c-probe` 要系统库 ✅ ✅，同理 ✅ ✅。
 
 ## 按平台不一样的地方
 

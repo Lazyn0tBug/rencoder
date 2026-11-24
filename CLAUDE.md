@@ -32,7 +32,9 @@ Rencoder is delivered and runs as a single self-contained directory:
 ## App-level config (U18)
 
 Only `target` (`-f`/`-d`) and `action` (`encode`/`analyze`) plus per-run
-overrides (`-i`, `--config`, `-o`, passthrough args) stay on the CLI.
+overrides (`-i`, `--config`, `-o`, passthrough args) stay on the CLI --
+`-i` (the interactive wizard) is **not implemented**: it says so instead
+of pretending.
 Everything else (format, bitrate, max-fps, crf, nv, extensions, encoder
 overrides, analyze format, parallel) lives in `rencoder.toml` at the
 app-level location (binary dir by default; `$RENENCODER_CONFIG` overrides).

@@ -66,6 +66,10 @@ pub struct EncodeArgs {
     pub dir: Option<PathBuf>,
 
     /// Launch the interactive wizard before transcoding.
+    ///
+    /// **Not implemented yet** (design doc §8 row 111): the wizard was
+    /// a placeholder file, and the flag used to be accepted and
+    /// ignored. The CLI now says so instead of pretending.
     #[arg(short = 'i', long = "interactive")]
     pub interactive: bool,
 

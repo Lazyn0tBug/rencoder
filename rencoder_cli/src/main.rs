@@ -11,7 +11,6 @@
 
 mod args;
 mod file_sink;
-mod interact;
 mod keys;
 mod signal;
 mod tracing_init;
@@ -69,25 +68,6 @@ fn main() -> Result<()> {
 fn exit_with(code: i32) -> ! {
     keys::restore_terminal();
     std::process::exit(code);
-}
-
-/// The exit code of a finished run.
-///
-/// - **Not cancelled** → 0.
-/// - **Cancelled by an interrupt** → 130 (128 + SIGINT): the run did
-///   not finish, and the shell should know.
-/// - **Cancelled by a deliberate quit** (Ctrl-D) → 0: the user asked
-///   for it, the records are on disk, the run ended the way they
-///   wanted.
-/// - Cancelled by *someone else* (the cancel file was written by a
-///   script) → 130: we cannot tell what was meant, so the
-///   conservative code stands.
-fn exit_code_for(cancelled: bool, reason: Option<signal::Reason>) -> i32 {
-    match (cancelled, reason) {
-        (false, _) => 0,
-        (true, Some(reason)) => signal::exit_code(reason),
-        (true, None) => 130,
-    }
 }
 
 /// Everything a run needs before it starts: the config, the paths
@@ -246,12 +226,21 @@ fn encode_cmd(
     force_detect: bool,
     cancel_slot: &signal::CancelSlot,
 ) -> Result<()> {
+    if args.interactive {
+        // The wizard is specified (design doc §"交互模式") but not
+        // built -- the placeholder file it lived in was a comment and
+        // nothing else. The flag used to be accepted and ignored, so
+        // `rencoder encode --interactive` failed with "either --file
+        // or --dir must be provided" and the user had no idea why.
+        // Say what is actually the case.
+        anyhow::bail!("the interactive wizard is not implemented yet -- pass --file or --dir");
+    }
     let target = if let Some(file) = &args.file {
         Target::File(file.clone())
     } else if let Some(dir) = &args.dir {
         Target::Dir(dir.clone())
     } else {
-        anyhow::bail!("either --file or --dir must be provided (or use --interactive)");
+        anyhow::bail!("either --file or --dir must be provided");
     };
 
     // The operation directory: where this run acts (design doc §3.6).
@@ -472,7 +461,7 @@ fn encode_cmd(
         report.termination,
         rencoder_lib::pipeline::task::Termination::Cancelled { .. }
     ) {
-        exit_with(exit_code_for(true, signal::reason(cancel_slot)));
+        exit_with(signal::exit_code_for(true, signal::reason(cancel_slot)));
     }
 
     Ok(())
@@ -602,7 +591,7 @@ fn analyze_cmd(args: args::AnalyzeArgs, cancel_slot: &signal::CancelSlot) -> Res
         report.termination,
         rencoder_lib::pipeline::task::Termination::Cancelled { .. }
     ) {
-        exit_with(exit_code_for(true, signal::reason(cancel_slot)));
+        exit_with(signal::exit_code_for(true, signal::reason(cancel_slot)));
     }
 
     // One-line summary to stderr regardless of output format.
@@ -723,27 +712,30 @@ mod tests {
 
     #[test]
     fn an_interrupted_run_leaves_with_130() {
-        assert_eq!(exit_code_for(true, Some(signal::Reason::Interrupt)), 130);
+        assert_eq!(
+            signal::exit_code_for(true, Some(signal::Reason::Interrupt)),
+            130
+        );
     }
 
     #[test]
     fn a_deliberate_quit_leaves_with_zero() {
         // The user asked for it: the records are on disk, the run
         // ended the way they wanted. The shell sees a success.
-        assert_eq!(exit_code_for(true, Some(signal::Reason::Quit)), 0);
+        assert_eq!(signal::exit_code_for(true, Some(signal::Reason::Quit)), 0);
     }
 
     #[test]
     fn a_finished_run_leaves_with_zero() {
-        assert_eq!(exit_code_for(false, None), 0);
-        assert_eq!(exit_code_for(false, Some(signal::Reason::Quit)), 0);
+        assert_eq!(signal::exit_code_for(false, None), 0);
+        assert_eq!(signal::exit_code_for(false, Some(signal::Reason::Quit)), 0);
     }
 
     #[test]
     fn a_cancel_from_someone_else_keeps_the_conservative_code() {
         // The cancel file was written by a script, not by us: we
         // cannot tell what was meant, so 130 stands.
-        assert_eq!(exit_code_for(true, None), 130);
+        assert_eq!(signal::exit_code_for(true, None), 130);
     }
 
     #[test]

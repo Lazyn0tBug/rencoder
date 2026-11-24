@@ -67,6 +67,28 @@ pub fn record_reason(slot: &CancelSlot, reason: Reason) -> Reason {
     *slot.reason.get_or_insert(reason)
 }
 
+/// The exit code of a finished run.
+///
+/// The whole policy lives here, next to the reason it is about -- the
+/// frontends only ask.
+///
+/// - **Not cancelled** → 0.
+/// - **Cancelled by an interrupt** → 130 (128 + SIGINT): the run did
+///   not finish, and the shell should know.
+/// - **Cancelled by a deliberate quit** (Ctrl-D) → 0: the user asked
+///   for it, the records are on disk, the run ended the way they
+///   wanted.
+/// - Cancelled by *someone else* (the cancel file was written by a
+///   script) → 130: we cannot tell what was meant, so the
+///   conservative code stands.
+pub fn exit_code_for(cancelled: bool, reason: Option<Reason>) -> i32 {
+    match (cancelled, reason) {
+        (false, _) => 0,
+        (true, Some(reason)) => exit_code(reason),
+        (true, None) => 130,
+    }
+}
+
 /// The cancel channel's state.
 #[derive(Default)]
 pub struct CancelState {

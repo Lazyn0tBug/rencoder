@@ -17,7 +17,7 @@
 
 use chrono::{DateTime, Utc};
 use polars::prelude::*;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::EncodeError;
 use crate::types::{EncodingOutcome, EncodingRecord, ErrorCategory, ErrorContext, SkippedReason};
@@ -447,6 +447,14 @@ fn parse_error_category(s: &str) -> ErrorCategory {
 /// produce: `.parquet`, `.jsonl` (or `.ndjson`) and `.csv`. Anything
 /// else is a parameter error.
 ///
+/// **The write is atomic**: the bytes go to a temporary file next to
+/// the target and are renamed over it (the same pattern as the config
+/// write, `config::app::write_atomic`). A crash or a power cut in the
+/// middle of a write would otherwise leave a **truncated parquet**
+/// behind -- and a truncated parquet is not recoverable: the history
+/// reader cannot parse it, so the run's records vanish from the
+/// history with nothing to show for it.
+///
 /// The mechanics of "where the records go" live here, so both
 /// frontends write the same file the same way (design doc §3.11.4).
 pub fn write_records(records: &[EncodingRecord], path: &Path) -> Result<(), EncodeError> {
@@ -471,8 +479,40 @@ pub fn write_records(records: &[EncodingRecord], path: &Path) -> Result<(), Enco
             )))
         }
     };
-    std::fs::write(path, bytes)?;
+    write_atomic(path, &bytes)
+}
+
+/// Write `bytes` to `path` atomically: a temporary file next to the
+/// target, then a rename over it.
+///
+/// The temporary name carries the pid and does **not** end in the
+/// target's extension -- the history reader globs `*.parquet` in the
+/// records directory, and a leftover temporary must not be picked up
+/// as a run of its own.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), EncodeError> {
+    let tmp = tmp_path_for(path);
+    if let Err(e) = std::fs::write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(EncodeError::Io(e));
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // The target keeps its old contents; the temporary does not
+        // linger.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(EncodeError::Io(e));
+    }
     Ok(())
+}
+
+/// The temporary path next to `path`: `<name>.<pid>.tmp`.
+fn tmp_path_for(path: &Path) -> PathBuf {
+    let mut tmp = path.to_path_buf();
+    let name = match path.file_name() {
+        Some(n) => format!("{}.{}.tmp", n.to_string_lossy(), std::process::id()),
+        None => format!("rencoder.{}.tmp", std::process::id()),
+    };
+    tmp.set_file_name(name);
+    tmp
 }
 
 /// The default path for a batch's records: `<records_dir>/encoding-<ts>.parquet`.

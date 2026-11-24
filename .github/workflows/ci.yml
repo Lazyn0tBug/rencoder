@@ -90,6 +90,36 @@ jobs:
           # failure stayed hidden behind the CLI's that way.
           cargo test -p rencoder_lib -p rencoder_cli --no-fail-fast
 
+  # The optional FFI bridge (c-probe) is off by default, so the core
+  # gate never compiles it -- and a feature nobody compiles rots
+  # silently (a changed C signature would only surface on a machine
+  # that happens to have libavformat-dev). This job compiles it on
+  # every push.
+  #
+  # It is a **separate** job on purpose: the core gate must not grow a
+  # system dependency, or it could go red for a reason that has
+  # nothing to do with the code.
+  c-probe:
+    name: c-probe (ubuntu)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install the Rust toolchain
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+
+      - name: Install pkg-config and libavformat
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libavformat-dev
+
+      - name: The optional bridge must still compile
+        run: cargo check -p rencoder_lib --features c-probe
+
   ui:
     name: ui (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
