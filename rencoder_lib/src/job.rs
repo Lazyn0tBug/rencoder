@@ -2959,6 +2959,25 @@ mod mock_tests {
         std::env::temp_dir().join(format!("rencoder_mock_{label}_{}_{n}", std::process::id()))
     }
 
+    /// A records directory that cannot exist -- and therefore cannot
+    /// be written to, and can never hold records.
+    ///
+    /// The "no data dir" case needs a path that is guaranteed to be
+    /// empty. A plain "/nonexistent/..." is not enough: on Windows it
+    /// resolves against the current drive, and a batch that runs
+    /// without a data dir *creates* it and writes its records there
+    /// (`default_encoding_path_in` does a `create_dir_all`) -- so the
+    /// next test that expects an empty history reads them back, and
+    /// the suite passes once and fails the next time. Putting a file
+    /// in the parent keeps the path unusable on every platform.
+    fn unusable_records_dir() -> PathBuf {
+        let dir = unique_tmp("unusable");
+        std::fs::create_dir_all(&dir).expect("the scratch dir must exist");
+        let blocker = dir.join("not-a-directory");
+        std::fs::write(&blocker, b"").expect("the blocker must exist");
+        blocker.join("records")
+    }
+
     /// Test helper: wrap a path literal in `InputPath`. See the
     /// equivalent in `mod tests` above for rationale.
     fn input(p: &str) -> crate::types::InputPath {
@@ -3074,9 +3093,7 @@ mod mock_tests {
 
         // The temp dir plays the records directory: the writer and
         // the history reader must agree on it (design doc §3.6).
-        let records_dir = data_dir
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("/nonexistent/rencoder-records"));
+        let records_dir = data_dir.clone().unwrap_or_else(unusable_records_dir);
         // The app directory: a temp dir, never the working directory
         // -- the actor writes there (the capability report, the saved
         // config), and a test must not leave files in the source
