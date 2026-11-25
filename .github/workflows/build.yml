@@ -162,7 +162,11 @@ jobs:
           # user's ffmpeg upgrades (macOS bumps the dylib major version
           # regularly; the Linux majors differ per distro release).
           failed=0
-          for bin in target/${{ matrix.target }}/release/rencoder*; do
+          # cargo-dist builds with the `dist` profile, so the binaries
+          # are in target/<triple>/dist/ -- NOT target/<triple>/release/
+          # (that directory does not exist, so this loop matched
+          # nothing and the check passed vacuously).
+          for bin in target/${{ matrix.target }}/dist/rencoder*; do
             [ -f "$bin" ] || continue
             if grep -a -q -E "libav(format|codec|util)" "$bin"; then
               echo "::error::$bin links libav* -- c-probe must stay off for release builds"
