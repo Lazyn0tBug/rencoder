@@ -11,7 +11,25 @@ edition = "2021"
 version = "0.8.0-pre2"
 license = "MIT"
 
-# The profile that 'dist' will build with
+# The profile that 'dist' will build with.
+#
+# Three deliberate choices, all about the *shipped* size:
+#
+# - `strip = "symbols"` -- the debug info is for our crash reports,
+#   not for the user's download. Without it the binaries carry ~12 MB
+#   of symbols each (measured: the CLI 70.6 MB -> 58 MB).
+# - `opt-level = "z"` -- nearly free here, because the hot path is
+#   ffmpeg (a subprocess): this side collects files, builds argv,
+#   parses a little text and writes the history once per batch.
+# - `lto = "thin"` -- cross-crate inlining and dead-code elimination;
+#   the link is the slow part, not the compile.
+#
+# `panic = "abort"` is deliberately NOT set: the batch worker's
+# `DoneGuard` reports "done" while the thread unwinds, so a panic
+# still opens the busy gate (design doc §3.11.2). Aborting would
+# strand the UI with a closed gate.
 [profile.dist]
 inherits = "release"
 lto = "thin"
+opt-level = "z"
+strip = "symbols"

@@ -4759,7 +4759,7 @@ Reload the selected TOML file on every invocation. Existing outputs and matching
 
 The application directory means the directory containing the executable, never a system application-data directory. Every Unix archive, Windows zip and macOS disk image includes rencoder.toml adjacent to the binary, with log/ and data/ subdirectories. Explicit --config and RENENCODER_CONFIG remain supported. Each invocation reloads the selected config.
 
-Use scripts/dist.sh to build with Cargo and scripts/package.py to package identically on every platform. Hash final archives after adding configuration. CI checks out and validates the requested tag, builds all three targets, verifies checksums, and publishes a GitHub Release for every pushed tag (including non-SemVer tags). Manual releases require an existing tag.
+Use scripts/dist.sh to build with Cargo and scripts/package.py to package identically on every platform. Hash final archives after adding configuration. The shipped binaries are stripped and optimized for size (`[profile.dist]`): the debug info is for our crash reports, not for the user's download, and the hot path is ffmpeg -- a subprocess -- so optimizing this side for size costs nothing measurable. `panic = "abort"` stays off: the batch worker's done-guard reports the end of a batch while the thread unwinds (design doc §3.11.2), and aborting would strand the UI with a closed gate. CI checks out and validates the requested tag, builds all three targets, verifies checksums, and publishes a GitHub Release for every pushed tag (including non-SemVer tags). Manual releases require an existing tag.
 
 ## Native probing is opt-in
 
