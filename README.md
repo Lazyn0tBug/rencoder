@@ -75,7 +75,7 @@ rencoder analyze -d ./my_videos/
 
 # Transcode a single file with default config (av1, crf=45)
 rencoder encode -f movie.mp4
-# Output: <app_dir>/data/encoding-<UTC-timestamp>Z.parquet (work record)
+# Output: <app_dir>/data/encoding-<UTC-timestamp>Z.arrow (work record)
 # Output: movie.av1.mkv (the actual transcoded video)
 ```
 

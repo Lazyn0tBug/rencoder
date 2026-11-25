@@ -177,8 +177,8 @@ let claim = platform::lock::claim(&marker)?;
 | 分析聚合 | `polars`（DataFrame `group_by` + `agg`） | 复用 Polars 生态；不再手写 BTreeMap 遍历 |
 | 分析输出（默认） | per-file CSV 到 stdout + 一行 summary 到 stderr | 原始数据可管道到 DuckDB/Polars 二次分析；摘要与数据流分离 |
 | 转码工作记录 | `EncodingRecord`（4 维度：source / process / result / status） | 工作分析（吞吐、压缩率、失败率），不是视频分析 |
-| 工作记录存储 | `<app_dir>/data/encoding-YYYY-MM-DDTHH-MM-SSZ.parquet`（按运行分文件，U18） | 每跑一次产出一个自包含文件，多批分析用 `read_parquet(['<app_dir>/data/*.parquet'])` glob；`RENENCODER_DATA_DIR` 覆盖 |
-| 工作记录序列化 | 单 DataFrame 中转（`records_to_dataframe`）+ 三种 writer（CSV / JSONL / Parquet） | schema 在 `records_to_dataframe` 一处定义；writer 都是 thin wrapper |
+| 工作记录存储 | `<app_dir>/data/encoding-YYYY-MM-DDTHH-MM-SSZ.arrow`（按运行分文件，U18） | 每跑一次产出一个自包含文件，多批分析用 `encoding-*.arrow` 的 glob；`RENCODER_DATA_DIR` 覆盖 |
+| 工作记录序列化 | 单 RecordBatch 中转（`records_to_batch`）+ 三种 writer（CSV / JSONL / Arrow IPC） | schema 在 `records_to_batch` 一处定义；writer 都是 thin wrapper |
 | 同路径保护 | 三层：`output_path_for` 命名避让 → `utils::fs::is_same_file` 判定 → 转码前拦截 | 输出覆盖输入会销毁源文件；取消清理按 `argv.last()` 删产物，输出等于输入时删的是输入（结构性失败） |
 | 单目录应用部署 | `scripts/dist.sh` 把 target 产物 + LICENSE + README + 配置种子装配成单目录应用（U18） | 跨平台一致；解压即用；放弃 `cargo install` 的共享 `~/.cargo/bin/` 模式 |
 | `rencoder_lib` publish 策略 | `publish = false`（U18） | 内部 lib，不发布到 crates.io；防止内部 API 泄露锁死 schema |
@@ -470,7 +470,7 @@ NVENC 用的是恒定质量（`-cq N -b:v 0`），不是 x265 的 CRF（`-crf N`
 **存储格式按场景选**：
 
 - **JSONL（默认 stdout）**：每条记录一行 JSON，stream-friendly，所有字段保留，可直接 pipe 到 `jq` 或 `duckdb`。
-- **Parquet（`-o file.parquet`）**：列式压缩格式，schema 内嵌，Snappy 压缩；原生 DuckDB / Polars 输入。多批分析：`SELECT * FROM read_parquet('./data/*.parquet')`。
+- **Arrow IPC（`-o file.arrow`）**：arrow 的原生磁盘格式，schema 内嵌，列式；可用 zstd 压缩。多批分析：用支持 Arrow IPC 的工具读（pyarrow 等）。
 - **CSV（`-o file.csv`，兼容旧脚本）**：仅保留最常用的列（path、fps、codec、resolution、duration、file_bytes、outcome）。
 
 **单一 DataFrame 中转，writer 是 thin wrapper**：
@@ -480,16 +480,16 @@ records → records_to_dataframe（schema 在这一处定义）
                 ↓
     ┌───────────┼──────────┐
     ↓           ↓          ↓
-df_to_csv  df_to_jsonl  df_to_parquet
+to_csv    to_jsonl    to_arrow
 ```
 
-`records_to_dataframe` 是唯一的 schema 定义点。writer 都是 2-5 行的 thin wrapper，schema 变化时只改一处。不做 `records_to_jsonl → records_from_jsonl_to_parquet` 这种 round-trip（浪费一次 parse，且丢失 Polars 的列类型信息）。
+`records_to_batch` 是唯一的 schema 定义点。writer 都是 2-5 行的 thin wrapper，schema 变化时只改一处。不做 `records_to_jsonl → records_from_jsonl_to_arrow` 这种 round-trip（浪费一次 parse，且丢失列类型信息）。
 
-**每跑一次产出一个文件**（`./data/encoding-<UTC-timestamp>Z.parquet`）：
+**每跑一次产出一个文件**（`./data/encoding-<UTC-timestamp>Z.arrow`）：
 
 - ISO 8601 UTC（`Z` 后缀避免时区歧义），`:` 替换为 `-`（macOS / Windows 文件系统兼容）
 - 时间戳文件名可字典序排序 = 时间顺序，`ls -t | head -1` 拿到最近一次
-- 多批分析用 glob：`read_parquet(['./data/*.parquet'])`
+- 多批分析用 glob：`./data/*.arrow`
 - 进程 ID 后缀（`a3f`）避免同一秒内并发冲突
 
 > 注：NVENC 探测失败（驱动缺失、卡不支持该编码器、会话额度耗尽）一律归为降级路径，
@@ -545,7 +545,7 @@ ffmpeg 不带 `-r` 时并不等于"不干预帧率"——默认 vsync 行为会�
 **最终状态**（U16 + U17 之后）：
 
 - `data/extract.rs` 拥有 probe 实现 + fps 解析（`probe_video_metadata*`、`parse_fps_value`）
-- `data/store.rs` 拥有 Polars DataFrame writers（`records_to_dataframe`、`records_to_csv/jsonl/parquet`、`dataframe_to_*`）
+- `data/store.rs` 拥有 Arrow RecordBatch writers（`records_to_batch`、`records_to_csv/jsonl/arrow`、`batch_to_*`）
 - `data/record.rs` 拥有 `EncodingRecord` 组装 helpers（`encoder_settings_from_params`）
 - `encoder/{command,select}.rs` 拥有 `build_ffmpeg_command` + `select_encoder`
 - `pipeline/{batch,cancel,cache}.rs` 拥有 `transcode_batch` + `CancelToken` + 从已解析能力构造编码器缓存（`cache_from_resolution`）
@@ -567,7 +567,7 @@ rencoder_lib/
 │   ├── mod.rs
 │   ├── extract.rs               # probe_video_metadata*, parse_fps_value, stderr_tail, output_size, output_duration
 │   ├── record.rs                # encoder_settings_from_params
-│   └── store.rs                 # records_to_dataframe, records_to_csv/jsonl/parquet, dataframe_to_*
+│   └── store.rs                 # records_to_batch, records_to_csv/jsonl/arrow, batch_to_*
 ├── encoder/
 │   ├── mod.rs
 │   ├── command.rs               # build_ffmpeg_command（参数映射，含 -r 输出选项位置）
@@ -636,7 +636,7 @@ rencoder_lib/
   （`cli/main.rs::write_records`）已改用 `rencoder_lib::data::store::*`。
 - 现在的 public API 没有 `ffmpeg/` / `encoding/`；probe 实现是
   `data::extract::{probe_video_metadata, probe_video_metadata_auto, parse_fps_value}`，
-  writers 是 `data::store::{records_to_csv, records_to_jsonl, records_to_parquet, records_to_dataframe, ...}`，
+  writers 是 `data::store::{records_to_csv, records_to_jsonl, records_to_arrow, records_to_batch, ...}`，
   记录类型是 `types::{EncodingRecord, EncodingOutcome, ...}`。这是 breaking change —
   任何使用旧路径的外部代码必须迁移。
 
@@ -848,7 +848,7 @@ pub enum TranscodeResult {
 /// backwards-compat alias。
 ///
 /// `Skipped` 是**只读历史**：现在没有"跳过"这个概念（§3.3.4），
-/// 它只为读旧 Parquet 保留，没有产生者。
+/// 它只为读旧格式的记录保留，没有产生者（格式换成 Arrow IPC 后随旧格式一起退役）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncodingOutcome {
     Succeeded,
@@ -899,7 +899,7 @@ pub struct ErrorContext {
 }
 
 /// 单文件转码的工作记录（4 维度：source / process / result / status）。
-/// 通过 `transcode_batch` 产出，写入 `<app_dir>/data/encoding-*.parquet`（CLI 路径）
+/// 通过 `transcode_batch` 产出，写入 `<app_dir>/data/encoding-*.arrow`（CLI 路径）
 /// 或经 `Event::FileCompleted` 推送（GUI 路径，§3.8）。
 #[derive(Clone, Debug)]
 pub struct EncodingRecord {
@@ -1453,7 +1453,7 @@ rencoder encode [选项] [--] [额外FFmpeg参数]
   -d, --dir DIR           指定目录（递归）
   -i, --interactive       启动交互模式（**尚未实现** ✅ ✅——传了会明确报错 ✅ ✅，不再装作收下了 ✅ ✅）
   --config PATH           TOML 配置路径（默认 `<app_dir>/rencoder.toml`；`$RENENCODER_CONFIG` 覆盖）
-  -o, --output FILE       详细输出文件路径（默认 `<app_dir>/data/encoding-<UTC-ISO8601>Z.parquet`；`$RENENCODER_DATA_DIR` 覆盖）
+  -o, --output FILE       详细输出文件路径（默认 `<app_dir>/data/encoding-<UTC-ISO8601>Z.arrow`；`$RENENCODER_DATA_DIR` 覆盖）
   --nv                    强制启用 NVIDIA 硬件编码（覆盖配置项；**不触发**能力实测——能力判定每进程形成一次）
   --no-nv                 强制禁用 NVIDIA 硬件编码（覆盖配置项）
   --                      之后的所有参数作为FFmpeg原生参数透传
@@ -1500,7 +1500,7 @@ rencoder analyze [选项]
   -d, --dir DIR           指定目录（递归），默认当前目录
   -f, --file FILE         指定单个文件
   --config PATH           TOML 配置路径（默认 `<app_dir>/rencoder.toml`；`$RENENCODER_CONFIG` 覆盖）
-  -o, --output FILE       详细输出文件路径（默认 - 即 stdout；`-o file.parquet` 时写入 `<app_dir>/data/`）
+  -o, --output FILE       详细输出文件路径（默认 - 即 stdout；`-o file.arrow` 时写入 `<app_dir>/data/`）
 
 `format` / `parallel` / `extensions` 在 `rencoder.toml` 的 `[analyze]` 段。
 ```
@@ -2015,7 +2015,9 @@ rencoder-cli-<triple>/
 ├── rencoder.toml              # 用户编辑的偏好（auto-create 后存在）
 ├── nvenc-capability.json      # 机器能力记录（`rencoder detect` 写入）
 ├── log/                       # 日志：rencoder.YYYY-MM-DD.NN.log
-└── data/                      # 工作记录：encoding-<ISO8601>Z.parquet
+├── librencoder_lib.dylib      # lib 的动态库（Windows: rencoder_lib.dll）
+├── libstd.dylib               # Rust 运行时（自带：可执行文件不依赖宿主机的 Rust）
+└── data/                      # 工作记录：encoding-<ISO8601>Z.arrow
 
 <操作目录>/                    # 本次操作作用的目录
 ├── cancel                     # 取消请求（存在即取消）
@@ -2228,7 +2230,7 @@ pub enum Command {
     /// 不会误伤现在正在跑的那批。
     /// **不**影响 `Command::Analyze` 批（v1 限制——见 §3.4 "分析进度上报"）。
     Cancel { batch_id: BatchId },
-    /// 从 `<app_dir>/data/encoding-*.parquet` 回读历史。
+    /// 从 `<app_dir>/data/encoding-*.arrow` 回读历史。
     /// - `limit`：返回最多 N 条最新记录；`None` 表示全部
     /// - `after`：仅返回 `started_at >= after` 的记录；`None` 表示不限时间
     LoadHistory {
@@ -2430,10 +2432,10 @@ UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `int
 | 通道 | 形式 | 生命周期 |
 |------|------|----------|
 | 实时 | mpsc 事件流 | 临时，重启即丢 |
-| 持久 | `<app_dir>/data/encoding-*.parquet` | 永久 |
+| 持久 | `<app_dir>/data/encoding-*.arrow` | 永久 |
 
-- 批结束：lib 写 Parquet + 发 `Event::BatchCompleted`。
-- **History 回读（v1.1 启用）**:UI 启动时发 `Command::LoadHistory { limit, after }` → lib 读 Parquet → 发 `Event::HistoryLoaded` 填充历史视图。v1 不展示历史(见 §3.8.7 limitations),但 Parquet 仍在写,数据可用。
+- 批结束：lib 写 Arrow IPC 文件 + 发 `Event::BatchCompleted`。
+- **History 回读（v1.1 启用）**:UI 启动时发 `Command::LoadHistory { limit, after }` → lib 读 Arrow IPC 文件 → 发 `Event::HistoryLoaded` 填充历史视图。v1 不展示历史(见 §3.8.7 limitations),但那个文件 仍在写,数据可用。
 - 这是 event sourcing 的两面：state 是 event log 的 fold，event log 是 append-only 真相源。
 - **Realtime 通道的消费方**:UI 端的具体消费机制——`crossbeam_channel::unbounded` 在专用 OS 线程里阻塞 recv,然后通过 `use_signal_sync` 的 `SyncSignal` 改 Dioxus state——见 §3.9 "UI 运行时 / Dioxus 适配"。Channel 策略:UI 侧用 `Arc<Mutex<>>` 共享给子组件;lib 侧不感知。背压:两侧都是 unbounded;send 永不 block。
 
@@ -2497,7 +2499,7 @@ UI 启动时调一次 `start_controller()` 拿到 `ControllerHandle`,然后 `int
 | `job.rs` | `Request { id, command }` + `RequestId` | 通道上跑的是"命令 + 提交方的号"——答复（接纳/拒绝）指名道姓，UI 才知道该恢复哪个状态（§3.11.3）|
 | `job.rs` | `Event::CommandAccepted { request_id, batch_id }` | 接纳的答复：请求号 + 它开启的批次号——UI 的 `Starting` 相位由它推动（§3.11.3）|
 | `job.rs` | `Event::BatchFailed { batch_id, .. }` / `Event::OperationFailed { request_id, .. }` | 两级失败作用域：批次级（只终结那一批）与非批次级（什么都不终结）（§3.11.3）|
-| `data/store.rs` | `read_records(path)` | 单 Parquet 文件回读(v1 不使用,v1.1 启用) |
+| `data/store.rs` | `read_records(path)` | 单 Arrow IPC 文件回读(v1 不使用,v1.1 启用) |
 | `encoder/ffmpeg_arg.rs` | `ExtraArg` enum + `ExtraArg::parse` factory + char-class 模块 | 类型级 ffmpeg argv 安全边界(§3.3.7)——非法 argv 在 parse 阶段被拒,运行时无法塞 unsafe 值。替换 v1 的 runtime `validate_extra_args` |
 | `config/app.rs` | `EncodersConfig::for_format` | 按格式取编码器覆盖；空字符串视为未设（否则 `has_encoder("")` 恒真） |
 | `job.rs` | `ActorEnv::detect_runner` + `spawn_probe` | 能力检查的 runner 缝——测试不必真跑探测（§3.10.4：测试不许碰真机器） |
@@ -2606,11 +2608,11 @@ struct AppState {
     ///
     /// **重要**: `task_history` 是 session 内 UX 缓存,**不是**记录
     /// 的 primary store。Per-file 的 EncodingRecord 已经由 lib 在
-    /// `BatchCompleted` 时写入 Parquet(`encoding-*.parquet`),v1.1
+    /// `BatchCompleted` 时写入 Arrow IPC 文件(`encoding-*.arrow`),v1.1
     /// `Command::LoadHistory` 启动时 reload 到 `state.history`。
     /// 所以 v1 "进程退出时 task_history 丢失" 不是数据丢失——
-    /// records 在 Parquet 里,只是 session 内 task 维度的导航 cache
-    /// 没了。v1.1 加 cross-session task 导航(把 Parquet records
+    /// records 在 Arrow IPC 文件里,只是 session 内 task 维度的导航 cache
+    /// 没了。v1.1 加 cross-session task 导航(把那些 records
     /// group by batch_id 渲染成 TaskInfo 形态)即可。
     task_history: Vec<TaskInfo>,
     /// 当前 active page tab(`§3.8.7.2`)。`Setup` 是 app 启动默认值;
@@ -2654,8 +2656,8 @@ struct AppState {
     /// tracing 事件(`Msg::LibLogLine` → `LogSource::LibInternal`),
     /// 上限 `LOG_RING_CAP = 1000`。
     pub log: VecDeque<LogLine>,
-    /// Parquet-loaded history(per-file EncodingRecord)。和
-    /// `task_history` 概念不同:这个是 cross-session 的 Parquet
+    /// 落盘回读的 history(per-file EncodingRecord)。和
+    /// `task_history` 概念不同:这个是 cross-session 的落盘记录
     /// reload 结果(`Command::LoadHistory`),v1.1 启用。
     pub history: Vec<EncodingRecord>,
     /// 当前选中的输入目录(DirPicker 设置)。
@@ -2742,11 +2744,11 @@ struct TaskInfo {
 /// `current_second_counts: HashMap<String, usize>` 来分配后缀。
 ///
 /// **Scope**: `TaskId` 只在 session 内唯一。Cross-session 不需要
-/// 唯一——`state.history` 通过 Parquet reload 拿到 EncodingRecord
+/// 唯一——`state.history` 通过回读落盘文件拿到 EncodingRecord
 /// 列表,每条 record 带 `batch_id`(lib-side 计数,重启清零),v1.1
 /// 按 batch_id group by 渲染成 TaskInfo 视图。所以**不**需要
 /// 跨进程跨重启的 TaskId 全局唯一,也不需要把 task_history 写到
-/// 另一个 SQLite / JSONL store——现有的 Parquet 已经是数据后端
+/// 另一个 SQLite / JSONL store——现有的 Arrow IPC 文件已经是数据后端
 /// (per review 反馈,避免引入新 store 类型)。
 ///
 /// **Why not u64 counter**: u64 counter 也行(单调递增,简单),但
@@ -3446,7 +3448,7 @@ fn push_toast(state: &mut AppState, msg: impl Into<String>, kind: ToastKind) {
 | "encode 0 files" 按钮可点击 | **v1.2 fixed**: Start button is **disabled** when `to_encode == 0`. `Event::DryRunFinished` only auto-dispatches `Command::StartBatch` when `to_encode > 0` | — |
 | `state.analyze_progress` / `state.analyze_results` 字段保留但未 populate | workflow 改造后 Start 自动调 `Command::DryRun`(不是 `Command::Analyze`),analyze state 字段未 populate。代码里还在(`#[allow(dead_code)]`),变成 dead field——AppState 代码块里保留定义以备 v1.1 / U22 重启用 | v1.1 移除 dead 字段 + 删除对应 `Event::Analyze*` reducer arm |
 | `UserClickedLoadHistory` 自动派 on app start | app 启动时 `use_hook` 派一次(per §3.8.7.2 history page);但目前没有显式 init code,history 是空直到用户手动 reload | v1.1 在 `use_hook` 里加 `cmd_tx.send(Command::LoadHistory { limit: Some(100), after: None })` |
-| Cross-session task 导航缺失 | `task_history` 是 session 内 cache(进程退出即丢);`state.history` 是 cross-session 但以 per-file EncodingRecord 为单位。**没有** task 维度的 cross-session 视图——v1 看不到昨天跑的 batch 用了哪个 dir / 多少文件 | v1.1 启动时 load Parquet records → group by batch_id → 渲染成 TaskInfo 列表。数据后端已经是 Parquet(`encoding-*.parquet`),不引新 store |
+| Cross-session task 导航缺失 | `task_history` 是 session 内 cache(进程退出即丢);`state.history` 是 cross-session 但以 per-file EncodingRecord 为单位。**没有** task 维度的 cross-session 视图——v1 看不到昨天跑的 batch 用了哪个 dir / 多少文件 | v1.1 启动时读回落盘记录 → group by batch_id → 渲染成 TaskInfo 列表。数据后端已经是 Arrow IPC(`encoding-*.arrow`),不引新 store |
 | Settings inline edit | **v1.2 implemented**: `[SETUP]` 页每个字段 `<input>` `oninput` 直接调 `AppConfig::save` (real-time TOML atomic write via `write_atomic`). 没有 Save 按钮 | — |
 | Page-header `[NAME]` 文字冗余 (`[TASK]` / `[HISTORY]` / `[LOG]` 与 TopBar tab 重名) | **v1.2 fixed**: drop `[TASK]` / `[HISTORY]` / `[LOG]` header rows。原 layout 把 header 留在 page 是为了给 top-right button 找一个 row——这版 button 改成 sticky 底部(随 phase 动态 show / hide),header 没有存在的必要。省 ~50px 垂直空间,按钮位置贴近 file list 看完后的视线终点。`[SETUP]` header 在 v1.2 早期已去(review #133 part 3b),这次扩展到剩余 3 页保持一致 | — |
 | User-action feedback 占据 main body 空间 | **v1.2 fixed**: 加 toast 通知系统(右上角 fixed,4s 自动 dismiss,带 × 按钮)。`state.last_error` banner 仍负责 lib-side 错误(`Event::Error` 派生,持久);toast 负责 user-action 反馈(点 Analyze 后 dir 不可读 / DryRun 0 encodable / save 失败等),不占 body 空间。两通道并存:lib 错误 → banner;action feedback → toast。容量 5(FIFO) | — |
@@ -4546,9 +4548,11 @@ worker 拿不到时**这一批开不了工** ✅ ✅ → 终态错误事件 ✅ 
 只有一种理解。GUI 的分析路径有自己的一套事件（每文件进度），那是**进度**的协议，
 不是终态的协议：它结束时同样给出一个报告。
 
-**一批做完要落盘，两个前端都一样**。记录的落盘是 lib 的事（§3.10.3）：格式分派（parquet / jsonl / csv，按扩展名）、默认路径（`<data_dir>/encoding-<时间戳>.parquet`）、目录与权限，都在 `data::store` 里。落盘是**原子的** ✅ ✅（同目录临时文件 → rename ✅ ✅，跟 config 的写一样 ✅ ✅）——写一半断电留下的**截断 parquet 是读不回来的** ✅ ✅，历史里那趟记录就凭空没了 ✅ ✅；读不动的记录文件**必须出声** ✅ ✅（`warn` ✅ ✅），不能当成"这一趟没跑过" ✅ ✅。**谁决定落盘**是前端的事——CLI 在编码命令结束时落，actor 那一侧在批次终态时落（记录在谁手里谁落 ✅ ✅）——但**怎么落**只有一份实现 ✅ ✅。
+**一批做完要落盘，两个前端都一样**。记录的落盘是 lib 的事（§3.10.3）：格式分派（arrow / jsonl / csv，按扩展名）、默认路径（`<data_dir>/encoding-<时间戳>.arrow`）、目录与权限，都在 `data::store` 里。落盘是**原子的** ✅ ✅（同目录临时文件 → rename ✅ ✅，跟 config 的写一样 ✅ ✅）——写一半断电留下的**截断 parquet 是读不回来的** ✅ ✅，历史里那趟记录就凭空没了 ✅ ✅；读不动的记录文件**必须出声** ✅ ✅（`warn` ✅ ✅），不能当成"这一趟没跑过" ✅ ✅。**谁决定落盘**是前端的事——CLI 在编码命令结束时落，actor 那一侧在批次终态时落（记录在谁手里谁落 ✅ ✅）——但**怎么落**只有一份实现 ✅ ✅。
 
-不落盘的后果很具体：GUI 的历史面板永远是空的（它读的是 `<data_dir>/encoding-*.parquet`，而只有 CLI 在写）。这不是"两个前端风格不同"，是少了一个功能。
+不落盘的后果很具体：GUI 的历史面板永远是空的（它读的是 `<data_dir>/encoding-*.arrow`，而只有 CLI 在写）。这不是"两个前端风格不同"，是少了一个功能。
+
+**lib 里只有一套数据机制** ✅ ✅（§8 行 118 ✅ ✅）：analyzer 的交叉表与 store 的读写用同一套 ✅ ✅——交叉表本质是"按 (fps, codec) 分组求和" ✅ ✅，手写即可 ✅ ✅。不为一次分组求和引入一整套 DataFrame 引擎 ✅ ✅（那套引擎是 lib 里最重的依赖 ✅ ✅，两个二进制都背着它 ✅ ✅）。
 
 **摘要的措辞也在 lib**：`Summary: Total / Success / Reduced / Failed` 的计数与措辞是同一份事实，CLI 打印它、GUI 渲染它（排版各自）。CLI 现在自己数一遍 Succeeded / Reduced / Failed，GUI 自己数一遍——两遍数字迟早对不上。
 
@@ -4654,7 +4658,7 @@ future 待做 / ⚠️ 已作废），§8 就是当前的路线图。
 | 24 | UI 与 lib 通过 `Command`（in）+ `Event`（out）消息通信，actor 模型，互不直接调用 | ✅ |
 | 25 | lib 不为 UI 新增 `Serialize` 派生（保持 `thiserror` 原样，actor 间传 Rust 类型无需序列化） | ✅ |
 | 26 | `Event::Error` 仅 fatal；per-file 失败走 `EncodingRecord.error` 字段 | ✅ |
-| 27 | 双轨 state：mpsc 实时事件 + Parquet 持久化；`Command::LoadHistory` 触发回读（v1 不触发,v1.1 启用） | ✅ |
+| 27 | 双轨 state：mpsc 实时事件 + Parquet 持久化；`Command::LoadHistory` 触发回读（v1 不触发,v1.1 启用）——**已作废**（持久化的**格式**换成 Arrow IPC ✅ ✅，见行 117 ✅ ✅；"双轨"本身不变 ✅ ✅） | ⚠️ 已作废 |
 | 28 | Channel 策略：`crossbeam_channel::Sender<Command>`（`unbounded()` 返回的类型；`Sender<T>` 是 `UnboundedSender<T>` 的别名，UI 与 lib 都用 `Sender` 简洁写法） | ✅ |
 | 29 | lib 内部 `CancelToken`（`Arc<AtomicBool>`）由 UI `Command::Cancel` 与 SIGINT handler 共享 | ✅ |
 | 30 | Log 行在 lib 透传；UI reducer 层设上限（`VecDeque` 1000 行） | ✅ |
@@ -4735,6 +4739,9 @@ future 待做 / ⚠️ 已作废），§8 就是当前的路线图。
 | 102 | **启动期可取消**（§3.11.2）：采集每 64 个条目查一次取消令牌 ✅ ✅；NVENC 探测走 ffmpeg 调用那道缝 ✅ ✅、每次调用前查一次 ✅ ✅；取消发生在开工前 ✅ ✅ → 不产出任何东西 ✅ ✅，退出码 130 ✅ ✅ | ✅ |
 | 101 | **批内输出规划**（§3.11.1）：两个输入指向同一输出时**改名**而不是整批终止 ✅ ✅ —— `<词干>_<输入扩展名>_<序号>.<目标扩展名>` ✅ ✅；序号按排序后的路径分配 ✅ ✅（名字不随采集顺序变 ✅ ✅）；输出不落在任何输入上 ✅ ✅ | ✅ |
 | 100 | **输出直写 + 写坏了就删**（§3.11.2）：编码器直接写目标路径 ✅ ✅（守卫保证没有第二个实例 ✅ ✅；中间文件只会多占一倍磁盘 ✅ ✅，不值 ✅ ✅）；中断删掉半截输出 ✅ ✅，失败删掉**这一次**写下的输出 ✅ ✅（ffmpeg 没动过输出就失败的话 ✅ ✅，旧产物留着 ✅ ✅）✅ ✅ | ✅ |
+| 118 | **lib 里只有一套数据机制** ✅ ✅（去 polars ✅ ✅）：analyzer 的交叉表与 store 的读写用**同一套** ✅ ✅——交叉表本质是"按 (fps, codec) 分组求和" ✅ ✅，手写即可 ✅ ✅（不为此引入一整套 DataFrame 引擎 ✅ ✅）；polars 的 core + ops + expr + **lazy** + sqlparser 全部离开 ✅ ✅（两个二进制各省一大截 ✅ ✅）| future |
+| 117 | **工作记录用 Arrow IPC** ✅ ✅（不再用 Parquet ✅ ✅）：少一个依赖 ✅ ✅（`parquet` crate ✅ ✅）——依赖面只剩 `arrow` ✅ ✅；**没有转换层** ✅ ✅（`records → RecordBatch → 写` ✅ ✅，IPC 就是内存结构的磁盘形态 ✅ ✅）；仍然是列式 ✅ ✅（RecordBatch 就是列 ✅ ✅）；schema 内嵌 ✅ ✅（"记录的形状恒定" ✅ ✅，§8 行 88 ✅ ✅）；代价 ✅ ✅：**旧的历史文件读不了** ✅ ✅（格式变了 ✅ ✅，一次性 ✅ ✅）+ 生态窄一档 ✅ ✅（pyarrow 等 ✅ ✅；Spark / BigQuery 那些原生吃 Parquet 的读不了 ✅ ✅）| future |
+| 116 | **lib 搬离可执行文件** ✅ ✅（§3.6 ✅ ✅）：可执行文件只留自己的代码 ✅ ✅（薄 ✅ ✅）；lib 是**动态库** ✅ ✅（`.dylib` / `.dll` ✅ ✅），Rust 的 std 运行时随它走 ✅ ✅（自带 ✅ ✅，不依赖宿主机的 Rust 工具链 ✅ ✅）——**总字节不变** ✅ ✅，但**可执行文件本身**小了 ✅ ✅（ffmpeg 那个模型 ✅ ✅）；CI 用同一个 commit 同时构建 lib 与两个可执行文件 ✅ ✅ → Rust ABI 天然配套 ✅ ✅（没有"只重编一半" ✅ ✅）；代价 ✅ ✅：app 目录多两个文件 ✅ ✅、macOS 签名要覆盖它们 ✅ ✅ | future |
 | 108 | **预演失效的比较放在点击时**（§3.10.5 ✅ ✅）：预演冻结的代次与当前代次都是 lib 给的事实 ✅ ✅，UI 比的是这两个 ✅ ✅；代次只有一处会动——**用户请求的那次检查** ✅ ✅（UI 自己发起 ✅ ✅、结论回到 UI ✅ ✅）；批次的第一段**不再自己探** ✅ ✅（它取已发布的事实 ✅ ✅，§3.10.1.2 ✅ ✅），所以"点击之后事实被刷新"不存在 ✅ ✅——actor 不重复这次比较 ✅ ✅（剩下的窗口 = 能力事件在路上的一拍 ✅ ✅，毫秒级 ✅ ✅）| ✅ |
 | 107 | **链在 actor 里，每段一个 barrier**（§3.10.1.2）：接纳 → 事实成立 → 执行 → 终态 ✅ ✅；**等待归 actor** ✅ ✅（事实的发布落地 = 第一道 barrier 的释放点 ✅ ✅），worker **不再轮询**已发布状态 ✅ ✅（它拿到的是冻结的事实快照 ✅ ✅）；**取消能打断 barrier** ✅ ✅——批次停在第一段时取消就地结束 ✅ ✅（`BatchCancelled { completed: 0 }` ✅ ✅，worker 根本不起 ✅ ✅）；事实迟迟不落地 → actor 的 deadline 分支判失败 ✅ ✅（闸门不会永远关着 ✅ ✅）| ✅ |
 | 106 | **必要时的一次检查**（§3.10.7）：能力是**机器的事实**，成立一次就沿用 ✅ ✅——没有例行的"重检" ✅ ✅；检查只发生在两种必要时 ✅ ✅：记录不成立（没有 / 指纹对不上）✅ ✅，或用户说机器变了 ✅ ✅（GUI 的 "check now" ✅ ✅、CLI 的 `--detect` ✅ ✅）；一次请求最多一次检查 ✅ ✅；**批次不发起检查** ✅ ✅——它取已发布的事实 ✅ ✅（链的第一段 = "确保事实成立" ✅ ✅）；检查的结论发布一代，整体共享 ✅ ✅（§3.10.6 步骤 5 ✅ ✅）| ✅ |
@@ -4760,6 +4767,8 @@ Reload the selected TOML file on every invocation. Existing outputs and matching
 The application directory means the directory containing the executable, never a system application-data directory. Every Unix archive, Windows zip and macOS disk image includes rencoder.toml adjacent to the binary, with log/ and data/ subdirectories. Explicit --config and RENENCODER_CONFIG remain supported. Each invocation reloads the selected config.
 
 Use scripts/dist.sh to build with Cargo and scripts/package.py to package identically on every platform. Hash final archives after adding configuration. The shipped binaries are stripped and optimized for size (`[profile.dist]`): the debug info is for our crash reports, not for the user's download, and the hot path is ffmpeg -- a subprocess -- so optimizing this side for size costs nothing measurable. `panic = "abort"` stays off: the batch worker's done-guard reports the end of a batch while the thread unwinds (design doc §3.11.2), and aborting would strand the UI with a closed gate. CI checks out and validates the requested tag, builds all three targets, verifies checksums, and publishes a GitHub Release for every pushed tag (including non-SemVer tags). Manual releases require an existing tag.
+
+**The library is a shared library; the executables are thin.** `rencoder_lib` ships as a dynamic library next to the executables (`.dylib` on macOS, `.dll` on Windows, `.so` on Linux), together with the Rust runtime it needs -- the executables must not depend on a Rust toolchain being installed on the user's machine. The executables contain only their own code; everything the library provides (including the data stack) lives in the library. What this buys: the *executable* is small, the way ffmpeg's is small next to its libraries. What it does not buy: the total size is unchanged -- the bytes simply moved into the library. The application directory stays self-contained (design doc §3.6), and it now holds the library and the Rust runtime beside the executables. CI builds the library and both executables from one commit, so the Rust ABI always matches; there is no "rebuild only half of it" case. macOS signing must cover the dynamic libraries as well as the executables.
 
 ## Native probing is opt-in
 

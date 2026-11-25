@@ -211,8 +211,8 @@ Options:
       --config PATH           Path to TOML config file
                               (default: <app_dir>/rencoder.toml;
                               honors $RENENCODER_CONFIG)
-  -o, --output PATH           Per-run data path (.parquet|.jsonl|.csv).
-                              Default: <app_dir>/data/encoding-<UTC-ISO8601>Z.parquet
+  -o, --output PATH           Per-run data path (.arrow|.jsonl|.csv).
+                              Default: <app_dir>/data/encoding-<UTC-ISO8601>Z.arrow
       --                      All subsequent args pass through to ffmpeg
   -h, --help                  Print help
 ```
@@ -363,23 +363,22 @@ tail -f <app_dir>/log/rencoder.*.log
 ## 6. Data lifecycle
 
 Rencoder writes per-run work records to `<app_dir>/data/`. These are
-Parquet/JSONL/CSV files capturing source / process / result / status
+Arrow IPC/JSONL/CSV files capturing source / process / result / status
 for each transcoded file. Use them for batch analytics:
 
 ```sh
 # List recent runs
 ls -lh <app_dir>/data/
-# encoding-2026-09-10T15-23-24Z.parquet
-# encoding-2026-09-10T15-30-01Z.parquet
+# encoding-2026-09-10T15-23-24Z.arrow
+# encoding-2026-09-10T15-30-01Z.arrow
 
-# Analyze with DuckDB
-duckdb -c "SELECT * FROM read_parquet('<app_dir>/data/*.parquet') \
-  WHERE outcome = 'failed'"
-
-# Aggregate compression ratios
-duckdb -c "SELECT source_format, AVG(compression_ratio) \
-  FROM read_parquet('<app_dir>/data/*.parquet') \
-  GROUP BY source_format"
+# Analyze with pyarrow (the records are Arrow IPC)
+python3 -c "
+import glob, pyarrow as pa, pyarrow.ipc as ipc
+for path in sorted(glob.glob('<app_dir>/data/*.arrow')):
+    table = ipc.open_file(pa.memory_map(path)).read_all()
+    print(path, table.num_rows, 'rows')
+"
 ```
 
 The `-o` flag overrides the per-run data path (see §3.2). Use this to
