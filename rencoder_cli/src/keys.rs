@@ -31,8 +31,6 @@
 
 use std::io;
 use std::io::IsTerminal;
-#[cfg(unix)]
-use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -223,6 +221,12 @@ pub fn restore_terminal() {
 /// Read keys until the quit key arrives (or the reader is stopped).
 #[cfg(unix)]
 fn read_loop(slot: &CancelSlot, stop: &AtomicBool) {
+    // The trait that gives `Stdin` its `read` -- imported here, where
+    // it is used: the platform-specific body keeps its own imports
+    // (design doc §1.3 -- `cfg` lives in the function that does the
+    // platform-specific work, not at the file's top).
+    use std::io::Read;
+
     loop {
         if stop.load(Ordering::Relaxed) {
             return;
