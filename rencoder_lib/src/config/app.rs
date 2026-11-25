@@ -373,7 +373,19 @@ pub struct EncodeConfig {
 #[serde(deny_unknown_fields)]
 pub struct FfmpegArgsConfig {
     /// Flags before `-i <input>`. Default: `["-y", "-hide_banner",
-    /// "-loglevel", "info", "-nostats"]`.
+    /// "-loglevel", "info"]`.
+    ///
+    /// **No `-nostats` by default** (design doc §3.10.7): the CLI lets
+    /// ffmpeg's stderr through to the terminal, and `-nostats` would
+    /// silence exactly the activity the user watches -- the periodic
+    /// `frame= … speed= …` lines. Only ffmpeg's *final* summary line
+    /// would survive, so the terminal would show one lonely line
+    /// instead of the run's activity.
+    ///
+    /// A user who wants a quiet terminal can put `-nostats` here
+    /// themselves; the GUI path adds it on its own (it reads the
+    /// machine-readable progress instead, and keeps the stderr tail
+    /// for the failure text).
     pub pre_input: Vec<String>,
     /// Flags after `-i <input>` and before any rate-control flags.
     /// Default: `[]` (caller appends `-c:v`, `-crf`, audio, etc. via
@@ -396,7 +408,6 @@ impl Default for FfmpegArgsConfig {
                 "-hide_banner".into(),
                 "-loglevel".into(),
                 "info".into(),
-                "-nostats".into(),
             ],
             post_input: vec![],
             default_preset: None,

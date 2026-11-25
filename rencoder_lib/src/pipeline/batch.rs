@@ -1247,11 +1247,15 @@ pub fn run_ffmpeg_with_progress(
     let program = &argv[0];
     let mut args: Vec<String> = argv[1..].to_vec();
     // Append `-progress pipe:1`. ffmpeg writes structured progress
-    // to stdout and suppresses the regular status updates when this
-    // flag is set. CLI path doesn't use this — it gets raw status
-    // lines from stderr.
+    // to stdout. CLI path doesn't use this — it gets raw status
+    // lines from stderr, and those are what the user watches.
     args.push("-progress".into());
     args.push("pipe:1".into());
+    // ... and `-nostats`, because *this* path does not show them:
+    // the stderr tail is the failure text (design doc §3.10.5), and
+    // the periodic status lines would push it out of the last 20
+    // lines we keep.
+    args.push("-nostats".into());
 
     let mut cmd = Command::new(program);
     cmd.args(&args);

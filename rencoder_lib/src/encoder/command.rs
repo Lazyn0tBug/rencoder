@@ -190,7 +190,7 @@ mod tests {
         );
         // argv[0] = "ffmpeg", argv[1] = "-y" (hardcoded). Then
         // FfmpegArgsConfig::default().pre_input (["-hide_banner",
-        // "-loglevel", "info", "-nostats"]) sits between `-y` and `-i`.
+        // "-loglevel", "info"]) sits between `-y` and `-i`.
         // Position-based lookups so a future pre_input change doesn't
         // break this assertion.
         assert_eq!(argv[0], "ffmpeg");
