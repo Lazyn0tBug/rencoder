@@ -127,11 +127,13 @@ jobs:
           # (cargo-dist-<target>.tar.xz) -- there is no
           # "lets-do-this-mac-latest" bundle, so that URL 404'd and the
           # 404 body was piped into tar ("File format not recognized").
-          # The official installer picks the right asset for the host.
+          # The official installer picks the right asset for the host --
+          # but it has to be **run as a file**: piped into `sh` it is a
+          # silent no-op (exit 0, nothing installed, no output).
           if [ ! -f ~/.cargo/bin/dist ]; then
-            curl --proto '=https' --tlsv1.2 -sSf \
-              https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh \
-              | sh
+            curl --proto '=https' --tlsv1.2 -sSf -o /tmp/cargo-dist-installer.sh \
+              https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh
+            sh /tmp/cargo-dist-installer.sh
             chmod +x ~/.cargo/bin/dist
           fi
           dist --version
