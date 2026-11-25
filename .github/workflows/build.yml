@@ -82,7 +82,12 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            runner: macos-14
+            # The arm64 macOS image: the aarch64 target is built
+            # natively, so cargo-dist never needs a runner to execute
+            # it. (`macos-14` is x86_64 -- cross-compiling made
+            # cargo-dist look for a hosted arm64 runner that does not
+            # exist.)
+            runner: macos-14-arm64
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
           - target: x86_64-pc-windows-msvc
@@ -112,15 +117,21 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cargo/bin/dist
-          key: cargo-dist-v0.32.0
+          # The arch belongs in the key: the dmg job (x86_64) and the
+          # aarch64 build job (arm64) share an OS-scoped cache.
+          key: cargo-dist-v0.32.0-${{ runner.arch }}
 
       - name: Install cargo-dist
         run: |
+          # The release assets are named per target
+          # (cargo-dist-<target>.tar.xz) -- there is no
+          # "lets-do-this-mac-latest" bundle, so that URL 404'd and the
+          # 404 body was piped into tar ("File format not recognized").
+          # The official installer picks the right asset for the host.
           if [ ! -f ~/.cargo/bin/dist ]; then
             curl --proto '=https' --tlsv1.2 -sSf \
-              https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-v0.32.0-lets-do-this-mac-latest.tar.xz \
-              | tar -xJ -C /tmp
-            mv /tmp/cargo-dist-v0.32.0-lets-do-this/bin/cargo-dist ~/.cargo/bin/dist
+              https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh \
+              | sh
             chmod +x ~/.cargo/bin/dist
           fi
           dist --version
