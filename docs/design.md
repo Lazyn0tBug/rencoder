@@ -2015,8 +2015,6 @@ rencoder-cli-<triple>/
 ├── rencoder.toml              # 用户编辑的偏好（auto-create 后存在）
 ├── nvenc-capability.json      # 机器能力记录（`rencoder detect` 写入）
 ├── log/                       # 日志：rencoder.YYYY-MM-DD.NN.log
-├── librencoder_lib.dylib      # lib 的动态库（Windows: rencoder_lib.dll）
-├── libstd.dylib               # Rust 运行时（自带：可执行文件不依赖宿主机的 Rust）
 └── data/                      # 工作记录：encoding-<ISO8601>Z.arrow
 
 <操作目录>/                    # 本次操作作用的目录
@@ -4741,7 +4739,7 @@ future 待做 / ⚠️ 已作废），§8 就是当前的路线图。
 | 100 | **输出直写 + 写坏了就删**（§3.11.2）：编码器直接写目标路径 ✅ ✅（守卫保证没有第二个实例 ✅ ✅；中间文件只会多占一倍磁盘 ✅ ✅，不值 ✅ ✅）；中断删掉半截输出 ✅ ✅，失败删掉**这一次**写下的输出 ✅ ✅（ffmpeg 没动过输出就失败的话 ✅ ✅，旧产物留着 ✅ ✅）✅ ✅ | ✅ |
 | 118 | **lib 里只有一套数据机制** ✅ ✅（去 polars ✅ ✅）：analyzer 的交叉表与 store 的读写用**同一套** ✅ ✅——交叉表本质是"按 (fps, codec) 分组求和" ✅ ✅，手写即可 ✅ ✅（不为此引入一整套 DataFrame 引擎 ✅ ✅）；polars 的 core + ops + expr + **lazy** + sqlparser 全部离开 ✅ ✅（两个二进制各省一大截 ✅ ✅）| future |
 | 117 | **工作记录用 Arrow IPC** ✅ ✅（不再用 Parquet ✅ ✅）：少一个依赖 ✅ ✅（`parquet` crate ✅ ✅）——依赖面只剩 `arrow` ✅ ✅；**没有转换层** ✅ ✅（`records → RecordBatch → 写` ✅ ✅，IPC 就是内存结构的磁盘形态 ✅ ✅）；仍然是列式 ✅ ✅（RecordBatch 就是列 ✅ ✅）；schema 内嵌 ✅ ✅（"记录的形状恒定" ✅ ✅，§8 行 88 ✅ ✅）；代价 ✅ ✅：**旧的历史文件读不了** ✅ ✅（格式变了 ✅ ✅，一次性 ✅ ✅）+ 生态窄一档 ✅ ✅（pyarrow 等 ✅ ✅；Spark / BigQuery 那些原生吃 Parquet 的读不了 ✅ ✅）| future |
-| 116 | **lib 搬离可执行文件** ✅ ✅（§3.6 ✅ ✅）：可执行文件只留自己的代码 ✅ ✅（薄 ✅ ✅）；lib 是**动态库** ✅ ✅（`.dylib` / `.dll` ✅ ✅），Rust 的 std 运行时随它走 ✅ ✅（自带 ✅ ✅，不依赖宿主机的 Rust 工具链 ✅ ✅）——**总字节不变** ✅ ✅，但**可执行文件本身**小了 ✅ ✅（ffmpeg 那个模型 ✅ ✅）；CI 用同一个 commit 同时构建 lib 与两个可执行文件 ✅ ✅ → Rust ABI 天然配套 ✅ ✅（没有"只重编一半" ✅ ✅）；代价 ✅ ✅：app 目录多两个文件 ✅ ✅、macOS 签名要覆盖它们 ✅ ✅ | future |
+| 116 | **lib 搬离可执行文件**——**已作废**（实测三条 ✅ ✅：cargo 对工作区成员**永远传 rlib** ✅ ✅ —— "rlib + cdylib" 并存时动态那条根本不会被选中 ✅ ✅；Rust 调 Rust 的 cdylib 要跨 FFI 边界 ✅ ✅ —— **Rust 的安全性不跨那条边界** ✅ ✅；cdylib-only 能强制动态链接 ✅ ✅，但换来 `unsafe extern` 边界 ✅ ✅，代价更大 ✅ ✅）→ 可执行文件保持厚 ✅ ✅，瘦身的路只剩**数据层** ✅ ✅（行 117 ✅ ✅ / 行 118 ✅ ✅）| ⚠️ 已作废 |
 | 108 | **预演失效的比较放在点击时**（§3.10.5 ✅ ✅）：预演冻结的代次与当前代次都是 lib 给的事实 ✅ ✅，UI 比的是这两个 ✅ ✅；代次只有一处会动——**用户请求的那次检查** ✅ ✅（UI 自己发起 ✅ ✅、结论回到 UI ✅ ✅）；批次的第一段**不再自己探** ✅ ✅（它取已发布的事实 ✅ ✅，§3.10.1.2 ✅ ✅），所以"点击之后事实被刷新"不存在 ✅ ✅——actor 不重复这次比较 ✅ ✅（剩下的窗口 = 能力事件在路上的一拍 ✅ ✅，毫秒级 ✅ ✅）| ✅ |
 | 107 | **链在 actor 里，每段一个 barrier**（§3.10.1.2）：接纳 → 事实成立 → 执行 → 终态 ✅ ✅；**等待归 actor** ✅ ✅（事实的发布落地 = 第一道 barrier 的释放点 ✅ ✅），worker **不再轮询**已发布状态 ✅ ✅（它拿到的是冻结的事实快照 ✅ ✅）；**取消能打断 barrier** ✅ ✅——批次停在第一段时取消就地结束 ✅ ✅（`BatchCancelled { completed: 0 }` ✅ ✅，worker 根本不起 ✅ ✅）；事实迟迟不落地 → actor 的 deadline 分支判失败 ✅ ✅（闸门不会永远关着 ✅ ✅）| ✅ |
 | 106 | **必要时的一次检查**（§3.10.7）：能力是**机器的事实**，成立一次就沿用 ✅ ✅——没有例行的"重检" ✅ ✅；检查只发生在两种必要时 ✅ ✅：记录不成立（没有 / 指纹对不上）✅ ✅，或用户说机器变了 ✅ ✅（GUI 的 "check now" ✅ ✅、CLI 的 `--detect` ✅ ✅）；一次请求最多一次检查 ✅ ✅；**批次不发起检查** ✅ ✅——它取已发布的事实 ✅ ✅（链的第一段 = "确保事实成立" ✅ ✅）；检查的结论发布一代，整体共享 ✅ ✅（§3.10.6 步骤 5 ✅ ✅）| ✅ |
@@ -4768,7 +4766,7 @@ The application directory means the directory containing the executable, never a
 
 Use scripts/dist.sh to build with Cargo and scripts/package.py to package identically on every platform. Hash final archives after adding configuration. The shipped binaries are stripped and optimized for size (`[profile.dist]`): the debug info is for our crash reports, not for the user's download, and the hot path is ffmpeg -- a subprocess -- so optimizing this side for size costs nothing measurable. `panic = "abort"` stays off: the batch worker's done-guard reports the end of a batch while the thread unwinds (design doc §3.11.2), and aborting would strand the UI with a closed gate. CI checks out and validates the requested tag, builds all three targets, verifies checksums, and publishes a GitHub Release for every pushed tag (including non-SemVer tags). Manual releases require an existing tag.
 
-**The library is a shared library; the executables are thin.** `rencoder_lib` ships as a dynamic library next to the executables (`.dylib` on macOS, `.dll` on Windows, `.so` on Linux), together with the Rust runtime it needs -- the executables must not depend on a Rust toolchain being installed on the user's machine. The executables contain only their own code; everything the library provides (including the data stack) lives in the library. What this buys: the *executable* is small, the way ffmpeg's is small next to its libraries. What it does not buy: the total size is unchanged -- the bytes simply moved into the library. The application directory stays self-contained (design doc §3.6), and it now holds the library and the Rust runtime beside the executables. CI builds the library and both executables from one commit, so the Rust ABI always matches; there is no "rebuild only half of it" case. macOS signing must cover the dynamic libraries as well as the executables.
+The library is linked into the executables statically: cargo always passes the `rlib` to a workspace member, and a Rust executable calling a Rust `cdylib` would have to cross an FFI boundary -- where Rust's safety guarantees do not reach (design doc §8 row 116). So the executables stay as thick as the library they carry, and the way to make them thinner is to make the library lighter (design doc §8 rows 117 and 118).
 
 ## Native probing is opt-in
 

@@ -19,9 +19,7 @@ Rencoder is delivered and runs as a single self-contained directory:
 
 ```
 <app_dir>/                    # = current_exe().parent()
-├── rencoder                  # binary (thin: only its own code)
-├── librencoder_lib.dylib     # the lib, as a shared library (Windows: rencoder_lib.dll)
-├── libstd.dylib              # the Rust runtime, shipped with it
+├── rencoder                  # binary
 ├── rencoder.toml             # config (auto-created on first run if missing)
 ├── log/                      # runtime logs
 └── data/                     # runtime data (Arrow IPC records, etc.)
@@ -30,11 +28,10 @@ Rencoder is delivered and runs as a single self-contained directory:
 - All persistent state lives in `<app_dir>`; CWD is reserved for input files only.
 - `$RENENCODER_CONFIG` / `$RENENCODER_LOG_DIR` / `$RENENCODER_DATA_DIR` override defaults.
 - dist (via `scripts/dist.sh`) mirrors this layout — extract a tarball, get a ready-to-run app dir.
-- **The lib is a shared library** (design doc §8 row 116): the executables stay thin
-  and everything the lib provides — including the data stack — lives in the
-  library. The Rust runtime ships with it, so the app never depends on a Rust
-  toolchain being installed. CI builds the library and both executables from one
-  commit, so the ABI always matches; macOS signing covers the libraries too.
+- The lib is linked **statically** into the executables (design doc §8 row 116): cargo
+  always passes the `rlib` to a workspace member, and a Rust executable calling a
+  Rust `cdylib` would cross an FFI boundary, where Rust's safety guarantees do
+  not reach. So the executables are as heavy as the lib they carry.
 
 ## App-level config (U18)
 
