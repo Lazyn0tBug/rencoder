@@ -31,6 +31,8 @@
 
 use std::io;
 use std::io::IsTerminal;
+#[cfg(unix)]
+use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -72,6 +74,7 @@ impl KeyPress {
     }
 
     /// A console key event (the Windows path).
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn key(virtual_key: u16, ctrl: bool) -> Self {
         Self {
             byte: None,
@@ -109,6 +112,11 @@ pub struct KeyReader {
     stop: Arc<AtomicBool>,
     /// Set by the reader when it is done -- so we do not poke the
     /// console for a reader that already left.
+    ///
+    /// **Read on Windows only**: the console nudge is the only thing
+    /// that needs to know the reader is gone. On Unix the reader is
+    /// stopped by the flag and joined.
+    #[cfg_attr(not(windows), allow(dead_code))]
     finished: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
     /// Windows: the console handle, so the reader can be woken up.
@@ -360,14 +368,15 @@ mod unix {
             events: libc::POLLIN,
             revents: 0,
         };
-        // SAFETY: `fds` is a valid pollfd array of the length we pass.
+        // SAFETY: `fds` is a valid pollfd, and we pass its address
+        // with the length 1 -- the array of one that `poll` expects.
         let ready = unsafe { libc::poll(&mut fds, 1, timeout_ms) };
         if ready < 0 {
             // A signal (EINTR) interrupted the wait: the caller tries
             // again.
             return false;
         }
-        ready > 0 && fds[0].revents & libc::POLLIN != 0
+        ready > 0 && fds.revents & libc::POLLIN != 0
     }
 }
 

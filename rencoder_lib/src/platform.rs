@@ -187,8 +187,7 @@ pub mod lock {
                     Err(e) => return Err(Error::Unreadable(e)),
                 }
             }
-            Err(Error::Unreadable(io::Error::new(
-                io::ErrorKind::Other,
+            Err(Error::Unreadable(io::Error::other(
                 "the target marker kept changing hands",
             )))
         }
