@@ -450,24 +450,29 @@ fn the_real_machine_answers_level_two() {
     let cache = EncoderCache {
         encoders_output: encoders_output.clone(),
     };
-    // The premise of this test is "the machine has an AV1 encoder" --
-    // either av1_nvenc or the software libsvtav1. A stock ffmpeg
-    // without libsvtav1 (the CI hosts' package builds) has neither,
-    // and then there is nothing to choose: the run would fail with
-    // "no AV1 encoder available in this ffmpeg build" (design doc
-    // §8 row 79 -- a missing encoder is a per-file failure, not a
-    // panic). Skip rather than assert on a premise that does not
-    // hold.
-    if !cache.has_encoder("av1_nvenc") && !cache.has_encoder("libsvtav1") {
-        eprintln!("skipping: this ffmpeg has no AV1 encoder");
-        return;
-    }
+    let capability = nvenc::Capability::from_support(support);
     let params = EncodeParams {
         nv: true,
         ..EncodeParams::default()
     };
+    // The premise of this test is "**an** AV1 encoder can be chosen" --
+    // the hardware one when it runs here, the software one otherwise.
+    //
+    // **Listed is not usable**: the CI hosts' ffmpeg builds *list*
+    // av1_nvenc (the encoder is compiled in) but the machine has no
+    // NVIDIA GPU, so the probe marks it unusable; and the package
+    // builds have no libsvtav1 either. Then there is nothing to
+    // choose and the run would fail with "no AV1 encoder available in
+    // this ffmpeg build" (design doc §8 row 79 -- a missing encoder
+    // is a per-file failure, not a panic). Skip rather than assert on
+    // a premise that does not hold -- and the premise is exactly what
+    // `select_encoder` decides below.
+    let can_choose = capability.usable("av1_nvenc") || cache.has_encoder("libsvtav1");
+    if !can_choose {
+        eprintln!("skipping: this machine has no usable AV1 encoder");
+        return;
+    }
 
-    let capability = nvenc::Capability::from_support(support);
     let chosen = select_encoder(VideoFormat::Av1, &cache, &params, &capability)
         .expect("an encoder must be chosen");
 

@@ -224,9 +224,13 @@ mod tests {
 
     #[test]
     fn normalize_returns_absolute_for_existing() {
-        let p = normalize(Path::new("/tmp"));
-        // canonicalize may resolve /tmp to /private/tmp on macOS; just
-        // assert the path is non-empty and absolute.
+        // The temp dir, not a literal "/tmp": on Windows "/tmp" is
+        // neither absolute nor existing, so the path would come back
+        // unchanged and the assertion would be about Unix.
+        let p = normalize(&std::env::temp_dir());
+        // canonicalize may resolve the path further (symlinks, the
+        // Windows UNC prefix); just assert the path is non-empty and
+        // absolute.
         assert!(p.is_absolute());
         assert!(!p.as_os_str().is_empty());
     }

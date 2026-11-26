@@ -17,6 +17,23 @@ use rencoder_lib::{
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+/// The lib's own log, on the test's output.
+///
+/// Without a subscriber the lib's `tracing` events go nowhere, so a
+/// failure shows the *symptom* ("the partial output must be removed")
+/// and not the *cause* (the cleanup's warning, with the I/O error).
+/// Design doc §3.11.5: a failure has to carry its evidence.
+fn init_tracing() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::INFO)
+            .try_init();
+    });
+}
+
 fn ffmpeg_available() -> bool {
     Command::new("ffmpeg")
         .arg("-version")
@@ -310,6 +327,7 @@ fn actor_cancel_aborts_the_batch_and_removes_the_partial_output() {
     if skip_if_no_ffmpeg() {
         return;
     }
+    init_tracing();
     let dir = fixture_dir("actor_cancel");
     // Long enough that the encode is still running when the cancel
     // lands (the cancel is sent after the first progress event).

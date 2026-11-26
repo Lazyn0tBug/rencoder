@@ -1452,15 +1452,51 @@ fn cleanup_partial_output_from_argv(argv: &[String]) {
     // v1.2 follow-up #4 commit 2: structured fields. The output
     // path is the cleanest key to grep on when a user reports
     // "did cancel actually clean up the partial for THIS file?".
-    match std::fs::remove_file(out) {
+    match remove_partial_output(std::path::Path::new(out)) {
         Ok(()) => tracing::info!(output = %out, "cancel cleanup: removed partial"),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => tracing::warn!(
             output = %out,
             error = %e,
             "cancel cleanup: failed to remove partial"
         ),
     }
+}
+
+/// How often the cleanup tries to remove the partial, and how long it
+/// waits between the attempts.
+///
+/// The window is short on purpose: the batch has already stopped, so
+/// this only delays the exit, and a file that is still held after the
+/// window is a failure we report -- not one we retry forever.
+const PARTIAL_REMOVAL_ATTEMPTS: usize = 20;
+const PARTIAL_REMOVAL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Remove the partial output, retrying while something else holds it.
+///
+/// The child is dead and reaped, so on Unix the file is ours to
+/// unlink -- the first attempt always works (Unix unlinks a file that
+/// is still open). On **Windows** a file that *any* process has open
+/// cannot be deleted, and something may hold it for a moment after
+/// the writer died: the scanner on a CI runner, an indexer, a file
+/// watcher. The contract is the same on both platforms -- "the
+/// partial is gone when the batch stops" (design doc §3.11.2) -- only
+/// the mechanism differs, and the mechanism's answer is "try again in
+/// a moment".
+///
+/// `NotFound` is success: the goal is "the file is not there".
+fn remove_partial_output(path: &std::path::Path) -> std::io::Result<()> {
+    let mut last_error = None;
+    for _ in 0..PARTIAL_REMOVAL_ATTEMPTS {
+        match std::fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                last_error = Some(e);
+                std::thread::sleep(PARTIAL_REMOVAL_RETRY_DELAY);
+            }
+        }
+    }
+    Err(last_error.expect("the loop runs at least once"))
 }
 
 /// Extract the encoder name from a build_ffmpeg_command argv. The argv
