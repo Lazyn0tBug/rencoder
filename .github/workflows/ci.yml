@@ -49,7 +49,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - os: macos-18
           - os: ubuntu-22.04
           - os: windows-2022
     steps:
@@ -140,7 +140,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - os: macos-18
           - os: ubuntu-22.04
           - os: windows-2022
     steps:
