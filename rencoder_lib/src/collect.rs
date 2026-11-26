@@ -29,7 +29,9 @@ const CANCEL_CHECK_EVERY: usize = 64;
 ///   all). Bad paths are skipped with a warning.
 /// - `Target::Dir(root)` walks the tree without following symlinks,
 ///   returns every regular file matching the filter, wrapped in
-///   `InputPath`. Dash-prefixed files are skipped with a warning.
+///   `InputPath`, **in path order** (the readdir order is not a
+///   contract -- design doc §3.11.1). Dash-prefixed files are
+///   skipped with a warning.
 ///
 /// `extensions` is a case-insensitive allowlist; an empty slice means
 /// "all files".
@@ -136,7 +138,24 @@ fn collect_dir(
             }
         }
     }
-    Ok(results)
+    Ok(sort_by_path(results))
+}
+
+/// The collected files in **path order**.
+///
+/// The filesystem's readdir order is not a contract: ext4 hands out
+/// hash order, APFS hands out creation order, so the same directory
+/// yields a different list on another machine (or after a rebuild).
+/// The batch would then run its files in a different order every
+/// time -- and the output numbering follows the *sorted* paths
+/// (design doc §3.11.1), so without this the collection order and
+/// the numbering order disagree.
+///
+/// Sorting once, here, is the single place the order is decided:
+/// the batch, the plan and the dry run all read this list.
+fn sort_by_path(mut results: Vec<InputPath>) -> Vec<InputPath> {
+    results.sort_by(|a, b| a.as_path().cmp(b.as_path()));
+    results
 }
 
 /// Is this file one of the app's own (design doc §3.6)?
@@ -251,6 +270,79 @@ mod tests {
         let p = dir.join(name);
         fs::write(&p, b"x").unwrap();
         p
+    }
+
+    // ---- the order is a contract ----
+
+    /// The collected files come back in **path order**.
+    ///
+    /// The filesystem's readdir order is not a contract (ext4 hands
+    /// out hash order, APFS creation order), so without this the
+    /// batch runs its files in a different order on another machine
+    /// -- and the "second file" stops being a thing you can point at
+    /// (design doc §3.11.1).
+    #[test]
+    fn the_collection_is_sorted_by_path() {
+        let dir = fixture_dir("sorted");
+        // Created in an order that is *not* the sorted one.
+        for name in ["c.mp4", "a.mp4", "b.mp4"] {
+            touch(&dir, name);
+        }
+        let files = collect_files(
+            &Target::Dir(dir.clone()),
+            &["mp4".into()],
+            u32::MAX,
+            &CancelToken::new(),
+        )
+        .expect("collection must succeed");
+
+        let names: Vec<String> = files
+            .iter()
+            .map(|f| {
+                f.as_path()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "a.mp4".to_string(),
+                "b.mp4".to_string(),
+                "c.mp4".to_string()
+            ],
+            "the collection is sorted by path"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The sort is not only within one directory: a nested file sorts
+    /// by its **full** path.
+    #[test]
+    fn the_collection_is_sorted_across_directories() {
+        let dir = fixture_dir("sorted_nested");
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        touch(&dir, "b.mp4");
+        touch(&sub, "a.mp4");
+        let files = collect_files(
+            &Target::Dir(dir.clone()),
+            &["mp4".into()],
+            u32::MAX,
+            &CancelToken::new(),
+        )
+        .expect("collection must succeed");
+
+        let paths: Vec<String> = files
+            .iter()
+            .map(|f| f.as_path().to_string_lossy().into_owned())
+            .collect();
+        let mut sorted = paths.clone();
+        sorted.sort();
+        assert_eq!(paths, sorted, "the collection is sorted by full path");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // ---- single-file target ----

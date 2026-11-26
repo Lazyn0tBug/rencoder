@@ -495,12 +495,17 @@ fn make_video_of_seconds(dir: &Path, name: &str, seconds: u32) -> PathBuf {
     path
 }
 
-/// Wait until `marker` shows up in `file` (or give up).
-fn wait_for(file: &Path, marker: &str, timeout: std::time::Duration) {
+/// Wait until `marker` shows up in `file` at least `count` times (or
+/// give up).
+///
+/// The log is read as **bytes**: ffmpeg's output is not guaranteed to
+/// be UTF-8, and a decode error would turn the whole file into "no
+/// marker at all" -- silently, because the failure then looks like a
+/// timing problem.
+fn wait_for(file: &Path, marker: &str, count: usize, timeout: std::time::Duration) {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        let text = std::fs::read_to_string(file).unwrap_or_default();
-        if text.contains(marker) {
+        if occurrences(file, marker) >= count {
             return;
         }
         if std::time::Instant::now() >= deadline {
@@ -508,7 +513,7 @@ fn wait_for(file: &Path, marker: &str, timeout: std::time::Duration) {
             // doing when the marker did not show up (design doc
             // §3.11.5: the timeout has to say what was going on).
             panic!(
-                "{marker} never showed up in {}\n--- the CLI's log (last 20 lines) ---\n{}\n---",
+                "{marker} did not show up {count} time(s) in {}\n--- the CLI's log (last 20 lines) ---\n{}\n---",
                 file.display(),
                 log_tail(file),
             );
@@ -517,9 +522,34 @@ fn wait_for(file: &Path, marker: &str, timeout: std::time::Duration) {
     }
 }
 
+/// How many times `marker` shows up in `file`.
+///
+/// The marker is a plain **message text** ("task start"), not a field
+/// rendering: tracing wraps the field names and values in ANSI
+/// escapes, so the raw bytes of a line look like
+/// `task_idx<ESC>[0m<ESC>[2m=<ESC>[0m2` -- "task_idx=2" is *not* a
+/// substring of them, even though a terminal shows it that way.
+fn occurrences(file: &Path, marker: &str) -> usize {
+    let needle = marker.as_bytes();
+    if needle.is_empty() {
+        return 0;
+    }
+    let Ok(data) = std::fs::read(file) else {
+        return 0;
+    };
+    data.windows(needle.len())
+        .filter(|window| *window == needle)
+        .count()
+}
+
 /// The last 20 lines of a log file -- the evidence for a failure.
+///
+/// Read as bytes and decoded leniently: the log carries ffmpeg's
+/// output, and a strict decode would throw away the evidence exactly
+/// when it is needed.
 fn log_tail(file: &Path) -> String {
-    let text = std::fs::read_to_string(file).unwrap_or_default();
+    let data = std::fs::read(file).unwrap_or_default();
+    let text = String::from_utf8_lossy(&data);
     text.lines()
         .rev()
         .take(20)
@@ -612,8 +642,8 @@ fn interrupt_fixture(label: &str) -> InterruptFixture {
     // output file would otherwise be collected as inputs too.
     let inputs = dir.join("in");
     std::fs::create_dir_all(&inputs).unwrap();
-    make_video_of_seconds(&inputs, "a-short.mp4", 1);
-    make_video_of_seconds(&inputs, "b-long.mp4", 60);
+    make_video_of_seconds(&inputs, "a.mp4", 30);
+    make_video_of_seconds(&inputs, "b.mp4", 30);
     // x264: the codec is incidental -- what is under test is the
     // cancel contract, not the encoder.
     //
@@ -623,11 +653,19 @@ fn interrupt_fixture(label: &str) -> InterruptFixture {
     // available in this ffmpeg build" (design doc §8 row 79) and the
     // cancel contract (exit 130) would never be exercised there.
     //
+    // **Both files are long** (60 s of video each): the request has
+    // to land *inside* the second file, whichever one that is. One
+    // short and one long would make the test's timing depend on the
+    // order the batch picks -- and the order is not the test's to
+    // assume (the collection is sorted, design doc §3.11.1, but the
+    // contract here is "a file finished before the request", not
+    // "which file that was").
+    //
     // And the encode does **not** have to be slow: the marker
-    // (`wait_until_encoding` sees "b-long.mp4" in the log) means the
-    // batch is inside the second file, so the request arrives while
-    // it is still working. The contract is "the batch stops at the
-    // next file boundary" (design doc §3.11.2) -- the assertions
+    // (`wait_until_second_task` sees "task_idx=2" in the log) means
+    // the batch is inside the second file, so the request arrives
+    // while it is still working. The contract is "the batch stops at
+    // the next file boundary" (design doc §3.11.2) -- the assertions
     // check *that*, not where the request happened to land.
     let config = write_config(&dir, "[encode]\nformat = \"x264\"\ncrf = 40\n");
     InterruptFixture {
@@ -676,27 +714,30 @@ impl InterruptFixture {
         spawn_in_own_process_group_with(cmd)
     }
 
-    /// Wait until the second file is really being encoded: the first
-    /// one is done by then, and the batch is busy -- so the request
+    /// Wait until the batch starts its **second** task: the first
+    /// file is done by then, and the batch is busy -- so the request
     /// has something to interrupt.
     ///
     /// A fixed sleep would be a race: the request can land before the
     /// batch starts, and then it interrupts nothing (design doc
     /// §3.11.5).
-    /// Wait for the **observable marker**: the batch is inside the
-    /// second file.
     ///
-    /// ffmpeg prints the input's name when it opens it, so "b-long.mp4"
-    /// in the log means the first file is done and the second one is
-    /// running. The request then arrives while the batch is working --
-    /// which is all the guarantee needs (design doc §3.11.2: the batch
-    /// stops at the next file boundary). No sleep, and no "the encode
-    /// has to be slow enough to survive a timeout".
-    fn wait_until_encoding(&self) {
+    /// The marker is the batch's own progress: the **second** "task
+    /// start" means the second task began, which means **one file has
+    /// already finished** -- and that file's record is what the
+    /// contract says must survive (design doc §3.11.2). It is
+    /// deliberately *not* a file name: which file comes second is the
+    /// product's business (the collection is sorted, design doc
+    /// §3.11.1), and a marker that assumed an order would be a race
+    /// whenever that order changed -- the same assumption is what made
+    /// these tests fail on CI (there, the walk handed out
+    /// `b-long.mp4` first).
+    fn wait_until_second_task(&self) {
         wait_for(
             &self.err_log,
-            "b-long.mp4",
-            std::time::Duration::from_secs(120),
+            "task start",
+            2,
+            std::time::Duration::from_secs(180),
         );
     }
 
@@ -739,7 +780,7 @@ fn the_cancel_file_stops_the_batch_and_the_records_survive() {
     let fixture = interrupt_fixture("cancel_file");
     let mut child = fixture.spawn();
 
-    fixture.wait_until_encoding();
+    fixture.wait_until_second_task();
 
     // The request: the file's existence is the request.
     std::fs::write(&fixture.cancel, b"").expect("the cancel file must be writable");
@@ -766,7 +807,7 @@ fn an_interrupt_keeps_the_records_of_the_files_that_finished() {
     let fixture = interrupt_fixture("interrupt");
     let mut child = fixture.spawn();
 
-    fixture.wait_until_encoding();
+    fixture.wait_until_second_task();
 
     let status = Command::new("kill")
         .arg("-INT")
@@ -807,7 +848,7 @@ fn an_interrupt_keeps_the_records_of_the_files_that_finished() {
     let fixture = interrupt_fixture("interrupt");
     let mut child = fixture.spawn_in_own_process_group();
 
-    fixture.wait_until_encoding();
+    fixture.wait_until_second_task();
 
     // SAFETY: the group id is the child's own pid, which was created
     // with CREATE_NEW_PROCESS_GROUP.
