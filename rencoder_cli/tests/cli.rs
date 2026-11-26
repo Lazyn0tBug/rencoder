@@ -364,9 +364,12 @@ fn encode_subcommand_produces_output_file() {
     let dir = fixture_dir("encode_e2e");
     let input = make_video(&dir, "movie.mp4", 30);
     // U17: format / crf / bitrate live in config now.
+    // x264: the codec is incidental here -- what is under test is
+    // that the subcommand produces the output file. AV1 (libsvtav1)
+    // is an optional encoder and is missing from the CI hosts' ffmpeg.
     let cfg = write_config(
         &dir,
-        "[encode]\nformat = \"av1\"\ncrf = 45\nbitrate = 5000\n",
+        "[encode]\nformat = \"x264\"\ncrf = 45\nbitrate = 5000\n",
     );
 
     let out = run(&[
@@ -582,9 +585,22 @@ fn interrupt_fixture(label: &str) -> InterruptFixture {
     std::fs::create_dir_all(&inputs).unwrap();
     make_video_of_seconds(&inputs, "a-short.mp4", 1);
     make_video_of_seconds(&inputs, "b-long.mp4", 60);
-    // AV1 is slow enough that the encode is still running when the
-    // request arrives.
-    let config = write_config(&dir, "[encode]\nformat = \"av1\"\ncrf = 40\n");
+    // x264: the codec is incidental -- what is under test is the
+    // cancel contract, not the encoder.
+    //
+    // **Not AV1**: libsvtav1 is an optional encoder and the stock
+    // ffmpeg of the CI hosts (Ubuntu's apt build, choco's build) does
+    // not have it -- the run would fail with "no AV1 encoder
+    // available in this ffmpeg build" (design doc §8 row 79) and the
+    // cancel contract (exit 130) would never be exercised there.
+    //
+    // And the encode does **not** have to be slow: the marker
+    // (`wait_until_encoding` sees "b-long.mp4" in the log) means the
+    // batch is inside the second file, so the request arrives while
+    // it is still working. The contract is "the batch stops at the
+    // next file boundary" (design doc §3.11.2) -- the assertions
+    // check *that*, not where the request happened to land.
+    let config = write_config(&dir, "[encode]\nformat = \"x264\"\ncrf = 40\n");
     InterruptFixture {
         out: dir.join("records.parquet"),
         err_log: dir.join("stderr.log"),
@@ -636,6 +652,15 @@ impl InterruptFixture {
     /// A fixed sleep would be a race: the request can land before the
     /// batch starts, and then it interrupts nothing (design doc
     /// §3.11.5).
+    /// Wait for the **observable marker**: the batch is inside the
+    /// second file.
+    ///
+    /// ffmpeg prints the input's name when it opens it, so "b-long.mp4"
+    /// in the log means the first file is done and the second one is
+    /// running. The request then arrives while the batch is working --
+    /// which is all the guarantee needs (design doc §3.11.2: the batch
+    /// stops at the next file boundary). No sleep, and no "the encode
+    /// has to be slow enough to survive a timeout".
     fn wait_until_encoding(&self) {
         wait_for(
             &self.err_log,

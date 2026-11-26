@@ -144,14 +144,22 @@ fn transcode_batch_end_to_end_produces_output_files() {
         rencoder_lib::types::InputPath::new(&input2).unwrap(),
     ];
 
-    // Build a minimal encoder cache. AV1 -> mkv container, so the
+    // Build a minimal encoder cache. x264 -> mkv container, so the
     // output filename (in1.mkv) differs from the input (in1.mp4) and
     // doesn't trip the existence-skip check.
+    //
+    // **x264, not AV1**: the codec is incidental here -- what is
+    // under test is the record -> output file path. AV1 (libsvtav1) is
+    // an *optional* encoder: the stock ffmpeg on the CI hosts
+    // (Ubuntu's apt build, choco's build) does not have it, and the
+    // encode then fails with "no AV1 encoder available in this ffmpeg
+    // build" (design doc §8 row 79: a missing encoder is a per-file
+    // failure, not a panic). x264 is in every ffmpeg build.
     let cache = EncoderCache {
-        encoders_output: "V..... libsvtav1            libsvtav1 SVT-AV1\n".to_string(),
+        encoders_output: "V..... libx264              libx264 H.264\n".to_string(),
     };
     let params = EncodeParams {
-        format: VideoFormat::Av1,
+        format: VideoFormat::X264,
         is_crf: true,
         bitrate_or_crf: 28,
         target: Target::Dir(dir.clone()),
