@@ -46,19 +46,6 @@ pub enum Reason {
     Quit,
 }
 
-/// The exit code a stop leaves behind.
-///
-/// - An **interrupt** is not a success: 130 (128 + SIGINT, the shell
-///   convention) -- the shell should know the run did not finish.
-/// - A **deliberate quit** is: 0. The user asked for it; the records
-///   are on disk and the run ended the way they wanted.
-pub fn exit_code(reason: Reason) -> i32 {
-    match reason {
-        Reason::Interrupt => 130,
-        Reason::Quit => 0,
-    }
-}
-
 /// Record why the run is stopping -- the first reason wins.
 ///
 /// Returns the reason that is now on record.
@@ -70,7 +57,8 @@ pub fn record_reason(slot: &CancelSlot, reason: Reason) -> Reason {
 /// The exit code of a finished run.
 ///
 /// The whole policy lives here, next to the reason it is about -- the
-/// frontends only ask.
+/// frontends only ask. **One function, one rule**: every stop asks
+/// it, nobody hands out a code by hand.
 ///
 /// - **Not cancelled** → 0.
 /// - **Cancelled by an interrupt** → 130 (128 + SIGINT): the run did
@@ -84,7 +72,8 @@ pub fn record_reason(slot: &CancelSlot, reason: Reason) -> Reason {
 pub fn exit_code_for(cancelled: bool, reason: Option<Reason>) -> i32 {
     match (cancelled, reason) {
         (false, _) => 0,
-        (true, Some(reason)) => exit_code(reason),
+        (true, Some(Reason::Interrupt)) => 130,
+        (true, Some(Reason::Quit)) => 0,
         (true, None) => 130,
     }
 }
@@ -175,8 +164,17 @@ fn write_request(slot: &CancelSlot, reason: Reason) {
         // has started, so there is nothing to cancel -- but the
         // process must still stop, the way it would without the
         // handler. No records exist yet, so nothing is lost.
+        //
+        // This is the **only** place that leaves the process outside
+        // the CLI's own exit path, and it is safe to do so here:
+        // nothing has been produced (no records to write), the quit
+        // key is not being read yet (the terminal is untouched), and
+        // the target's lock dies with the process (design doc
+        // §3.11.1.1 -- the marker is information, the lock is the
+        // claim). The code it leaves with is the same one every other
+        // stop asks for.
         tracing::warn!("stop requested before the paths resolved; stopping the process");
-        std::process::exit(exit_code(reason));
+        std::process::exit(exit_code_for(true, Some(reason)));
     };
     // The file *is* the request -- its content does not matter, so
     // creating it needs no atomic write.
@@ -307,7 +305,7 @@ mod tests {
 
     #[test]
     fn the_exit_codes_follow_the_reason() {
-        assert_eq!(exit_code(Reason::Interrupt), 130);
-        assert_eq!(exit_code(Reason::Quit), 0);
+        assert_eq!(exit_code_for(true, Some(Reason::Interrupt)), 130);
+        assert_eq!(exit_code_for(true, Some(Reason::Quit)), 0);
     }
 }

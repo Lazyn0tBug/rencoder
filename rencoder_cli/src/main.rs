@@ -69,6 +69,25 @@ fn exit_with(code: i32) -> ! {
     std::process::exit(code);
 }
 
+/// The run was stopped: leave with the code the **reason** asks for.
+///
+/// This is the one place that decides the exit code of a stopped run
+/// (design doc §3.11.2): an interrupt is 130 (the shell convention),
+/// a deliberate quit is 0 (the user asked for it), and a request from
+/// someone else is 130 (we cannot tell what was meant). The reason
+/// lives in the cancel slot; the mapping lives in
+/// [`signal::exit_code_for`].
+///
+/// Every stop goes through here -- the startup paths (the collection,
+/// the NVENC probe) as much as the batch. The literal `130` they used
+/// to carry was only *accidentally* right: a deliberate quit cannot
+/// reach them today (the quit key is read around the batch only,
+/// §3.11.2), so the reason there is always an interrupt or a foreign
+/// request. The contract should not rest on that.
+fn exit_cancelled(cancel_slot: &signal::CancelSlot) -> ! {
+    exit_with(signal::exit_code_for(true, signal::reason(cancel_slot)))
+}
+
 /// Everything a run needs before it starts: the config, the paths
 /// (design doc §3.6), and the cancel channel (design doc §3.11.2).
 ///
@@ -151,7 +170,7 @@ fn detect_cmd(cancel_slot: &signal::CancelSlot) -> Result<()> {
         }) {
             Ok(resolution) => resolution,
             Err(rencoder_lib::error::EncodeError::UserCancel) => {
-                exit_with(130);
+                exit_cancelled(cancel_slot);
             }
             Err(e) => return Err(e).context("NVENC detection failed"),
         };
@@ -284,7 +303,7 @@ fn encode_cmd(
             // The run never started: release the target and leave
             // with the cancel exit code (130).
             drop(target_guard.take());
-            exit_with(130);
+            exit_cancelled(cancel_slot);
         }
         Err(e) => {
             return Err(e).with_context(|| {
@@ -364,7 +383,7 @@ fn encode_cmd(
             Err(rencoder_lib::error::EncodeError::UserCancel) => {
                 // Cancelled before the batch started.
                 drop(target_guard.take());
-                exit_with(130);
+                exit_cancelled(cancel_slot);
             }
             Err(e) => {
                 // ffmpeg does not run. The check still reports what it
@@ -460,7 +479,7 @@ fn encode_cmd(
         report.termination,
         rencoder_lib::pipeline::task::Termination::Cancelled { .. }
     ) {
-        exit_with(signal::exit_code_for(true, signal::reason(cancel_slot)));
+        exit_cancelled(cancel_slot);
     }
 
     Ok(())
@@ -502,7 +521,7 @@ fn analyze_cmd(args: args::AnalyzeArgs, cancel_slot: &signal::CancelSlot) -> Res
         Ok(files) => files,
         Err(rencoder_lib::error::EncodeError::UserCancel) => {
             // Cancelled before the analysis started.
-            exit_with(130);
+            exit_cancelled(cancel_slot);
         }
         Err(e) => {
             return Err(e).with_context(|| {
@@ -590,7 +609,7 @@ fn analyze_cmd(args: args::AnalyzeArgs, cancel_slot: &signal::CancelSlot) -> Res
         report.termination,
         rencoder_lib::pipeline::task::Termination::Cancelled { .. }
     ) {
-        exit_with(signal::exit_code_for(true, signal::reason(cancel_slot)));
+        exit_cancelled(cancel_slot);
     }
 
     // One-line summary to stderr regardless of output format.
@@ -708,6 +727,29 @@ mod tests {
     use super::*;
     use rencoder_lib::config::{AnalyzeConfig, EncodeConfig, EncodersConfig, FormatArg};
     use std::path::PathBuf;
+
+    /// The CLI's own source.
+    ///
+    /// Used by the test below to keep the exit code of a stopped run
+    /// in one place.
+    const SOURCE: &str = include_str!("main.rs");
+
+    #[test]
+    fn a_stopped_run_never_hands_out_its_exit_code_by_hand() {
+        // The exit code of a stopped run is **one decision**: the
+        // reason (interrupt / deliberate quit / someone else's
+        // request) asks `signal::exit_code_for`, and every stop goes
+        // through `exit_cancelled`. A literal code at a call site
+        // would decide the same thing a second time -- and it would
+        // decide it *wrong* the moment a deliberate quit could reach
+        // that path (the quit is not an interrupt: it leaves with 0,
+        // design doc §3.11.2).
+        let literal = format!("exit_with({})", 130);
+        assert!(
+            !SOURCE.contains(&literal),
+            "the CLI must not hand out the exit code by hand: {literal}"
+        );
+    }
 
     #[test]
     fn an_interrupted_run_leaves_with_130() {
