@@ -25,7 +25,7 @@
 //! | [`lock`] | Claiming a target: atomic takeover, released on process death, probeable without interfering, **does not block reads**, located by path |
 //! | [`perms`] | The config file is editable by its user and readable by others; the app directories are enterable and writable |
 //! | [`fs_semantics`] | "The output is never the input" holds on every platform (design doc §3.11.2) |
-//! | [`process`] | A console control event reaches the app, not the encoder it started |
+//! | [`process`] | A console control event reaches the app, not the encoder it started; stopping the encoder stops every process it runs |
 
 /// Claiming a target: the single-instance guard's lock.
 ///
@@ -674,6 +674,22 @@ pub mod fs_semantics {
 /// output would be left behind. Putting the encoder in a process
 /// group of its own restores the Unix "one process, one signal"
 /// semantics.
+///
+/// # The second contract: stopping the encoder stops all of it
+///
+/// **When the app stops the encoder, every process the encoder runs
+/// is gone, and the files they held are released** -- so the cancel
+/// cleanup can remove the half-written output ([`ProcessTree`]).
+///
+/// On Windows the `ffmpeg.exe` on `PATH` is often not ffmpeg: a
+/// package manager's shim (Chocolatey, Scoop) runs the real binary
+/// as *its* child. `Child::kill` ends only the shim; the real encoder
+/// keeps running, keeps writing the output, and Windows refuses to
+/// delete a file a live process holds (`os error 32`). The child is
+/// put in a **job object** and the whole job is ended instead.
+///
+/// On Unix the shims `exec` (the wrapper *becomes* ffmpeg) and an open
+/// file can be unlinked anyway, so `Child::kill` is the whole answer.
 pub mod process {
     use std::process::Command;
 
@@ -697,6 +713,266 @@ pub mod process {
         #[cfg(not(windows))]
         {
             let _ = cmd;
+        }
+    }
+
+    /// How long [`ProcessTree::kill`] waits for the tree to be gone.
+    ///
+    /// Ending a process is asynchronous on Windows: the call returns
+    /// once termination has *started*. The wait is what makes "the
+    /// files are released" true when `kill` returns.
+    const TREE_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// A started child and every process it starts in turn.
+    ///
+    /// Create it right after `spawn` with [`ProcessTree::adopt`], stop
+    /// the child with [`ProcessTree::kill`] instead of `Child::kill`.
+    /// Dropping it (the child finished on its own) also ends whatever
+    /// the child left running -- nothing outlives the encode.
+    pub struct ProcessTree {
+        #[cfg(windows)]
+        job: Option<job::Job>,
+    }
+
+    impl ProcessTree {
+        /// Take the child -- and, from now on, everything it starts --
+        /// into one tree.
+        ///
+        /// Windows: a job object that ends its processes when it is
+        /// closed. There is a window between `spawn` and this call in
+        /// which the child runs outside the job; a shim spends far
+        /// longer than that loading before it starts the real binary.
+        /// If the job cannot be set up, this falls back to stopping
+        /// the child alone (logged), which is what happened before.
+        pub fn adopt(child: &std::process::Child) -> Self {
+            #[cfg(windows)]
+            {
+                use std::os::windows::io::AsRawHandle;
+                match job::Job::for_process(child.as_raw_handle() as _) {
+                    Ok(job) => ProcessTree { job: Some(job) },
+                    Err(e) => {
+                        tracing::warn!(
+                            pid = child.id(),
+                            error = %e,
+                            "could not put the encoder in a job object; \
+                             a cancel stops only the direct child"
+                        );
+                        ProcessTree { job: None }
+                    }
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = child;
+                ProcessTree {}
+            }
+        }
+
+        /// Stop the child and everything it started, and reap the
+        /// child. When this returns, none of them holds a file open
+        /// any more (Windows: within [`TREE_EXIT_TIMEOUT`]; past it,
+        /// a warning is logged and the caller's cleanup reports what
+        /// it could not remove).
+        pub fn kill(&self, child: &mut std::process::Child) {
+            #[cfg(windows)]
+            if let Some(job) = &self.job {
+                if let Err(e) = job.terminate() {
+                    tracing::warn!(pid = child.id(), error = %e, "ending the encoder's job failed");
+                } else if !job.wait_until_empty(TREE_EXIT_TIMEOUT) {
+                    tracing::warn!(
+                        pid = child.id(),
+                        "the encoder's processes were still running after the timeout"
+                    );
+                }
+            }
+            #[cfg(not(windows))]
+            let _ = TREE_EXIT_TIMEOUT;
+            // Already dead on Windows (the job ended it) -- then this
+            // is a harmless error; on Unix it is the kill.
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    #[cfg(windows)]
+    mod job {
+        use std::time::{Duration, Instant};
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation,
+            JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+            TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+
+        /// An owned job object handle.
+        pub(super) struct Job(HANDLE);
+
+        // SAFETY: a job handle names a kernel object; the calls made on
+        // it here are safe from any thread.
+        unsafe impl Send for Job {}
+        unsafe impl Sync for Job {}
+
+        impl Job {
+            /// A new job that ends its processes when it is closed,
+            /// with `process` in it.
+            pub(super) fn for_process(process: HANDLE) -> std::io::Result<Self> {
+                // SAFETY: no security attributes, no name -- both may be null.
+                let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+                if handle.is_null() {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let job = Job(handle);
+
+                // SAFETY: a plain C struct; all-zero is its "no limits" value.
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                // SAFETY: `info` is the struct this class expects, with its size.
+                let ok = unsafe {
+                    SetInformationJobObject(
+                        job.0,
+                        JobObjectExtendedLimitInformation,
+                        &info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+                            as *const core::ffi::c_void,
+                        std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                    )
+                };
+                if ok == 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // SAFETY: both handles are valid for the call.
+                if unsafe { AssignProcessToJobObject(job.0, process) } == 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(job)
+            }
+
+            /// Start ending every process in the job.
+            pub(super) fn terminate(&self) -> std::io::Result<()> {
+                // SAFETY: the handle is valid while `self` lives.
+                if unsafe { TerminateJobObject(self.0, 1) } == 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            }
+
+            fn active_processes(&self) -> std::io::Result<u32> {
+                // SAFETY: a plain C struct, filled in by the call.
+                let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION =
+                    unsafe { std::mem::zeroed() };
+                // SAFETY: `info` is the struct this class expects, with its size.
+                let ok = unsafe {
+                    QueryInformationJobObject(
+                        self.0,
+                        JobObjectBasicAccountingInformation,
+                        &mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
+                            as *mut core::ffi::c_void,
+                        std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ok == 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(info.ActiveProcesses)
+            }
+
+            /// Wait until no process in the job is alive. `false` on
+            /// timeout, or if the job cannot be asked.
+            pub(super) fn wait_until_empty(&self, timeout: Duration) -> bool {
+                let deadline = Instant::now() + timeout;
+                loop {
+                    match self.active_processes() {
+                        Ok(0) => return true,
+                        Ok(_) => {}
+                        Err(_) => return false,
+                    }
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+
+        impl Drop for Job {
+            fn drop(&mut self) {
+                // SAFETY: we own the handle and close it once. Closing
+                // the last handle ends what is left in the job
+                // (KILL_ON_JOB_CLOSE).
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::ProcessTree;
+
+        /// The contract on every host: after `kill`, the child is
+        /// reaped.
+        #[test]
+        fn killing_the_tree_reaps_the_child() {
+            #[cfg(windows)]
+            let mut cmd = {
+                let mut c = std::process::Command::new("ping");
+                c.args(["-n", "30", "127.0.0.1"]);
+                c
+            };
+            #[cfg(not(windows))]
+            let mut cmd = {
+                let mut c = std::process::Command::new("sleep");
+                c.arg("30");
+                c
+            };
+            cmd.stdout(std::process::Stdio::null());
+            let mut child = cmd.spawn().expect("spawn the child");
+            let tree = ProcessTree::adopt(&child);
+            tree.kill(&mut child);
+            assert!(
+                child.try_wait().expect("ask the child").is_some(),
+                "the child must be reaped after kill"
+            );
+        }
+
+        /// The bug this exists for: a shim in front of the encoder.
+        /// `cmd` opens the redirection target and hands it to `ping`,
+        /// its child -- the same shape as a Chocolatey shim running
+        /// the real ffmpeg. Killing only `cmd` leaves `ping` holding
+        /// the file, and Windows refuses to delete it.
+        #[cfg(windows)]
+        #[test]
+        fn killing_the_tree_releases_a_file_a_grandchild_holds() {
+            use std::os::windows::process::CommandExt;
+
+            let dir =
+                std::env::temp_dir().join(format!("rencoder_process_tree_{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let held = dir.join("held.txt");
+
+            let mut cmd = std::process::Command::new("cmd");
+            cmd.raw_arg(format!("/C ping -n 30 127.0.0.1 > \"{}\"", held.display()));
+            let mut child = cmd.spawn().expect("spawn cmd");
+            let tree = ProcessTree::adopt(&child);
+
+            // Wait for the grandchild to be writing.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::fs::metadata(&held).map(|m| m.len()).unwrap_or(0) == 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "ping never wrote to the file"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+
+            tree.kill(&mut child);
+
+            let removed = std::fs::remove_file(&held);
+            let _ = std::fs::remove_dir_all(&dir);
+            assert!(
+                removed.is_ok(),
+                "the file must be deletable once the tree is killed: {removed:?}"
+            );
         }
     }
 }

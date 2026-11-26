@@ -1020,6 +1020,9 @@ fn run_ffmpeg_with_stderr(
                 ))
             }
         };
+        // The `ffmpeg` we started may be a shim running the real one
+        // as its child: a cancel must stop both (platform::process).
+        let tree = crate::platform::process::ProcessTree::adopt(&child);
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -1034,8 +1037,7 @@ fn run_ffmpeg_with_stderr(
                 }
                 Ok(None) => {
                     if cancel.is_cancelled() {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        tree.kill(&mut child);
                         cleanup_partial_output_from_argv(argv);
                         return Err((
                             ErrorCategory::Cancelled,
@@ -1276,6 +1278,10 @@ pub fn run_ffmpeg_with_progress(
             ));
         }
     };
+    // The `ffmpeg` we started may be a shim running the real one as
+    // its child (Chocolatey, Scoop): a cancel must stop both, or the
+    // real encoder keeps the partial output open (platform::process).
+    let tree = crate::platform::process::ProcessTree::adopt(&child);
 
     let stdout = child
         .stdout
@@ -1314,8 +1320,7 @@ pub fn run_ffmpeg_with_progress(
     for line in stdout_reader.lines() {
         // Cancel poll: cheap, runs once per progress line (~2/sec).
         if cancel.is_cancelled() {
-            let _ = child.kill();
-            let _ = child.wait();
+            tree.kill(&mut child);
             // Review fix #5: the stderr reader thread can be
             // blocked in `read_to_string` if the kernel pipe hasn't
             // been reaped after kill(). `JoinHandle::join_timeout`
@@ -1325,8 +1330,6 @@ pub fn run_ffmpeg_with_progress(
             // already been moved into `stderr_buf` before the
             // drop, so we don't lose already-buffered output.
             drop(stderr_thread);
-            // v1.2 follow-up #2: delete the partial output file
-            // ffmpeg was writing when cancel hit. argv layout is
             // v1.2 follow-up #2: remove the partial output file
             // ffmpeg was writing when cancel hit. See
             // [`cleanup_partial_output_from_argv`] for the
@@ -1478,9 +1481,11 @@ const PARTIAL_REMOVAL_RETRY_DELAY: std::time::Duration = std::time::Duration::fr
 /// is still open). On **Windows** a file that *any* process has open
 /// cannot be deleted, and something may hold it for a moment after
 /// the writer died: the scanner on a CI runner, an indexer, a file
-/// watcher. The contract is the same on both platforms -- "the
-/// partial is gone when the batch stops" (design doc §3.11.2) -- only
-/// the mechanism differs, and the mechanism's answer is "try again in
+/// watcher. (The writer itself is gone by now: the cancel ends the
+/// encoder's whole process tree, shim and real ffmpeg alike --
+/// `platform::process::ProcessTree`.) The contract is the same on
+/// both platforms -- "the partial is gone when the batch stops"
+/// (design doc §3.11.2) -- only the mechanism differs, and the mechanism's answer is "try again in
 /// a moment".
 ///
 /// `NotFound` is success: the goal is "the file is not there".
