@@ -411,17 +411,15 @@ fn encode_rejects_missing_target() {
 
 // ---- interrupt: the records survive it (design doc §3.11.2) ----
 
-/// Spawn the binary with the scratch environment, so the caller can
-/// signal it. The output is discarded: ffmpeg writes a lot of it, and
-/// a pipe nobody reads would fill up and block the child.
-fn spawn(args: &[&str], logs: Option<(&Path, &Path)>) -> std::process::Child {
-    command(args, logs).spawn().expect("the binary must start")
-}
-
 /// The command the binary is spawned with, before it is started.
 ///
-/// Split out of [`spawn`] so a platform can add its own flags (the
-/// Windows interrupt test needs its own process group).
+/// The output goes to the given log files (or to `/dev/null`): ffmpeg
+/// writes a lot of it, and a pipe nobody reads would fill up and
+/// block the child.
+///
+/// Split out of the spawn so a platform can add its own flags (the
+/// Windows interrupt test needs its own process group) and so a test
+/// can point the child at a cancel file of its own.
 fn command(args: &[&str], logs: Option<(&Path, &Path)>) -> Command {
     let scratch = scratch_dir();
     let mut cmd = Command::new(bin());
@@ -432,11 +430,13 @@ fn command(args: &[&str], logs: Option<(&Path, &Path)>) -> Command {
         .env(
             "RENENCODER_NVENC_CACHE",
             scratch.join("nvenc-capability.json"),
-        )
-        // The cancel request is a file in the app directory (design
-        // doc §3.11.2); point it at the scratch so the test never
-        // writes into the build directory.
-        .env("RENENCODER_CANCEL_FILE", scratch.join("cancel"));
+        );
+    // The cancel request is **not** pointed at a shared path here: the
+    // request is a global "stop" for whatever watches that file
+    // (design doc §3.11.2), so a shared path means a request written
+    // by one test cancels the run of another test that happens to
+    // watch the same file. The tests that interrupt a run give their
+    // child a cancel file of its own (see `InterruptFixture`).
     match logs {
         Some((out, err)) => {
             cmd.stdout(std::fs::File::create(out).expect("the log file must be creatable"))
@@ -456,13 +456,12 @@ fn command(args: &[&str], logs: Option<(&Path, &Path)>) -> Command {
 /// `CTRL_BREAK_EVENT` can (design doc §3.11.2). The child's group id
 /// is then its own pid, which is what the event is sent to.
 #[cfg(windows)]
-fn spawn_in_own_process_group(args: &[&str], logs: Option<(&Path, &Path)>) -> std::process::Child {
+fn spawn_in_own_process_group_with(mut cmd: Command) -> std::process::Child {
     use std::os::windows::process::CommandExt;
 
     /// CREATE_NEW_PROCESS_GROUP
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
-    let mut cmd = command(args, logs);
     cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
     cmd.spawn().expect("the binary must start")
 }
@@ -595,6 +594,16 @@ struct InterruptFixture {
     config: PathBuf,
     out: PathBuf,
     err_log: PathBuf,
+    /// The cancel request of **this** run (design doc §3.11.2).
+    ///
+    /// One file per run, inside the fixture's own directory: the
+    /// request is a global "stop" for whoever watches that file, so a
+    /// shared path would let one test's request stop another test's
+    /// run -- and the run it stops would have no completed file, so
+    /// its records would be empty. That is a race, not a contract
+    /// violation, and it is what made the cancel tests fail on CI
+    /// (two runners, two 60 s fixtures, less CPU for each).
+    cancel: PathBuf,
 }
 
 fn interrupt_fixture(label: &str) -> InterruptFixture {
@@ -624,6 +633,7 @@ fn interrupt_fixture(label: &str) -> InterruptFixture {
     InterruptFixture {
         out: dir.join("records.parquet"),
         err_log: dir.join("stderr.log"),
+        cancel: dir.join("cancel"),
         inputs,
         config,
         dir,
@@ -631,38 +641,39 @@ fn interrupt_fixture(label: &str) -> InterruptFixture {
 }
 
 impl InterruptFixture {
+    /// The argv of an encode run over the fixture's inputs.
+    fn args(&self) -> Vec<&str> {
+        vec![
+            "encode",
+            "-d",
+            self.inputs.to_str().unwrap(),
+            "--config",
+            self.config.to_str().unwrap(),
+            "-o",
+            self.out.to_str().unwrap(),
+        ]
+    }
+
     /// Spawn the encoder on the fixture.
     fn spawn(&self) -> std::process::Child {
-        spawn(
-            &[
-                "encode",
-                "-d",
-                self.inputs.to_str().unwrap(),
-                "--config",
-                self.config.to_str().unwrap(),
-                "-o",
-                self.out.to_str().unwrap(),
-            ],
+        let mut cmd = command(
+            &self.args(),
             Some((&self.dir.join("stdout.log"), &self.err_log)),
-        )
+        );
+        cmd.env("RENENCODER_CANCEL_FILE", &self.cancel);
+        cmd.spawn().expect("the binary must start")
     }
 
     /// Windows: spawn the encoder in its own process group, so a
     /// console control event can be sent to it.
     #[cfg(windows)]
     fn spawn_in_own_process_group(&self) -> std::process::Child {
-        spawn_in_own_process_group(
-            &[
-                "encode",
-                "-d",
-                self.inputs.to_str().unwrap(),
-                "--config",
-                self.config.to_str().unwrap(),
-                "-o",
-                self.out.to_str().unwrap(),
-            ],
+        let mut cmd = command(
+            &self.args(),
             Some((&self.dir.join("stdout.log"), &self.err_log)),
-        )
+        );
+        cmd.env("RENENCODER_CANCEL_FILE", &self.cancel);
+        spawn_in_own_process_group_with(cmd)
     }
 
     /// Wait until the second file is really being encoded: the first
@@ -731,8 +742,7 @@ fn the_cancel_file_stops_the_batch_and_the_records_survive() {
     fixture.wait_until_encoding();
 
     // The request: the file's existence is the request.
-    let cancel_file = scratch_dir().join("cancel");
-    std::fs::write(&cancel_file, b"").expect("the cancel file must be writable");
+    std::fs::write(&fixture.cancel, b"").expect("the cancel file must be writable");
 
     let status = wait_for_child(
         &mut child,
