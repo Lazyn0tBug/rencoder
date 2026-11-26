@@ -505,10 +505,30 @@ fn wait_for(file: &Path, marker: &str, timeout: std::time::Duration) {
             return;
         }
         if std::time::Instant::now() >= deadline {
-            panic!("{marker} never showed up in {}", file.display());
+            // The log tail is the only evidence of what the CLI was
+            // doing when the marker did not show up (design doc
+            // §3.11.5: the timeout has to say what was going on).
+            panic!(
+                "{marker} never showed up in {}\n--- the CLI's log (last 20 lines) ---\n{}\n---",
+                file.display(),
+                log_tail(file),
+            );
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+}
+
+/// The last 20 lines of a log file -- the evidence for a failure.
+fn log_tail(file: &Path) -> String {
+    let text = std::fs::read_to_string(file).unwrap_or_default();
+    text.lines()
+        .rev()
+        .take(20)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Wait for the spawned CLI, but not forever.
@@ -676,7 +696,9 @@ impl InterruptFixture {
         assert_eq!(
             status.code(),
             Some(130),
-            "an interrupted run exits with 130 (128 + SIGINT); got {status:?}"
+            "an interrupted run exits with 130 (128 + SIGINT); got {status:?}\n\
+             --- the CLI's log (last 20 lines) ---\n{}\n---",
+            log_tail(&self.err_log),
         );
         assert!(
             self.out.exists(),
@@ -687,7 +709,9 @@ impl InterruptFixture {
             .expect("the records must be readable");
         assert!(
             !records.is_empty(),
-            "the file that finished before the request must be in the records"
+            "the file that finished before the request must be in the records\n\
+             --- the CLI's log (last 20 lines) ---\n{}\n---",
+            log_tail(&self.err_log),
         );
     }
 }
