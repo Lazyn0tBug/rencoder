@@ -23,7 +23,15 @@ crossbeam-channel = "0.5"
 # Exit, no animations). The async version returns a future;
 # we spawn it on tokio and dispatch the result back via
 # state.with_mut() when it resolves.
-rfd = "0.14"
+#
+# `default-features = false` + `tokio`: rfd's defaults are
+# `["xdg-portal", "async-std"]`, and rfd's `ashpd` backend then
+# demands async-std while the rest of the app (Dioxus, and the
+# `tokio` dependency below) is on tokio -- ashpd refuses to build
+# with both ("You can't enable both async-std & tokio features at
+# once"). This is the same declaration `dioxus-desktop` itself
+# uses, so the features unify instead of fighting.
+rfd = { version = "0.14", default-features = false, features = ["xdg-portal", "tokio"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # Unified logging (§3.8.7.5): v1.2 follow-up #4 — lib emits via
 # `tracing` directly (was `log` bridged via `tracing-log`). UI

@@ -86,6 +86,14 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
 
       - name: The gate
+        # `shell: bash` on purpose: the default shell on the Windows
+        # runner is PowerShell, where `set -euo pipefail` is not
+        # valid syntax -- the step died on the *first* line, so the
+        # Windows gate had never run a single test (the Unix-only and
+        # the Windows-only branches were never even compiled).
+        # Git Bash is on the runner, so the same script runs
+        # everywhere.
+        shell: bash
         run: |
           set -euo pipefail
           cargo fmt --check
@@ -175,6 +183,10 @@ jobs:
           key: ${{ runner.os }}-cargo-ui-${{ hashFiles('Cargo.lock') }}
 
       - name: The gate (the whole workspace)
+        # `shell: bash` for the same reason as the core job: the
+        # Windows runner's default shell is PowerShell, where
+        # `set -euo pipefail` is not valid syntax.
+        shell: bash
         run: |
           set -euo pipefail
           cargo fmt --check
