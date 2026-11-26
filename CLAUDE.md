@@ -80,7 +80,7 @@ signature at call"** principle:
 
 Concrete: `rencoder_lib::platform` is the **only** file in the repo
 with `#[cfg]` in product code (plus `rencoder_cli::signal`, the
-registered CLI exception). It holds four contracts:
+registered CLI exception). It holds five contracts:
 
 | Contract | Unix | Windows |
 |----------|------|---------|
@@ -88,6 +88,7 @@ registered CLI exception). It holds four contracts:
 | `lock::claim` / `lock::probe` (the single-instance guard) | std `flock` (advisory) | open share mode (deny writers, allow readers) |
 | `fs_semantics::fold_name` / `same_name` | one folding rule (case-insensitive) | same rule — not split per platform |
 | `process::isolate_from_console_events` | no-op (a signal hits one process) | `CREATE_NEW_PROCESS_GROUP` for the encoder |
+| `process::ProcessTree` (stopping the encoder stops everything it runs) | the shim `exec`s — one process, `Child::kill` | job object — `TerminateJobObject` ends the whole tree |
 
 The lock's contract is the five properties of design doc §3.11.1.1
 (atomic takeover, release on process death, probeable without
