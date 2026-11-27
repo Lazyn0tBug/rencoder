@@ -116,28 +116,30 @@ jobs:
       - name: Cache cargo-dist
         uses: actions/cache@v4
         with:
-          path: ~/.cargo/bin/dist
-          # The arch belongs in the key: the dmg job (x86_64) and the
-          # aarch64 build job (arm64) share an OS-scoped cache.
-          key: cargo-dist-v0.32.0-${{ runner.arch }}
+          # `dist` on unix, `dist.exe` on windows.
+          path: |
+            ~/.cargo/bin/dist
+            ~/.cargo/bin/dist.exe
+          # The arch belongs in the key: the dmg job and the build job
+          # share an OS-scoped cache.
+          key: cargo-dist-v0.32.0-${{ runner.os }}-${{ runner.arch }}
 
       - name: Install cargo-dist
         run: |
-          # The release assets are named per target
-          # (cargo-dist-<target>.tar.xz) -- there is no
-          # "lets-do-this-mac-latest" bundle, so that URL 404'd and the
-          # 404 body was piped into tar ("File format not recognized").
-          # The official installer picks the right asset for the host --
-          # but it has to be **run as a file**: piped into `sh` it is a
-          # silent no-op (exit 0, nothing installed, no output).
-          if [ ! -f ~/.cargo/bin/dist ]; then
-            curl --proto '=https' --tlsv1.2 -sSf -o /tmp/cargo-dist-installer.sh \
+          set -euo pipefail
+          # The release URL is a 302 to objects.githubusercontent.com:
+          # without `-L` curl saves the empty redirect body, `-f` does
+          # not fail on a 3xx, and `sh` runs the empty file -- exit 0,
+          # no output, nothing installed. That was the "silent no-op",
+          # piped or not. `test -s` makes an empty download loud.
+          if ! command -v dist >/dev/null 2>&1; then
+            installer="$RUNNER_TEMP/cargo-dist-installer.sh"
+            curl --proto '=https' --tlsv1.2 -sSfL -o "$installer" \
               https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh
-            sh /tmp/cargo-dist-installer.sh
-            chmod +x ~/.cargo/bin/dist
+            test -s "$installer" || { echo "::error::cargo-dist installer download is empty"; exit 1; }
+            sh "$installer"
           fi
           dist --version
-
       - name: Build and package (cargo-dist + scripts/dist.sh)
         run: |
           set -euo pipefail
