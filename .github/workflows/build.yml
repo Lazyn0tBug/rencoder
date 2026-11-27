@@ -107,6 +107,29 @@ jobs:
           rustup default stable
           rustup target add ${{ matrix.target }}
 
+      # The webview stack, on Linux.
+      #
+      # `dist build` builds **every** package in the workspace, and
+      # one of them is the Dioxus desktop app: on Linux it links
+      # webkit2gtk -> gtk3 -> gdk-3.0, so the build fails without
+      # these headers ("Package gdk-3.0 was not found"). The list is
+      # the same one the CI's `ui` job installs (`.github/workflows/
+      # ci.yml`); `libwebkit2gtk-4.0-dev` pulls in `libgtk-3-dev`
+      # (and with it `gdk-3.0.pc`).
+      #
+      # macOS needs nothing (WKWebView is in the system) and Windows
+      # needs nothing (WebView2 is preinstalled on the runner).
+      - name: Install the webview stack (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.0-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
       # Python is needed for the zip augmentation (scripts/augment_zip.py);
       # `zip` / `unzip` are not reliably available on the windows runner.
       - uses: actions/setup-python@v5
