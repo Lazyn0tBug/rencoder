@@ -99,9 +99,21 @@ for tarball in dist/rencoder_*-*.tar.xz dist/rencoder_*-*.tar.gz; do
     inner_top=$(find "$workdir" -mindepth 1 -maxdepth 1 -type d \
                 -name 'rencoder_*' | head -1)
     if [ -z "$inner_top" ]; then
-        echo "warn: no rencoder_* dir inside $tarball, skipping augment" >&2
-        rm -rf "$workdir"
-        continue
+        # A **flat** archive: the files sit at the root. The app dir is
+        # a directory, so create one -- named after the archive, the
+        # same convention the Windows zip uses (scripts/augment_zip.py)
+        # -- so the extracted layout is the same on every platform.
+        # Skipping the augmentation here would ship a package that does
+        # not match the documented app dir, silently.
+        inner_name=$(basename "$tarball" | sed 's/\.tar\.[a-z0-9]*$//')
+        inner_top="$workdir/$inner_name"
+        mkdir -p "$inner_top"
+        for entry in "$workdir"/* "$workdir"/.[!.]*; do
+            [ -e "$entry" ] || continue
+            if [ "$entry" != "$inner_top" ]; then
+                mv "$entry" "$inner_top"/
+            fi
+        done
     fi
 
     # Config template (matches DEFAULT_CONFIG_TOML in app.rs; dev-only

@@ -18,6 +18,14 @@ top-level package directory:
 
 The `.gitkeep` files matter: zip (like tar) does not store empty
 directories, so an app dir without them loses `log/` and `data/`.
+
+The archive layout cargo-dist produces is not the same on every
+platform: the Unix tarballs carry a `<pkg>-<triple>/` directory, the
+Windows zip puts the files at the archive root. Both are handled
+here -- the app dir is a *directory*, so a flat archive gets one
+created (named after the archive, like the tarballs), and the result
+is the same shape on every platform: extract, and you have an app
+dir.
 """
 
 import shutil
@@ -31,9 +39,26 @@ CONFIG_TEMPLATE = REPO_ROOT / "examples" / "rencoder.toml.example"
 KEEP_DIRS = ("log", "data")
 
 
+def normalize_name(name):
+    """The entry name with the separators the zip format wants.
+
+    The spec says forward slashes; an archive written on Windows may
+    carry backslashes, and a name without any separator is a file at
+    the archive root.
+    """
+    return name.replace("\\", "/")
+
+
 def top_level_prefix(names):
-    """Return the single top-level directory the archive stores."""
+    """The single top-level directory the archive stores, if any.
+
+    `None` means the archive is **flat** -- every entry sits at the
+    root. That is a legitimate layout (cargo-dist's Windows zip does
+    it); the caller then creates the directory.
+    """
     prefixes = {name.split("/", 1)[0] for name in names if "/" in name}
+    if not prefixes:
+        return None
     if len(prefixes) != 1:
         raise SystemExit(
             f"expected exactly one top-level directory, found {sorted(prefixes)}"
@@ -43,9 +68,18 @@ def top_level_prefix(names):
 
 def augment(archive: Path) -> None:
     with zipfile.ZipFile(archive) as source:
-        names = source.namelist()
-        prefix = top_level_prefix(names)
-        payload = {name: source.read(name) for name in names}
+        payload = {
+            normalize_name(name): source.read(name) for name in source.namelist()
+        }
+
+    prefix = top_level_prefix(payload.keys())
+    if prefix is None:
+        # A flat archive: the files sit at the root. The app dir is a
+        # directory, so create one -- named after the archive, exactly
+        # like the Unix tarballs (`rencoder_cli-<triple>/`), so the
+        # extracted layout is the same on every platform.
+        prefix = archive.stem
+        payload = {f"{prefix}/{name}": data for name, data in payload.items()}
 
     payload[f"{prefix}/rencoder.toml"] = CONFIG_TEMPLATE.read_bytes()
     for directory in KEEP_DIRS:
