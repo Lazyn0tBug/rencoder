@@ -1139,7 +1139,7 @@ pub mod process {
 
             // Wait for the grandchild to be writing.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while std::fs::metadata(&held).map(|m| m.len()).unwrap_or(0) == 0 {
+            while std::fs::metadata(&held).map_or(0, |m| m.len()) == 0 {
                 assert!(
                     std::time::Instant::now() < deadline,
                     "ping never wrote to the file"
