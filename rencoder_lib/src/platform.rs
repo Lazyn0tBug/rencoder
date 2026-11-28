@@ -660,22 +660,21 @@ pub mod fs_semantics {
     /// only delays the exit, and a file that is still held after the
     /// window is a failure we report -- not one we retry forever.
     pub fn remove_written_file(path: &std::path::Path) -> Removal {
-        let mut last_error = None;
         for attempt in 0..REMOVE_ATTEMPTS {
             match std::fs::remove_file(path) {
                 Ok(()) => return Removal::Removed,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Removal::Absent,
-                Err(e) => {
-                    last_error = Some(e);
-                    // No sleep after the last attempt: it would buy
-                    // nothing.
-                    if attempt + 1 < REMOVE_ATTEMPTS {
-                        std::thread::sleep(REMOVE_RETRY_DELAY);
-                    }
-                }
+                // The last attempt is the one that reports: no sleep
+                // after it (it would buy nothing), and the error goes
+                // out with the attempt, not through an `Option` that
+                // has to be unwrapped back out of the loop.
+                Err(e) if attempt + 1 == REMOVE_ATTEMPTS => return Removal::Failed(e),
+                Err(_) => std::thread::sleep(REMOVE_RETRY_DELAY),
             }
         }
-        Removal::Failed(last_error.expect("the loop runs at least once"))
+        // Unreachable: the last attempt returns. Kept as a total
+        // function rather than an `expect` the reader has to trust.
+        Removal::Absent
     }
 
     #[cfg(test)]
@@ -798,6 +797,10 @@ pub mod process {
     /// Ending a process is asynchronous on Windows: the call returns
     /// once termination has *started*. The wait is what makes "the
     /// files are released" true when `kill` returns.
+    ///
+    /// Windows only: on Unix the shim `exec`s, so there is one
+    /// process and killing it ends it.
+    #[cfg(windows)]
     const TREE_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
     /// A started child and every process it starts in turn.
@@ -910,8 +913,6 @@ pub mod process {
                      -- a shim's real encoder may still be running and holding the output"
                 ),
             }
-            #[cfg(not(windows))]
-            let _ = TREE_EXIT_TIMEOUT;
             // Already dead on Windows (the job ended it) -- then this
             // is a harmless error; on Unix it is the kill.
             let _ = child.kill();

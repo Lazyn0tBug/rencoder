@@ -580,19 +580,12 @@ fn wait_for_child(
             // would keep running (and keep writing) after the test
             // is over.
             let _ = child.kill();
-            let log = std::fs::read_to_string(err_log).unwrap_or_default();
-            let tail: String = log
-                .lines()
-                .rev()
-                .take(20)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
-                .join(
-                    "
-",
-                );
+            // The same helper the other failure path uses: one place
+            // owns the "last 20 lines" rule, and it decodes leniently
+            // -- a strict decode of ffmpeg's output can fail, and
+            // then the evidence would be empty exactly when it is
+            // needed.
+            let tail = log_tail(err_log);
             panic!(
                 "the child did not exit within {timeout:?}
                  --- the CLI's stderr (last 20 lines) ---

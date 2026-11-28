@@ -318,12 +318,11 @@ where
     // available to tell the two cases apart; the probe is the only
     // decisive check that works on every path.
     let mut fallback_note: Option<FallbackNote> = None;
-    if run_result.is_err()
+    if let Err((_, message, stderr_tail)) = &run_result
         && let Some(encoder) = extract_encoder_from_argv(plan.argv())
         && nvenc::is_nvenc_encoder(&encoder)
         && !nvenc::verify_capability(ctx.capability_mut(), &encoder)
     {
-        let (_, message, stderr_tail) = run_result.clone().unwrap_err();
         tracing::warn!(
             encoder = %encoder,
             error = %message,
@@ -1008,16 +1007,14 @@ fn run_ffmpeg_with_stderr(
         // and removes the half-written file (design doc §3.11.2).
         // The `ffmpeg` we start may be a shim running the real one as
         // its child: a cancel must stop both (platform::process).
-        let (mut child, tree) = match crate::platform::process::ProcessTree::spawn(&mut cmd) {
-            Ok(started) => started,
-            Err(e) => {
-                return Err((
+        let (mut child, tree) =
+            crate::platform::process::ProcessTree::spawn(&mut cmd).map_err(|e| {
+                (
                     ErrorCategory::FfmpegSpawnFailed,
                     format!("spawn {program}: {e}"),
                     String::new(),
-                ));
-            }
-        };
+                )
+            })?;
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -1266,16 +1263,14 @@ pub fn run_ffmpeg_with_progress(
     // The `ffmpeg` we start may be a shim running the real one as its
     // child (Chocolatey, Scoop): a cancel must stop both, or the real
     // encoder keeps the partial output open (platform::process).
-    let (mut child, tree) = match crate::platform::process::ProcessTree::spawn(&mut cmd) {
-        Ok(started) => started,
-        Err(e) => {
-            return Err((
+    let (mut child, tree) =
+        crate::platform::process::ProcessTree::spawn(&mut cmd).map_err(|e| {
+            (
                 ErrorCategory::FfmpegSpawnFailed,
                 format!("spawn {program}: {e}"),
                 String::new(),
-            ));
-        }
-    };
+            )
+        })?;
 
     let stdout = child
         .stdout
