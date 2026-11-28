@@ -577,9 +577,7 @@ fn analyze_cmd(args: args::AnalyzeArgs, cancel_slot: &signal::CancelSlot) -> Res
             target_path(&target),
             &cancel,
             |task, _ctx| {
-                let file_bytes = std::fs::metadata(task.input.as_path())
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+                let file_bytes = std::fs::metadata(task.input.as_path()).map_or(0, |m| m.len());
                 match probe_video_metadata(task.input.as_path()) {
                     Ok(metadata) => Ok(rencoder_lib::analyzer::records::AnalysisRecord::new(
                         task.input.as_path().to_path_buf(),

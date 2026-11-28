@@ -146,7 +146,22 @@ cargo build --features c-probe        # macOS: brew install pkg-config ffmpeg
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo fmt --check
+cargo check -p rencoder_lib --features c-probe   # the optional FFI bridge
 ```
+
+**The local gate must be the CI's gate** ✅ ✅ -- two things make it
+otherwise ✅ ✅:
+
+- **The same toolchain** ✅ ✅: CI runs `rustup update stable` ✅ ✅
+  (`rust-toolchain.toml` ✅ ✅ pins the same channel ✅ ✅). A rustc from
+  a package manager ✅ ✅ (Homebrew ✅ ✅, distro ✅ ✅) ignores that
+  file ✅ ✅ **and is often older** ✅ ✅ -- and the lint set moves with
+  the compiler ✅ ✅ (`clippy::map_unwrap_or` grew to cover `Result` ✅ ✅
+  in a later release ✅ ✅) → the local gate quietly checks less ✅ ✅ ✅.
+- **All the features** ✅ ✅: `c-probe` is off by default ✅ ✅, so
+  `rencoder_lib/src/ffi/mod.rs` ✅ ✅ is **not** compiled by the three
+  commands above ✅ ✅. The last line of the block is there for exactly
+  that reason ✅ ✅ ✅.
 
 Running the suite on another host: `docs/TESTING.md` (what each host
 needs, what differs per platform, what the CI covers).

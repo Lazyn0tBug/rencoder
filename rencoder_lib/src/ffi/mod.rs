@@ -25,7 +25,10 @@ struct ProbeResult {
     bit_rate: i64,
 }
 
-extern "C" {
+// Edition 2024: an `extern` block that declares foreign functions is
+// `unsafe` by default -- the compiler no longer assumes the callee is
+// safe to call.
+unsafe extern "C" {
     fn rencoder_probe(path: *const c_char) -> *mut ProbeResult;
     fn rencoder_free(result: *mut ProbeResult);
 }

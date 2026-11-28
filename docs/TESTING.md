@@ -23,7 +23,18 @@
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo check -p rencoder_lib --features c-probe   # 可选 FFI 那条路也要编
 ```
+
+**本地闸门必须和 CI 的闸门是同一个** ✅ ✅：
+
+- **同一个工具链** ✅ ✅：CI 跑的是 `rustup update stable` ✅ ✅
+  （`rust-toolchain.toml` ✅ ✅ 钉的就是这个 channel ✅ ✅）。**包管理器装的
+  rustc 不认这个文件** ✅ ✅（Homebrew ✅ ✅、发行版 ✅ ✅），而且往往更旧
+  ✅ ✅ —— lint 集合是跟着编译器走的 ✅ ✅（`clippy::map_unwrap_or` 后来把
+  `Result` 也管上了 ✅ ✅）→ 本地闸门就在**少查** ✅ ✅ ✅。
+- **所有 feature** ✅ ✅：`c-probe` 默认不开 ✅ ✅，所以上面那三条命令**没有**
+  编 `rencoder_lib/src/ffi/mod.rs` ✅ ✅——第四行就是为它准备的 ✅ ✅ ✅。
 
 ## 各宿主机
 

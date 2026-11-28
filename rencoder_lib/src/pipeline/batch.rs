@@ -471,8 +471,7 @@ fn remove_failed_output(output: &Path, started_at: chrono::DateTime<chrono::Utc>
     };
     let modified_secs = modified
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs() as i64);
     if modified_secs <= started_at.timestamp() {
         return;
     }
@@ -536,9 +535,7 @@ fn build_encode_record(
                 .ok()
                 .filter(|m| m.len() > 0)
                 .map(|m| m.len());
-            let source_size_bytes = std::fs::metadata(task.input.as_path())
-                .map(|m| m.len())
-                .unwrap_or(0);
+            let source_size_bytes = std::fs::metadata(task.input.as_path()).map_or(0, |m| m.len());
             // Review fix #114 (partial-output detection fall-through):
             // when ffmpeg exits 0 but the output is missing or
             // zero-byte, the encode produced nothing useful. If the
@@ -665,9 +662,7 @@ fn build_encode_record(
             };
             Ok(EncodingRecord {
                 source_path: task.input.to_string(),
-                source_size_bytes: std::fs::metadata(task.input.as_path())
-                    .map(|m| m.len())
-                    .unwrap_or(0),
+                source_size_bytes: std::fs::metadata(task.input.as_path()).map_or(0, |m| m.len()),
                 source_codec: metadata.codec.clone(),
                 source_container: metadata.container.clone(),
                 source_width: metadata.width,
@@ -833,9 +828,7 @@ fn make_planned_ready_record(
     metadata: &VideoMetadata,
     started_at: chrono::DateTime<chrono::Utc>,
 ) -> EncodingRecord {
-    let source_size_bytes = std::fs::metadata(task.input.as_path())
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let source_size_bytes = std::fs::metadata(task.input.as_path()).map_or(0, |m| m.len());
     let mut record = EncodingRecord::from_metadata(&task.input, source_size_bytes, Some(metadata));
     record.started_at = started_at;
     record.encoder_settings = encoder_settings_from_params(params);
@@ -922,9 +915,7 @@ fn make_failed_record(
     err: &EncodeError,
     category: ErrorCategory,
 ) -> EncodingRecord {
-    let source_size_bytes = std::fs::metadata(task.input.as_path())
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let source_size_bytes = std::fs::metadata(task.input.as_path()).map_or(0, |m| m.len());
     EncodingRecord {
         source_path: task.input.to_string(),
         source_size_bytes,
@@ -1501,8 +1492,7 @@ mod tests {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+            .is_ok_and(|s| s.success())
     }
 
     /// Generate a tiny real video so the probe has something to read.

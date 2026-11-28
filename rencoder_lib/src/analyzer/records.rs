@@ -146,7 +146,7 @@ where
 {
     let mut records = Vec::with_capacity(files.len());
     for path in files {
-        let file_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let file_bytes = std::fs::metadata(path).map_or(0, |m| m.len());
         match probe(path) {
             Ok(metadata) => {
                 let fps = metadata.best_fps().map(|f| f.round() as u32);
@@ -197,7 +197,7 @@ pub fn analyze_records_parallel(
         .par_iter()
         .filter(|_| !cancel.is_cancelled())
         .map(|path| {
-            let file_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            let file_bytes = std::fs::metadata(path).map_or(0, |m| m.len());
             match probe_video_metadata_auto(path) {
                 Ok(metadata) => AnalysisRecord {
                     path: path.clone(),
@@ -235,7 +235,7 @@ where
     files
         .par_iter()
         .map(|path| {
-            let file_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            let file_bytes = std::fs::metadata(path).map_or(0, |m| m.len());
             match probe(path) {
                 Ok(metadata) => AnalysisRecord {
                     path: path.clone(),
@@ -316,7 +316,7 @@ where
         .map(|input| {
             let path = input.as_path();
             let path_buf = path.to_path_buf();
-            let file_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            let file_bytes = std::fs::metadata(path).map_or(0, |m| m.len());
             let (record, last) = match probe(path) {
                 Ok(metadata) => {
                     let last = AnalyzedFile {

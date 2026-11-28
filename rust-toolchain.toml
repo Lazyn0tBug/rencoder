@@ -1,0 +1,18 @@
+# The toolchain the gate runs.
+#
+# CI installs `rustup update stable` and builds with that, so the
+# **local** gate has to be the same toolchain -- otherwise the lint
+# set differs (a lint that got broader upstream, like
+# `clippy::map_unwrap_or` covering `Result` as well as `Option`, is
+# invisible to the older clippy) and the local gate is quietly weaker
+# than the CI one.
+#
+# `stable` and not a pinned version: the CI does not pin either, and
+# pinning here would only create a second place to update.
+#
+# Note: this file is honoured by **rustup's** cargo. A rustc installed
+# by a package manager (Homebrew, distro) ignores it -- and then the
+# local gate is running a *different compiler* than CI's, which is
+# exactly the hole this file is meant to close.
+[toolchain]
+channel = "stable"

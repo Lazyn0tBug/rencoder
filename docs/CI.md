@@ -55,6 +55,7 @@ gh run view <run-id> --json jobs \
 | 退出码 130 但**记录是空的** | 请求落在了文件内部 | CI-11、CI-12 |
 | Windows 上半成品删不掉 | `ffmpeg.exe` 是 shim / 文件被占着 | CI-15、CI-16 |
 | 同一个包在发布页上出现两次，或者 `sha256sum -c` 说压缩包不存在 | 发布的格式集合在几处分叉了 | CI-19 |
+| 本地全绿，CI 全红，而且红的地方本地编不到 | 本地闸门不是 CI 的闸门（工具链 / feature 集合不同） | CI-20 |
 
 ---
 
@@ -421,6 +422,32 @@ cd dist && for f in *.sha256; do sha256sum -c "$f"; done
 
 同一个包出现两次 ✅，或者某个 `.sha256` 指着一个不存在的压缩包 ✅，就是
 集合分叉了 ✅。
+
+### CI-20 本地闸门不是 CI 的闸门
+
+**现象**：本地全绿 ✅ ✅（`cargo fmt --check` ✅ ✅、`cargo clippy -- -D
+warnings` ✅ ✅、`cargo test --workspace` ✅ ✅），CI 全红 ❌ ✅ ——而且红的
+地方本地**根本编不到** ❌ ✅。
+
+**原因**：两个洞 ✅ ✅：
+
+1. **工具链不同** ✅ ✅：CI 跑 `rustup update stable` ✅ ✅（= 1.98 ✅ ✅），
+   而本地的 `cargo` 来自包管理器 ✅ ✅（Homebrew ✅ ✅，= 1.94 ✅ ✅）。**lint
+   集合跟着编译器走** ✅ ✅——`clippy::map_unwrap_or` 在某个版本起**也管
+   `Result`** ✅ ✅，所以 1.94 看不见 ✅ ✅、1.98 看得见 ✅ ✅ ✅。包管理器装
+   的 rustc **不认 `rust-toolchain.toml`** ✅ ✅ ✅。
+2. **feature 不同** ✅ ✅：`c-probe` 默认不开 ✅ ✅，所以本地那三条命令**没有**
+   编 `rencoder_lib/src/ffi/mod.rs` ✅ ✅——而它里面有一个 edition 2024 要改
+   的 `extern` 块 ✅ ✅（"extern blocks must be unsafe" ✅ ✅）✅ ✅。
+
+**修法**：`rust-toolchain.toml` 钉住 `channel = "stable"` ✅ ✅（和 CI 一样
+✅ ✅）；本地闸门**加上** `cargo check -p rencoder_lib --features c-probe`
+✅ ✅ ✅。
+
+**下次怎么早发现**：本地闸门要**和 CI 逐条对应** ✅ ✅——CI 有几个 job ✅ ✅，
+本地就要跑几件事 ✅ ✅（`c-probe` ✅ ✅、整个 workspace ✅ ✅、三个平台里本地
+能跑的那个 ✅ ✅）✅ ✅。还有一条 ✅ ✅：**"本地全绿"不等于"CI 会绿"** ✅ ✅，
+除非两边的**工具链**和**feature 集合**都一样 ✅ ✅ ✅。
 
 ---
 
