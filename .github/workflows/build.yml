@@ -218,7 +218,7 @@ jobs:
           name: artifacts-${{ matrix.target }}
           if-no-files-found: error
           path: |
-            dist/*.tar.*
+            dist/*.tar.xz
             dist/*.zip
             dist/*.sha256
             dist/sha256.sum
@@ -302,7 +302,7 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
-            release/*.tar.*
+            release/*.tar.xz
             release/*.zip
             release/*.dmg
             release/*.sha256
