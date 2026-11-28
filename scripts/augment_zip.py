@@ -79,7 +79,14 @@ def augment(archive: Path) -> None:
         # like the Unix tarballs (`rencoder_cli-<triple>/`), so the
         # extracted layout is the same on every platform.
         prefix = archive.stem
-        payload = {f"{prefix}/{name}": data for name, data in payload.items()}
+    # Whatever was at the root belongs to the app dir: the promise is
+    # "extract, and you have exactly one app directory", so a stray
+    # root file would break it. (The Unix tarball path in
+    # scripts/dist.sh applies the same rule.)
+    payload = {
+        (name if "/" in name else f"{prefix}/{name}"): data
+        for name, data in payload.items()
+    }
 
     payload[f"{prefix}/rencoder.toml"] = CONFIG_TEMPLATE.read_bytes()
     for directory in KEEP_DIRS:

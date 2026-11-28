@@ -151,10 +151,14 @@ fn collect_dir(
 /// (design doc §3.11.1), so without this the collection order and
 /// the numbering order disagree.
 ///
+/// The order itself is [`crate::utils::fs::path_order`]: by path
+/// **component**, one rule for the whole repo (the numbering uses
+/// the same one).
+///
 /// Sorting once, here, is the single place the order is decided:
 /// the batch, the plan and the dry run all read this list.
 fn sort_by_path(mut results: Vec<InputPath>) -> Vec<InputPath> {
-    results.sort_by(|a, b| a.as_path().cmp(b.as_path()));
+    results.sort_by(|a, b| crate::utils::fs::path_order(a.as_path(), b.as_path()));
     results
 }
 
@@ -320,13 +324,24 @@ mod tests {
 
     /// The sort is not only within one directory: a nested file sorts
     /// by its **full** path.
+    ///
+    /// The rule is *by path component*, not by the bytes of the path
+    /// string -- and the fixture is chosen so the two rules
+    /// disagree. `a/x.mp4` comes **before** `a-b/y.mp4` under the
+    /// component rule ("a" < "a-b"), while the byte-wise order of
+    /// the same strings is the other way round ('-' = 0x2D < '/' =
+    /// 0x2F). A fixture without such a pair cannot tell the two
+    /// rules apart: the sort could be changed to the other one and
+    /// the test would still pass.
     #[test]
     fn the_collection_is_sorted_across_directories() {
         let dir = fixture_dir("sorted_nested");
-        let sub = dir.join("sub");
+        let sub = dir.join("a");
         fs::create_dir_all(&sub).unwrap();
-        touch(&dir, "b.mp4");
-        touch(&sub, "a.mp4");
+        let sibling = dir.join("a-b");
+        fs::create_dir_all(&sibling).unwrap();
+        touch(&sub, "x.mp4");
+        touch(&sibling, "y.mp4");
         let files = collect_files(
             &Target::Dir(dir.clone()),
             &["mp4".into()],
@@ -335,13 +350,25 @@ mod tests {
         )
         .expect("collection must succeed");
 
-        let paths: Vec<String> = files
-            .iter()
-            .map(|f| f.as_path().to_string_lossy().into_owned())
-            .collect();
+        // The oracle is the rule itself (`Path`'s component-wise
+        // `Ord`), not a proxy for it.
+        let paths: Vec<&Path> = files.iter().map(|f| f.as_path()).collect();
         let mut sorted = paths.clone();
         sorted.sort();
-        assert_eq!(paths, sorted, "the collection is sorted by full path");
+        assert_eq!(paths, sorted, "the collection is sorted by path component");
+        assert_eq!(
+            files
+                .iter()
+                .map(|f| f
+                    .as_path()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned())
+                .collect::<Vec<_>>(),
+            vec!["x.mp4".to_string(), "y.mp4".to_string()],
+            "a/x.mp4 sorts before a-b/y.mp4 -- the component rule, not the byte rule"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

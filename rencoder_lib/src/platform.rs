@@ -872,21 +872,43 @@ pub mod process {
         }
 
         /// Stop the child and everything it started, and reap the
-        /// child. When this returns, none of them holds a file open
-        /// any more (Windows: within [`TREE_EXIT_TIMEOUT`]; past it,
-        /// a warning is logged and the caller's cleanup reports what
-        /// it could not remove).
+        /// child.
+        ///
+        /// When this returns, **none of them holds a file open** any
+        /// more -- with one exception, and it is loud: on Windows, if
+        /// the job object could not be created (see [`ProcessTree::spawn`]),
+        /// only the direct child is stopped, so a shim's real encoder
+        /// may still be running and still holding the output. That
+        /// case is reported here, because the caller cannot see it
+        /// otherwise: the cleanup that follows will fail to remove
+        /// the partial, and the reason has to be in the log next to
+        /// it.
+        ///
+        /// The wait for the tree to drain is bounded by
+        /// [`TREE_EXIT_TIMEOUT`]; past it, a warning is logged and the
+        /// caller's cleanup reports what it could not remove.
         pub fn kill(&self, child: &mut std::process::Child) {
             #[cfg(windows)]
-            if let Some(job) = &self.job {
-                if let Err(e) = job.terminate() {
-                    tracing::warn!(pid = child.id(), error = %e, "ending the encoder's job failed");
-                } else if !job.wait_until_empty(TREE_EXIT_TIMEOUT) {
-                    tracing::warn!(
-                        pid = child.id(),
-                        "the encoder's processes were still running after the timeout"
-                    );
+            match &self.job {
+                Some(job) => {
+                    if let Err(e) = job.terminate() {
+                        tracing::warn!(pid = child.id(), error = %e, "ending the encoder's job failed");
+                    } else if !job.wait_until_empty(TREE_EXIT_TIMEOUT) {
+                        tracing::warn!(
+                            pid = child.id(),
+                            "the encoder's processes were still running after the timeout"
+                        );
+                    }
                 }
+                // No job: the tree cannot be ended, so the guarantee
+                // above does not hold. Say so here -- the cleanup
+                // that follows needs the reader to know why it may
+                // fail to remove the partial.
+                None => tracing::warn!(
+                    pid = child.id(),
+                    "the encoder had no job object; only the direct child was stopped \
+                     -- a shim's real encoder may still be running and holding the output"
+                ),
             }
             #[cfg(not(windows))]
             let _ = TREE_EXIT_TIMEOUT;

@@ -546,18 +546,14 @@ fn occurrences(file: &Path, marker: &str) -> usize {
 ///
 /// Read as bytes and decoded leniently: the log carries ffmpeg's
 /// output, and a strict decode would throw away the evidence exactly
-/// when it is needed.
+/// when it is needed. The "last N lines" rule itself is the lib's
+/// ([`rencoder_lib::data::extract::stderr_tail`]) -- one place owns
+/// the shape of the evidence, so the next change to it does not land
+/// in one copy and miss the other.
 fn log_tail(file: &Path) -> String {
     let data = std::fs::read(file).unwrap_or_default();
     let text = String::from_utf8_lossy(&data);
-    text.lines()
-        .rev()
-        .take(20)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("\n")
+    rencoder_lib::data::extract::stderr_tail(&text, 20)
 }
 
 /// Wait for the spawned CLI, but not forever.

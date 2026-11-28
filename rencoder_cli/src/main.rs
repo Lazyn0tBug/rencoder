@@ -59,16 +59,6 @@ fn main() -> Result<()> {
     }
 }
 
-/// Leave the terminal as we found it, then leave with `code`.
-///
-/// `process::exit` skips the destructors, so the key reader's guard
-/// never runs on this path -- the terminal is restored explicitly
-/// (design doc §3.11.2).
-fn exit_with(code: i32) -> ! {
-    keys::restore_terminal();
-    std::process::exit(code);
-}
-
 /// The run was stopped: leave with the code the **reason** asks for.
 ///
 /// This is the one place that decides the exit code of a stopped run
@@ -79,13 +69,27 @@ fn exit_with(code: i32) -> ! {
 /// [`signal::exit_code_for`].
 ///
 /// Every stop goes through here -- the startup paths (the collection,
-/// the NVENC probe) as much as the batch. The literal `130` they used
-/// to carry was only *accidentally* right: a deliberate quit cannot
-/// reach them today (the quit key is read around the batch only,
-/// §3.11.2), so the reason there is always an interrupt or a foreign
-/// request. The contract should not rest on that.
+/// the NVENC probe) as much as the batch. The literal `130` the
+/// startup paths used to carry was only *accidentally* right: a
+/// deliberate quit cannot reach them today (the quit key is read
+/// around the batch only, §3.11.2), so the reason there is always an
+/// interrupt or a foreign request. The contract should not rest on
+/// that.
+///
+/// There is deliberately **no** "exit with this number" helper
+/// beside it: the code of a stopped run is one decision, and it is
+/// made here from the reason. A call site *cannot* hand out a code
+/// of its own -- the compiler says so, which is stronger than the
+/// source-grep test this replaces (that one could only catch the
+/// spelling `exit_with(130)`, and went quiet for every other
+/// spelling).
+///
+/// `process::exit` skips the destructors, so the key reader's guard
+/// never runs on this path -- the terminal is restored explicitly
+/// (design doc §3.11.2).
 fn exit_cancelled(cancel_slot: &signal::CancelSlot) -> ! {
-    exit_with(signal::exit_code_for(true, signal::reason(cancel_slot)))
+    keys::restore_terminal();
+    std::process::exit(signal::exit_code_for(true, signal::reason(cancel_slot)));
 }
 
 /// Everything a run needs before it starts: the config, the paths
@@ -727,29 +731,6 @@ mod tests {
     use super::*;
     use rencoder_lib::config::{AnalyzeConfig, EncodeConfig, EncodersConfig, FormatArg};
     use std::path::PathBuf;
-
-    /// The CLI's own source.
-    ///
-    /// Used by the test below to keep the exit code of a stopped run
-    /// in one place.
-    const SOURCE: &str = include_str!("main.rs");
-
-    #[test]
-    fn a_stopped_run_never_hands_out_its_exit_code_by_hand() {
-        // The exit code of a stopped run is **one decision**: the
-        // reason (interrupt / deliberate quit / someone else's
-        // request) asks `signal::exit_code_for`, and every stop goes
-        // through `exit_cancelled`. A literal code at a call site
-        // would decide the same thing a second time -- and it would
-        // decide it *wrong* the moment a deliberate quit could reach
-        // that path (the quit is not an interrupt: it leaves with 0,
-        // design doc §3.11.2).
-        let literal = format!("exit_with({})", 130);
-        assert!(
-            !SOURCE.contains(&literal),
-            "the CLI must not hand out the exit code by hand: {literal}"
-        );
-    }
 
     #[test]
     fn an_interrupted_run_leaves_with_130() {

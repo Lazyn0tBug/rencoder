@@ -55,9 +55,19 @@ dist build --target "$TARGET" "$@"
 # stale archives from previous targets don't linger. Glob picks up
 # both rencoder_cli-* and rencoder_ui-* (and any future rencoder_*
 # binary packages) without per-binary hardcoding.
+#
+# **One published format** ✅ ✅: cargo-dist 0.32 emits `.tar.xz` for the
+# packages and `.tar.gz` only for the *source* archive (which is not
+# published). So this script stages, augments, checksums and extracts
+# exactly `.tar.xz` (+ `.zip` on Windows). If cargo-dist's format ever
+# changes, this script and the workflow's upload list change **together**
+# -- a glob that names a format *family* would publish the same package
+# twice, or leave a checksum behind for an archive nobody uploaded (the
+# release job's own `sha256sum -c` gate would then fail -- docs/CI.md
+# CI-19 ✅).
 rm -rf dist
 mkdir -p dist
-for f in target/distrib/*.tar.xz target/distrib/*.tar.gz \
+for f in target/distrib/*.tar.xz \
          target/distrib/*.zip target/distrib/*.sha256 \
          target/distrib/sha256.sum; do
     [ -f "$f" ] || continue
@@ -80,25 +90,45 @@ done
 #
 # `rencoder_*-*` glob covers both rencoder_cli-* and rencoder_ui-*
 # packages. The matching inner dir (rencoder_cli-* or rencoder_ui-*)
-# is detected dynamically rather than per-binary hardcoded. Both
-# archive formats are handled: cargo-dist's default is tar.gz on some
-# versions and tar.xz on others.
+# is detected dynamically rather than per-binary hardcoded. Only
+# `.tar.xz` is handled: it is what cargo-dist 0.32 emits for packages
+# (see the staging comment above).
 augmented=0
-for tarball in dist/rencoder_*-*.tar.xz dist/rencoder_*-*.tar.gz; do
+for tarball in dist/rencoder_*-*.tar.xz; do
     [ -f "$tarball" ] || continue
 
-    case "$tarball" in
-        *.tar.xz) extract_flag="-xJf"; pack_flag="-cJf" ;;
-        *.tar.gz)  extract_flag="-xzf"; pack_flag="-czf" ;;
-    esac
-
     workdir=$(mktemp -d)
-    tar "$extract_flag" "$tarball" -C "$workdir"
+    tar -xJf "$tarball" -C "$workdir"
 
-    # cargo-dist lays out: <workdir>/<pkg>-<triple>/<files>
-    inner_top=$(find "$workdir" -mindepth 1 -maxdepth 1 -type d \
-                -name 'rencoder_*' | head -1)
-    if [ -z "$inner_top" ]; then
+    # The archive has one top-level package directory, or it is flat
+    # (the files sit at the root). This is the **same rule**
+    # scripts/augment_zip.py applies to the Windows zip: a flat archive
+    # gets a directory created, named after the archive, so the
+    # extracted layout is the same on every platform.
+    #
+    # The detection is **structural** -- how many top-level directories
+    # are there -- not by name. A name-based rule ("a dir called
+    # rencoder_*") treats an archive whose single top directory
+    # happened to be named differently as flat and wraps it in a second
+    # directory; and it silently drops the entries it did not match.
+    top_dirs=$(find "$workdir" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
+    if [ "$top_dirs" -gt 1 ]; then
+        echo "error: $tarball has $top_dirs top-level directories; expected one" >&2
+        rm -rf "$workdir"
+        exit 1
+    fi
+    if [ "$top_dirs" -eq 1 ]; then
+        inner_top=$(find "$workdir" -mindepth 1 -maxdepth 1 -type d | head -1)
+        # Files at the root belong to the package too: moving them in
+        # keeps the app dir self-contained (the old, name-based rule
+        # dropped them silently).
+        for entry in "$workdir"/* "$workdir"/.[!.]*; do
+            [ -e "$entry" ] || continue
+            if [ "$entry" != "$inner_top" ] && [ -f "$entry" ]; then
+                mv "$entry" "$inner_top"/
+            fi
+        done
+    else
         # A **flat** archive: the files sit at the root. The app dir is
         # a directory, so create one -- named after the archive, the
         # same convention the Windows zip uses (scripts/augment_zip.py)
@@ -135,7 +165,7 @@ for tarball in dist/rencoder_*-*.tar.xz dist/rencoder_*-*.tar.gz; do
     # write to dist/$tarball.new relative to the tempdir (which
     # doesn't exist there).
     inner_name=$(basename "$inner_top")
-    tar -C "$workdir" "$pack_flag" "$tarball.new" "$inner_name"
+    tar -C "$workdir" -cJf "$tarball.new" "$inner_name"
     mv "$tarball.new" "$tarball"
     rm -rf "$workdir"
     augmented=$((augmented + 1))
@@ -174,7 +204,11 @@ sha256_of() {
 }
 rm -f dist/*.sha256 dist/sha256.sum
 : > dist/sha256.sum
-for archive in dist/*.tar.xz dist/*.tar.gz dist/*.zip; do
+# Only the archives that are published get a checksum file: the
+# release job runs `sha256sum -c` over them, and a checksum for an
+# archive that was not uploaded makes that gate fail (docs/CI.md
+# CI-19).
+for archive in dist/*.tar.xz dist/*.zip; do
     [ -f "$archive" ] || continue
     archive_name=$(basename "$archive")
     sum=$(sha256_of "$archive")
@@ -189,15 +223,10 @@ done
 # both rencoder_cli-$TARGET and rencoder_ui-$TARGET (whichever
 # exist).
 for bin in rencoder_cli rencoder_ui; do
-    for ext in tar.xz tar.gz; do
-        host_tarball="dist/${bin}-${TARGET}.${ext}"
-        [ -f "$host_tarball" ] || continue
-        case "$ext" in
-            tar.xz) tar -xJf "$host_tarball" -C dist/ ;;
-            tar.gz)  tar -xzf "$host_tarball" -C dist/ ;;
-        esac
-        echo "Extracted ./dist/${bin}-${TARGET}/ (with U18 app_dir layout)"
-    done
+    host_tarball="dist/${bin}-${TARGET}.tar.xz"
+    [ -f "$host_tarball" ] || continue
+    tar -xJf "$host_tarball" -C dist/
+    echo "Extracted ./dist/${bin}-${TARGET}/ (with U18 app_dir layout)"
 done
 
 echo

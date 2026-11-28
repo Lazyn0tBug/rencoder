@@ -5,11 +5,15 @@
 #   - x86_64-unknown-linux-gnu -> .tar.xz
 #   - x86_64-pc-windows-msvc   -> .zip (portable)
 #
-# cargo-dist emits **two** tar formats for a package (.tar.xz and
-# .tar.gz) and `scripts/dist.sh` stages both of them -- but only
-# .tar.xz is published. The upload globs below name that one format
-# on purpose: `*.tar.*` would attach the same package twice, once
-# per extension (docs/CI.md CI-19).
+# **One published format**: cargo-dist 0.32 emits `.tar.xz` for the
+# packages and `.tar.gz` only for the *source* archive (which is not
+# published). `scripts/dist.sh` stages, augments, checksums and
+# extracts exactly that set, and the upload globs below name the
+# same formats -- one decision, three places that have to agree
+# (docs/CI.md CI-19). A glob that named a format *family* instead
+# would publish the same package twice, or leave a checksum behind
+# for an archive nobody uploaded -- and the release job's own
+# `sha256sum -c` gate would then fail.
 #
 # Each archive is augmented by scripts/dist.sh with the U18 single-dir
 # app layout (rencoder.toml + log/ + data/) and gets a checksum that is

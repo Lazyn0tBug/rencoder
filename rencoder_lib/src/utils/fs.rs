@@ -13,6 +13,20 @@ pub fn normalize(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// The one ordering rule for paths: **by path component**.
+///
+/// `Path`'s `Ord` compares component by component, not byte by byte:
+/// `dir/a/x.mp4` sorts *before* `dir/a-b/y.mp4`, while the byte-wise
+/// order of the same strings is the other way round. One rule, one
+/// place: the collection order (design doc §3.11.1) and the output
+/// numbering (this module) must not disagree -- a file that moves
+/// position in one must not move in the other.
+///
+/// The rule is stated in the design doc: "按完整路径**分量**排序".
+pub fn path_order(a: &Path, b: &Path) -> std::cmp::Ordering {
+    a.cmp(b)
+}
+
 /// Compute the output path for a transcoded file.
 ///
 /// # Naming convention (v1.2 follow-up #3)
@@ -119,7 +133,7 @@ pub fn plan_outputs(inputs: &[PathBuf], format: VideoFormat) -> Vec<PathBuf> {
         }
         // Sorted by path: the numbers must not depend on the order the
         // files were collected in.
-        members.sort_by(|a, b| inputs[*a].cmp(&inputs[*b]));
+        members.sort_by(|a, b| path_order(&inputs[*a], &inputs[*b]));
         for (position, index) in members.iter().enumerate() {
             let mut number = position + 1;
             let candidate = loop {
