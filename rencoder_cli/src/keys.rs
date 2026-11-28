@@ -181,10 +181,10 @@ impl KeyReader {
         // left is not poked -- the nudge would land in the console's
         // input buffer and the user's shell would see it.
         #[cfg(windows)]
-        if !self.finished.load(Ordering::Relaxed) {
-            if let Some(console) = &self.console {
-                console.wake();
-            }
+        if !self.finished.load(Ordering::Relaxed)
+            && let Some(console) = &self.console
+        {
+            console.wake();
         }
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
