@@ -20,6 +20,14 @@
 # distribution and tag releases"). The older
 # `v[0-9]*.[0-9]*.[0-9]*` glob was narrower than that: it let
 # `nightly-2026-11-23` and `v1.2` through without a release.
+#
+# This workflow runs **no tests**. The tests are CI's (ci.yml), which
+# runs on the push to main -- and the tag must point at main's HEAD
+# (the `verify` job). So instead of running the suite a second time,
+# `verify` requires CI to have **passed on this exact commit**,
+# waiting for it if the tag was pushed right after the commit. A red
+# or cancelled CI run stops the release: fix it (or re-run CI), then
+# dispatch this workflow with the same tag.
 
 name: Release
 
@@ -47,12 +55,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Gate everything on "the tag we are about to publish really points
-  # at this commit". A mistyped dispatch tag would otherwise publish
-  # the branch tip under someone else's tag name.
+  # Gate everything on two facts about the commit we are about to
+  # publish:
+  #   1. the tag really points at it -- a mistyped dispatch tag would
+  #      otherwise publish the branch tip under someone else's tag;
+  #   2. CI passed on it -- this workflow runs no tests of its own.
   verify:
     name: verify tag
     runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      # `gh run list` reads this repo's workflow runs.
+      actions: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -72,6 +86,46 @@ jobs:
             exit 1
           fi
           echo "tag $RELEASE_TAG -> $head"
+
+      # 0.8.0.4 was published while CI on the same commit was red: the
+      # release only builds and packages, so "release green" said
+      # nothing about the tests. CI ran on the push to main, and the
+      # step above proved the tag points at main's HEAD -- so this
+      # commit has a CI run. Release only what it passed.
+      #
+      # Pushing the tag right after the commit is the normal flow, so
+      # a pending run is waited for (up to 40 x 30s = 20 minutes; CI
+      # takes ~12). "missing" is waited for too: the run may not be
+      # registered yet in the first seconds.
+      - name: Require a green CI run for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          for attempt in $(seq 1 40); do
+            result=$(gh run list -R "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$sha" \
+              --json status,conclusion \
+              --jq 'if length == 0 then "missing"
+                    elif .[0].status != "completed" then "pending"
+                    else .[0].conclusion end')
+            case "$result" in
+              success)
+                echo "CI passed for $sha"
+                exit 0
+                ;;
+              pending|missing)
+                echo "CI for $sha: $result, waiting ($attempt/40)"
+                sleep 30
+                ;;
+              *)
+                echo "::error::CI for $sha concluded '$result' -- fix it or re-run CI, then dispatch the release with the same tag"
+                exit 1
+                ;;
+            esac
+          done
+          echo "::error::no finished CI run for $sha after 20 minutes"
+          exit 1
 
   build:
     name: build (${{ matrix.target }})
