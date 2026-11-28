@@ -2,6 +2,7 @@
 name = "rencoder_lib"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Core library for Rencoder: smart video transcoding and analysis."
 # U18: internal lib for this app only. `cargo publish -p rencoder_lib`

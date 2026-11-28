@@ -11,10 +11,13 @@ members = [
 
 [workspace.package]
 edition = "2024"
-# The floor: edition 2024 needs 1.85, and let chains (which this
-# codebase uses) need 1.88. Declaring it makes the promise explicit
-# and lets resolver 3 stop picking dependencies newer than it.
-rust-version = "1.88"
+# The floor: edition 2024 needs 1.85, let chains (which this codebase
+# uses) need 1.88, and the single-instance guard uses
+# `File::try_lock` / `File::try_lock_shared` (std, stable in
+# **1.89**) -- see `rencoder_lib::platform::lock`. So the floor is
+# 1.89, not 1.88: declaring lower would be a promise the code does
+# not keep.
+rust-version = "1.89"
 version = "0.8.0"
 license = "MIT"
 

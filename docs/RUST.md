@@ -184,13 +184,77 @@ if let Some(x) = mutex.lock().unwrap().get() {
 
 ---
 
-## 五、这个仓库已经做了什么（记录）
+## 五、从 1.89 到 1.98 逐条过一遍（当前 stable = 1.98.1）
+
+这一节是**一次具体的审查记录** ✅ ✅：本仓库的 MSRV 是 **1.89** ✅ ✅
+（`File::try_lock` ✅ ✅，`rencoder_lib::platform::lock` ✅ ✅），当前 stable 是
+**1.98.1** ✅ ✅——中间十个版本 ✅ ✅ 的新特性 ✅ ✅，按上面的判据过一遍 ✅ ✅ ✅。
+
+### 结论先说：**十 个版本里，只有一个是"必须改"的** ✅ ✅
+
+**`File::try_lock` / `try_lock_shared`（1.89）** ✅ ✅——单实例守卫的锁 ✅ ✅
+**早就在用它了** ✅ ✅（`platform.rs` ✅ ✅ 的 Unix 实现 ✅ ✅）✅ ✅，而 MSRV 一度
+写成 1.88 ✅ ✅ ✅——**那是个不成立的承诺** ✅ ✅（用 1.88 编不过 ✅ ✅）。
+现在 MSRV 是 1.89 ✅ ✅，而且每个 crate 都 `rust-version.workspace = true`
+✅ ✅（不继承的话，承诺根本没立下 ✅ ✅——`cargo metadata` 里是 `None` ✅ ✅）。
+
+### 可用，但要看交换什么（✅ ✅）
+
+| 特性 | 版本 | 判据 | 结论 |
+|---|---|---|---|
+| `assert_matches!` / `debug_assert_matches!` | 1.96 | ③ 一致性 ✅ ✅（仓库里 43 处 `assert!(matches!(..))` ✅ ✅）✅ ✅ | **可用** ✅ ✅——失败时会把值打出来 ✅ ✅（比"assertion failed"有用 ✅ ✅）✅ ✅。**代价**：它是 1.96 ✅ ✅，用它就得把 MSRV 从 1.89 抬到 1.96 ✅ ✅，而收益**只在测试里** ✅ ✅ → **不划算** ✅ ✅，除非仓库愿意把地板定在 1.96 ✅ ✅ ✅ |
+| `PathBuf::with_added_extension` | 1.91 | ③ | `tmp_path_for` ✅ ✅（`config/app.rs` ✅ ✅）那处可以用 ✅ ✅——但它现在的形状 ✅ ✅（先取文件名 ✅ ✅ 再拼 ✅ ✅）也一样好读 ✅ ✅ → **不值得** ✅ ✅ |
+| `dead_code_pub_in_binary` | 1.97 | ② | 量过 ✅ ✅：**0 处** ✅ ✅（ui 的那些 `pub` ✅ ✅ 都是 crate 内部在用 ✅ ✅）✅ ✅ → **没有东西可抓** ✅ ✅ → 不开 ✅ ✅ |
+| `build.warnings`（cargo 配置） | 1.97 | ② | 能替掉 CI 里的 `-D warnings` ✅ ✅ → 但它要 **cargo 1.97** ✅ ✅，而仓库的 MSRV 承诺的是 **rustc 1.89** ✅ ✅ → 工具链的版本 ✅ ✅ 和代码的版本 ✅ ✅ 是两件事 ✅ ✅，这里会混淆 ✅ ✅ → **不换** ✅ ✅ |
+
+### 明确用不上的（✅ ✅ 查过了 ✅ ✅）
+
+- **`if let` 守卫**（1.95 ✅ ✅）：仓库里**没有一个**带守卫的 match 分支 ✅ ✅ ✅。
+- **`Result::flatten`**（1.89 ✅ ✅）：没有 `Result<Result<..>>` ✅ ✅ ✅。
+- **`BTreeMap::extract_if`**（1.91 ✅ ✅）：仓库里**没有 BTreeMap** ✅ ✅ ✅。
+- **`AtomicBool::try_update`**（1.95 ✅ ✅）：取消令牌是"置位后一直为真" ✅ ✅
+  （`store` ✅ ✅ 就对 ✅ ✅）✅ ✅——`try_update` 是给"读改写"用的 ✅ ✅ ✅。
+- **`core::hint::cold_path`**（1.95 ✅ ✅）：只省几个字节 ✅ ✅ ✅。
+- **`core::range`**（1.95/1.96 ✅ ✅）：`std::ops::Range` ✅ ✅ 就是它的 re-export
+  ✅ ✅ ✅。
+
+### 一个**别用**的（✅ ✅ 陷阱 ✅ ✅）
+
+**`str::eq_ignore_ascii_case`（1.89 ✅ ✅）** ✅ ✅——仓库的文件名比较是
+**Unicode 感知**的 ✅ ✅（`platform::fs_semantics::fold_name` ✅ ✅ 用
+`to_lowercase` ✅ ✅，设计文档 §1.3 写了"唯一折叠口径" ✅ ✅）✅ ✅；换成 ASCII
+折叠 ✅ ✅ 就把 `Ärger.mkv` 和 `ärger.mkv` 变成两个文件了 ✅ ✅ ✅ ✅。
+
+### 已经是默认开着的（✅ ✅ 不用做什么 ✅ ✅）
+
+这几个 lint 是 warn-by-default ✅ ✅，仓库的 unsafe 代码 ✅ ✅
+（`platform.rs` ✅ ✅）已经在它们的射程里 ✅ ✅ ✅，构建全绿 ✅ ✅ 说明它们没报
+✅ ✅——**这正是它们该有的样子** ✅ ✅：`dangling_pointers_from_locals` ✅ ✅
+（1.91 ✅ ✅）、`integer_to_ptr_transmutes` ✅ ✅（1.90 ✅ ✅）✅ ✅、
+`mismatched_lifetime_syntaxes` ✅ ✅（1.89 ✅ ✅）✅ ✅、
+`unused_visibilities` ✅ ✅（1.94 ✅ ✅）✅ ✅、
+`const_item_interior_mutations` ✅ ✅（1.93 ✅ ✅）✅ ✅，
+以及 1.91 起 **deny** 的 `semicolon_in_expressions_from_macros` ✅ ✅
+（仓库大量用宏 ✅ ✅）✅ ✅ ✅。
+
+### 搬 edition 之外的两条（✅ ✅ 顺手记住 ✅ ✅）
+
+- **cargo 1.89** ✅ ✅：`cargo fix` / `cargo clippy --fix` 现在**只动默认目标**
+  ✅ ✅（以前动所有目标 ✅ ✅）✅ ✅——本仓库这几轮 `--fix` ✅ ✅ 正是靠它没有
+  误伤别的 target ✅ ✅ ✅。
+- **cargo 1.93** ✅ ✅：`cargo clean --workspace` ✅ ✅ ✅——清构建产物而不动
+  依赖缓存 ✅ ✅ ✅（这个仓库的 `target/` 曾经涨到 17 GB ✅ ✅ ✅）。
+
+---
+
+## 六、这个仓库已经做了什么（记录）
 
 | 提交 | 做了什么 | 属于哪一类 |
 |---|---|---|
 | `e9f4725` | 工作区升到 edition 2024 ✅ ✅：16 处 let 链 ✅ ✅、一处 `unsafe` ✅ ✅ | 一类 + 工具链 ✅ ✅ |
 | `13d0c89` | std 库的新 API ✅ ✅：重复的日志尾巴 ✅ ✅、被拷两次的错误 ✅ ✅、两处手写 `match` ✅ ✅、`Option<Error>` + `expect` ✅ ✅ | 一类 ✅ ✅ |
 | `38f53f1` | lint 策略搬进 `[workspace.lints]` ✅ ✅、四处 `allow` → `expect` ✅ ✅、13 处 `map(...).unwrap_or(...)` ✅ ✅、行尾钉死 ✅ ✅ | 一类 + 工具链 ✅ ✅ |
+| `（本次）` | MSRV 从 1.88 改成 **1.89** ✅ ✅（代码早就在用 `File::try_lock` ✅ ✅——1.89 才稳定 ✅ ✅），并且让每个 crate `rust-version.workspace = true` ✅ ✅（不继承的话承诺根本没立下 ✅ ✅）✅ ✅ | 工具链 ✅ ✅ |
 
 **明确没做** ✅ ✅：`clippy::pedantic` ✅ ✅（483 条 ✅ ✅）、
 `needless_pass_by_value` ✅ ✅（和 §3.10.4 打架 ✅ ✅）、
