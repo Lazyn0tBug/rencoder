@@ -84,10 +84,19 @@ jobs:
           - target: aarch64-apple-darwin
             # The arm64 macOS image: the aarch64 target is built
             # natively, so cargo-dist never needs a runner to execute
-            # it. (`macos-18` is x86_64 -- cross-compiling made
-            # cargo-dist look for a hosted arm64 runner that does not
-            # exist.)
-            runner: macos-18-arm64
+            # it.
+            #
+            # The label is `macos-15` because that is the **arm64**
+            # image (actions/runner-images: "macOS 15 Arm64 --
+            # `macos-15`, `macos-15-xlarge`"). The x64 images need an
+            # explicit `-intel` / `-large` label.
+            #
+            # This job used to sit queued forever: `macos-14` is
+            # retired and `macos-18` never existed, and a job whose
+            # label matches no image waits forever instead of
+            # failing. Every macOS job in this repo's history had an
+            # empty `runner_name` -- they never ran.
+            runner: macos-15
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
           - target: x86_64-pc-windows-msvc
@@ -220,7 +229,9 @@ jobs:
   macos-dmg:
     name: macos dmg
     needs: [verify, build]
-    runs-on: macos-18
+    # `macos-15` is the arm64 image (actions/runner-images); the x64
+    # images need an explicit `-intel` / `-large` label.
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 

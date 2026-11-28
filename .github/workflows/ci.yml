@@ -24,6 +24,12 @@
 #
 # ffmpeg/ffprobe are installed so the integration tests actually run
 # instead of skipping (they skip when the binaries are missing).
+#
+# Runner labels: `macos-15` is the **arm64** macOS image (the x64
+# images need an explicit `-intel` / `-large` label). A job whose
+# label matches no image does not fail -- it waits forever, so a
+# wrong label looks like a busy queue. Check `runner_name` on the job:
+# empty means no runner ever picked it up.
 
 name: CI
 
@@ -49,7 +55,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-18
+          - os: macos-15
           - os: ubuntu-22.04
           - os: windows-2022
     steps:
@@ -83,7 +89,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('Cargo.lock') }}
 
       - name: The gate
         # `shell: bash` on purpose: the default shell on the Windows
@@ -140,7 +146,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-18
+          - os: macos-15
           - os: ubuntu-22.04
           - os: windows-2022
     steps:
@@ -180,7 +186,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-ui-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-ui-${{ hashFiles('Cargo.lock') }}
 
       - name: The gate (the whole workspace)
         # `shell: bash` for the same reason as the core job: the
