@@ -725,31 +725,50 @@ pub mod process {
 
     /// A started child and every process it starts in turn.
     ///
-    /// Create it right after `spawn` with [`ProcessTree::adopt`], stop
-    /// the child with [`ProcessTree::kill`] instead of `Child::kill`.
-    /// Dropping it (the child finished on its own) also ends whatever
-    /// the child left running -- nothing outlives the encode.
+    /// Start the child with [`ProcessTree::spawn`] instead of
+    /// `Command::spawn`, stop it with [`ProcessTree::kill`] instead of
+    /// `Child::kill`. Dropping it (the child finished on its own) also
+    /// ends whatever the child left running -- nothing outlives the
+    /// encode.
     pub struct ProcessTree {
         #[cfg(windows)]
         job: Option<job::Job>,
     }
 
     impl ProcessTree {
-        /// Take the child -- and, from now on, everything it starts --
-        /// into one tree.
+        /// Start `cmd` with the child -- and everything it starts --
+        /// in one tree.
         ///
-        /// Windows: a job object that ends its processes when it is
-        /// closed. There is a window between `spawn` and this call in
-        /// which the child runs outside the job; a shim spends far
-        /// longer than that loading before it starts the real binary.
-        /// If the job cannot be set up, this falls back to stopping
-        /// the child alone (logged), which is what happened before.
-        pub fn adopt(child: &std::process::Child) -> Self {
+        /// Windows: the child is created **suspended**, put in a job
+        /// object that ends its processes when it is closed, and only
+        /// then resumed. It runs no instruction outside the job, so
+        /// nothing it starts can escape it. (Assigning after a normal
+        /// `spawn` leaves a window in which a busy machine lets the
+        /// child start its own child first -- and that one is outside
+        /// the job; CI showed it.)
+        ///
+        /// This also does what [`isolate_from_console_events`] does:
+        /// `Command` keeps only the *last* `creation_flags` value, so
+        /// the two flags have to be set together, here.
+        ///
+        /// If the job cannot be set up, the child still runs and a
+        /// cancel stops it alone (logged) -- what happened before.
+        pub fn spawn(cmd: &mut Command) -> std::io::Result<(std::process::Child, ProcessTree)> {
             #[cfg(windows)]
             {
                 use std::os::windows::io::AsRawHandle;
-                match job::Job::for_process(child.as_raw_handle() as _) {
-                    Ok(job) => ProcessTree { job: Some(job) },
+                use std::os::windows::process::CommandExt;
+
+                /// CREATE_NEW_PROCESS_GROUP (see `isolate_from_console_events`)
+                const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+                /// CREATE_SUSPENDED: the main thread waits for `ResumeThread`.
+                const CREATE_SUSPENDED: u32 = 0x0000_0004;
+
+                cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED);
+                let mut child = cmd.spawn()?;
+
+                let job = match job::Job::for_process(child.as_raw_handle() as _) {
+                    Ok(job) => Some(job),
                     Err(e) => {
                         tracing::warn!(
                             pid = child.id(),
@@ -757,14 +776,21 @@ pub mod process {
                             "could not put the encoder in a job object; \
                              a cancel stops only the direct child"
                         );
-                        ProcessTree { job: None }
+                        None
                     }
+                };
+                // Resume whether or not the job was set up: a child left
+                // suspended would hang the encode forever.
+                if let Err(e) = job::resume_main_thread(child.id()) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(e);
                 }
+                Ok((child, ProcessTree { job }))
             }
             #[cfg(not(windows))]
             {
-                let _ = child;
-                ProcessTree {}
+                Ok((cmd.spawn()?, ProcessTree {}))
             }
         }
 
@@ -797,13 +823,71 @@ pub mod process {
     #[cfg(windows)]
     mod job {
         use std::time::{Duration, Instant};
-        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+        };
         use windows_sys::Win32::System::JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation,
             JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
             TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         };
+        use windows_sys::Win32::System::Threading::{
+            OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+        };
+
+        /// Resume the threads of a process created with
+        /// `CREATE_SUSPENDED` -- just one, its main thread.
+        ///
+        /// `std::process::Child` keeps the main thread's handle to
+        /// itself, so the thread is found by its owner's pid in a
+        /// thread snapshot. The pid cannot be reused meanwhile: the
+        /// `Child` holds the process handle open.
+        pub(super) fn resume_main_thread(pid: u32) -> std::io::Result<()> {
+            // SAFETY: a snapshot of all threads; closed below.
+            let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+            if snapshot == INVALID_HANDLE_VALUE {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut entry = THREADENTRY32 {
+                dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+                ..Default::default()
+            };
+            let mut resumed = 0u32;
+            let mut failure = None;
+            // SAFETY: `entry` is a THREADENTRY32 with its dwSize set.
+            let mut more = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+            while more {
+                if entry.th32OwnerProcessID == pid {
+                    // SAFETY: a thread id from the snapshot; null on failure.
+                    let thread =
+                        unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+                    if thread.is_null() {
+                        failure = Some(std::io::Error::last_os_error());
+                    } else {
+                        // SAFETY: a valid thread handle, closed right after.
+                        if unsafe { ResumeThread(thread) } == u32::MAX {
+                            failure = Some(std::io::Error::last_os_error());
+                        } else {
+                            resumed += 1;
+                        }
+                        unsafe { CloseHandle(thread) };
+                    }
+                }
+                // SAFETY: as for Thread32First.
+                more = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+            }
+            // SAFETY: we own the snapshot handle.
+            unsafe { CloseHandle(snapshot) };
+            match (resumed, failure) {
+                (0, Some(e)) => Err(e),
+                (0, None) => Err(std::io::Error::other(format!(
+                    "no thread of process {pid} to resume"
+                ))),
+                _ => Ok(()),
+            }
+        }
 
         /// An owned job object handle.
         pub(super) struct Job(HANDLE);
@@ -926,8 +1010,7 @@ pub mod process {
                 c
             };
             cmd.stdout(std::process::Stdio::null());
-            let mut child = cmd.spawn().expect("spawn the child");
-            let tree = ProcessTree::adopt(&child);
+            let (mut child, tree) = ProcessTree::spawn(&mut cmd).expect("spawn the child");
             tree.kill(&mut child);
             assert!(
                 child.try_wait().expect("ask the child").is_some(),
@@ -952,8 +1035,7 @@ pub mod process {
 
             let mut cmd = std::process::Command::new("cmd");
             cmd.raw_arg(format!("/C ping -n 30 127.0.0.1 > \"{}\"", held.display()));
-            let mut child = cmd.spawn().expect("spawn cmd");
-            let tree = ProcessTree::adopt(&child);
+            let (mut child, tree) = ProcessTree::spawn(&mut cmd).expect("spawn cmd");
 
             // Wait for the grandchild to be writing.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

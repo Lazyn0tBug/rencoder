@@ -1010,8 +1010,10 @@ fn run_ffmpeg_with_stderr(
         // child is supervised here instead of being captured. The
         // cancel token is polled; a cancel kills and reaps the child
         // and removes the half-written file (design doc §3.11.2).
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
+        // The `ffmpeg` we start may be a shim running the real one as
+        // its child: a cancel must stop both (platform::process).
+        let (mut child, tree) = match crate::platform::process::ProcessTree::spawn(&mut cmd) {
+            Ok(started) => started,
             Err(e) => {
                 return Err((
                     ErrorCategory::FfmpegSpawnFailed,
@@ -1020,9 +1022,6 @@ fn run_ffmpeg_with_stderr(
                 ))
             }
         };
-        // The `ffmpeg` we started may be a shim running the real one
-        // as its child: a cancel must stop both (platform::process).
-        let tree = crate::platform::process::ProcessTree::adopt(&child);
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -1268,8 +1267,11 @@ pub fn run_ffmpeg_with_progress(
     // rather than the file being *failed* (platform::process).
     crate::platform::process::isolate_from_console_events(&mut cmd);
 
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
+    // The `ffmpeg` we start may be a shim running the real one as its
+    // child (Chocolatey, Scoop): a cancel must stop both, or the real
+    // encoder keeps the partial output open (platform::process).
+    let (mut child, tree) = match crate::platform::process::ProcessTree::spawn(&mut cmd) {
+        Ok(started) => started,
         Err(e) => {
             return Err((
                 ErrorCategory::FfmpegSpawnFailed,
@@ -1278,10 +1280,6 @@ pub fn run_ffmpeg_with_progress(
             ));
         }
     };
-    // The `ffmpeg` we started may be a shim running the real one as
-    // its child (Chocolatey, Scoop): a cancel must stop both, or the
-    // real encoder keeps the partial output open (platform::process).
-    let tree = crate::platform::process::ProcessTree::adopt(&child);
 
     let stdout = child
         .stdout
