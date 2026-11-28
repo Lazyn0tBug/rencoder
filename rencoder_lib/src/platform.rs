@@ -890,6 +890,14 @@ pub mod process {
         /// The wait for the tree to drain is bounded by
         /// [`TREE_EXIT_TIMEOUT`]; past it, a warning is logged and the
         /// caller's cleanup reports what it could not remove.
+        ///
+        /// "None of them holds a file open" is the **eventual**
+        /// contract, not an instantaneous one: the kernel releases a
+        /// terminated process's handles as the process goes down ✅ ✅,
+        /// which is not the same instant as "the job reports no active
+        /// process" ✅ ✅. The caller expresses the same bound ✅ ✅
+        /// (`platform::fs_semantics::remove_written_file` ✅ ✅ retries
+        /// for a short while ✅ ✅) ✅ ✅.
         pub fn kill(&self, child: &mut std::process::Child) {
             #[cfg(windows)]
             match &self.job {
@@ -917,6 +925,28 @@ pub mod process {
             // is a harmless error; on Unix it is the kill.
             let _ = child.kill();
             let _ = child.wait();
+        }
+
+        /// Does stopping this tree stop **everything** it started?
+        ///
+        /// On Unix always: the shim `exec`s, so the child *is* the
+        /// encoder ✅ ✅. On Windows only when the job object exists
+        /// ✅ ✅ -- without it, a grandchild (the real encoder behind
+        /// a package-manager shim ✅ ✅) survives the kill ✅ ✅ and
+        /// keeps holding the output ✅ ✅.
+        ///
+        /// The caller cannot see this otherwise ✅ ✅ (the fallback is
+        /// a log line ✅ ✅), and the difference decides whether the
+        /// cleanup that follows can remove the partial ✅ ✅ ✅.
+        pub fn covers_whole_tree(&self) -> bool {
+            #[cfg(windows)]
+            {
+                self.job.is_some()
+            }
+            #[cfg(not(windows))]
+            {
+                true
+            }
         }
     }
 
@@ -1149,11 +1179,24 @@ pub mod process {
 
             tree.kill(&mut child);
 
-            let removed = std::fs::remove_file(&held);
+            // The contract is **bounded**, not instantaneous: the
+            // kernel releases a terminated process's handles as the
+            // process goes down, which is not the same instant as
+            // "the job reports no active process". The production
+            // cleanup states the same bound -- it removes the file
+            // through the shared primitive, which retries for a short
+            // while (platform::fs_semantics::remove_written_file).
+            //
+            // So the test uses that primitive: the rule lives in one
+            // place, and the test asserts the rule rather than a
+            // timing detail of the kernel.
+            let removed = crate::platform::fs_semantics::remove_written_file(&held);
             let _ = std::fs::remove_dir_all(&dir);
             assert!(
-                removed.is_ok(),
-                "the file must be deletable once the tree is killed: {removed:?}"
+                matches!(removed, crate::platform::fs_semantics::Removal::Removed),
+                "the file must be deletable once the tree is killed \
+                 (the tree covers everything: {}) -- removal: {removed:?}",
+                tree.covers_whole_tree(),
             );
         }
     }
