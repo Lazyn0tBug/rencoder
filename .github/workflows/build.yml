@@ -1,9 +1,15 @@
 # GitHub Actions release workflow for Rencoder.
 #
 # Builds for three targets with cargo-dist:
-#   - aarch64-apple-darwin     -> .tar.xz / .tar.gz
-#   - x86_64-unknown-linux-gnu -> .tar.xz / .tar.gz
+#   - aarch64-apple-darwin     -> .tar.xz
+#   - x86_64-unknown-linux-gnu -> .tar.xz
 #   - x86_64-pc-windows-msvc   -> .zip (portable)
+#
+# cargo-dist emits **two** tar formats for a package (.tar.xz and
+# .tar.gz) and `scripts/dist.sh` stages both of them -- but only
+# .tar.xz is published. The upload globs below name that one format
+# on purpose: `*.tar.*` would attach the same package twice, once
+# per extension (docs/CI.md CI-19).
 #
 # Each archive is augmented by scripts/dist.sh with the U18 single-dir
 # app layout (rencoder.toml + log/ + data/) and gets a checksum that is
@@ -299,7 +305,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          TARBALL=$(ls dist-tmp/rencoder_cli-aarch64-apple-darwin.tar.* | head -1)
+          # The extension is named, not globbed: cargo-dist emits both
+          # .tar.xz and .tar.gz, and `ls ... | head -1` would pick
+          # whichever sorts first -- not whichever we publish
+          # (docs/CI.md CI-19).
+          TARBALL=dist-tmp/rencoder_cli-aarch64-apple-darwin.tar.xz
+          test -f "$TARBALL" || { echo "::error::missing $TARBALL"; exit 1; }
           rm -rf dmg-stage
           mkdir -p dmg-stage
           # `tar -xf` auto-detects xz / gzip compression.
