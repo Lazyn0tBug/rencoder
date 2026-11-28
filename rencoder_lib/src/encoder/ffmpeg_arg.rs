@@ -353,8 +353,8 @@ mod tests {
             assert!(
                 matches!(
                     ExtraArg::parse(s),
-                    Err(ExtraArgParseError::DeniedFlag(_))
-                        | Err(ExtraArgParseError::BadValueChars { .. })
+                    Err(ExtraArgParseError::DeniedFlag(_)
+                        | ExtraArgParseError::BadValueChars { .. })
                 ),
                 "expected deny-list reject for {s:?}, got: {:?}",
                 ExtraArg::parse(s)

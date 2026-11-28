@@ -294,10 +294,7 @@ impl EncodeParams {
         use crate::config::app::EncodeConfig;
         let default_enc = EncodeConfig::default();
         let enc: &EncodeConfig = encode.unwrap_or(&default_enc);
-        let format = enc
-            .format
-            .map(VideoFormat::from)
-            .unwrap_or(VideoFormat::Av1);
+        let format = enc.format.map_or(VideoFormat::Av1, VideoFormat::from);
         let (is_crf, bitrate_or_crf) = if enc.crf == 0 {
             (false, enc.bitrate.unwrap_or(5000))
         } else {
@@ -341,8 +338,7 @@ impl Target {
             Target::File(f) => f
                 .parent()
                 .filter(|p| !p.as_os_str().is_empty())
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| PathBuf::from(".")),
+                .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
             Target::Dir(d) => d.clone(),
         }
     }
@@ -625,7 +621,7 @@ impl EncodingRecord {
             source_container: metadata.and_then(|m| m.container.clone()),
             source_width: metadata.and_then(|m| m.width),
             source_height: metadata.and_then(|m| m.height),
-            source_fps: metadata.and_then(|m| m.best_fps()),
+            source_fps: metadata.and_then(VideoMetadata::best_fps),
             source_duration_secs: metadata.and_then(|m| m.duration_secs),
             source_bit_rate_bps: metadata.and_then(|m| m.bit_rate),
             // Caller fills in the process / result / status fields.

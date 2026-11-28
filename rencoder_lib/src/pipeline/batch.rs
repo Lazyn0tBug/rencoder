@@ -622,7 +622,7 @@ fn build_encode_record(
                 // but only after the NVENC attempt failed.
                 ffmpeg_stderr_tail: fallback_note
                     .as_ref()
-                    .map(|note| note.detail())
+                    .map(FallbackNote::detail)
                     .unwrap_or_default(),
 
                 output_path: Some(output_path.to_string_lossy().into_owned()),
@@ -864,10 +864,10 @@ pub fn batch_target_path(target: &crate::types::Target) -> PathBuf {
 /// the first file's path so the scaffold log line points at the
 /// directory the user is working with.
 pub fn batch_target_path_for_files(files: &[crate::types::InputPath]) -> std::path::PathBuf {
-    files
-        .first()
-        .map(|f| f.as_path().parent().unwrap_or(f.as_path()).to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("(empty)"))
+    files.first().map_or_else(
+        || std::path::PathBuf::from("(empty)"),
+        |f| f.as_path().parent().unwrap_or(f.as_path()).to_path_buf(),
+    )
 }
 
 /// Build the ffmpeg argv (used by `transcode_single`). Probes the source
@@ -1331,10 +1331,7 @@ pub fn run_ffmpeg_with_progress(
             ));
         }
 
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
+        let Ok(line) = line else { break };
 
         if line.is_empty() {
             continue;

@@ -394,7 +394,7 @@ impl TaskQueue {
         let id = if *count == 0 {
             TaskId(base)
         } else {
-            TaskId(format!("{}-{}", base, count))
+            TaskId(format!("{base}-{count}"))
         };
         *count += 1;
         id
@@ -546,7 +546,10 @@ pub enum LogSource {
 /// UI messages. Translating user gestures into Commands happens
 /// in the reducer (`User*` variants); translating lib Events into
 /// state changes happens too (the `Lib(Event)` wrapper).
-#[allow(clippy::large_enum_variant)] // same rationale as Event — single mpsc emission
+#[expect(
+    clippy::large_enum_variant,
+    reason = "same rationale as Event: one mpsc emission"
+)]
 #[derive(Debug)]
 pub enum Msg {
     /// User picked a directory. Updates `state.input_dir`.
@@ -631,7 +634,7 @@ pub fn is_quit_key(character: &str, ctrl: bool) -> bool {
 pub fn quit_can_close_now(phase: Option<BatchPhase>) -> bool {
     !matches!(
         phase,
-        Some(BatchPhase::Encoding) | Some(BatchPhase::Starting) | Some(BatchPhase::Cancelling)
+        Some(BatchPhase::Encoding | BatchPhase::Starting | BatchPhase::Cancelling)
     )
 }
 
@@ -774,7 +777,7 @@ pub fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Request>) {
                     // defense-in-depth — UI shouldn't dispatch
                     // this, but if it does, ignore).
                 }
-                Some(BatchPhase::AwaitingConfirm) | Some(BatchPhase::Cancelled) => {
+                Some(BatchPhase::AwaitingConfirm | BatchPhase::Cancelled) => {
                     // v1.2 follow-up #2: both AwaitingConfirm and
                     // Cancelled dispatch StartBatch with the dir's
                     // current files. AwaitingConfirm fires after
@@ -810,8 +813,7 @@ pub fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Request>) {
                             push_toast(
                                 state,
                                 format!(
-                                    "batch too large: {} files (max {}). Narrow extensions or split the dir.",
-                                    count, max
+                                    "batch too large: {count} files (max {max}). Narrow extensions or split the dir."
                                 ),
                                 ToastKind::Error,
                             );
@@ -828,7 +830,7 @@ pub fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Request>) {
                         let dir = state.tasks.active.as_ref().unwrap().dir.display();
                         push_toast(
                             state,
-                            format!("no files in {} (file list changed since DryRun)", dir),
+                            format!("no files in {dir} (file list changed since DryRun)"),
                             ToastKind::Error,
                         );
                         return;
@@ -873,10 +875,12 @@ pub fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Request>) {
                         }
                     }
                 }
-                Some(BatchPhase::Analyzing)
-                | Some(BatchPhase::Encoding)
-                | Some(BatchPhase::Starting)
-                | Some(BatchPhase::Cancelling) => {
+                Some(
+                    BatchPhase::Analyzing
+                    | BatchPhase::Encoding
+                    | BatchPhase::Starting
+                    | BatchPhase::Cancelling,
+                ) => {
                     // Defense-in-depth: the bottom button is
                     // disabled in these phases, so this is
                     // unreachable via the UI. Keep the toast as
@@ -901,7 +905,7 @@ pub fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Request>) {
             // partial output is removed before the process goes.
             state.quitting = true;
             match state.tasks.active.as_ref().map(|t| t.phase) {
-                Some(BatchPhase::Encoding) | Some(BatchPhase::Starting) => {
+                Some(BatchPhase::Encoding | BatchPhase::Starting) => {
                     // The same cancel the Cancel button sends (design
                     // doc §3.11.3): it names the batch, so a stale
                     // quit cannot stop another batch.
@@ -916,7 +920,7 @@ pub fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Request>) {
         Msg::UserClickedCancel => {
             let phase = state.tasks.active.as_ref().map(|t| t.phase);
             match phase {
-                Some(BatchPhase::Encoding) | Some(BatchPhase::Starting) => {
+                Some(BatchPhase::Encoding | BatchPhase::Starting) => {
                     // The cancel names the batch (design doc §3.11.3):
                     // a cancel that names another batch is refused,
                     // so a stale cancel cannot stop the batch the
@@ -1190,12 +1194,7 @@ fn apply_event(state: &mut AppState, evt: Event) {
         } => {
             // The user cancelled while the dry run was running: the
             // result is discarded and the task goes away.
-            let cancelled = state
-                .tasks
-                .active
-                .as_ref()
-                .map(|t| t.cancelled)
-                .unwrap_or(false);
+            let cancelled = state.tasks.active.as_ref().is_some_and(|t| t.cancelled);
             if cancelled {
                 state.tasks.active = None;
                 return;
@@ -1655,8 +1654,7 @@ fn dispatch_dry_run_for_new_task(
             push_toast(
                 state,
                 format!(
-                    "batch too large: {} files (max {}). Narrow extensions or split the dir.",
-                    count, max
+                    "batch too large: {count} files (max {max}). Narrow extensions or split the dir."
                 ),
                 ToastKind::Error,
             );
@@ -1745,7 +1743,7 @@ fn stat_inputs(files: &[rencoder_lib::types::InputPath]) -> Vec<(PathBuf, InputS
             let path = file.as_path().to_path_buf();
             let meta = std::fs::metadata(&path).ok();
             let stat = InputStat {
-                size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                size: meta.as_ref().map_or(0, std::fs::Metadata::len),
                 mtime: meta.as_ref().and_then(|m| m.modified().ok()),
             };
             (path, stat)
@@ -1776,7 +1774,10 @@ fn plan_is_stale(
         .iter()
         .map(|(path, _)| path.as_path())
         .collect();
-    let current: Vec<&std::path::Path> = files.iter().map(|f| f.as_path()).collect();
+    let current: Vec<&std::path::Path> = files
+        .iter()
+        .map(rencoder_lib::types::InputPath::as_path)
+        .collect();
     if planned != current {
         return Some("the file list changed");
     }
@@ -1786,14 +1787,17 @@ fn plan_is_stale(
         return Some("the parameters changed");
     }
     // 3. the capability generation
-    let current_generation = state.nvenc_capability.as_ref().map(|c| c.generation());
+    let current_generation = state
+        .nvenc_capability
+        .as_ref()
+        .map(rencoder_lib::encoder::nvenc::Capability::generation);
     if task.dry_run_generation != current_generation {
         return Some("the machine's capability changed");
     }
     // 4. the inputs on disk
     for (path, stat) in &task.dry_run_inputs {
         let meta = std::fs::metadata(path).ok();
-        let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let size = meta.as_ref().map_or(0, std::fs::Metadata::len);
         let mtime = meta.as_ref().and_then(|m| m.modified().ok());
         if size != stat.size || mtime != stat.mtime {
             return Some("an input changed on disk");
@@ -1835,7 +1839,7 @@ fn apply_field_edit(
             // Empty string clears the filter (= "all").
             let parts: Vec<String> = s
                 .split(',')
-                .map(|p| p.trim())
+                .map(str::trim)
                 .filter(|p| !p.is_empty())
                 .map(String::from)
                 .collect();

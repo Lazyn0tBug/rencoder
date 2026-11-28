@@ -1,0 +1,11 @@
+# The line ending is pinned, not left to the host.
+#
+# rustfmt's default is `newline_style = "Auto"`, which writes the
+# *native* line ending -- so the same source formats differently on
+# Windows and on Linux, and `cargo fmt --check` (which runs on all
+# three CI hosts) would pass on one and fail on another. `.gitattributes`
+# pins the checkout; this pins the formatter.
+newline_style = "Unix"
+
+# The style edition follows the Cargo edition (2024) -- nothing to set
+# here.

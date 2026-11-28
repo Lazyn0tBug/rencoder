@@ -200,7 +200,7 @@ mod tests {
     fn list_log_files(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(dir)
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.starts_with("rencoder."))
             .collect();

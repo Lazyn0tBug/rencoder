@@ -113,7 +113,7 @@ pub fn App() -> Element {
         if let Some(tx) = cmd_tx.read().clone() {
             // The request id comes from the UI's counter (design doc
             // §3.11.3): the lib's answer names the request.
-            let request_id = state_thread.with_mut(|s| s.alloc_request_id());
+            let request_id = state_thread.with_mut(super::msg::AppState::alloc_request_id);
             let _ = tx.try_send(Request {
                 id: request_id,
                 command: Command::LoadHistory {
@@ -354,7 +354,7 @@ fn CapabilityPopup(
         .read()
         .nvenc_capability
         .as_ref()
-        .and_then(|cap| cap.review_advisory());
+        .and_then(rencoder_lib::encoder::nvenc::Capability::review_advisory);
     let checks: Vec<(String, bool)> = state
         .read()
         .capability_report
@@ -1488,8 +1488,7 @@ fn HistoryPanel(state: Signal<AppState, SyncStorage>) -> Element {
                 r.source_path.clone(),
                 format!("{:?}", r.outcome),
                 r.output_size_bytes
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "—".into()),
+                    .map_or_else(|| "—".into(), |s| s.to_string()),
             )
         })
         .collect();

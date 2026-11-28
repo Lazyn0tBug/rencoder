@@ -1,5 +1,8 @@
 [workspace]
-resolver = "2"
+# Resolver 3 is the edition-2024 default; stating it keeps the choice
+# visible (and it is what lets `rust-version` steer dependency
+# selection).
+resolver = "3"
 members = [
     "rencoder_lib",
     "rencoder_cli",
@@ -8,8 +11,37 @@ members = [
 
 [workspace.package]
 edition = "2024"
+# The floor: edition 2024 needs 1.85, and let chains (which this
+# codebase uses) need 1.88. Declaring it makes the promise explicit
+# and lets resolver 3 stop picking dependencies newer than it.
+rust-version = "1.88"
 version = "0.8.0"
 license = "MIT"
+
+# The lint policy, in one place.
+#
+# The gate runs `cargo clippy -- -D warnings` (CI), so every lint
+# listed here is an error in CI. The list is deliberately short: the
+# lints that earn their place (the ones that catch a real mistake),
+# not the whole pedantic set -- `cargo clippy -- -W clippy::pedantic`
+# reports 483 warnings here, 316 of them doc/style noise.
+#
+# `needless_pass_by_value` is deliberately NOT in the list: the design
+# doc's own rule (section 3.10.4, "is this a context object?") asks
+# exactly that question, and passing by value is sometimes the answer.
+[workspace.lints.clippy]
+# `map(f).unwrap_or(x)` -> `map_or` / `is_some_and`: one form for the
+# same thing, and the repo already uses `is_some_and` everywhere.
+map_unwrap_or = "warn"
+# A closure that only calls a method: the method is shorter.
+redundant_closure_for_method_calls = "warn"
+# `A | B | C` in a pattern instead of three alternatives.
+unnested_or_patterns = "warn"
+# `format!("{x}")` instead of `format!("{}", x)`.
+uninlined_format_args = "warn"
+# `let Some(x) = ... else { return };` instead of a match with one
+# meaningful arm.
+manual_let_else = "warn"
 
 # The profile that 'dist' will build with.
 #

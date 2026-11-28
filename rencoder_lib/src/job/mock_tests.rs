@@ -77,7 +77,6 @@ fn batch_files(label: &str, count: usize) -> Vec<crate::types::InputPath> {
 /// The mock mirrors the production actor's structure: batches run
 /// on a worker thread and the command loop stays responsive. The
 /// tests therefore exercise the real mechanism (§3.10.1.1).
-#[allow(clippy::needless_pass_by_value)]
 /// Test harness: the **production** actor with test dependencies.
 ///
 /// The mock replaces one step -- "encode one file" -- through the
@@ -141,7 +140,6 @@ where
 /// make a probe block, or answer differently each time -- the
 /// probe's *order* matters (design doc §3.10.6 step 5: an older
 /// probe's result must not overwrite a newer one).
-#[allow(clippy::too_many_arguments)]
 fn run_test_controller_with_runner<F>(
     mock_fn: F,
     data_dir: Option<PathBuf>,
@@ -1239,7 +1237,7 @@ fn a_finished_batch_writes_its_records_to_the_history_file() {
     // recognises.
     let written: Vec<_> = std::fs::read_dir(&dir)
         .expect("the data dir must be readable")
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|name| name.starts_with("encoding-") && name.ends_with(".parquet"))
         .collect();

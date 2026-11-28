@@ -162,7 +162,7 @@ impl ScriptedFfmpeg {
         let rules = Arc::new(Mutex::new(self.rules.clone()));
         let calls = self.calls.clone();
         Box::new(move |args: &[&str]| {
-            let argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let argv: Vec<String> = args.iter().map(std::string::ToString::to_string).collect();
             calls.lock().push(argv.clone());
 
             let mut rules = rules.lock();

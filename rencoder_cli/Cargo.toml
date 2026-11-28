@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "CLI frontend for Rencoder."
 
+# The lint policy lives in the workspace (Cargo.toml, [workspace.lints]).
+[lints]
+workspace = true
+
 [[bin]]
 name = "rencoder"
 path = "src/main.rs"

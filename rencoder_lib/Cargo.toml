@@ -11,6 +11,10 @@ description = "Core library for Rencoder: smart video transcoding and analysis."
 # "single application" deployment model.
 publish = false
 
+# The lint policy lives in the workspace (Cargo.toml, [workspace.lints]).
+[lints]
+workspace = true
+
 [dependencies]
 walkdir = "2"
 serde = { version = "1", features = ["derive"] }

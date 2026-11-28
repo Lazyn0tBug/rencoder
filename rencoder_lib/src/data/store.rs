@@ -26,7 +26,10 @@ use crate::types::{EncodingOutcome, EncodingRecord, ErrorCategory, ErrorContext,
 /// `i64` (milliseconds since epoch) into Polars' `Datetime` type so
 /// `df!` accepts the column.
 fn datetime_series(name: &str, values: Vec<DateTime<Utc>>) -> Series {
-    let micros: Vec<i64> = values.iter().map(|dt| dt.timestamp_micros()).collect();
+    let micros: Vec<i64> = values
+        .iter()
+        .map(chrono::DateTime::timestamp_micros)
+        .collect();
     Series::new(name.into(), micros)
         .cast(&DataType::Datetime(TimeUnit::Microseconds, None))
         .expect("datetime cast")
@@ -297,14 +300,15 @@ fn columns_to_records(df: &DataFrame) -> PolarsResult<Vec<EncodingRecord>> {
         // Unacceptable: timezones, nanoseconds, physical types.
         if !matches!(
             dt,
-            DataType::Datetime(polars::prelude::TimeUnit::Microseconds, _)
-                | DataType::Datetime(polars::prelude::TimeUnit::Milliseconds, _)
+            DataType::Datetime(
+                polars::prelude::TimeUnit::Microseconds | polars::prelude::TimeUnit::Milliseconds,
+                _
+            )
         ) {
             return Err(PolarsError::ComputeError(
                 format!(
-                    "Parquet column '{}' has dtype {:?}; expected Datetime(Us/Ms, _). \
-                     Refusing to silently corrupt timestamps.",
-                    name, dt
+                    "Parquet column '{name}' has dtype {dt:?}; expected Datetime(Us/Ms, _). \
+                     Refusing to silently corrupt timestamps."
                 )
                 .into(),
             ));
@@ -471,7 +475,7 @@ pub fn write_records(records: &[EncodingRecord], path: &Path) -> Result<(), Enco
     let bytes: Vec<u8> = match path.extension().and_then(|e| e.to_str()) {
         Some("parquet") => records_to_parquet(records)
             .map_err(|e| EncodeError::Probe(format!("parquet encode: {e}")))?,
-        Some("jsonl") | Some("ndjson") => records_to_jsonl(records).into_bytes(),
+        Some("jsonl" | "ndjson") => records_to_jsonl(records).into_bytes(),
         Some("csv") => records_to_csv(records).into_bytes(),
         other => {
             return Err(EncodeError::InvalidParam(format!(

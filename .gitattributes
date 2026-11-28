@@ -1,0 +1,18 @@
+# Text files are checked out with LF on every platform.
+#
+# `cargo fmt --check` runs on all three CI hosts, and rustfmt's
+# default `newline_style = "Auto"` writes the *native* line ending.
+# Without this, a file committed with CRLF passes the Windows job and
+# fails the Linux one -- the gate would depend on which machine ran
+# it. rustfmt.toml pins the same thing on the Rust side.
+* text=auto eol=lf
+
+# Binary files: never touched.
+*.png binary
+*.jpg binary
+*.ico binary
+*.mp4 binary
+*.mkv binary
+*.zip binary
+*.gz binary
+*.xz binary

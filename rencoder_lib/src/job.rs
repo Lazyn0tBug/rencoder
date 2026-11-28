@@ -233,7 +233,10 @@ pub enum Command {
 /// one-at-a-time through a single mpsc receiver — no in-flight
 /// accumulation, so the memory cost is bounded by one variant's
 /// worst-case size at a time.
-#[allow(clippy::large_enum_variant)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the events travel over one channel; boxing one variant would split the stream"
+)]
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Event {
@@ -1763,7 +1766,10 @@ impl BatchUpdates {
 ///
 /// The terminal event (`BatchCompleted` / `BatchCancelled`) is sent by
 /// the worker, so the whole batch reads as one ordered stream.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the batch context is a parameter list, not a context object (design doc §3.10.4)"
+)]
 fn spawn_task_batch<P, F>(
     batch_id: BatchId,
     tasks: Vec<EncodeTask>,
@@ -2967,14 +2973,12 @@ fn load_history(
 ) -> Vec<EncodingRecord> {
     use crate::data::store::read_records;
 
-    let dir = match data_dir {
-        Some(d) => d,
-        None => return Vec::new(),
+    let Some(dir) = data_dir else {
+        return Vec::new();
     };
 
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(_) => return Vec::new(),
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
     };
 
     let mut all: Vec<EncodingRecord> = Vec::new();
@@ -3042,5 +3046,8 @@ mod controller_tests {
 // =====================================================================
 
 #[cfg(test)]
-#[allow(clippy::type_complexity)] // mock closure types are intentionally explicit
+#[expect(
+    clippy::type_complexity,
+    reason = "the mock closure types are intentionally explicit"
+)]
 mod mock_tests;

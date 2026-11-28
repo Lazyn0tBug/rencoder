@@ -318,9 +318,7 @@ pub fn resolve_max_batch_size(encode: Option<&EncodeConfig>) -> u32 {
             }
         }
     }
-    encode
-        .map(|e| e.max_batch_size)
-        .unwrap_or_else(default_max_batch_size)
+    encode.map_or_else(default_max_batch_size, |e| e.max_batch_size)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]

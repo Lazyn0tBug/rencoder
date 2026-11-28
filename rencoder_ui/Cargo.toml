@@ -6,6 +6,10 @@ license.workspace = true
 description = "Dioxus desktop GUI for Rencoder (U21)."
 publish = false
 
+# The lint policy lives in the workspace (Cargo.toml, [workspace.lints]).
+[lints]
+workspace = true
+
 [dependencies]
 rencoder_lib = { path = "../rencoder_lib" }
 dioxus = { version = "0.6", features = ["desktop"] }

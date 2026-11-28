@@ -126,9 +126,7 @@ fn prepare(
         .with_context(|| format!("failed to load config from {}", config_path.display()))?;
     // No operation directory means the run acts on no directory of
     // its own (`rencoder detect`): its state stays with the app.
-    let op_dir = op_dir
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| app_dir.clone());
+    let op_dir = op_dir.map_or_else(|| app_dir.clone(), Path::to_path_buf);
     let paths = Paths::resolve(config_path, app_dir, op_dir, &app_config);
 
     tracing_init::init(&paths.log_dir, &app_config).context("initialize tracing")?;

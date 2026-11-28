@@ -152,10 +152,10 @@ pub fn plan_outputs(inputs: &[PathBuf], format: VideoFormat) -> Vec<PathBuf> {
 
 /// The renamed output: `<stem>_<source extension>_<n>.<target extension>`.
 fn disambiguated_output(output: &Path, input: &Path, number: usize) -> PathBuf {
-    let stem = output
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "output".to_string());
+    let stem = output.file_stem().map_or_else(
+        || "output".to_string(),
+        |stem| stem.to_string_lossy().into_owned(),
+    );
     let target_ext = output
         .extension()
         .map(|ext| ext.to_string_lossy().into_owned())

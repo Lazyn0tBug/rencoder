@@ -352,7 +352,10 @@ mod tests {
 
         // The oracle is the rule itself (`Path`'s component-wise
         // `Ord`), not a proxy for it.
-        let paths: Vec<&Path> = files.iter().map(|f| f.as_path()).collect();
+        let paths: Vec<&Path> = files
+            .iter()
+            .map(super::super::types::InputPath::as_path)
+            .collect();
         let mut sorted = paths.clone();
         sorted.sort();
         assert_eq!(paths, sorted, "the collection is sorted by path component");
