@@ -479,13 +479,14 @@ fn remove_failed_output(output: &Path, started_at: chrono::DateTime<chrono::Utc>
     if modified_secs <= started_at.timestamp() {
         return;
     }
-    match std::fs::remove_file(output) {
-        Ok(()) => tracing::warn!(
+    match crate::platform::fs_semantics::remove_written_file(output) {
+        crate::platform::fs_semantics::Removal::Removed => tracing::warn!(
             output = %output.display(),
             "the encode failed; removed the half-written output"
         ),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => tracing::warn!(
+        // Nothing to remove: the file is already gone.
+        crate::platform::fs_semantics::Removal::Absent => {}
+        crate::platform::fs_semantics::Removal::Failed(e) => tracing::warn!(
             output = %output.display(),
             error = %e,
             "the encode failed; could not remove the half-written output"
@@ -562,27 +563,24 @@ fn build_encode_record(
                 ),
                 None if source_has_known_duration => {
                     // Best-effort cleanup of any zero-byte file left
-                    // by ffmpeg before it gave up. We tolerate a
-                    // remove failure (e.g. file vanished between
-                    // `metadata()` and `remove_file`) since the next
-                    // run's partial detector will retry.
-                    if output_path.exists() {
-                        match std::fs::remove_file(output_path) {
-                            Ok(()) => tracing::warn!(
-                                output = %output_path.display(),
-                                "ffmpeg exit 0 but output was zero bytes; removed, recording Failed"
-                            ),
-                            Err(e) => tracing::warn!(
-                                output = %output_path.display(),
-                                error = %e,
-                                "ffmpeg exit 0 but output was zero bytes and remove failed; recording Failed"
-                            ),
-                        }
-                    } else {
-                        tracing::warn!(
+                    // by ffmpeg before it gave up. The removal goes
+                    // through the shared primitive (design doc
+                    // §3.11.2), so it also survives a file that
+                    // something else still holds on Windows.
+                    match crate::platform::fs_semantics::remove_written_file(output_path) {
+                        crate::platform::fs_semantics::Removal::Removed => tracing::warn!(
+                            output = %output_path.display(),
+                            "ffmpeg exit 0 but output was zero bytes; removed, recording Failed"
+                        ),
+                        crate::platform::fs_semantics::Removal::Absent => tracing::warn!(
                             output = %output_path.display(),
                             "ffmpeg exit 0 but output missing; recording Failed"
-                        );
+                        ),
+                        crate::platform::fs_semantics::Removal::Failed(e) => tracing::warn!(
+                            output = %output_path.display(),
+                            error = %e,
+                            "ffmpeg exit 0 but output was zero bytes and remove failed; recording Failed"
+                        ),
                     }
                     (EncodingOutcome::Failed, None)
                 }
@@ -1436,16 +1434,17 @@ pub fn run_ffmpeg_with_progress(
 ///   (`[ffmpeg, -y, -i, INPUT, ...encoders..., OUTPUT]`).
 /// - Empty argv (shouldn't happen — ffmpeg argv always has at
 ///   least 2 elements) → no-op.
-/// - File missing → `NotFound` is silently ignored (already
-///   cleaned up by something else; nothing to do).
+/// - File missing → `Absent`: already cleaned up by something else;
+///   nothing to do, and nothing to say.
 /// - Any other I/O error → logged at warn, NOT propagated.
 ///   The cancel branch is already returning `Err(Cancelled)`;
 ///   we don't want to mask that with a cleanup error.
 ///
-/// This is symmetric with the CLI path's `PartialOutputHandle`
-/// Guard but doesn't share an implementation (the actor path
-/// doesn't carry a handle — it's run on the actor thread
-/// directly via `TaskManager::run`).
+/// The removal itself is the shared primitive
+/// ([`platform::fs_semantics::remove_written_file`]): the same rule
+/// the failed-encode and zero-byte paths use, so the Windows half
+/// (retry while something still holds the file) is not forgotten
+/// here.
 fn cleanup_partial_output_from_argv(argv: &[String]) {
     let Some(out) = argv.last() else {
         return;
@@ -1453,53 +1452,19 @@ fn cleanup_partial_output_from_argv(argv: &[String]) {
     // v1.2 follow-up #4 commit 2: structured fields. The output
     // path is the cleanest key to grep on when a user reports
     // "did cancel actually clean up the partial for THIS file?".
-    match remove_partial_output(std::path::Path::new(out)) {
-        Ok(()) => tracing::info!(output = %out, "cancel cleanup: removed partial"),
-        Err(e) => tracing::warn!(
+    match crate::platform::fs_semantics::remove_written_file(std::path::Path::new(out)) {
+        crate::platform::fs_semantics::Removal::Removed => {
+            tracing::info!(output = %out, "cancel cleanup: removed partial")
+        }
+        // There was no partial to remove: nothing happened, and
+        // nothing to report.
+        crate::platform::fs_semantics::Removal::Absent => {}
+        crate::platform::fs_semantics::Removal::Failed(e) => tracing::warn!(
             output = %out,
             error = %e,
             "cancel cleanup: failed to remove partial"
         ),
     }
-}
-
-/// How often the cleanup tries to remove the partial, and how long it
-/// waits between the attempts.
-///
-/// The window is short on purpose: the batch has already stopped, so
-/// this only delays the exit, and a file that is still held after the
-/// window is a failure we report -- not one we retry forever.
-const PARTIAL_REMOVAL_ATTEMPTS: usize = 20;
-const PARTIAL_REMOVAL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
-
-/// Remove the partial output, retrying while something else holds it.
-///
-/// The child is dead and reaped, so on Unix the file is ours to
-/// unlink -- the first attempt always works (Unix unlinks a file that
-/// is still open). On **Windows** a file that *any* process has open
-/// cannot be deleted, and something may hold it for a moment after
-/// the writer died: the scanner on a CI runner, an indexer, a file
-/// watcher. (The writer itself is gone by now: the cancel ends the
-/// encoder's whole process tree, shim and real ffmpeg alike --
-/// `platform::process::ProcessTree`.) The contract is the same on
-/// both platforms -- "the partial is gone when the batch stops"
-/// (design doc §3.11.2) -- only the mechanism differs, and the mechanism's answer is "try again in
-/// a moment".
-///
-/// `NotFound` is success: the goal is "the file is not there".
-fn remove_partial_output(path: &std::path::Path) -> std::io::Result<()> {
-    let mut last_error = None;
-    for _ in 0..PARTIAL_REMOVAL_ATTEMPTS {
-        match std::fs::remove_file(path) {
-            Ok(()) => return Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => {
-                last_error = Some(e);
-                std::thread::sleep(PARTIAL_REMOVAL_RETRY_DELAY);
-            }
-        }
-    }
-    Err(last_error.expect("the loop runs at least once"))
 }
 
 /// Extract the encoder name from a build_ffmpeg_command argv. The argv
@@ -2247,9 +2212,11 @@ Encoders:
 
     #[test]
     fn cleanup_partial_output_tolerates_missing_file() {
-        // NotFound is silently ignored — the cancel branch is
-        // already returning Err(Cancelled); we don't want to
-        // double-log or change the return shape.
+        // `Absent` is silent -- the cancel branch is already
+        // returning Err(Cancelled); we don't want to double-log or
+        // change the return shape. (It is also not "removed": the
+        // shared primitive tells the two apart, so the log cannot
+        // claim a file was removed that never existed.)
         let tmp = cleanup_tmp("missing");
         let phantom = tmp.join("never_written.mkv");
         assert!(!phantom.exists());

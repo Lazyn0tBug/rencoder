@@ -81,13 +81,14 @@ signature at call"** principle:
 
 Concrete: `rencoder_lib::platform` is the **only** file in the repo
 with `#[cfg]` in product code (plus `rencoder_cli::signal`, the
-registered CLI exception). It holds five contracts:
+registered CLI exception). It holds six contracts:
 
 | Contract | Unix | Windows |
 |----------|------|---------|
 | `perms::set_config_file_mode` / `set_app_dir_mode` | `0o644` / `0o755` | no-op — ACL inheritance is equivalent |
 | `lock::claim` / `lock::probe` (the single-instance guard) | std `flock` (advisory) | open share mode (deny writers, allow readers) |
 | `fs_semantics::fold_name` / `same_name` | one folding rule (case-insensitive) | same rule — not split per platform |
+| `fs_semantics::remove_written_file` (a file this run wrote can be removed) | unlink works even while it is open | an open file cannot be deleted — retry for a short while |
 | `process::isolate_from_console_events` | no-op (a signal hits one process) | `CREATE_NEW_PROCESS_GROUP` for the encoder |
 | `process::ProcessTree` (stopping the encoder stops everything it runs) | the shim `exec`s — one process, `Child::kill` | job object — `TerminateJobObject` ends the whole tree |
 

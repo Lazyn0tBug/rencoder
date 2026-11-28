@@ -623,6 +623,61 @@ pub mod fs_semantics {
         fold_name(a) == fold_name(b)
     }
 
+    /// How long the removal keeps trying while something else holds
+    /// the file.
+    const REMOVE_ATTEMPTS: usize = 20;
+    const REMOVE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+    /// What happened when a file this run wrote was removed.
+    #[derive(Debug)]
+    pub enum Removal {
+        /// The file was there and is gone now.
+        Removed,
+        /// There was no file to remove.
+        Absent,
+        /// The file is still there -- the error says why.
+        Failed(std::io::Error),
+    }
+
+    /// Remove a file this run wrote.
+    ///
+    /// The contract: **the file is gone when this returns, or the
+    /// failure is reported** -- never a silent "it is probably fine".
+    /// One primitive for every site that deletes an output (the cancel
+    /// path, the failed-encode path, the zero-byte cleanup): three
+    /// copies of the rule is three chances to forget the Windows
+    /// half.
+    ///
+    /// # Why this is a platform difference
+    ///
+    /// Unix unlinks a file that is still open, so the first attempt
+    /// always works. **Windows** refuses to delete a file that *any*
+    /// process has open -- and something may hold it for a moment
+    /// after the writer died: the scanner on a CI runner, an indexer,
+    /// a file watcher. So the removal is retried for a short while.
+    ///
+    /// The wait is bounded: the batch has already stopped, so this
+    /// only delays the exit, and a file that is still held after the
+    /// window is a failure we report -- not one we retry forever.
+    pub fn remove_written_file(path: &std::path::Path) -> Removal {
+        let mut last_error = None;
+        for attempt in 0..REMOVE_ATTEMPTS {
+            match std::fs::remove_file(path) {
+                Ok(()) => return Removal::Removed,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Removal::Absent,
+                Err(e) => {
+                    last_error = Some(e);
+                    // No sleep after the last attempt: it would buy
+                    // nothing.
+                    if attempt + 1 < REMOVE_ATTEMPTS {
+                        std::thread::sleep(REMOVE_RETRY_DELAY);
+                    }
+                }
+            }
+        }
+        Removal::Failed(last_error.expect("the loop runs at least once"))
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -632,6 +687,28 @@ pub mod fs_semantics {
             assert!(same_name("movie.mkv", "MOVIE.MKV"));
             assert!(same_name("Movie.Mkv", "movie.mkv"));
             assert!(!same_name("movie.mkv", "movie2.mkv"));
+        }
+
+        #[test]
+        fn removing_a_file_that_is_not_there_is_not_a_failure() {
+            let path = std::env::temp_dir().join("rencoder_remove_absent_never_here");
+            let _ = std::fs::remove_file(&path);
+            match remove_written_file(&path) {
+                Removal::Absent => {}
+                other => panic!("expected Absent, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn removing_a_file_removes_it() {
+            let path = std::env::temp_dir()
+                .join(format!("rencoder_remove_present_{}", std::process::id()));
+            std::fs::write(&path, b"x").unwrap();
+            match remove_written_file(&path) {
+                Removal::Removed => {}
+                other => panic!("expected Removed, got {other:?}"),
+            }
+            assert!(!path.exists());
         }
 
         /// The folding is Unicode-aware, so a non-ASCII name folds the
