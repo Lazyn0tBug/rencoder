@@ -19,8 +19,8 @@
 //! `PartialOutputHandle` mechanism.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Shareable cancel flag. Cheap to clone (Arc bump), safe to share
 /// across threads.

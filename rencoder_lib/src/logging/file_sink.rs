@@ -55,10 +55,10 @@ impl FileSink {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if let Some(date) = parse_date_from_filename(&name) {
-                if date < cutoff {
-                    let _ = fs::remove_file(entry.path());
-                }
+            if let Some(date) = parse_date_from_filename(&name)
+                && date < cutoff
+            {
+                let _ = fs::remove_file(entry.path());
             }
         }
         Ok(())

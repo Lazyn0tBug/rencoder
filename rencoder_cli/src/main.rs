@@ -20,7 +20,7 @@ use rencoder_lib::pipeline::cancel::CancelToken;
 use rencoder_lib::{
     capability::{Capabilities, MachineFacts},
     collect::collect_files,
-    config::{paths::Paths, AnalyzeFormatArg, AppConfig},
+    config::{AnalyzeFormatArg, AppConfig, paths::Paths},
     data::extract::probe_video_metadata,
     encoder::nvenc::{self},
     pipeline::context::BatchContext,

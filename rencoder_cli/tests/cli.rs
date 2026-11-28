@@ -835,7 +835,7 @@ fn an_interrupt_keeps_the_records_of_the_files_that_finished() {
 #[cfg(windows)]
 #[test]
 fn an_interrupt_keeps_the_records_of_the_files_that_finished() {
-    use windows_sys::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
 
     if !ffmpeg_available() {
         eprintln!("skipping: ffmpeg not available");

@@ -177,11 +177,12 @@ mod tests {
         let mut ctx = ctx();
         assert!(!ctx.params().format.default_extension().is_empty());
         assert!(ctx.cache().encoders_output.is_empty());
-        assert!(ctx
-            .params()
-            .encoders
-            .for_format(ctx.params().format)
-            .is_none());
+        assert!(
+            ctx.params()
+                .encoders
+                .for_format(ctx.params().format)
+                .is_none()
+        );
         assert!(!ctx.capability().verdicts().is_disabled("h264_nvenc"));
         // The verdicts are the mutable part.
         ctx.capability_mut().verdicts_mut().set("h264_nvenc", false);

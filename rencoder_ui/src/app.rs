@@ -38,11 +38,11 @@ use dioxus::prelude::*;
 use crossbeam_channel::Sender;
 
 use rencoder_lib::config::app::FormatArg;
-use rencoder_lib::job::{start_controller, Command, Request};
+use rencoder_lib::job::{Command, Request, start_controller};
 
 use crate::msg::{
-    reduce, AppState, BatchPhase, ConfigFieldKind, ConfigFieldValue, Msg, Page, TaskId, TaskQueue,
-    Toast, ToastKind,
+    AppState, BatchPhase, ConfigFieldKind, ConfigFieldValue, Msg, Page, TaskId, TaskQueue, Toast,
+    ToastKind, reduce,
 };
 use crate::tracing_init;
 

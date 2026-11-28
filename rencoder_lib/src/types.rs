@@ -917,56 +917,68 @@ mod tests {
 
     #[test]
     fn video_metadata_is_valid_with_codec() {
-        assert!(VideoMetadata {
-            codec: Some("h264".into()),
-            ..Default::default()
-        }
-        .is_valid());
+        assert!(
+            VideoMetadata {
+                codec: Some("h264".into()),
+                ..Default::default()
+            }
+            .is_valid()
+        );
     }
 
     #[test]
     fn video_metadata_is_valid_with_avg_fps() {
-        assert!(VideoMetadata {
-            avg_fps: Some(30.0),
-            ..Default::default()
-        }
-        .is_valid());
+        assert!(
+            VideoMetadata {
+                avg_fps: Some(30.0),
+                ..Default::default()
+            }
+            .is_valid()
+        );
     }
 
     #[test]
     fn video_metadata_is_valid_with_nominal_fps() {
-        assert!(VideoMetadata {
-            nominal_fps: Some(30.0),
-            ..Default::default()
-        }
-        .is_valid());
+        assert!(
+            VideoMetadata {
+                nominal_fps: Some(30.0),
+                ..Default::default()
+            }
+            .is_valid()
+        );
     }
 
     #[test]
     fn max_fps_config_enabled_zero_is_false() {
-        assert!(!MaxFpsConfig {
-            max_fps: 0.0,
-            eps: 0.05
-        }
-        .enabled());
+        assert!(
+            !MaxFpsConfig {
+                max_fps: 0.0,
+                eps: 0.05
+            }
+            .enabled()
+        );
     }
 
     #[test]
     fn max_fps_config_enabled_positive_is_true() {
-        assert!(MaxFpsConfig {
-            max_fps: 30.0,
-            eps: 0.05
-        }
-        .enabled());
+        assert!(
+            MaxFpsConfig {
+                max_fps: 30.0,
+                eps: 0.05
+            }
+            .enabled()
+        );
     }
 
     #[test]
     fn max_fps_config_enabled_negative_is_false() {
-        assert!(!MaxFpsConfig {
-            max_fps: -30.0,
-            eps: 0.05
-        }
-        .enabled());
+        assert!(
+            !MaxFpsConfig {
+                max_fps: -30.0,
+                eps: 0.05
+            }
+            .enabled()
+        );
     }
 
     // need_reduce: origin §6 matrix.

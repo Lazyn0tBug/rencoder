@@ -23,7 +23,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use rencoder_lib::config::app::AppConfig;
 use rencoder_lib::logging::file_sink::FileSink;
-use rencoder_lib::logging::{level_filter, LogSettings};
+use rencoder_lib::logging::{LogSettings, level_filter};
 
 /// Initialize the global tracing subscriber with stdout + file sinks.
 ///

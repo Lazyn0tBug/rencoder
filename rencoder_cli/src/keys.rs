@@ -31,8 +31,8 @@
 
 use std::io;
 use std::io::IsTerminal;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::signal::{self, CancelSlot};
 
@@ -259,7 +259,7 @@ fn read_loop(slot: &CancelSlot, stop: &AtomicBool) {
 #[cfg(windows)]
 fn read_loop(slot: &CancelSlot, stop: &AtomicBool) {
     use windows_sys::Win32::System::Console::{
-        ReadConsoleInputW, INPUT_RECORD, KEY_EVENT, LEFT_CTRL_PRESSED, RIGHT_CTRL_PRESSED,
+        INPUT_RECORD, KEY_EVENT, LEFT_CTRL_PRESSED, RIGHT_CTRL_PRESSED, ReadConsoleInputW,
     };
 
     let Some(console) = windows::Console::open() else {
@@ -389,8 +389,8 @@ mod unix {
 mod windows {
     use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Console::{
-        GetStdHandle, WriteConsoleInputW, INPUT_RECORD, INPUT_RECORD_0, KEY_EVENT,
-        KEY_EVENT_RECORD, STD_INPUT_HANDLE,
+        GetStdHandle, INPUT_RECORD, INPUT_RECORD_0, KEY_EVENT, KEY_EVENT_RECORD, STD_INPUT_HANDLE,
+        WriteConsoleInputW,
     };
 
     /// The console's input handle.

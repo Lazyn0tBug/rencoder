@@ -296,10 +296,10 @@ fn nvenc_check(capability: Option<&nvenc::Capability>) -> Check {
 
 /// Write the report where the frontends read it.
 fn write_report(capabilities: &Capabilities, path: &Path) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
     let json = serde_json::to_string_pretty(capabilities)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -408,10 +408,11 @@ mod tests {
         assert!(capability.any_usable());
         // ... and it survives the round trip through the file.
         let read = read_report(&paths.capability_report).expect("the report must be readable");
-        assert!(read
-            .nvenc
-            .expect("the capability must be in the file")
-            .any_usable());
+        assert!(
+            read.nvenc
+                .expect("the capability must be in the file")
+                .any_usable()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

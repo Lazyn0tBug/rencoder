@@ -512,17 +512,15 @@ where
         .as_ref()
         .filter(|record| record.matches_fingerprint(&fingerprint));
 
-    if !force {
-        if let Some(record) = usable_stored {
-            let review_due = record.review_due(now);
-            return Ok(Resolution {
-                encoders_output,
-                support: record.support().to_vec(),
-                record: record.clone(),
-                probed: false,
-                review_due,
-            });
-        }
+    if !force && let Some(record) = usable_stored {
+        let review_due = record.review_due(now);
+        return Ok(Resolution {
+            encoders_output,
+            support: record.support().to_vec(),
+            record: record.clone(),
+            probed: false,
+            review_due,
+        });
     }
 
     // Probe now.
@@ -782,10 +780,10 @@ pub fn load(path: &Path) -> Option<CapabilityRecord> {
 /// A failure here is not fatal: the capability is still usable for this
 /// run, it just will not be reused next time.
 pub fn save(path: &Path, record: &CapabilityRecord) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
     let json = serde_json::to_string_pretty(record)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -1268,11 +1266,13 @@ Encoders:
             assert!(entry.is_build_absent(), "{absent}: {entry:?}");
         }
         // The probe ran (one call per NVENC encoder in the build).
-        assert!(calls
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|c| c.contains("-c:v av1_nvenc")));
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.contains("-c:v av1_nvenc"))
+        );
     }
 
     #[test]
@@ -1361,11 +1361,12 @@ Encoders:
             .expect("av1_nvenc must be listed");
         assert!(!av1.usable);
         assert!(!av1.is_build_absent());
-        assert!(av1
-            .reason
-            .as_deref()
-            .unwrap_or_default()
-            .contains("No NVENC capable devices found"));
+        assert!(
+            av1.reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("No NVENC capable devices found")
+        );
         // The encoders this build does not have failed for a different
         // reason: the build, not the machine.
         let h264 = resolution

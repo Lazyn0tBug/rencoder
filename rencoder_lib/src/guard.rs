@@ -269,13 +269,13 @@ impl TargetGuard {
                 return Err(GuardError::Io {
                     path: marker,
                     source: e,
-                })
+                });
             }
             Err(lock::Error::Unsupported(e)) => {
                 return Err(GuardError::Unsupported {
                     path: marker,
                     source: e,
-                })
+                });
             }
         };
 
@@ -324,14 +324,14 @@ impl TargetGuard {
             // is closed (design doc §3.11.1.1): while the name is gone
             // we still hold the lock, so nobody can take the target
             // believing it is free.
-            if let Err(e) = std::fs::remove_file(&marker) {
-                if e.kind() != io::ErrorKind::NotFound {
-                    tracing::warn!(
-                        error = %e,
-                        path = %marker.display(),
-                        "could not remove the target marker"
-                    );
-                }
+            if let Err(e) = std::fs::remove_file(&marker)
+                && e.kind() != io::ErrorKind::NotFound
+            {
+                tracing::warn!(
+                    error = %e,
+                    path = %marker.display(),
+                    "could not remove the target marker"
+                );
             }
         }
     }

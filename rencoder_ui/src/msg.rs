@@ -680,15 +680,15 @@ fn dispatch(
 pub fn reduce(state: &mut AppState, msg: Msg, cmd_tx: &Sender<Request>) {
     match msg {
         Msg::UserSelectedDir(path) => {
-            if let Some(t) = &state.tasks.active {
-                if !matches!(t.phase, BatchPhase::Done) {
-                    // P2.5 fix: silently rejected (active task).
-                    // Don't keep a stale last_error on screen —
-                    // clear it so the user isn't misled by an
-                    // error from an earlier action.
-                    state.last_error = None;
-                    return;
-                }
+            if let Some(t) = &state.tasks.active
+                && !matches!(t.phase, BatchPhase::Done)
+            {
+                // P2.5 fix: silently rejected (active task).
+                // Don't keep a stale last_error on screen —
+                // clear it so the user isn't misled by an
+                // error from an earlier action.
+                state.last_error = None;
+                return;
             }
             state.last_error = None;
             state.input_dir = Some(path.clone());

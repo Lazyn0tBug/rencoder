@@ -22,7 +22,7 @@ mod tracing_init;
 
 use std::path::PathBuf;
 
-use rencoder_lib::config::app::{read_config_lenient, AppConfig};
+use rencoder_lib::config::app::{AppConfig, read_config_lenient};
 use rencoder_lib::config::paths::{self, Paths};
 
 fn main() {

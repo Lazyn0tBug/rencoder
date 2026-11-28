@@ -233,15 +233,15 @@ fn register_handler(slot: CancelSlot) {
 /// `OnceLock` and read from there.
 #[cfg(windows)]
 mod windows {
-    use super::{request_cancel, CancelSlot};
+    use super::{CancelSlot, request_cancel};
     use std::sync::OnceLock;
 
-    use windows_sys::core::BOOL;
     use windows_sys::Win32::Foundation::{FALSE, TRUE};
     use windows_sys::Win32::System::Console::{
-        SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT,
-        CTRL_SHUTDOWN_EVENT,
+        CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+        SetConsoleCtrlHandler,
     };
+    use windows_sys::core::BOOL;
 
     static CANCEL: OnceLock<CancelSlot> = OnceLock::new();
 

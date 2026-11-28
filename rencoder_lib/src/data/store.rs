@@ -458,15 +458,15 @@ fn parse_error_category(s: &str) -> ErrorCategory {
 /// The mechanics of "where the records go" live here, so both
 /// frontends write the same file the same way (design doc §3.11.4).
 pub fn write_records(records: &[EncodingRecord], path: &Path) -> Result<(), EncodeError> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                EncodeError::Io(std::io::Error::new(
-                    e.kind(),
-                    format!("failed to create directory {}: {e}", parent.display()),
-                ))
-            })?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            EncodeError::Io(std::io::Error::new(
+                e.kind(),
+                format!("failed to create directory {}: {e}", parent.display()),
+            ))
+        })?;
     }
     let bytes: Vec<u8> = match path.extension().and_then(|e| e.to_str()) {
         Some("parquet") => records_to_parquet(records)
@@ -476,7 +476,7 @@ pub fn write_records(records: &[EncodingRecord], path: &Path) -> Result<(), Enco
         other => {
             return Err(EncodeError::InvalidParam(format!(
                 "unsupported output extension {other:?}; use .parquet, .jsonl, or .csv"
-            )))
+            )));
         }
     };
     write_atomic(path, &bytes)

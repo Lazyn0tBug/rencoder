@@ -35,13 +35,13 @@ use std::io;
 use std::path::Path;
 use std::sync::OnceLock;
 
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use rencoder_lib::config::app::AppConfig;
 use rencoder_lib::logging::file_sink::FileSink;
-use rencoder_lib::logging::{level_filter, LogSettings};
+use rencoder_lib::logging::{LogSettings, level_filter};
 
 /// The receiver side of the log channel, populated by `init()` and
 /// taken (cloned) by App's `use_hook` for the drain thread.

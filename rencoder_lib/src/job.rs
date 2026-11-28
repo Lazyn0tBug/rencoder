@@ -28,7 +28,7 @@
 //! frozen into it. The waiting belongs to the actor, so a cancel can
 //! interrupt it.
 
-use crossbeam_channel::{after, bounded, never, select, unbounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, after, bounded, never, select, unbounded};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -36,7 +36,7 @@ use parking_lot::Mutex;
 
 use chrono::{DateTime, Utc};
 
-use crate::analyzer::records::{analyze_records_with_probe_and_progress_parallel, AnalyzeProgress};
+use crate::analyzer::records::{AnalyzeProgress, analyze_records_with_probe_and_progress_parallel};
 use crate::config::app::AppConfig;
 use crate::config::paths::{self, Paths};
 use crate::data::extract::probe_video_metadata_auto;
@@ -1923,12 +1923,9 @@ fn make_encode_processor(
     dropped_counter: DropCounter,
     update_tx: Sender<VerdictUpdate>,
     encoder: Arc<dyn FileEncoder>,
-) -> impl FnMut(
-    &EncodeTask,
-    &crate::pipeline::task::TaskContext,
-) -> Result<EncodingRecord, EncodeError>
-       + Send
-       + 'static {
+) -> impl FnMut(&EncodeTask, &crate::pipeline::task::TaskContext) -> Result<EncodingRecord, EncodeError>
++ Send
++ 'static {
     // What the actor already knows: the verdicts this batch started
     // with. The comparison tells us what the encode changed.
     let mut reported = batch_ctx.capability().verdicts().clone();
@@ -2422,19 +2419,19 @@ impl Ctx {
         // is the whole point of the waiting belonging to the
         // actor: a cancel is a command, and the actor is the
         // one who processes it.
-        if self.state.stage() == Some(Stage::Facts) {
-            if let Some(p) = self.pending.take() {
-                self.state.finish_batch();
-                send_evt_lossy(
-                    &self.evt_tx,
-                    Event::BatchCancelled {
-                        batch_id: p.id,
-                        completed: 0,
-                        total: p.total,
-                    },
-                    &self.dropped_counter,
-                );
-            }
+        if self.state.stage() == Some(Stage::Facts)
+            && let Some(p) = self.pending.take()
+        {
+            self.state.finish_batch();
+            send_evt_lossy(
+                &self.evt_tx,
+                Event::BatchCancelled {
+                    batch_id: p.id,
+                    completed: 0,
+                    total: p.total,
+                },
+                &self.dropped_counter,
+            );
         }
     }
 

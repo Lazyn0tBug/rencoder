@@ -35,10 +35,10 @@ pub fn config_file(explicit: Option<&Path>) -> Option<PathBuf> {
     if let Some(p) = explicit {
         return Some(p.to_path_buf());
     }
-    if let Some(raw) = std::env::var_os("RENENCODER_CONFIG") {
-        if !raw.is_empty() {
-            return Some(PathBuf::from(raw));
-        }
+    if let Some(raw) = std::env::var_os("RENENCODER_CONFIG")
+        && !raw.is_empty()
+    {
+        return Some(PathBuf::from(raw));
     }
     app_dir().map(|d| d.join("rencoder.toml"))
 }
@@ -158,10 +158,10 @@ impl Paths {
 ///
 /// 配置里的相对路径相对 `base`（各自的基准目录）解析，绝对路径原样使用。
 fn env_or(env_key: &str, configured: Option<&PathBuf>, base: &Path, default_name: &str) -> PathBuf {
-    if let Some(raw) = std::env::var_os(env_key) {
-        if !raw.is_empty() {
-            return PathBuf::from(raw);
-        }
+    if let Some(raw) = std::env::var_os(env_key)
+        && !raw.is_empty()
+    {
+        return PathBuf::from(raw);
     }
     match configured {
         Some(p) if p.is_absolute() => p.clone(),

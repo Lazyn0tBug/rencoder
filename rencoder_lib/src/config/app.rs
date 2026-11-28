@@ -532,21 +532,25 @@ impl AppConfig {
     /// other fields are type-validated at parse time.
     fn validate(&self) -> Result<(), ConfigError> {
         if let Some(enc) = &self.encode {
-            if let Some(m) = enc.max_fps {
-                if m != 0 && m != 24 && m != 25 && m != 30 && m != 60 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "encode.max_fps".into(),
-                        value: m.to_string(),
-                    });
-                }
+            if let Some(m) = enc.max_fps
+                && m != 0
+                && m != 24
+                && m != 25
+                && m != 30
+                && m != 60
+            {
+                return Err(ConfigError::InvalidValue {
+                    field: "encode.max_fps".into(),
+                    value: m.to_string(),
+                });
             }
-            if let Some(b) = enc.bitrate {
-                if b == 0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "encode.bitrate".into(),
-                        value: "0".into(),
-                    });
-                }
+            if let Some(b) = enc.bitrate
+                && b == 0
+            {
+                return Err(ConfigError::InvalidValue {
+                    field: "encode.bitrate".into(),
+                    value: "0".into(),
+                });
             }
             if enc.crf > 63 {
                 return Err(ConfigError::InvalidValue {
@@ -638,10 +642,10 @@ pub enum ConfigError {
 /// cleaned up so it doesn't leak. A successful `rename` atomically
 /// removes the tmp, so cleanup is only needed on the error path.
 fn write_atomic(path: &Path, content: &[u8]) -> Result<(), ConfigError> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
     let tmp = tmp_path_for(path);
     let result: Result<(), ConfigError> = (|| {

@@ -311,14 +311,14 @@ fn fake_record(path: &crate::types::InputPath) -> EncodingRecord {
 /// and counts calls. No progress events emitted.
 fn make_succeeding_mock() -> (
     impl Fn(
-            &EncodeTask,
-            &mut BatchContext,
-            &CancelToken,
-            &mut dyn FnMut(FfmpegProgress),
-        ) -> Result<EncodingRecord, EncodeError>
-        + Send
-        + Sync
-        + 'static,
+        &EncodeTask,
+        &mut BatchContext,
+        &CancelToken,
+        &mut dyn FnMut(FfmpegProgress),
+    ) -> Result<EncodingRecord, EncodeError>
+    + Send
+    + Sync
+    + 'static,
     Arc<AtomicUsize>,
 ) {
     let count = Arc::new(AtomicUsize::new(0));
@@ -342,9 +342,9 @@ fn make_progress_mock() -> impl Fn(
     &CancelToken,
     &mut dyn FnMut(FfmpegProgress),
 ) -> Result<EncodingRecord, EncodeError>
-       + Send
-       + Sync
-       + 'static {
++ Send
++ Sync
++ 'static {
     fn f(
         task: &EncodeTask,
         _: &mut BatchContext,
@@ -1113,7 +1113,15 @@ fn a_rejected_request_names_the_request() {
 fn load_history_returns_empty_when_no_data_dir() {
     // No RENENCODER_DATA_DIR set + no resolvable app dir →
     // load_history returns Vec::new() and emits HistoryLoaded(empty).
-    std::env::remove_var("RENENCODER_DATA_DIR");
+    //
+    // SAFETY: `remove_var` is unsafe in a multithreaded program
+    // (edition 2024 makes that explicit) because another thread could
+    // be reading the environment at the same time. This test binary
+    // runs one test at a time here, and no other thread in this
+    // process reads the environment.
+    unsafe {
+        std::env::remove_var("RENENCODER_DATA_DIR");
+    }
     let (cmd_tx, evt_rx) = run_test_controller(|task, _, _, _| Ok(fake_record(&task.input)), None);
     cmd_tx
         .send(Request::new(

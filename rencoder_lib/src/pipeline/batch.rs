@@ -318,36 +318,34 @@ where
     // available to tell the two cases apart; the probe is the only
     // decisive check that works on every path.
     let mut fallback_note: Option<FallbackNote> = None;
-    if run_result.is_err() {
-        if let Some(encoder) = extract_encoder_from_argv(plan.argv()) {
-            if nvenc::is_nvenc_encoder(&encoder)
-                && !nvenc::verify_capability(ctx.capability_mut(), &encoder)
-            {
-                let (_, message, stderr_tail) = run_result.clone().unwrap_err();
+    if run_result.is_err()
+        && let Some(encoder) = extract_encoder_from_argv(plan.argv())
+        && nvenc::is_nvenc_encoder(&encoder)
+        && !nvenc::verify_capability(ctx.capability_mut(), &encoder)
+    {
+        let (_, message, stderr_tail) = run_result.clone().unwrap_err();
+        tracing::warn!(
+            encoder = %encoder,
+            error = %message,
+            stderr = %stderr_tail,
+            "NVENC encoder is not usable on this machine; falling back to software encoding"
+        );
+        fallback_note = Some(FallbackNote {
+            encoder: encoder.clone(),
+            message: message.clone(),
+            stderr_tail: stderr_tail.clone(),
+        });
+        if let Some(fallback_argv) = rebuild_argv(&*ctx)
+            && !fallback_argv.is_empty()
+        {
+            plan.set_argv(fallback_argv);
+            run_result = run_ffmpeg(plan.argv().to_vec());
+            if let Err((_, message, _)) = &run_result {
                 tracing::warn!(
                     encoder = %encoder,
                     error = %message,
-                    stderr = %stderr_tail,
-                    "NVENC encoder is not usable on this machine; falling back to software encoding"
+                    "software fallback also failed"
                 );
-                fallback_note = Some(FallbackNote {
-                    encoder: encoder.clone(),
-                    message: message.clone(),
-                    stderr_tail: stderr_tail.clone(),
-                });
-                if let Some(fallback_argv) = rebuild_argv(&*ctx) {
-                    if !fallback_argv.is_empty() {
-                        plan.set_argv(fallback_argv);
-                        run_result = run_ffmpeg(plan.argv().to_vec());
-                        if let Err((_, message, _)) = &run_result {
-                            tracing::warn!(
-                                encoder = %encoder,
-                                error = %message,
-                                "software fallback also failed"
-                            );
-                        }
-                    }
-                }
             }
         }
     }
@@ -1017,7 +1015,7 @@ fn run_ffmpeg_with_stderr(
                     ErrorCategory::FfmpegSpawnFailed,
                     format!("spawn {program}: {e}"),
                     String::new(),
-                ))
+                ));
             }
         };
         loop {
@@ -1049,7 +1047,7 @@ fn run_ffmpeg_with_stderr(
                         ErrorCategory::FfmpegSpawnFailed,
                         format!("wait {program}: {e}"),
                         String::new(),
-                    ))
+                    ));
                 }
             }
         }
@@ -1848,9 +1846,11 @@ Encoders:
             "fallback must leave a trace in the record: {}",
             record.ffmpeg_stderr_tail
         );
-        assert!(record
-            .ffmpeg_stderr_tail
-            .contains("NVENC test_nvenc failed"));
+        assert!(
+            record
+                .ffmpeg_stderr_tail
+                .contains("NVENC test_nvenc failed")
+        );
     }
 
     #[test]
