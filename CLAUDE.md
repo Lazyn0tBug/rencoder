@@ -120,6 +120,15 @@ cargo build --release
 cargo build -p rencoder_lib --features parallel-analyze
 ```
 
+The workspace is **edition 2024** (`rust-version = "1.88"`), and the
+lint policy lives in the root `Cargo.toml`'s `[workspace.lints]` -- each
+crate opts in with `[lints] workspace = true`. Adding a lint there
+makes it an error in CI (the gate runs `cargo clippy -- -D warnings`).
+Keep the list short and purposeful: `clippy::pedantic` alone reports
+483 warnings here, and `clippy::needless_pass_by_value` must stay off
+(the design doc's own "is this a context object?" rule asks that
+question, design doc §3.10.4).
+
 `c-probe` (native libavformat probing) is **opt-in**: it needs pkg-config +
 libavformat dev headers, so it is off by default and the default build
 probes via the `ffprobe` subprocess. Enable it on a host that has the
