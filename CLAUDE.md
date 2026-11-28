@@ -12,6 +12,7 @@ Design source of truth: `docs/design.md`. Update the doc first when behavior cha
 **Doc scope split:**
 - `docs/design.md` describes **WHAT/WHY** (architecture, contracts, constraints, design rationale). New abstractions get a one-line entry in §3.8.6's "新增" table.
 - Implementation details (signatures, struct fields, work flows, thresholds) live in **`///` rustdoc comments** in the code itself. Generated with `cargo doc --no-deps`. Reviewers should reject design-doc additions that duplicate what rustdoc already says.
+- `docs/CI.md` is the **CI/release fault archive**: every way this repo's CI has lied (a gate that cannot go red, a runner label that matches no image, a test asserting a premise the product does not guarantee). Read it when CI is red, stuck, or "green but I do not believe it" -- and add an entry when a new one is found.
 
 ## Single-directory app (U18)
 

@@ -91,3 +91,13 @@ cargo test -p rencoder_lib -p rencoder_cli
 - **真实 GPU 的 NVENC 验收**（§8 row 87 ✅）——需要一台带 NVIDIA 显卡的机器 ✅，
   CI 跑不了 ✅（GitHub 的 runner 没有 GPU ✅）✅。
 - **Windows 的 GUI 能不能真的开窗** ✅ ❌——CI 只能证"编得过、测试过" ✅ ✅（测试无头的 ✅ ✅），"窗口开得起来"要人在 Windows 上跑一遍 ✅ ✅。
+
+## CI 红了 / 卡住了
+
+看 **`docs/CI.md`** ✅ ✅——那是本仓库 CI 与发布工作流的**故障档案** ✅ ✅：
+每条写清"现象 → 原因 → 修法 → 下次怎么早发现" ✅ ✅（Windows 的 shell ✅ ✅、
+runner 标签 ✅ ✅、`rfd` 的 feature 冲突 ✅ ✅、发布少装 webview 栈 ✅ ✅、
+cargo-dist 的 zip 是平的 ✅ ✅……）。
+
+两条最常犯的 ✅ ✅：**两秒就红 = 环境问题** ✅ ✅（门根本没跑起来 ✅ ✅），
+**永远排队 = 标签匹配不到镜像** ✅ ✅（不是队列忙 ✅ ✅）。
