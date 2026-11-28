@@ -18,7 +18,7 @@ edition = "2024"
 # 1.89, not 1.88: declaring lower would be a promise the code does
 # not keep.
 rust-version = "1.89"
-version = "0.8.0"
+version = "0.9.0-pre1"
 license = "MIT"
 
 # The lint policy, in one place.
