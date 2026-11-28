@@ -33,7 +33,12 @@ tracing = "0.1"
 # subscriber dependency does not leak into a public API surface.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "1"
-num_cpus = "1"
+# `num_cpus` used to be declared here and never used -- the parallelism
+# comes from `rayon` (the optional `parallel-analyze` feature) and
+# from `std::thread::available_parallelism()`. Cargo's
+# `unused_dependencies` lint says so on every build ("unused
+# dependency `num_cpus`"); the declaration only cost a crate in the
+# dependency graph.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 parking_lot = "0.12"
 rayon = { version = "1", optional = true }
